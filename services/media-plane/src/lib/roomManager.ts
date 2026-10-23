@@ -5026,8 +5026,9 @@ export class RoomManager {
   /**
    * Compute the "codec floor" — the intersection of all participants' video
    * decode capabilities. Returns canonical lowercase primary-video keys that
-   * every participant with non-null rtpCapabilities can decode.
-   * Returns null if <2 participants have capabilities (no constraint needed).
+   * every participant with usable video capabilities can decode.
+   * Returns null if fewer than two participants advertise video, or if there
+   * is no common codec. Per-recipient canConsume still gates delivery.
    *
    * VP9 profiles remain distinct. H.264 levels normalize to Concord's configured
    * representative for their RFC 6184 profile class because level asymmetry is
@@ -5037,16 +5038,17 @@ export class RoomManager {
     const room = this.rooms.get(roomId);
     if (!room) return null;
 
-    const capableParts: RtpCapabilities[] = [];
+    const codecKeySets: Set<string>[] = [];
     for (const [, p] of room.participants) {
-      if (p.rtpCapabilities) capableParts.push(p.rtpCapabilities);
+      if (!p.rtpCapabilities) continue;
+      const keys = extractVideoCodecKeys(p.rtpCapabilities);
+      if (keys.size > 0) codecKeySets.push(keys);
     }
 
-    if (capableParts.length < 2) return null;
+    if (codecKeySets.length < 2) return null;
 
-    const codecKeySets = capableParts.map(extractVideoCodecKeys);
     const floor = intersectCodecKeySets(codecKeySets);
-    return Array.from(floor);
+    return floor.size > 0 ? Array.from(floor) : null;
   }
 
   /**
@@ -6305,8 +6307,39 @@ export class RoomManager {
   }
 
   private cameraLayeringCodecKind(room: Room): LayeredCodecKind {
+    let hasCameraProducer = false;
+    for (const [, participant] of room.participants) {
+      for (const [, entry] of participant.producers) {
+        if (entry.source !== 'camera') continue;
+        hasCameraProducer = true;
+        const parameters = entry.producer.rtpParameters;
+        const primaryMime = parameters?.codecs
+          ?.find((codec) => codec.mimeType.toLowerCase() !== 'video/rtx')
+          ?.mimeType.toLowerCase();
+        if (
+          parameters?.encodings?.length !== 1 ||
+          (primaryMime !== 'video/av1' && primaryMime !== 'video/vp9')
+        ) {
+          return 'simulcast';
+        }
+      }
+    }
+    // Receive claims cannot override the codec of a working camera producer.
+    if (hasCameraProducer) return 'svc';
+
     const floor = this.computeCodecFloor(room.id);
-    if (!floor) return 'svc';
+    if (!floor) {
+      // Null also covers empty or disjoint claims. Keep the former conservative
+      // simulcast gate once two participants have submitted capabilities.
+      let capabilityCount = 0;
+      for (const [, participant] of room.participants) {
+        if (participant.rtpCapabilities) {
+          capabilityCount++;
+          if (capabilityCount >= 2) return 'simulcast';
+        }
+      }
+      return 'svc';
+    }
     if (
       floor.some(
         (codec) => codec === 'video/av1' || codec === 'video/vp9' || codec.startsWith('video/vp9:')

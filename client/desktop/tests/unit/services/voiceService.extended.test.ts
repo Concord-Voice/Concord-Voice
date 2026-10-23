@@ -4932,8 +4932,7 @@ describe('VoiceService Extended', () => {
       });
       svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
       svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
-      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
-      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+      const reselectSpy = vi.spyOn(svc, 'reProduceIfBetterCodec').mockResolvedValue(undefined);
 
       try {
         useVideoSettingsStore.getState().setCodecCapabilities([
@@ -4948,11 +4947,17 @@ describe('VoiceService Extended', () => {
           },
         ]);
 
-        expect(cameraSpy).toHaveBeenCalledTimes(1);
-        expect(screenSpy).toHaveBeenCalledTimes(1);
+        expect(reselectSpy).toHaveBeenCalledWith('camera', {
+          requireRoomFloorMatch: true,
+          forceReproduce: true,
+        });
+        expect(reselectSpy).toHaveBeenCalledWith('screen', {
+          requireRoomFloorMatch: true,
+          forceReproduce: true,
+        });
+        expect(reselectSpy).toHaveBeenCalledTimes(2);
       } finally {
-        cameraSpy.mockRestore();
-        screenSpy.mockRestore();
+        reselectSpy.mockRestore();
       }
     });
 
@@ -4962,8 +4967,7 @@ describe('VoiceService Extended', () => {
       useVideoSettingsStore.setState({ hdrEncoding: false, codecCapabilities: [] });
       svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
       svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
-      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
-      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+      const reselectSpy = vi.spyOn(svc, 'reProduceIfBetterCodec').mockResolvedValue(undefined);
 
       try {
         useVideoSettingsStore.getState().setCodecCapabilities([
@@ -4978,11 +4982,17 @@ describe('VoiceService Extended', () => {
           },
         ]);
 
-        expect(cameraSpy).toHaveBeenCalledTimes(1);
-        expect(screenSpy).toHaveBeenCalledTimes(1);
+        expect(reselectSpy).toHaveBeenCalledWith('camera', {
+          requireRoomFloorMatch: true,
+          forceReproduce: true,
+        });
+        expect(reselectSpy).toHaveBeenCalledWith('screen', {
+          requireRoomFloorMatch: true,
+          forceReproduce: true,
+        });
+        expect(reselectSpy).toHaveBeenCalledTimes(2);
       } finally {
-        cameraSpy.mockRestore();
-        screenSpy.mockRestore();
+        reselectSpy.mockRestore();
       }
     });
 
@@ -5058,21 +5068,21 @@ describe('VoiceService Extended', () => {
     it('supportSvc change reproduces camera once', () => {
       const svc = voiceService as any;
       svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
-      const spy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const spy = vi.spyOn(svc, 'fastReproduceCamera').mockResolvedValue(undefined);
       const prev = flip({ supportSvc: true });
       const state = flip({ supportSvc: false });
       svc.applyCameraSettingsChange(state, prev);
-      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledExactlyOnceWith(true);
     });
 
     it('supportSimulcast change reproduces camera once', () => {
       const svc = voiceService as any;
       svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
-      const spy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const spy = vi.spyOn(svc, 'fastReproduceCamera').mockResolvedValue(undefined);
       const prev = flip({ supportSimulcast: true });
       const state = flip({ supportSimulcast: false });
       svc.applyCameraSettingsChange(state, prev);
-      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledExactlyOnceWith(true);
     });
 
     it('supportSimulcast change does NOT reproduce screen (SVC-only, #1921 Gitar fix)', () => {

@@ -485,6 +485,23 @@ describe('selectCodecFromCascade', () => {
     expect(result).toBe(vp8);
   });
 
+  it.each([[], ['video/av1']])(
+    'uses a locally supported codec when the room floor %j has no eligible match',
+    (floor) => {
+      const vp8 = fakeCodec('video/VP8');
+      const lookup = makeLookup({ floor, available: { 'video/vp8': vp8 } });
+      expect(
+        selectCodecFromCascade({
+          preferred: null,
+          hwAccel: false,
+          hdrEncoding: false,
+          prioritizeHdrCodecs: false,
+          ...lookup,
+        })
+      ).toBe(vp8);
+    }
+  );
+
   it('returns undefined when no codecs available at all', () => {
     const lookup = makeLookup({ available: {} });
     const result = selectCodecFromCascade({

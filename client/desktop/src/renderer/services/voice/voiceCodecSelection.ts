@@ -350,18 +350,22 @@ export function selectCodecCandidate<T = mediasoupTypes.RtpCodecCapability>(
   config: CodecCascadeConfig<T>
 ): SelectedCodecCandidate<T> | undefined {
   const { preferred, hwAccel, hdrEncoding, prioritizeHdrCodecs, ...lookup } = config;
+  const candidates = buildCodecCandidates(hdrEncoding, hwAccel, prioritizeHdrCodecs);
+  const select = (searchLookup: CodecLookup<T>): SelectedCodecCandidate<T> | undefined => {
+    if (preferred) {
+      const selected = findPreferredCandidate(preferred, hwAccel, hdrEncoding, searchLookup);
+      if (selected) return selected;
+    }
+    for (const candidate of candidates) {
+      const selected = findCandidate(candidate, searchLookup);
+      if (selected) return selected;
+    }
+    return undefined;
+  };
 
-  if (preferred) {
-    const selected = findPreferredCandidate(preferred, hwAccel, hdrEncoding, lookup);
-    if (selected) return selected;
-  }
-
-  for (const candidate of buildCodecCandidates(hdrEncoding, hwAccel, prioritizeHdrCodecs)) {
-    const selected = findCandidate(candidate, lookup);
-    if (selected) return selected;
-  }
-
-  return undefined;
+  // If the room floor leaves no local publishing codec, publish with a locally
+  // supported codec instead. Per-recipient canConsume still gates delivery.
+  return select(lookup) ?? select({ ...lookup, isInCodecFloor: () => true });
 }
 
 export function selectCodecFromCascade<T = mediasoupTypes.RtpCodecCapability>(

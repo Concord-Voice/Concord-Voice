@@ -4296,7 +4296,13 @@ describe('VoiceService', () => {
       };
       try {
         await svc.learnWebrtcHwSignal();
-        expect(calls).toEqual([['camera', { requireHwImprovement: true }, expect.any(Number)]]);
+        expect(calls).toEqual([
+          [
+            'camera',
+            { requireHwImprovement: true, requireRoomFloorMatch: true },
+            expect.any(Number),
+          ],
+        ]);
       } finally {
         delete svc.reProduceIfBetterCodec;
       }
@@ -4365,6 +4371,7 @@ describe('VoiceService', () => {
       replacement.rtpParameters = {
         codecs: [{ mimeType: 'video/H264', parameters: { 'profile-level-id': '640034' } }],
       };
+      useVoiceStore.getState().setCodecFloor(['video/H264:640034']);
       sendTransport.produce.mockClear();
       sendTransport.produce.mockResolvedValue(replacement);
 
@@ -4399,8 +4406,16 @@ describe('VoiceService', () => {
       try {
         await svc.learnWebrtcHwSignal();
         expect(calls).toEqual([
-          ['camera', { requireHwImprovement: true }, expect.any(Number)],
-          ['screen', { requireHwImprovement: true }, expect.any(Number)],
+          [
+            'camera',
+            { requireHwImprovement: true, requireRoomFloorMatch: true },
+            expect.any(Number),
+          ],
+          [
+            'screen',
+            { requireHwImprovement: true, requireRoomFloorMatch: true },
+            expect.any(Number),
+          ],
         ]);
       } finally {
         delete svc.reProduceIfBetterCodec;
@@ -4453,6 +4468,7 @@ describe('VoiceService', () => {
         oldProducer.getStats = vi.fn().mockResolvedValue(bFalseStats('video/VP8'));
 
         svc.cameraLayeringEnabled = false;
+        useVoiceStore.getState().setCodecFloor(['video/AV1']);
         svc.producers.set(source, oldProducer);
         svc[streamField] = createMockMediaStream([{ kind: 'video', id: `${source}-track` }]);
         setActive();
@@ -5148,6 +5164,30 @@ describe('VoiceService', () => {
   // ===== Codec Selection =====
 
   describe('codec selection', () => {
+    it.each([
+      { source: 'camera' as const, floor: [] },
+      { source: 'screen' as const, floor: ['video/h265'] },
+    ])(
+      'publishes $source when a peer-controlled floor has no local codec',
+      async ({ source, floor }) => {
+        const { sendTransport } = await joinVoiceChannel();
+        useVoiceStore.setState({ codecFloor: floor });
+        const stream = createMockMediaStream([{ kind: 'video', id: `${source}-floor-track` }]);
+        sendTransport.produce.mockClear();
+        if (source === 'camera') {
+          mockGetUserMedia.mockResolvedValue(stream);
+          await voiceService.toggleVideo();
+        } else {
+          mockGetDisplayMedia.mockResolvedValue(stream);
+          await voiceService.produceScreen();
+        }
+
+        expect(sendTransport.produce).toHaveBeenCalledWith(
+          expect.objectContaining({ codec: expect.objectContaining({ kind: 'video' }) })
+        );
+      }
+    );
+
     it.each(['camera', 'screen'] as const)(
       'publishes H264 with one temporal layer per rung after the %s gate turns on',
       async (source) => {
@@ -5165,6 +5205,11 @@ describe('VoiceService', () => {
           mockGetDisplayMedia.mockResolvedValue(stream);
           await voiceService.produceScreen();
         }
+        // The transport mock does not populate Producer.rtpParameters. Gate
+        // reproduction now reads the actual published codec from that field.
+        const publishedCodec = sendTransport.produce.mock.lastCall?.[0].codec;
+        const activeProducer = (voiceService as any).producers.get(source);
+        activeProducer.rtpParameters = { codecs: [publishedCodec] };
         sendTransport.produce.mockClear();
 
         const handler = socketListeners[`${source}-layering-gate`]?.[0];
@@ -7582,6 +7627,294 @@ describe('VoiceService', () => {
   // ===== handleCodecFloorChange =====
 
   describe('codec floor change', () => {
+    it.each([
+      { nextFloor: null, expectedCodec: 'video/VP8' },
+      { nextFloor: ['video/AV1'], expectedCodec: 'video/AV1' },
+    ])(
+      'pins dead-track camera recovery when the floor becomes $nextFloor during capture',
+      async ({ nextFloor, expectedCodec }) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        useVideoSettingsStore.setState({ preferredVideoCodec: 'video/AV1' });
+        const oldProducer = createMockProducer('prod-camera-dead-vp8', 'camera') as any;
+        oldProducer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+        svc.producers.set('camera', oldProducer);
+        const oldStream = createMockMediaStream([{ kind: 'video', id: 'camera-dead-track' }]);
+        oldStream.getVideoTracks()[0].readyState = 'ended';
+        svc.localCameraStream = oldStream;
+        const newStream = createMockMediaStream([{ kind: 'video', id: 'camera-new-track' }]);
+        const pendingCapture = deferred<ReturnType<typeof createMockMediaStream>>();
+        mockGetUserMedia.mockReturnValue(pendingCapture.promise);
+        mockGetUserMedia.mockClear();
+        sendTransport.produce.mockResolvedValue(
+          createMockProducer('prod-camera-recovered', 'camera')
+        );
+        sendTransport.produce.mockClear();
+        useVoiceStore.getState().setCodecFloor(['video/AV1']);
+        svc.drainSendTransportQueue = vi.fn().mockResolvedValue(undefined);
+
+        let replacement!: Promise<void>;
+        try {
+          replacement = svc.handleCodecFloorChange(['video/VP8'], ['video/AV1']);
+          await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalled());
+          useVoiceStore.getState().setCodecFloor(nextFloor);
+          pendingCapture.resolve(newStream);
+          await replacement;
+
+          expect(sendTransport.produce).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+              codec: expect.objectContaining({ mimeType: expectedCodec }),
+            })
+          );
+          expect(svc.producers.has('camera')).toBe(true);
+        } finally {
+          pendingCapture.resolve(newStream);
+          await replacement?.catch(() => undefined);
+          delete svc.drainSendTransportQueue;
+        }
+      }
+    );
+
+    it('drains and restores VP8 when a dead-track recovery floor changes during publication', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({ preferredVideoCodec: 'video/AV1' });
+      const oldProducer = createMockProducer('prod-camera-dead-race', 'camera') as any;
+      oldProducer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+      svc.producers.set('camera', oldProducer);
+      const oldStream = createMockMediaStream([{ kind: 'video', id: 'camera-dead-race-track' }]);
+      oldStream.getVideoTracks()[0].readyState = 'ended';
+      svc.localCameraStream = oldStream;
+      mockGetUserMedia.mockResolvedValue(
+        createMockMediaStream([{ kind: 'video', id: 'camera-recovered-race-track' }])
+      );
+      const unsafeProducer = createMockProducer('prod-camera-dead-av1', 'camera');
+      const restoredProducer = createMockProducer('prod-camera-dead-vp8', 'camera');
+      const pendingPublication = deferred<ReturnType<typeof createMockProducer>>();
+      sendTransport.produce.mockImplementationOnce(() => pendingPublication.promise);
+      sendTransport.produce.mockResolvedValue(restoredProducer);
+      sendTransport.produce.mockClear();
+      useVoiceStore.getState().setCodecFloor(['video/AV1']);
+      svc.drainSendTransportQueue = vi.fn().mockResolvedValue(undefined);
+
+      let replacement!: Promise<void>;
+      try {
+        replacement = svc.handleCodecFloorChange(['video/VP8'], ['video/AV1']);
+        await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+        useVoiceStore.getState().setCodecFloor(null);
+        pendingPublication.resolve(unsafeProducer);
+        await replacement;
+
+        expect(
+          sendTransport.produce.mock.calls.map((call: any[]) => call[0].codec.mimeType)
+        ).toEqual(['video/AV1', 'video/VP8']);
+        expect(unsafeProducer.close).toHaveBeenCalled();
+        expect(svc.drainSendTransportQueue).toHaveBeenCalledTimes(2);
+        expect(svc.drainSendTransportQueue.mock.invocationCallOrder[1]).toBeLessThan(
+          sendTransport.produce.mock.invocationCallOrder[1]
+        );
+        expect(svc.producers.get('camera')).toBe(restoredProducer);
+      } finally {
+        pendingPublication.resolve(unsafeProducer);
+        await replacement?.catch(() => undefined);
+        delete svc.drainSendTransportQueue;
+      }
+    });
+
+    it.each(['camera', 'screen'] as const)(
+      'keeps active %s VP8 when an automatic codec probe finishes under a disjoint floor',
+      async (source) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        useVideoSettingsStore.setState({
+          hdrEncoding: true,
+          prioritizeHdrCodecs: true,
+          codecCapabilities: [],
+        });
+        const producer = createMockProducer(`prod-${source}-vp8`, source) as any;
+        producer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+        svc.producers.set(source, producer);
+        svc[source === 'camera' ? 'localCameraStream' : 'localScreenStream'] =
+          createMockMediaStream([{ kind: 'video', id: `${source}-probe-track` }]);
+        sendTransport.produce.mockClear();
+        useVoiceStore.getState().setCodecFloor(null);
+
+        useVideoSettingsStore.getState().setCodecCapabilities([
+          {
+            mimeType: 'video/AV1',
+            profileId: 'hdr',
+            profileLabel: 'HDR',
+            hwAvailable: false,
+            swAvailable: true,
+            supported: true,
+            isHdr: true,
+          },
+        ]);
+        await svc.videoReproduceQueues[source];
+
+        expect(producer.close).not.toHaveBeenCalled();
+        expect(sendTransport.produce).not.toHaveBeenCalled();
+        expect(svc.producers.get(source)).toBe(producer);
+      }
+    );
+
+    it.each(['camera', 'screen'] as const)(
+      'restores the active VP8 codec when the %s floor becomes disjoint during publication',
+      async (source) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        useVideoSettingsStore.setState({ preferredVideoCodec: 'video/AV1' });
+        const oldProducer = createMockProducer(`prod-${source}-old`, source) as any;
+        oldProducer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+        svc.producers.set(source, oldProducer);
+        svc[source === 'camera' ? 'localCameraStream' : 'localScreenStream'] =
+          createMockMediaStream([{ kind: 'video', id: `${source}-publish-race-track` }]);
+        const unsafeProducer = createMockProducer(`prod-${source}-av1`, source);
+        const restoredProducer = createMockProducer(`prod-${source}-vp8`, source);
+        const pendingPublication = deferred<ReturnType<typeof createMockProducer>>();
+        sendTransport.produce.mockImplementationOnce(() => pendingPublication.promise);
+        sendTransport.produce.mockResolvedValue(restoredProducer);
+        sendTransport.produce.mockClear();
+        useVoiceStore.getState().setCodecFloor(['video/AV1']);
+        svc.drainSendTransportQueue = vi.fn().mockResolvedValue(undefined);
+
+        let replacement!: Promise<void>;
+        try {
+          replacement = svc.handleCodecFloorChange(['video/VP8'], ['video/AV1']);
+          await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+          useVoiceStore.getState().setCodecFloor(null);
+          pendingPublication.resolve(unsafeProducer);
+          await replacement;
+
+          expect(sendTransport.produce).toHaveBeenCalledTimes(2);
+          expect(
+            sendTransport.produce.mock.calls.map((call: any[]) => call[0].codec.mimeType)
+          ).toEqual(['video/AV1', 'video/VP8']);
+          expect(unsafeProducer.close).toHaveBeenCalled();
+          expect(svc.drainSendTransportQueue).toHaveBeenCalledTimes(2);
+          expect(svc.drainSendTransportQueue.mock.invocationCallOrder[1]).toBeLessThan(
+            sendTransport.produce.mock.invocationCallOrder[1]
+          );
+          expect(svc.producers.get(source)).toBe(restoredProducer);
+        } finally {
+          pendingPublication.resolve(unsafeProducer);
+          await replacement?.catch(() => undefined);
+          delete svc.drainSendTransportQueue;
+        }
+      }
+    );
+
+    it.each([
+      { source: 'camera' as const, nextFloor: null, expectedCodec: 'video/VP8' },
+      { source: 'screen' as const, nextFloor: null, expectedCodec: 'video/VP8' },
+      { source: 'camera' as const, nextFloor: ['video/AV1'], expectedCodec: 'video/AV1' },
+      { source: 'screen' as const, nextFloor: ['video/AV1'], expectedCodec: 'video/AV1' },
+    ])(
+      'binds the $source replacement codec across transport drain when the floor becomes $nextFloor',
+      async ({ source, nextFloor, expectedCodec }) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        useVideoSettingsStore.setState({ preferredVideoCodec: 'video/AV1' });
+        const oldProducer = createMockProducer(`prod-${source}-old`, source) as any;
+        oldProducer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+        svc.producers.set(source, oldProducer);
+        svc[source === 'camera' ? 'localCameraStream' : 'localScreenStream'] =
+          createMockMediaStream([{ kind: 'video', id: `${source}-floor-race-track` }]);
+        sendTransport.produce.mockResolvedValue(createMockProducer(`prod-${source}-new`, source));
+        sendTransport.produce.mockClear();
+        useVoiceStore.getState().setCodecFloor(['video/AV1']);
+
+        let releaseDrain!: () => void;
+        const drain = new Promise<void>((resolve) => {
+          releaseDrain = resolve;
+        });
+        svc.drainSendTransportQueue = vi.fn(async () => drain);
+        let replacement!: Promise<void>;
+        try {
+          replacement = svc.handleCodecFloorChange(['video/VP8'], ['video/AV1']);
+          await vi.waitFor(() => expect(svc.drainSendTransportQueue).toHaveBeenCalled());
+          useVoiceStore.getState().setCodecFloor(nextFloor);
+          releaseDrain();
+          await replacement;
+
+          expect(sendTransport.produce).toHaveBeenCalledWith(
+            expect.objectContaining({ codec: expect.objectContaining({ mimeType: expectedCodec }) })
+          );
+        } finally {
+          releaseDrain();
+          await replacement?.catch(() => undefined);
+          delete svc.drainSendTransportQueue;
+        }
+      }
+    );
+
+    it.each(['camera', 'screen'] as const)(
+      'keeps the active VP8 codec when the %s layering gate changes under a disjoint floor',
+      async (source) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        useVoiceStore.getState().setCodecFloor(null);
+        useVideoSettingsStore.setState({ preferredVideoCodec: 'video/AV1' });
+        const oldProducer = createMockProducer(`prod-${source}-vp8`, source) as any;
+        oldProducer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+        svc.producers.set(source, oldProducer);
+        svc[source === 'camera' ? 'localCameraStream' : 'localScreenStream'] =
+          createMockMediaStream([{ kind: 'video', id: `${source}-vp8-track` }]);
+        sendTransport.produce.mockResolvedValue(
+          createMockProducer(`prod-${source}-replacement`, source)
+        );
+        sendTransport.produce.mockClear();
+
+        expect(
+          svc[source === 'camera' ? 'pickCameraCodec' : 'pickScreenCodec']().codec?.mimeType
+        ).toBe('video/AV1');
+        const handler = socketListeners[`${source}-layering-gate`]?.[0];
+        expect(handler).toBeDefined();
+        handler?.({ enabled: true });
+
+        await vi.waitFor(() => {
+          expect(sendTransport.produce).toHaveBeenCalledWith(
+            expect.objectContaining({ codec: expect.objectContaining({ mimeType: 'video/VP8' }) })
+          );
+        });
+        expect(oldProducer.close).toHaveBeenCalled();
+      }
+    );
+
+    it.each([
+      { source: 'camera' as const, floor: null, shouldSwitch: false },
+      { source: 'screen' as const, floor: ['video/h264'], shouldSwitch: false },
+      { source: 'camera' as const, floor: ['video/av1'], shouldSwitch: true },
+    ])(
+      'preserves an existing $source codec unless the new floor supports its replacement',
+      async ({ source, floor, shouldSwitch }) => {
+        await joinVoiceChannel();
+        const svc = voiceService as any;
+        const producer = createMockProducer(`prod-${source}-floor`, source) as any;
+        producer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+        svc.producers.set(source, producer);
+        const pickName = source === 'camera' ? 'pickCameraCodec' : 'pickScreenCodec';
+        const reproduceName =
+          source === 'camera' ? 'fastReproduceCameraQueued' : 'fastReproduceScreenQueued';
+        svc[pickName] = () => ({
+          codec: { kind: 'video', mimeType: 'video/AV1', clockRate: 90000 },
+          encodings: [{ maxBitrate: 2_000_000 }],
+        });
+        const reproduce = vi.fn().mockResolvedValue(undefined);
+        svc[reproduceName] = reproduce;
+        useVoiceStore.getState().setCodecFloor(floor);
+
+        try {
+          await svc.handleCodecFloorChange(['video/vp8'], floor);
+          expect(reproduce).toHaveBeenCalledTimes(shouldSwitch ? 1 : 0);
+          expect(producer.close).not.toHaveBeenCalled();
+        } finally {
+          delete svc[pickName];
+          delete svc[reproduceName];
+        }
+      }
+    );
+
     it('re-produces when better codec available', async () => {
       await joinVoiceChannel();
 
@@ -7676,7 +8009,7 @@ describe('VoiceService', () => {
       }
     });
 
-    it('closes an active producer when the policy has no eligible codec', async () => {
+    it('keeps an active producer when a floor update leaves no eligible replacement', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       const cameraProducer = createMockProducer('prod-cam-no-codec', 'camera') as any;
@@ -7692,11 +8025,11 @@ describe('VoiceService', () => {
 
       try {
         await svc.reProduceIfBetterCodec('camera');
-        expect(cameraProducer.close).toHaveBeenCalled();
-        expect(svc.producers.has('camera')).toBe(false);
-        expect(svc.localCameraStream).toBeNull();
-        expect(useVoiceStore.getState().activeCameraCodec).toBeNull();
-        expect(useVoiceStore.getState().isVideoOn).toBe(false);
+        expect(cameraProducer.close).not.toHaveBeenCalled();
+        expect(svc.producers.get('camera')).toBe(cameraProducer);
+        expect(svc.localCameraStream).not.toBeNull();
+        expect(useVoiceStore.getState().activeCameraCodec).toBe('video/vp8');
+        expect(useVoiceStore.getState().isVideoOn).toBe(true);
       } finally {
         delete svc.pickCameraCodec;
       }

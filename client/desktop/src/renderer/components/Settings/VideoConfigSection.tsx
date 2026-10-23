@@ -389,15 +389,20 @@ function codecPreferenceHint(args: {
   selectedName: string | null;
   targetName: string | null;
   targetUsesHardware: boolean;
+  outOfRoomFloor: boolean;
 }): string {
   const { preferredVideoCodec, selectedIsTarget, effectiveKey, targetUsesHardware } = args;
   const selectedName = args.selectedName ?? 'codec';
   const targetName = args.targetName ?? 'the next eligible codec';
   const prefix = 'Preferred codec for camera and screen share encoding.';
 
+  if (args.outOfRoomFloor) {
+    return `No locally available codec matches this room's advertised codecs. Concord will try ${targetName} for camera and screen; some participants may not receive your video.`;
+  }
+
   if (preferredVideoCodec) {
     if (selectedIsTarget) {
-      return `${prefix} Currently ${args.targetName ?? 'unavailable'}. Concord falls back automatically if a peer cannot decode it.`;
+      return `${prefix} Currently ${args.targetName ?? 'unavailable'}. Some participants may not receive your video if they cannot decode this codec.`;
     }
     if (effectiveKey) {
       return `Selected ${selectedName} cannot be used with the current room and settings. Concord will try ${targetName} instead.`;
@@ -849,6 +854,10 @@ const VideoConfigSection: React.FC = () => {
   const targetCodec = targetSelection?.codec;
   const targetCodecKey = targetSelection?.candidate.key.toLowerCase() ?? null;
   const targetUsesHardware = targetSelection?.candidate.backend === 'hardware';
+  const targetOutsideRoomFloor =
+    targetCodecKey !== null &&
+    codecFloor !== null &&
+    !isCodecKeyInFloor(targetCodecKey, codecFloor);
 
   useEffect(() => {
     if (!preferredVideoCodec || codecCapabilities.length === 0) return;
@@ -1587,6 +1596,7 @@ const VideoConfigSection: React.FC = () => {
               selectedName: selectedInfo?.name ?? null,
               targetName: info?.name ?? null,
               targetUsesHardware,
+              outOfRoomFloor: targetOutsideRoomFloor,
             });
             const preferredBackend = hardwareAcceleration ? 'hardware' : 'software';
             let preferredSelectorValue = '';
@@ -1679,9 +1689,10 @@ const VideoConfigSection: React.FC = () => {
                 <div className="settings-codec-preference-notice">
                   <strong>Preferred</strong> is the target Concord will try first.{' '}
                   <strong>Camera In Use</strong> and <strong>Screen In Use</strong> report what each
-                  active producer actually uses after room compatibility checks. Hardware and
-                  Software entries are targets; active outbound WebRTC stats are authoritative for
-                  actual hardware use. WebRTC does not expose definitive AV1 encoded bit depth.
+                  active producer actually uses. Peer delivery depends on each peer's decoding
+                  support. Hardware and Software entries are targets; active outbound WebRTC stats
+                  are authoritative for actual hardware use. WebRTC does not expose definitive AV1
+                  encoded bit depth.
                 </div>
                 <CodecProfilesModal
                   isOpen={codecProfilesOpen}

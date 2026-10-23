@@ -99,6 +99,8 @@ you verify your email.
 
 ### Fixed
 
+- **Video stays on when someone joins a call with incompatible video support** (internal development reference omitted) — a participant's codec claim no longer stops an active camera or screen share. Codec and layering changes keep a working format for existing viewers.
+
 - **Server message purges refresh only affected channels** (internal development reference omitted) — a server purge no longer clears cached messages in private or skipped channels. A purge that removes no messages leaves channel caches alone.
 
 - **Invite links keep previews in the signed-in app** (internal development reference omitted) — shared links show a generic friend or server greeting, then offer to open Concord Voice. After sign-in and key unlock, the app opens the selected invite. Profile pictures, banners, and server icons now load through the signed-in account instead of anonymous image requests. The feedback screenshot picker warns that attached images are publicly readable and should be redacted before upload.

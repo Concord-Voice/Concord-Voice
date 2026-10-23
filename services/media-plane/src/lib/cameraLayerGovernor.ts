@@ -117,7 +117,11 @@ export function clampCameraLayerDemand(
   spatialLayer: LayerValue;
   temporalLayer: LayerValue;
 } {
-  const spatialLayer = Math.min(demand.spatialLayer, layerForRender(demand), maxSpatialLayer) as LayerValue;
+  const spatialLayer = Math.min(
+    demand.spatialLayer,
+    layerForRender(demand),
+    maxSpatialLayer
+  ) as LayerValue;
   const temporalLayer = Math.min(demand.temporalLayer, spatialLayer === 0 ? 1 : 2) as LayerValue;
   return { spatialLayer, temporalLayer };
 }
@@ -140,6 +144,9 @@ export function computeCameraLayeringGate(input: {
   demands: StoredCameraLayerDemand[];
   previouslyEnabled?: boolean;
 }): boolean {
+  // Closing the last producer precedes asynchronous consumer-demand cleanup.
+  // Stale demands must not arm an SVC gate while no camera can provide layers.
+  if (input.cameraProducerCount === 0) return false;
   const visible = input.demands.filter((demand) => demand.visible);
   const visibleThreshold = input.previouslyEnabled ? 1 : 2;
   const hasLayerBenefit =

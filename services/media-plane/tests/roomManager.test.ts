@@ -6003,10 +6003,19 @@ describe('RoomManager', () => {
       return { participant, consumer };
     }
 
-    async function addCameraProducer(userId: string, producerId: string, videoCodecs?: string[]) {
+    async function addCameraProducer(
+      userId: string,
+      producerId: string,
+      videoCodecs?: string[],
+      sentCodec = videoCodecs?.[0] ?? 'video/VP9'
+    ) {
       await ensureParticipant(userId, videoCodecs);
       const participant = manager.getParticipant('room-1', userId)!;
-      const producer = createMockProducer({ id: producerId, kind: 'video' });
+      const producer = createMockProducer({
+        id: producerId,
+        kind: 'video',
+        rtpParameters: { codecs: [{ mimeType: sentCodec }], encodings: [{}] },
+      });
       participant.producers.set(producerId, {
         producer: producer as any,
         source: 'camera',
@@ -6188,6 +6197,7 @@ describe('RoomManager', () => {
     it('emits camera-layering-gate once when demand makes layering beneficial', async () => {
       const handler = vi.fn();
       manager.onEvent(handler);
+      await addCameraProducer('u-1', 'p1', ['video/VP9']);
       await addCameraConsumer('u-1', 'c1');
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer2 = createMockConsumer({
@@ -6214,11 +6224,82 @@ describe('RoomManager', () => {
       ]);
     });
 
+    it('keeps the simulcast threshold when a capability update removes the common codec', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await addCameraProducer('u-1', 'camera-1', ['video/VP8']);
+      const { participant } = await addCameraConsumer('u-2', 'c1', ['video/VP8']);
+      participant.consumers.set(
+        'c2',
+        createMockConsumer({ id: 'c2', kind: 'video', appData: { source: 'camera' } }) as any
+      );
+      await manager.setPreferredLayers(
+        'room-1',
+        'u-2',
+        validLayerDemand('c1', { cssWidth: 320, cssHeight: 180 })
+      );
+      await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('c2'));
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+
+      manager.updateRtpCapabilities('room-1', 'u-2', createRtpCapabilities(['video/VP9']) as any);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+      expect(gateEvents(handler)).toEqual([]);
+    });
+
+    it('does not arm an SVC gate from stale demands after the last VP8 camera closes', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await addCameraProducer('u-1', 'p1', ['video/VP9'], 'video/VP8');
+      const { participant } = await addCameraConsumer('u-1', 'c1');
+      participant.consumers.set(
+        'c2',
+        createMockConsumer({ id: 'c2', kind: 'video', appData: { source: 'camera' } }) as any
+      );
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+      );
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+
+      await manager.closeProducer('room-1', 'u-1', 'p1');
+
+      expect(manager.getRoom('room-1')!.cameraLayerDemands.size).toBe(2);
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+      expect(gateEvents(handler)).toEqual([]);
+    });
+
+    it('keeps an active SVC camera gate when a disjoint claim removes the floor', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await addCameraProducer('u-1', 'p1', ['video/VP9']);
+      await addCameraProducer('u-2', 'p2', ['video/VP9']);
+      await addCameraConsumer('u-1', 'c1');
+      await addCameraConsumer('u-1', 'c2');
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+      );
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+
+      manager.updateRtpCapabilities('room-1', 'u-2', createRtpCapabilities(['video/VP8']) as any);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+      expect(gateEvents(handler)).toEqual([
+        { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
+      ]);
+    });
+
     it('keeps gate on at one useful consumer, then disables when no useful demand remains', async () => {
       vi.useFakeTimers();
       try {
         const handler = vi.fn();
         manager.onEvent(handler);
+        await addCameraProducer('u-1', 'p1', ['video/VP9']);
         await addCameraConsumer('u-1', 'c1');
         const participant = manager.getParticipant('room-1', 'u-1')!;
         participant.consumers.set(
@@ -6267,6 +6348,7 @@ describe('RoomManager', () => {
       try {
         const handler = vi.fn();
         manager.onEvent(handler);
+        await addCameraProducer('u-1', 'p1', ['video/VP9']);
         await addCameraConsumer('u-1', 'c1');
         const participant = manager.getParticipant('room-1', 'u-1')!;
         participant.consumers.set(
@@ -6601,6 +6683,25 @@ describe('RoomManager', () => {
       expect(gateEvents(handler)).toEqual([
         { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
       ]);
+    });
+
+    it('uses the simulcast threshold when a camera publishes outside an SVC floor', async () => {
+      await addCameraProducer('u-1', 'p1', ['video/VP9'], 'video/VP8');
+      await addCameraProducer('u-2', 'p2', ['video/VP9']);
+      await addCameraConsumer('u-1', 'c1');
+      await addCameraConsumer('u-1', 'c2');
+
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+      );
+
+      const room = manager.getRoom('room-1')!;
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/vp9:0']);
+      expect((manager as any).cameraLayeringCodecKind(room)).toBe('simulcast');
+      expect(room.cameraLayeringGateEnabled).toBe(false);
     });
   });
 
@@ -7480,6 +7581,7 @@ describe('RoomManager', () => {
     it('returns null when fewer than 2 participants have capabilities', async () => {
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(manager.computeCodecFloor('room-1')).toBeNull();
+      expect((manager as any).cameraLayeringCodecKind(manager.getRoom('room-1'))).toBe('svc');
     });
 
     it('returns intersection of video codecs', async () => {
@@ -7552,6 +7654,60 @@ describe('RoomManager', () => {
       expect(floor).toEqual(['video/vp8']);
     });
 
+    it('keeps the shared floor when another participant advertises no usable video', async () => {
+      const vp8 = createRtpCapabilities(['video/VP8']);
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        vp8 as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        vp8 as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-3',
+        'sock-3',
+        { username: 'charlie' },
+        createRtpCapabilities([]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/vp8']);
+      manager.updateRtpCapabilities('room-1', 'u-3', { codecs: {} } as any);
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/vp8']);
+    });
+
+    it('keeps the conservative layering policy with one video and one audio-only claim', async () => {
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        createRtpCapabilities(['video/VP8']) as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createRtpCapabilities([]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
+      expect((manager as any).cameraLayeringCodecKind(manager.getRoom('room-1'))).toBe('simulcast');
+    });
+
     it('does not treat VP9 Profile 0 and Profile 2 as interchangeable', async () => {
       await joinRoomWithSupportedCrypto(
         manager,
@@ -7574,7 +7730,8 @@ describe('RoomManager', () => {
         ]) as any
       );
 
-      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
+      expect((manager as any).cameraLayeringCodecKind(manager.getRoom('room-1'))).toBe('simulcast');
     });
 
     it('includes a common VP9 Profile 2 capability parsed from parameters or fmtp', async () => {
@@ -7663,7 +7820,7 @@ describe('RoomManager', () => {
         createProfiledRtpCapabilities([h264('4d0032')]) as any
       );
 
-      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
     });
 
     it('excludes auxiliary RTP codecs from the primary-video floor', async () => {
@@ -7742,7 +7899,7 @@ describe('RoomManager', () => {
         ]) as any
       );
 
-      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
     });
 
     it('rejects partially specified profileless H264 with router-incompatible flags', async () => {
@@ -7769,7 +7926,7 @@ describe('RoomManager', () => {
         capabilities as any
       );
 
-      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
     });
 
     it('ignores malformed codec records instead of poisoning floor computation', async () => {
@@ -7815,7 +7972,7 @@ describe('RoomManager', () => {
       );
       manager.updateRtpCapabilities('room-1', 'u-1', { codecs: {} } as any);
 
-      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+      expect(manager.computeCodecFloor('room-1')).toBeNull();
     });
 
     it('keeps profile-qualified VP9 on the SVC camera-layering path', async () => {

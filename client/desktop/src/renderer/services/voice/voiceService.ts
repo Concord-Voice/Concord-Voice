@@ -737,6 +737,18 @@ interface ConsumeResponse {
 
 type VideoReproduceSource = 'camera' | 'screen';
 
+interface VideoCodecSwapOptions {
+  preserveActiveCodec?: boolean;
+  selectedCodec?: mediasoupTypes.RtpCodecCapability;
+  requireRoomFloorMatch?: boolean;
+}
+
+interface CameraRecoveryCodecOptions {
+  selectedCodec: mediasoupTypes.RtpCodecCapability;
+  activeCodec: mediasoupTypes.RtpCodecCapability;
+  requireRoomFloorMatch?: boolean;
+}
+
 interface VideoReproduceToken {
   source: VideoReproduceSource;
   sessionGeneration: number;
@@ -1316,7 +1328,7 @@ class VoiceService {
         // (observability.md § Console error logging).
         void this.reProduceIfBetterCodec(
           o.source,
-          { requireHwImprovement: true },
+          { requireHwImprovement: true, requireRoomFloorMatch: true },
           expectedSessionGeneration
         ).catch((err) =>
           console.warn('[codec-floor] HW re-selection failed:', (err as Error).message)
@@ -1741,7 +1753,7 @@ class VoiceService {
     return selected ? `${selected.candidate.key}:${selected.candidate.backend}` : null;
   }
 
-  private pickCameraCodec(): {
+  private pickCameraCodec(codecOverride?: mediasoupTypes.RtpCodecCapability): {
     codec?: mediasoupTypes.RtpCodecCapability;
     encodings: mediasoupTypes.RtpEncodingParameters[];
   } {
@@ -1749,13 +1761,15 @@ class VoiceService {
     const prio = vs.cameraPriority;
     const budget = this.cameraBitrateBudget();
 
-    const codec = selectCodecFromCascade({
-      preferred: vs.preferredVideoCodec,
-      hwAccel: vs.hardwareAcceleration,
-      hdrEncoding: vs.hdrEncoding,
-      prioritizeHdrCodecs: vs.prioritizeHdrCodecs,
-      ...this.codecLookup(),
-    });
+    const codec =
+      codecOverride ??
+      selectCodecFromCascade({
+        preferred: vs.preferredVideoCodec,
+        hwAccel: vs.hardwareAcceleration,
+        hdrEncoding: vs.hdrEncoding,
+        prioritizeHdrCodecs: vs.prioritizeHdrCodecs,
+        ...this.codecLookup(),
+      });
 
     const base: Partial<mediasoupTypes.RtpEncodingParameters> =
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
@@ -1764,7 +1778,7 @@ class VoiceService {
       return { codec, encodings: [{ ...base, maxBitrate: budget }] };
     }
 
-    const layeringCodec = this.pickLayeringCodec();
+    const layeringCodec = codecOverride ?? this.pickLayeringCodec();
     const plan = buildCameraEncodingPlan({
       codec: layeringCodec,
       maxBitrate: budget,
@@ -1800,7 +1814,7 @@ class VoiceService {
    * Uses the shared hardware-first codec policy. Layering toggles change only
    * the encoding plan; they never replace the selected codec.
    */
-  private pickScreenCodec(): {
+  private pickScreenCodec(codecOverride?: mediasoupTypes.RtpCodecCapability): {
     codec?: mediasoupTypes.RtpCodecCapability;
     encodings: mediasoupTypes.RtpEncodingParameters[];
     effectiveBitrate: number;
@@ -1812,7 +1826,7 @@ class VoiceService {
     const base: Partial<mediasoupTypes.RtpEncodingParameters> =
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
 
-    const layeringCodec = this.pickLayeringCodec();
+    const layeringCodec = codecOverride ?? this.pickLayeringCodec();
 
     // Manual and automatic values are both bounded by the current entitlement.
     // The RTP encoding plan treats this as the aggregate simulcast budget.
@@ -1997,24 +2011,36 @@ class VoiceService {
     } else if (state.cameraBitrate !== prev.cameraBitrate) {
       this.liveUpdateCameraBitrate(cameraProducer);
     }
-    // SVC/Simulcast casting toggles (#1921): a shape-only change does not alter the
-    // codec MIME, so reProduceIfBetterCodec early-returns — reproduce explicitly.
-    // liveReproduceCamera rides the existing stopTracks:false (#1902) + fail-closed
-    // capture-stop (CWE-212) path; do NOT call sendTransport.produce directly.
-    // The codec probe can finish after capture starts; its backend result can
-    // change the selected codec without a settings toggle.
-    const codecPlanChanged =
+    // Shape-only casting toggles retain the current codec. A delayed backend
+    // probe can change the selected codec without a user action, so it must
+    // pass the same floor check as a floor-driven replacement.
+    const userCodecPlanChanged =
       state.preferredVideoCodec !== prev.preferredVideoCodec ||
       state.hdrEncoding !== prev.hdrEncoding ||
-      state.prioritizeHdrCodecs !== prev.prioritizeHdrCodecs ||
-      (state.codecCapabilities !== prev.codecCapabilities &&
-        this.selectedCodecPlanKey(state) !== this.selectedCodecPlanKey(prev));
+      state.prioritizeHdrCodecs !== prev.prioritizeHdrCodecs;
+    const probeCodecPlanChanged =
+      state.codecCapabilities !== prev.codecCapabilities &&
+      this.selectedCodecPlanKey(state) !== this.selectedCodecPlanKey(prev);
     const layeringChanged =
       state.supportSvc !== prev.supportSvc || state.supportSimulcast !== prev.supportSimulcast;
-    if (codecPlanChanged || layeringChanged) {
+    if (userCodecPlanChanged) {
       void this.liveReproduceCamera().catch((err) =>
         console.warn('[video-settings] Camera re-produce failed:', errorMessage(err))
       );
+    } else {
+      if (layeringChanged) {
+        void this.fastReproduceCamera(true).catch((err) =>
+          console.warn('[video-settings] Camera layering re-produce failed:', errorMessage(err))
+        );
+      }
+      if (probeCodecPlanChanged) {
+        void this.reProduceIfBetterCodec('camera', {
+          requireRoomFloorMatch: true,
+          forceReproduce: true,
+        }).catch((err) =>
+          console.warn('[video-settings] Camera probe re-produce failed:', errorMessage(err))
+        );
+      }
     }
   }
 
@@ -2041,20 +2067,31 @@ class VoiceService {
     // fastReproduceScreen) so a toggle flip and a concurrent gate edge cannot overlap
     // two reproduces; the serializer rides the existing stopTracks:false (#1902) +
     // fail-closed capture-stop (CWE-212) path.
-    const codecPlanChanged =
+    const userCodecPlanChanged =
       state.preferredVideoCodec !== prev.preferredVideoCodec ||
       state.hdrEncoding !== prev.hdrEncoding ||
-      state.prioritizeHdrCodecs !== prev.prioritizeHdrCodecs ||
-      (state.codecCapabilities !== prev.codecCapabilities &&
-        this.selectedCodecPlanKey(state) !== this.selectedCodecPlanKey(prev));
+      state.prioritizeHdrCodecs !== prev.prioritizeHdrCodecs;
+    const probeCodecPlanChanged =
+      state.codecCapabilities !== prev.codecCapabilities &&
+      this.selectedCodecPlanKey(state) !== this.selectedCodecPlanKey(prev);
     const svcChanged = state.supportSvc !== prev.supportSvc;
     const simulcastChanged = state.supportSimulcast !== prev.supportSimulcast;
-    if (codecPlanChanged) {
+    if (userCodecPlanChanged) {
       void this.fastReproduceScreen().catch((err) =>
         console.warn('[video-settings] Screen re-produce failed:', errorMessage(err))
       );
-    } else if (svcChanged || (simulcastChanged && this.screenLayeringEnabled)) {
-      this.scheduleScreenLayeringReproduce();
+    } else {
+      if (svcChanged || (simulcastChanged && this.screenLayeringEnabled)) {
+        this.scheduleScreenLayeringReproduce();
+      }
+      if (probeCodecPlanChanged) {
+        void this.reProduceIfBetterCodec('screen', {
+          requireRoomFloorMatch: true,
+          forceReproduce: true,
+        }).catch((err) =>
+          console.warn('[video-settings] Screen probe re-produce failed:', errorMessage(err))
+        );
+      }
     }
     // Note: screen resolution/FPS/contentType changes cannot use replaceTrack
     // because getDisplayMedia requires a user gesture. Apply on next session.
@@ -2730,7 +2767,10 @@ class VoiceService {
     return this.enqueueVideoReproduce('camera', (token) => this.liveReproduceCameraQueued(token));
   }
 
-  private async liveReproduceCameraQueued(token: VideoReproduceToken): Promise<void> {
+  private async liveReproduceCameraQueued(
+    token: VideoReproduceToken,
+    recoveryCodec?: CameraRecoveryCodecOptions
+  ): Promise<void> {
     if (!this.isCurrentVideoReproduceToken(token)) return;
 
     const producer = this.producers.get('camera');
@@ -2750,7 +2790,7 @@ class VoiceService {
     this.socket?.emit('close-producer', { producerId: producer.id });
     this.stopMediaStream(this.localCameraStream);
     this.localCameraStream = null;
-    await this.produceVideoQueued(undefined, token, true, transport);
+    await this.produceVideoQueued(undefined, token, true, transport, recoveryCodec);
     if (this.isCurrentVideoReproduce(token, transport) && !this.producers.has('camera')) {
       this.cleanupCameraState();
     }
@@ -2778,15 +2818,32 @@ class VoiceService {
     return senderCodec ? this.codecKeyFromParameters(senderCodec) : null;
   }
 
+  private currentVideoSendCodec(
+    source: VideoReproduceSource
+  ): mediasoupTypes.RtpCodecCapability | undefined {
+    const key = this.getProducerCodecMimeType(source);
+    return key ? this.findSendCodec(key) : undefined;
+  }
+
+  private roomFloorIncludesCodec(codec: mediasoupTypes.RtpCodecCapability): boolean {
+    const floor = useVoiceStore.getState().codecFloor;
+    return floor !== null && isCodecKeyInFloor(this.codecKeyFromParameters(codec), floor);
+  }
+
   /**
    * Fast re-produce camera: close producer and re-produce with best floor-compatible
    * codec, reusing the existing video track for a subsecond switch.
    */
-  private async fastReproduceCamera(): Promise<void> {
-    return this.enqueueVideoReproduce('camera', (token) => this.fastReproduceCameraQueued(token));
+  private async fastReproduceCamera(preserveActiveCodec = false): Promise<void> {
+    return this.enqueueVideoReproduce('camera', (token) =>
+      this.fastReproduceCameraQueued(token, { preserveActiveCodec })
+    );
   }
 
-  private async fastReproduceCameraQueued(token: VideoReproduceToken): Promise<void> {
+  private async fastReproduceCameraQueued(
+    token: VideoReproduceToken,
+    opts: VideoCodecSwapOptions = {}
+  ): Promise<void> {
     if (!this.isCurrentVideoReproduceToken(token)) return;
 
     const producer = this.producers.get('camera');
@@ -2795,9 +2852,28 @@ class VoiceService {
     const socket = this.socket;
     if (!producer || !transport || !stream) return;
 
+    // Gate events change the encoding plan, not the codec. Resolve the active
+    // codec before closing its producer so a disjoint room floor cannot turn a
+    // layering change into an unsafe codec switch.
+    const activeCodec =
+      opts.preserveActiveCodec || opts.requireRoomFloorMatch
+        ? this.currentVideoSendCodec('camera')
+        : undefined;
+    if ((opts.preserveActiveCodec || opts.requireRoomFloorMatch) && !activeCodec) return;
+    let codecOverride = opts.preserveActiveCodec ? activeCodec : opts.selectedCodec;
+
     const track = stream.getVideoTracks()[0];
     if (track?.readyState !== 'live') {
-      await this.liveReproduceCameraQueued(token);
+      await this.liveReproduceCameraQueued(
+        token,
+        activeCodec && codecOverride
+          ? {
+              selectedCodec: codecOverride,
+              activeCodec,
+              requireRoomFloorMatch: opts.requireRoomFloorMatch,
+            }
+          : undefined
+      );
       return;
     }
 
@@ -2820,18 +2896,23 @@ class VoiceService {
     try {
       this.socket?.emit('close-producer', { producerId: producer.id });
 
-      let codec: mediasoupTypes.RtpCodecCapability;
-      let newProducer: mediasoupTypes.Producer;
-      let publishedBitrate = 0;
-      try {
-        const selection = this.pickCameraCodec();
-        codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
-        publishedBitrate = selection.encodings.reduce(
+      // The floor may have changed while the transport queue drained. If the
+      // checked replacement is no longer shared, re-publish the old codec.
+      if (opts.requireRoomFloorMatch && codecOverride) {
+        if (!this.roomFloorIncludesCodec(codecOverride)) {
+          codecOverride = activeCodec;
+        }
+      }
+
+      const publish = async (override?: mediasoupTypes.RtpCodecCapability) => {
+        const selection = this.pickCameraCodec(override);
+        const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+        const publishedBitrate = selection.encodings.reduce(
           (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
           0
         );
         const cameraBitrate = this.cameraStartBitrate(selection.encodings);
-        newProducer = await this.produceEncrypted(transport, {
+        const newProducer = await this.produceEncrypted(transport, {
           track,
           encodings: selection.encodings,
           codec,
@@ -2839,6 +2920,36 @@ class VoiceService {
           stopTracks: false,
           appData: videoPublishAppData('camera'),
         });
+        return { codec, newProducer, publishedBitrate };
+      };
+      let replacement;
+      try {
+        replacement = await publish(codecOverride);
+        // transport.produce itself awaits the media plane. A second floor
+        // change during that await must not commit the now-unsafe codec.
+        if (
+          opts.requireRoomFloorMatch &&
+          activeCodec &&
+          this.isCurrentVideoReproduce(token, transport) &&
+          this.localCameraStream === stream &&
+          !this.producers.has('camera') &&
+          !this.codecKeysEquivalent(
+            this.codecKeyFromParameters(replacement.codec),
+            this.codecKeyFromParameters(activeCodec)
+          ) &&
+          !this.roomFloorIncludesCodec(replacement.codec)
+        ) {
+          this.discardProducedProducer(replacement.newProducer, socket);
+          await this.drainSendTransportQueue(transport);
+          if (
+            !this.isCurrentVideoReproduce(token, transport) ||
+            this.localCameraStream !== stream ||
+            this.producers.has('camera')
+          ) {
+            return;
+          }
+          replacement = await publish(activeCodec);
+        }
       } catch (err) {
         if (
           this.isCurrentVideoReproduce(token, transport) &&
@@ -2856,17 +2967,27 @@ class VoiceService {
         this.localCameraStream !== stream ||
         this.producers.has('camera')
       ) {
-        this.discardProducedProducer(newProducer, socket);
+        this.discardProducedProducer(replacement.newProducer, socket);
         return;
       }
 
-      if (publishedBitrate > this.cameraBitrateBudget()) {
-        this.discardProducedProducer(newProducer, socket);
+      if (replacement.publishedBitrate > this.cameraBitrateBudget()) {
+        this.discardProducedProducer(replacement.newProducer, socket);
         this.cleanupCameraState();
         return;
       }
-      if (!this.commitCameraProducer(newProducer, stream, token, transport, socket, codec)) return;
-      const selectedCodecKey = this.codecKeyFromParameters(codec);
+      if (
+        !this.commitCameraProducer(
+          replacement.newProducer,
+          stream,
+          token,
+          transport,
+          socket,
+          replacement.codec
+        )
+      )
+        return;
+      const selectedCodecKey = this.codecKeyFromParameters(replacement.codec);
       const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
       console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
     } finally {
@@ -2880,11 +3001,16 @@ class VoiceService {
    * Fast re-produce screen: close producer and re-produce with best floor-compatible
    * codec, reusing the existing screen track.
    */
-  private async fastReproduceScreen(): Promise<void> {
-    return this.enqueueVideoReproduce('screen', (token) => this.fastReproduceScreenQueued(token));
+  private async fastReproduceScreen(preserveActiveCodec = false): Promise<void> {
+    return this.enqueueVideoReproduce('screen', (token) =>
+      this.fastReproduceScreenQueued(token, { preserveActiveCodec })
+    );
   }
 
-  private async fastReproduceScreenQueued(token: VideoReproduceToken): Promise<void> {
+  private async fastReproduceScreenQueued(
+    token: VideoReproduceToken,
+    opts: VideoCodecSwapOptions = {}
+  ): Promise<void> {
     if (!this.isCurrentVideoReproduceToken(token)) return;
 
     const oldProducer = this.producers.get('screen');
@@ -2892,6 +3018,13 @@ class VoiceService {
     const stream = this.localScreenStream;
     const socket = this.socket;
     if (!oldProducer || !transport || !stream) return;
+
+    const activeCodec =
+      opts.preserveActiveCodec || opts.requireRoomFloorMatch
+        ? this.currentVideoSendCodec('screen')
+        : undefined;
+    if ((opts.preserveActiveCodec || opts.requireRoomFloorMatch) && !activeCodec) return;
+    let codecOverride = opts.preserveActiveCodec ? activeCodec : opts.selectedCodec;
 
     const track = stream.getVideoTracks()[0];
     if (track?.readyState !== 'live') {
@@ -2928,14 +3061,49 @@ class VoiceService {
     this.producers.delete('screen');
     this.socket?.emit('close-producer', { producerId: oldProducerId });
 
-    const replacement = await this.produceScreenReplacement(
+    if (opts.requireRoomFloorMatch && codecOverride) {
+      if (!this.roomFloorIncludesCodec(codecOverride)) {
+        codecOverride = activeCodec;
+      }
+    }
+
+    let replacement = await this.produceScreenReplacement(
       token,
       transport,
       stream,
       track,
-      socket
+      socket,
+      codecOverride
     );
     if (!replacement) return;
+    if (
+      opts.requireRoomFloorMatch &&
+      activeCodec &&
+      !this.codecKeysEquivalent(
+        this.codecKeyFromParameters(replacement.codec),
+        this.codecKeyFromParameters(activeCodec)
+      ) &&
+      !this.roomFloorIncludesCodec(replacement.codec)
+    ) {
+      this.discardProducedProducer(replacement.producer, socket);
+      await this.drainSendTransportQueue(transport);
+      if (
+        !this.isCurrentVideoReproduce(token, transport) ||
+        this.localScreenStream !== stream ||
+        this.producers.has('screen')
+      ) {
+        return;
+      }
+      replacement = await this.produceScreenReplacement(
+        token,
+        transport,
+        stream,
+        track,
+        socket,
+        activeCodec
+      );
+      if (!replacement) return;
+    }
     const { producer: newProducer, codec } = replacement;
 
     this.applyDegradationPreference(newProducer);
@@ -3037,7 +3205,8 @@ class VoiceService {
     transport: mediasoupTypes.Transport,
     stream: MediaStream,
     track: MediaStreamTrack,
-    socket: Socket | null
+    socket: Socket | null,
+    codecOverride?: mediasoupTypes.RtpCodecCapability
   ): Promise<{
     producer: mediasoupTypes.Producer;
     codec: mediasoupTypes.RtpCodecCapability;
@@ -3046,7 +3215,7 @@ class VoiceService {
     let producer: mediasoupTypes.Producer;
     let publishedBitrate = 0;
     try {
-      const selection = this.pickScreenCodec();
+      const selection = this.pickScreenCodec(codecOverride);
       codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
       publishedBitrate = selection.effectiveBitrate;
       producer = await this.produceEncrypted(transport, {
@@ -3184,7 +3353,11 @@ class VoiceService {
     }
     await Promise.all(
       (['camera', 'screen'] as const).map((source) =>
-        this.reProduceIfBetterCodec(source, undefined, expectedSessionGeneration)
+        this.reProduceIfBetterCodec(
+          source,
+          { requireRoomFloorMatch: true },
+          expectedSessionGeneration
+        )
       )
     );
   }
@@ -3283,7 +3456,11 @@ class VoiceService {
   /** Re-produce a video source if the codec cascade now selects a different codec. */
   private async reProduceIfBetterCodec(
     source: VideoReproduceSource,
-    opts?: { requireHwImprovement?: boolean },
+    opts?: {
+      requireHwImprovement?: boolean;
+      requireRoomFloorMatch?: boolean;
+      forceReproduce?: boolean;
+    },
     expectedSessionGeneration = this.videoReproduceGeneration
   ): Promise<void> {
     await this.enqueueVideoReproduce(
@@ -3296,7 +3473,11 @@ class VoiceService {
   private async reProduceIfBetterCodecQueued(
     source: VideoReproduceSource,
     token: VideoReproduceToken,
-    opts?: { requireHwImprovement?: boolean }
+    opts?: {
+      requireHwImprovement?: boolean;
+      requireRoomFloorMatch?: boolean;
+      forceReproduce?: boolean;
+    }
   ): Promise<void> {
     const producer = this.producers.get(source);
     if (!producer) return;
@@ -3306,11 +3487,20 @@ class VoiceService {
 
     const bestPick = source === 'camera' ? this.pickCameraCodec() : this.pickScreenCodec();
     if (!bestPick.codec) {
-      await this.closeProducer(source);
+      // Keep the working producer when a new codec cannot be selected. A room
+      // floor update must never turn a peer's claim into a local teardown.
       return;
     }
     const bestMime = this.codecKeyFromParameters(bestPick.codec);
-    if (this.codecKeysEquivalent(bestMime, currentMime)) return;
+    if (this.codecKeysEquivalent(bestMime, currentMime) && !opts?.forceReproduce) return;
+
+    // A null or unsatisfiable floor says nothing about which codec existing
+    // viewers can consume. Keep a working producer instead of switching to a
+    // preferred codec solely because another participant changed its claim.
+    if (opts?.requireRoomFloorMatch) {
+      const floor = useVoiceStore.getState().codecFloor;
+      if (!floor || !isCodecKeyInFloor(bestMime, floor)) return;
+    }
 
     // #2187 item 2: a B=false-driven re-selection only switches toward a genuinely
     // HW-accelerated codec — prevents SW→SW churn/oscillation.
@@ -3331,9 +3521,15 @@ class VoiceService {
     );
 
     if (source === 'camera') {
-      await this.fastReproduceCameraQueued(token);
+      await this.fastReproduceCameraQueued(token, {
+        selectedCodec: bestPick.codec,
+        requireRoomFloorMatch: opts?.requireRoomFloorMatch,
+      });
     } else {
-      await this.fastReproduceScreenQueued(token);
+      await this.fastReproduceScreenQueued(token, {
+        selectedCodec: bestPick.codec,
+        requireRoomFloorMatch: opts?.requireRoomFloorMatch,
+      });
     }
   }
 
@@ -4938,7 +5134,8 @@ class VoiceService {
     deviceId: string | undefined,
     token: VideoReproduceToken,
     replacing = false,
-    transport = this.sendTransport
+    transport = this.sendTransport,
+    recoveryCodec?: CameraRecoveryCodecOptions
   ): Promise<void> {
     if (!transport || !this.device || !this.isCurrentVideoReproduce(token, transport)) return;
     if (this.producers.has('camera')) return;
@@ -4986,36 +5183,67 @@ class VoiceService {
       }
       this.localCameraStream = acquiredStream;
       const track = acquiredStream.getVideoTracks()[0];
-
-      const selection = this.pickCameraCodec();
-      const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
-      const { encodings } = selection;
-      const publishedBitrate = encodings.reduce(
-        (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
-        0
-      );
-      const cameraBitrate = this.cameraStartBitrate(encodings);
-
-      const producer = await this.produceEncrypted(transport, {
-        track,
-        encodings,
-        codec,
-        codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
-        // The track is owned by localCameraStream and reused across codec/layer
-        // re-produces (fastReproduceCamera). stopTracks:false keeps producer.close()
-        // from stopping it; every teardown path stops localCameraStream explicitly.
-        stopTracks: false,
-        appData: videoPublishAppData('camera'),
-      });
+      const publish = async (override?: mediasoupTypes.RtpCodecCapability) => {
+        const selection = this.pickCameraCodec(override);
+        const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+        const { encodings } = selection;
+        const publishedBitrate = encodings.reduce(
+          (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
+          0
+        );
+        const cameraBitrate = this.cameraStartBitrate(encodings);
+        const producer = await this.produceEncrypted(transport, {
+          track,
+          encodings,
+          codec,
+          codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
+          // The track is owned by localCameraStream and reused across codec/layer
+          // re-produces (fastReproduceCamera). stopTracks:false keeps producer.close()
+          // from stopping it; every teardown path stops localCameraStream explicitly.
+          stopTracks: false,
+          appData: videoPublishAppData('camera'),
+        });
+        return { codec, producer, publishedBitrate };
+      };
+      const selectedCodec =
+        recoveryCodec?.requireRoomFloorMatch &&
+        !this.roomFloorIncludesCodec(recoveryCodec.selectedCodec)
+          ? recoveryCodec.activeCodec
+          : recoveryCodec?.selectedCodec;
+      let replacement = await publish(selectedCodec);
+      if (
+        recoveryCodec?.requireRoomFloorMatch &&
+        this.isCurrentVideoReproduce(token, transport) &&
+        this.localCameraStream === acquiredStream &&
+        !this.producers.has('camera') &&
+        !this.codecKeysEquivalent(
+          this.codecKeyFromParameters(replacement.codec),
+          this.codecKeyFromParameters(recoveryCodec.activeCodec)
+        ) &&
+        !this.roomFloorIncludesCodec(replacement.codec)
+      ) {
+        this.discardProducedProducer(replacement.producer, socket);
+        await this.drainSendTransportQueue(transport);
+        if (
+          !this.isCurrentVideoReproduce(token, transport) ||
+          this.localCameraStream !== acquiredStream ||
+          this.producers.has('camera')
+        ) {
+          this.stopMediaStream(acquiredStream);
+          if (this.localCameraStream === acquiredStream) this.localCameraStream = null;
+          return;
+        }
+        replacement = await publish(recoveryCodec.activeCodec);
+      }
       if (
         !this.commitCameraProducer(
-          producer,
+          replacement.producer,
           acquiredStream,
           token,
           transport,
           socket,
-          codec,
-          publishedBitrate
+          replacement.codec,
+          replacement.publishedBitrate
         )
       ) {
         return;
@@ -7451,7 +7679,7 @@ class VoiceService {
         if (!this.isCurrentVideoReproduceSession(sessionGeneration)) return;
         this.cameraLayeringReproducePending = false;
         try {
-          await this.fastReproduceCamera();
+          await this.fastReproduceCamera(true);
         } catch (err) {
           console.warn(
             '[camera-layering] failed to re-produce camera after gate change:',
@@ -7493,7 +7721,7 @@ class VoiceService {
         if (!this.isCurrentVideoReproduceSession(sessionGeneration)) return;
         this.screenLayeringReproducePending = false;
         try {
-          await this.fastReproduceScreen();
+          await this.fastReproduceScreen(true);
         } catch (err) {
           console.warn(
             '[screen-layering] failed to re-produce screen after gate change:',

@@ -750,6 +750,20 @@ describe('VideoConfigSection', () => {
       expect(screen.getByText(/Currently VP8/)).toBeInTheDocument();
     });
 
+    it('does not promise peer fallback when a null floor may hide disjoint claims', () => {
+      mockVoiceStore({ codecFloor: null });
+      mockDraftSettings({ preferredVideoCodec: 'video/AV1' });
+
+      renderComponent();
+
+      expect(
+        screen.getByText(
+          /Some participants may not receive your video if they cannot decode this codec/
+        )
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/falls back automatically if a peer cannot decode it/)).toBeNull();
+    });
+
     it('keeps a manual preference while clearly naming the room-floor fallback', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
@@ -778,6 +792,20 @@ describe('VideoConfigSection', () => {
       ).toBeInTheDocument();
       expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('VP8');
       expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith('preferredVideoCodec', null);
+    });
+
+    it('warns when a locally sendable codec falls outside the room floor', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [makeCodec('video/VP8', false)],
+      });
+      mockVoiceStore({ codecFloor: ['video/vp9:2'] });
+      mockDraftSettings({ preferredVideoCodec: 'video/VP8', hardwareAcceleration: false });
+
+      renderComponent();
+
+      expect(screen.getByText(/some participants may not receive your video/)).toBeInTheDocument();
+      expect(screen.queryByText(/falls back automatically if a peer cannot decode it/)).toBeNull();
     });
 
     it('predicts a profile-qualified VP9 floor entry in Settings', () => {

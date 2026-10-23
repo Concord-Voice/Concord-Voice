@@ -218,6 +218,20 @@ describe('storedDemand', () => {
 });
 
 describe('computeCameraLayeringGate', () => {
+  it('keeps the gate off during a last-producer replacement gap with stale demands', () => {
+    expect(
+      computeCameraLayeringGate({
+        codecKind: 'svc',
+        cameraProducerCount: 0,
+        demands: [
+          { consumerId: 'c1', visible: true, maxUsefulSpatialLayer: 1, pressureStepDown: false },
+          { consumerId: 'c2', visible: true, maxUsefulSpatialLayer: 2, pressureStepDown: false },
+        ],
+        previouslyEnabled: true,
+      })
+    ).toBe(false);
+  });
+
   it('enables SVC when two visible consumers include lower-layer benefit', () => {
     expect(
       computeCameraLayeringGate({
@@ -301,7 +315,9 @@ describe('computeCameraLayeringGate', () => {
       computeCameraLayeringGate({
         codecKind: 'svc',
         cameraProducerCount: 2,
-        demands: [{ consumerId: 'c1', visible: true, maxUsefulSpatialLayer: 1, pressureStepDown: false }],
+        demands: [
+          { consumerId: 'c1', visible: true, maxUsefulSpatialLayer: 1, pressureStepDown: false },
+        ],
         previouslyEnabled: true,
       })
     ).toBe(true);
