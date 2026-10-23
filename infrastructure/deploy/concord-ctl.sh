@@ -408,6 +408,315 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
   COMPOSE_CMD=selfhost_storage_compose
 fi
 
+# A merged caller stays direct until a root operator has completed the separate
+# commissioning ceremony. The receipt is public metadata, never policy input.
+readonly EGRESS_RECEIPT=/etc/concord/egress-commissioned.json
+readonly EGRESS_ENGINE=/usr/local/sbin/nightwatch-egress
+readonly EGRESS_COMPANION=/usr/local/sbin/concord-egress
+readonly EGRESS_BUILD_IMAGE='moby/buildkit:v0.32.2-rootless@sha256:504731e577c20559c00f968f33219f30115e70be29ab96728d1d06e963fc494b'
+
+managed_egress_role() {
+  case "$COMPOSE_OVERRIDE" in
+    docker-compose.production.yml) printf '%s' production ;;
+    docker-compose.staging.yml|docker-compose.west-staging.yml) printf '%s' staging ;;
+    *) echo 'managed-egress: deployment role is unknown' >&2; return 1 ;;
+  esac
+}
+
+managed_egress_receipt_valid() {
+  local role="$1"
+  [[ ! -L /etc/concord && -d /etc/concord \
+     && "$(stat -c '%u:%g:%a:%F' /etc/concord 2>/dev/null)" == '0:0:755:directory' \
+     && ! -L "$EGRESS_RECEIPT" && -f "$EGRESS_RECEIPT" \
+     && "$(stat -c '%u:%g:%a:%F' "$EGRESS_RECEIPT" 2>/dev/null)" == '0:0:644:regular file' ]] || return 1
+  python3 -c '
+import json, re, sys
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        receipt = json.load(stream, object_pairs_hook=strict_object)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+expected = {
+    "schema", "status", "role", "project", "manifest_sha256", "build_image",
+    "host_admission_id", "companion_admission_id", "host_source_sha256",
+    "companion_source_sha256", "host_package_sha256", "companion_package_sha256",
+    "host_policy_sha256", "companion_policy_sha256",
+}
+uuid_v4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+name = re.compile(r"[a-z][a-z0-9_-]{0,62}")
+digest_fields = (
+    "manifest_sha256", "host_source_sha256", "companion_source_sha256",
+    "host_package_sha256", "companion_package_sha256", "host_policy_sha256",
+    "companion_policy_sha256",
+)
+if (not isinstance(receipt, dict) or set(receipt) != expected or
+        type(receipt["schema"]) is not int or receipt["schema"] != 1 or receipt["status"] != "active" or
+        receipt["role"] != sys.argv[2] or
+        not isinstance(receipt["project"], str) or not name.fullmatch(receipt["project"]) or
+        any(not isinstance(receipt[key], str) or not re.fullmatch(r"[0-9a-f]{64}", receipt[key]) for key in digest_fields) or
+        any(not isinstance(receipt[key], str) or not uuid_v4.fullmatch(receipt[key]) for key in ("host_admission_id", "companion_admission_id")) or
+        receipt["build_image"] != sys.argv[3]):
+    raise SystemExit(1)
+' "$EGRESS_RECEIPT" "$role" "$EGRESS_BUILD_IMAGE"
+}
+
+managed_egress_receipt_project() {
+  local role="$1"
+  managed_egress_receipt_valid "$role" || return 1
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["project"])' "$EGRESS_RECEIPT"
+}
+
+managed_egress_project_matches_receipt() {
+  local role="$1" project rendered
+  project="$(managed_egress_receipt_project "$role")" || return 1
+  rendered="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json)" || {
+    echo 'managed-egress: cannot render the commissioned Compose project' >&2
+    return 1
+  }
+  python3 -c '
+import json, sys
+try:
+    model = json.load(sys.stdin)
+except (ValueError, TypeError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(model, dict) and model.get("name") == sys.argv[1] else 1)
+' "$project" <<<"$rendered" || {
+    echo 'managed-egress: rendered Compose project differs from the commissioned project' >&2
+    return 1
+  }
+}
+
+managed_egress_mode() {
+  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
+    printf '%s\n' direct
+    return 0
+  fi
+  local receipt_present=0 engine_present=0 companion_present=0 role
+  # Classify complete absence before deriving a role. This preserves direct CD
+  # on every uncommissioned overlay, including immutable West staging.
+  [[ -e "$EGRESS_RECEIPT" || -L "$EGRESS_RECEIPT" ]] && receipt_present=1
+  [[ -e "$EGRESS_ENGINE" || -L "$EGRESS_ENGINE" ]] && engine_present=1
+  [[ -e "$EGRESS_COMPANION" || -L "$EGRESS_COMPANION" ]] && companion_present=1
+  if [[ "$receipt_present:$engine_present:$companion_present" == 0:0:0 ]]; then
+    printf '%s\n' direct
+    return 0
+  fi
+  role="$(managed_egress_role)" || return 1
+  # Inspect and authenticate the receipt before accepting a commissioned state.
+  if [[ $receipt_present -eq 1 ]] && ! managed_egress_receipt_valid "$role"; then
+    echo 'managed-egress: commissioning receipt is invalid; refusing deployment' >&2
+    return 1
+  fi
+  if [[ "$receipt_present:$engine_present:$companion_present" != 1:1:1 \
+     || -L "$EGRESS_ENGINE" || -L "$EGRESS_COMPANION" \
+     || ! -f "$EGRESS_ENGINE" || ! -x "$EGRESS_ENGINE" \
+     || ! -f "$EGRESS_COMPANION" || ! -x "$EGRESS_COMPANION" ]]; then
+    echo 'managed-egress: commissioning is partial; refusing deployment' >&2
+    return 1
+  fi
+  printf '%s\n' managed
+}
+
+managed_egress_gate() {
+  [[ $# -eq 1 && ( $1 == verify || $1 == ready ) ]] || return 1
+  local mode role status
+  mode="$(managed_egress_mode)" || return 1
+  [[ "$mode" == direct ]] && return 0
+  role="$(managed_egress_role)" || return 1
+  managed_egress_project_matches_receipt "$role" || return 1
+  status="$(sudo -n "$EGRESS_COMPANION" deployment-status --role "$role")" || {
+    echo 'managed-egress: commissioned deployment status is unavailable' >&2
+    return 1
+  }
+  [[ ${#status} -le 4096 ]] || return 1
+  python3 -c '
+import json, re, sys
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        receipt = json.load(stream, object_pairs_hook=strict_object)
+    status = json.load(sys.stdin, object_pairs_hook=strict_object)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+expected = {"schema", "status", "role", "manifest_sha256", "build_image"}
+if (not isinstance(status, dict) or set(status) != expected or
+        type(status.get("schema")) is not int or status.get("schema") != 1 or status.get("status") != "active" or
+        status.get("role") != sys.argv[2] or
+        not isinstance(status.get("manifest_sha256"), str) or
+        not re.fullmatch(r"[0-9a-f]{64}", status["manifest_sha256"]) or
+        status.get("build_image") != sys.argv[3] or
+        status != {key: receipt[key] for key in expected}):
+    raise SystemExit(1)
+' "$EGRESS_RECEIPT" "$role" "$EGRESS_BUILD_IMAGE" <<<"$status" || {
+    echo 'managed-egress: commissioned deployment status is invalid' >&2
+    return 1
+  }
+  sudo -n "$EGRESS_ENGINE" "$1" --role "$role" >/dev/null || {
+    echo 'managed-egress: root-admitted role policy is unavailable or not ready' >&2
+    return 1
+  }
+  if [[ "$1" == ready ]]; then
+    sudo -n "$EGRESS_COMPANION" ready --role "$role" >/dev/null || {
+      echo 'managed-egress: admitted workload graph is incomplete or not ready' >&2
+      return 1
+    }
+  fi
+}
+
+managed_egress_reconcile() {
+  local mode
+  mode="$(managed_egress_mode)" || return 1
+  [[ "$mode" == direct ]] && return 0
+  sudo -n "$EGRESS_COMPANION" refresh >/dev/null || {
+    echo 'managed-egress: namespace reconciliation failed' >&2
+    return 1
+  }
+  managed_egress_gate verify
+}
+
+# Reconcile every namespace mutation, including a partially failed Compose
+# operation. Health waits run only after the new namespaces have been admitted.
+managed_compose_mutate() (
+  cd "$DEPLOY_DIR" || return
+  local mode command wait=0 wait_timeout=180 result=0 ids id states state health deadline
+  local -a original=("$@") args=() services=() containers=()
+  mode="$(managed_egress_mode)" || return 1
+  if [[ "$mode" == direct ]]; then
+    $COMPOSE_CMD "$@"
+    return
+  fi
+  command="$1"
+  shift
+  if [[ "$command" == up || "$command" == start ]]; then
+    while (( $# )); do
+      case "$1" in
+        --wait|--wait=true) wait=1; shift ;;
+        --wait=false) wait=0; shift ;;
+        -d|--detach|--detach=*)
+          [[ "$command" == up ]] || args+=("$1")
+          shift ;;
+        --wait-timeout)
+          [[ $# -ge 2 ]] || { echo 'managed-egress: --wait-timeout requires seconds' >&2; return 2; }
+          wait_timeout="$2"; shift 2 ;;
+        --wait-timeout=*) wait_timeout="${1#*=}"; shift ;;
+        --pull|--timeout|-t|--scale|--attach|--no-attach|--exit-code-from)
+          [[ $# -ge 2 ]] || { echo 'managed-egress: Compose option requires a value' >&2; return 2; }
+          args+=("$1" "$2"); shift 2 ;;
+        --) args+=("$@"); shift; services+=("$@"); break ;;
+        -*) args+=("$1"); shift ;;
+        *) args+=("$1"); services+=("$1"); shift ;;
+      esac
+    done
+  fi
+  if (( wait )); then
+    [[ "$wait_timeout" =~ ^[0-9]+$ && "$wait_timeout" -gt 0 ]] || {
+      echo 'managed-egress: health wait requires a positive bounded timeout' >&2
+      return 2
+    }
+    # --wait implies detached up even when the caller omitted -d.
+    if [[ "$command" == up ]]; then
+      $COMPOSE_CMD up --detach "${args[@]}" || result=$?
+    else
+      $COMPOSE_CMD start "${args[@]}" || result=$?
+    fi
+  else
+    $COMPOSE_CMD "${original[@]}" || result=$?
+  fi
+  managed_egress_reconcile || return 1
+  [[ "$result" -eq 0 ]] || return "$result"
+  if (( wait )); then
+    # Compose start --wait also starts dependencies; inspect only the exact
+    # selected containers so --no-deps cannot activate a stopped dependency.
+    ids="$($COMPOSE_CMD ps --all -q -- "${services[@]}")" || return 1
+    [[ -n "$ids" ]] || { echo 'managed-egress: no containers to wait for' >&2; return 1; }
+    while IFS= read -r id; do
+      [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+      containers+=("$id")
+    done <<<"$ids"
+    deadline=$((SECONDS + wait_timeout))
+    result=1
+    while (( SECONDS < deadline )); do
+      states="$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${containers[@]}")" || break
+      result=0
+      while read -r state health; do
+        case "$state:$health" in
+          running:healthy|running:none) ;;
+          *) result=1 ;;
+        esac
+      done <<<"$states"
+      [[ "$result" -eq 0 ]] && break
+      sleep 1
+    done
+    # A restart during the wait can replace a namespace without replacing its ID.
+    managed_egress_reconcile || return 1
+    [[ "$result" -eq 0 ]] || echo 'managed-egress: selected containers did not become running or healthy' >&2
+    return "$result"
+  fi
+)
+
+managed_compose_build() (
+  cd "$DEPLOY_DIR" || return
+  local mode image metadata
+  mode="$(managed_egress_mode)" || return 1
+  if [[ "$mode" == direct ]]; then
+    $COMPOSE_CMD "$@"
+    return
+  fi
+  managed_egress_gate verify || return
+  image="$($COMPOSE_CMD config --images egress-build)" || return
+  [[ "$image" == "$EGRESS_BUILD_IMAGE" ]] || {
+    echo 'managed-egress: rendered builder image is not admitted' >&2
+    return 1
+  }
+  managed_compose_mutate up -d --no-deps --no-build --pull never --wait --wait-timeout 90 egress-build >&2 || return
+  metadata="$(mktemp -d)" || return
+  trap 'rm -rf -- "$metadata"' EXIT
+  export BUILDX_CONFIG="$metadata" BUILDX_BUILDER=concord-egress
+  unset BUILDKIT_HOST
+  docker buildx create --name concord-egress --driver remote --driver-opt default-load=true \
+    docker-container://concord-egress-build >/dev/null || return
+  managed_compose_mutate "$@"
+)
+
+control_plane_cli() (
+  local mode running temporary
+  mode="$(managed_egress_mode)" || return 1
+  if [[ "$mode" == direct ]]; then
+    cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never control-plane ./main "$@"
+    return
+  fi
+  managed_egress_gate verify || return 1
+  running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
+  temporary=''
+  if [[ -z "$running" ]]; then
+    temporary="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --detach --no-deps --pull never \
+      --entrypoint /bin/sleep control-plane 2147483647)" || return 1
+    [[ "$temporary" =~ ^[a-f0-9]{64}$ ]] || { echo 'managed-egress: invalid maintenance container identity' >&2; return 1; }
+    trap 'result=$?; docker rm -f "$temporary" >/dev/null 2>&1 || result=1; managed_egress_reconcile >/dev/null 2>&1 || result=1; exit "$result"' EXIT
+    trap 'exit 1' HUP INT TERM
+    managed_egress_reconcile || return 1
+  fi
+  managed_egress_gate verify || return 1
+  if [[ -n "$temporary" ]]; then
+    docker exec "$temporary" ./main "$@"
+  else
+    cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T control-plane ./main "$@"
+  fi
+)
+
 selfhost_storage_start_guard() {
   [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] || return 0
   selfhost_storage_assert_no_running_minio
@@ -660,7 +969,7 @@ turn_managed_control_gid() {
   }
   if ! image_id="$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null)"; then
     [[ "$build" == build && -z "${CONTROL_PLANE_IMAGE:-}" ]] \
-      && (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane </dev/null) >&2 \
+      && managed_compose_build build control-plane </dev/null >&2 \
       && image_id="$(docker image inspect --format '{{.Id}}' "$image")" || {
       echo 'turn-managed: selected control-plane image is unavailable locally' >&2; return 1;
     }
@@ -820,7 +1129,7 @@ turn_managed_verb_locked() {
 turn_managed_init_schema_before_coturn() {
   [[ "$TURN_CREDENTIAL_MODE" == managed ]] || return 0
   turn_managed_prepare_writer build || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile turn-writer build turn-secret-writer </dev/null) || {
+  managed_compose_build --profile turn-writer build turn-secret-writer </dev/null || {
     echo 'turn-managed: writer image build failed; refusing to start coturn' >&2
     return 1
   }
@@ -1517,16 +1826,15 @@ activity_history_image_is_local() {
 
 activity_history_run_admin() {
   local verb="$1"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never \
-    control-plane ./main activity-history "$verb" --confirm-drained)
+  control_plane_cli activity-history "$verb" --confirm-drained
 }
 
 activity_history_start_control_plane() {
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --pull never control-plane)
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build --pull never control-plane)
 }
 
 activity_history_stop_control_plane() {
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 control-plane)
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 control-plane)
 }
 
 privacy_defaults_require_local_control_plane_drained() {
@@ -2047,8 +2355,7 @@ voice_enforcement_rollout_cli() {
       return 2
       ;;
   esac
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never \
-    control-plane ./main voice-enforcement-rollout "$verb" "$@")
+  control_plane_cli voice-enforcement-rollout "$verb" "$@"
 }
 
 voice_enforcement_rollout_deactivate_for_rollback() {
@@ -2168,7 +2475,7 @@ raise SystemExit(0 if isinstance(value, dict) and value.get("ready") is True
 voice_enforcement_rollout_stop_media() {
   local running
   echo "voice-enforcement-rollout: draining the old media-plane"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 media-plane)
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 media-plane) || return 1
   if ! running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q media-plane 2>/dev/null)"; then
     echo "voice-enforcement-rollout: cannot verify that the old media-plane stopped" >&2
     return 1
@@ -2196,7 +2503,7 @@ voice_enforcement_rollout_deploy() {
   # readiness because the rollout singleton is created by CP startup migration.
   if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
     echo "voice-enforcement-rollout: building the new control-plane image"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane)
+    managed_compose_build build control-plane
   fi
   # Migrations 000165–000166 change privacy and presence defaults. Stop and
   # drain the previous local binary before startup can apply them; older
@@ -2207,13 +2514,13 @@ voice_enforcement_rollout_deploy() {
   activity_history_stop_control_plane || return 1
   privacy_defaults_require_local_control_plane_drained || return 1
   echo "voice-enforcement-rollout: starting the control-plane in compatibility mode"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build "${restore_pull[@]}" --wait \
-    --wait-timeout 180 control-plane)
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build "${restore_pull[@]}" --wait \
+    --wait-timeout 180 control-plane) || return 1
   voice_enforcement_rollout_wait_control_plane
   # Keep the old media serving while an uncached image build runs.
   if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
     echo "voice-enforcement-rollout: building the new media-plane image"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
+    managed_compose_build build media-plane || return 1
   fi
   voice_enforcement_rollout_cli deactivate
 
@@ -2223,8 +2530,8 @@ voice_enforcement_rollout_deploy() {
   voice_enforcement_rollout_stop_media
   echo "voice-enforcement-rollout: starting the new media-plane"
   echo "voice-enforcement-rollout: waiting for media-plane liveness"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build "${restore_pull[@]}" --wait \
-    --wait-timeout 180 media-plane)
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build "${restore_pull[@]}" --wait \
+    --wait-timeout 180 media-plane) || return 1
   echo "voice-enforcement-rollout: waiting for media-plane protocol 3 readiness"
   voice_enforcement_rollout_wait_media
 
@@ -2234,11 +2541,11 @@ voice_enforcement_rollout_deploy() {
 }
 
 voice_enforcement_rollout_media_rebuild() {
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
+  managed_compose_build build media-plane || return 1
   voice_enforcement_rollout_cli deactivate
   voice_enforcement_rollout_stop_media
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
-    --wait-timeout 180 media-plane)
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build --wait \
+    --wait-timeout 180 media-plane) || return 1
   voice_enforcement_rollout_wait_media
   voice_enforcement_rollout_activate
 }
@@ -2333,7 +2640,7 @@ media_bluegreen_verify_standby_image() {
   [[ -n "$project" && "$project" != *[[:space:]]* ]] || return 1
   # Build the current source without replacing the running empty standby, then
   # compare immutable image IDs before allowing an interrupted cutover to resume.
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build --quiet "$service") || {
+  managed_compose_build build --quiet "$service" || {
     echo "media-bluegreen: cannot build current ${service} image; refusing to reuse the running standby" >&2
     return 1
   }
@@ -2618,8 +2925,8 @@ media_bluegreen_cutover_locked() {
     media_bluegreen_verify_standby_image "$standby" "$running" || return 1
   else
     echo "media-bluegreen: starting standby ${standby}"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait \
-      --wait-timeout 180 "media-plane-${standby}") || return 1
+    managed_compose_build up -d --build --no-deps --wait \
+      --wait-timeout 180 "media-plane-${standby}" || return 1
   fi
   if ! media_bluegreen_probe_ready "$standby" true "$standby_port" 1 true; then
     echo "media-bluegreen: standby ${standby} failed its identity, worker, or readiness gate" >&2
@@ -2751,7 +3058,7 @@ raise SystemExit(0 if stopped else 1)
       # R7 may have stopped/removed the container before losing its acknowledgement.
       # Repeat the idempotent marker sweep before removing the tombstone.
       media_bluegreen_sweep_markers "$colour" "$active" || return 1
-      (cd "$DEPLOY_DIR" && $COMPOSE_CMD rm -f "media-plane-${colour}") || return 1
+      (cd "$DEPLOY_DIR" && managed_compose_mutate rm -f "media-plane-${colour}") || return 1
       result="$(media_bluegreen_redis DEL "media:colour_draining:${colour}")" || return 1
       [[ "$result" =~ ^[01]$ ]] || return 1
       echo "media-bluegreen: resumed reap of stopped color ${colour}"
@@ -2822,12 +3129,12 @@ print(value["rooms"], value["creates_in_flight"], value["generation"])
     result="$(media_bluegreen_redis SREM media:colours:registered "$colour")" || return 1
     [[ "$result" =~ ^[01]$ ]] || return 1
     echo "media-bluegreen: ${colour} reached the 2-hour deadline; disconnecting remaining rooms"
-    if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 "media-plane-${colour}"); then
+    if ! (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 "media-plane-${colour}"); then
       echo "media-bluegreen: deadline stop failed; ${colour} remains fenced for retry" >&2
       return 1
     fi
     media_bluegreen_sweep_markers "$colour" "$active" || return 1
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD rm -f "media-plane-${colour}") || return 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate rm -f "media-plane-${colour}") || return 1
     result="$(media_bluegreen_redis DEL "media:colour_draining:${colour}")" || return 1
     [[ "$result" =~ ^[01]$ ]] || return 1
     echo "media-bluegreen: reaped ${colour} after the deadline"
@@ -2872,11 +3179,11 @@ print(value["rooms"], value["creates_in_flight"])
     return 2
   fi
   rm -f "$body"
-  if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop --timeout 45 "media-plane-${colour}"); then
+  if ! (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 "media-plane-${colour}"); then
     echo "media-bluegreen: stop failed; ${colour} remains fenced; rerun media-reap to resume" >&2
     return 1
   fi
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD rm -f "media-plane-${colour}") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate rm -f "media-plane-${colour}") || return 1
   result="$(media_bluegreen_redis DEL "media:colour_draining:${colour}")" || return 1
   [[ "$result" =~ ^[01]$ ]] || return 1
   echo "media-bluegreen: reaped drained color ${colour}"
@@ -2997,7 +3304,7 @@ media_legacy_actuate() {
     return 0
   fi
   read -r rooms creates <<<"${second:-${first:-unknown unknown}}"
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop media-plane) || {
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane) || {
     echo 'media-legacy: legacy stop failed; retrying next run' >&2
     return 1
   }
@@ -3362,8 +3669,9 @@ redis_managed_prepare_registered_apps() {
   else
     service=control-plane
     redis_managed_replace_ready "$service" || return 1
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "$service") || return 1
+    managed_compose_build build "$service" || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$service") || return 1
+    managed_egress_reconcile || return 1
     ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
     [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || return 1
     hostname="$(redis_managed_bind_stopped_instance "$service" "$ids")" || return 1
@@ -3395,8 +3703,9 @@ redis_managed_prepare_registered_apps() {
     return 1
   }
   redis_managed_replace_ready "$candidate_service" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "$candidate_service") || return 1
+  managed_compose_build build "$candidate_service" || return 1
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$candidate_service") || return 1
+  managed_egress_reconcile || return 1
   ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$candidate_service")" || return 1
   [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || return 1
   hostname="$(redis_managed_bind_stopped_instance "$candidate_service" "$ids")" || return 1
@@ -3520,7 +3829,7 @@ except (ValueError, TypeError, KeyError, json.JSONDecodeError):
     start_services+=(control-plane)
   fi
   if [[ ${#start_services[@]} -gt 0 ]]; then
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 -- "${start_services[@]}") || return 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --no-deps --wait --wait-timeout 180 -- "${start_services[@]}") || return 1
   fi
 
   local deadline=$((SECONDS + 90)) current
@@ -3610,7 +3919,7 @@ redis_managed_image_preflight() {
   else
     image_services+=(media-plane)
   fi
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile services build "${image_services[@]}") || return 1
+  managed_compose_build --profile services build "${image_services[@]}" || return 1
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD pull redis) || return 1
   model="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile services config --format json)" || return 1
   image_services+=(redis)
@@ -3872,10 +4181,10 @@ redis_managed_prepare_locked() {
     && { [[ "$recover" != 3 ]] || ! cmp -s /var/lib/concord/redis-auth/activated <(printf 'concord-managed-redis-initializing-v1\n'); }; then
     echo 'redis-managed: state already exists; use redis-managed-rebuild or --recover' >&2; return 1
   fi
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop control-plane) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop media-plane media-plane-blue media-plane-green) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop redis-auth-controller) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop redis) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane media-plane-blue media-plane-green) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop redis) || return 1
   redis_managed_stopped_apps || return 1
   controller_running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q redis-auth-controller)" || return 1
   [[ -z "$controller_running" ]] || {
@@ -3889,8 +4198,8 @@ redis_managed_prepare_locked() {
   redis_managed_prepare_controller "$recover" "$proof" || return 1
   REDIS_MANAGED_MARKER_MODE=required
   redis_managed_marker_preflight required || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps redis-auth-controller) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait redis) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait redis) || return 1
   [[ "$recover" == 1 ]] && mode=recover
   media_service="$(redis_managed_select_media_service "$mode")" || return 1
   if [[ "$recover" == 1 ]]; then
@@ -3914,10 +4223,11 @@ raise SystemExit(0 if valid and sys.argv[2]!=sys.argv[3] else 1)
   for service in control-plane "$media_service"; do
     redis_managed_replace_ready "$service" || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$service") || return 1
+    managed_egress_reconcile || return 1
   done
   redis_managed_register_stopped_apps "$media_service" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
   redis_managed_wait_apps "$media_service" "$mode"
 }
 
@@ -4034,8 +4344,8 @@ redis_managed_rebuild_locked() {
   local initial_status="$status"
   redis_managed_assert_same_rotation "$initial_status" || return 1
   redis_managed_rebuild_marker begin "$status" "$media_service" "$cp_id" "$media_id" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop control-plane) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop media-plane media-plane-blue media-plane-green) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane media-plane-blue media-plane-green) || return 1
   redis_managed_stopped_apps || return 1
   redis_managed_assert_same_rotation "$initial_status" || return 1
   local cp_running
@@ -4043,15 +4353,16 @@ redis_managed_rebuild_locked() {
   [[ -z "$cp_running" ]] || { echo 'redis-managed: zero-control-plane migration gate failed' >&2; return 1; }
   for service in control-plane "$media_service"; do
     redis_managed_replace_ready "$service" || return 1
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "$service") || return 1
+    managed_compose_build build "$service" || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD create --no-deps --force-recreate "$service") || return 1
+    managed_egress_reconcile || return 1
   done
   redis_managed_assert_same_rotation "$initial_status" || return 1
   redis_managed_register_stopped_apps "$media_service" || return 1
   redis_managed_assert_same_rotation "$initial_status" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
   redis_managed_assert_same_rotation "$initial_status" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
   redis_managed_wait_apps "$media_service" || return 1
   rm -- "$REDIS_MANAGED_REBUILD_MARKER"
 }
@@ -4084,9 +4395,9 @@ redis_managed_resume_stopped_rebuild() {
   redis_managed_assert_same_rotation "$status" || return 1
   redis_managed_register_stopped_apps "$media_service" || return 1
   redis_managed_assert_same_rotation "$status" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 control-plane) || return 1
   redis_managed_assert_same_rotation "$status" || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 "$media_service") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 "$media_service") || return 1
   redis_managed_wait_apps "$media_service" || return 1
   [[ "$mode" != rebuild ]] || rm -- "$REDIS_MANAGED_REBUILD_MARKER"
 }
@@ -4120,13 +4431,13 @@ redis_managed_restart_bound_stack() {
     status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
     redis_managed_require_registered_state "$status" || return 1
     redis_managed_status_acks_preflight "$status" || return 1
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD stop) || return 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate stop) || return 1
   fi
   redis_managed_stopped_apps || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start redis-auth-controller) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 redis) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 redis-auth-controller) || return 1
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD start --wait --wait-timeout 180 "${supporting[@]}") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 redis) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 redis-auth-controller) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 "${supporting[@]}") || return 1
   redis_managed_resume_stopped_rebuild
 }
 
@@ -4164,7 +4475,7 @@ managed_production_nats_reconcile() {
   fi
   # freshstart checks the model before wiping, then starts fresh NATS afterward.
   [[ "${1:-}" != model-only ]] || return 0
-  if ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --pull missing --wait --wait-timeout 180 nats) >/dev/null 2>&1; then
+  if ! (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build --pull missing --wait --wait-timeout 180 nats) >/dev/null 2>&1; then
     echo 'rebuild: cannot reconcile production NATS; refusing' >&2
     return 1
   fi
@@ -4277,7 +4588,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
   activity_history_routine_guard || return 1
   managed_production_nats_reconcile || return 1
   if (( full == 1 )) && [[ ${#deps_arr[@]} -gt 0 ]]; then
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${deps_arr[@]}") || return 1
+    managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 -- "${deps_arr[@]}" || return 1
   fi
   if [[ "$REDIS_CREDENTIAL_MODE" == managed && "$start_media" == 1 ]]; then
     if (( start_cp == 1 )); then
@@ -4295,11 +4606,11 @@ print(" ".join(sorted(set(s) - closure - excluded)))
       : # cold prepare already created, registered, started, and proved this instance
     else
     clear_activity_history_image_selector || return 1
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane) || return 1
+    managed_compose_build build control-plane || return 1
     privacy_defaults_refuse_foreign_control_plane || return 1
     activity_history_stop_control_plane || return 1
     privacy_defaults_require_local_control_plane_drained || return 1
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 control-plane) || return 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --no-deps --wait --wait-timeout 180 control-plane) || return 1
     voice_enforcement_rollout_wait_control_plane || return 1
     fi
   fi
@@ -4307,7 +4618,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
     if [[ "${COMPOSE_OVERRIDE:-}" == docker-compose.staging.yml ]]; then
       ingress_ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q staging-media-proxy)" || return 1
       if [[ -z "$ingress_ids" ]]; then
-        (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --wait --wait-timeout 180 staging-media-proxy) || return 1
+        (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 staging-media-proxy) || return 1
       fi
       media_bluegreen_dependencies_ready staging-media-proxy || return 1
     else
@@ -4317,7 +4628,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
     voice_enforcement_rollout_activate || return 1
   fi
   if (( full == 1 )) && [[ ${#rest_arr[@]} -gt 0 ]]; then
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps -- "${rest_arr[@]}") || return 1
+    managed_compose_build up -d --build --no-deps -- "${rest_arr[@]}" || return 1
   elif (( full == 0 )); then
     local -a extra=()
     for scope_token in "$@"; do
@@ -4327,7 +4638,7 @@ print(" ".join(sorted(set(s) - closure - excluded)))
       esac
     done
     if [[ ${#extra[@]} -gt 0 ]]; then
-      (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 -- "${extra[@]}") || return 1
+      managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 -- "${extra[@]}" || return 1
     fi
   fi
   echo 'media-bluegreen: rebuild completed with active colour excluded'
@@ -4476,8 +4787,6 @@ except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
 rebuild_unscoped() {
   local rendered plan closure rest
   local -a closure_arr=() rest_arr=()
-  local -a build_flags=(--build)
-  [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]] || build_flags=(--no-build --pull never)
   # stderr is NOT merged: Compose warns on stderr while exiting 0, and a merged
   # warning would corrupt the JSON (same rule as the scoped dependency probe).
   if ! rendered="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json)"; then
@@ -4515,15 +4824,23 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
   # service name may start with `-`, and Compose would read it as a flag.
   if [[ ${#closure_arr[@]} -gt 0 ]]; then
     echo "rebuild: starting the voice services' dependencies: ${closure_arr[*]}"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d "${build_flags[@]}" --no-deps --wait --wait-timeout 180 -- \
-      "${closure_arr[@]}")
+    if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
+      managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 -- "${closure_arr[@]}"
+    else
+      (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --pull never --no-deps --wait --wait-timeout 180 -- \
+        "${closure_arr[@]}")
+    fi
   fi
   voice_enforcement_rollout_deploy
   if [[ ${#rest_arr[@]} -gt 0 ]]; then
     # No --wait: coturn's STUN probe flaking would abort a deploy that
     # otherwise succeeded, and post-rsync's wait-healthy follows anyway.
     echo "rebuild: starting the remaining services: ${rest_arr[*]}"
-    (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d "${build_flags[@]}" --no-deps -- "${rest_arr[@]}")
+    if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
+      managed_compose_build up -d --build --no-deps -- "${rest_arr[@]}"
+    else
+      (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --pull never --no-deps -- "${rest_arr[@]}")
+    fi
   fi
 }
 
@@ -4724,13 +5041,23 @@ if [[ "$MEDIA_DEPLOY_PROFILE" == media-bluegreen ]]; then
   esac
 fi
 
+if [[ "${1:-help}" == docker-clean ]]; then
+  # Reject typos before waiting for the lock or invoking the admission gate.
+  case "${2:-}" in
+    "") AGGRESSIVE=0 ;;
+    --aggressive) AGGRESSIVE=1 ;;
+    *) echo "docker-clean: unknown argument '${2}'. Only --aggressive is supported." >&2; exit 2 ;;
+  esac
+  [[ $# -le 2 ]] || { echo 'docker-clean: unexpected extra arguments' >&2; exit 2; }
+fi
+
 case "${1:-help}" in
   nginx-reload|sudoers-sync)
     # These early post-rsync transactions wait for an in-progress actor cycle.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
     ;;
-  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|redis-managed-prepare|redis-managed-rebuild|turn-managed-init-schema|turn-managed-bootstrap|turn-managed-add-candidate|turn-managed-promote|turn-managed-rollback|turn-managed-recover|turn-managed-discard-unrecorded|turn-managed-status)
+  rebuild|stage-restore|restart|stop|docker-clean|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|redis-managed-prepare|redis-managed-rebuild|turn-managed-init-schema|turn-managed-bootstrap|turn-managed-add-candidate|turn-managed-promote|turn-managed-rollback|turn-managed-recover|turn-managed-discard-unrecorded|turn-managed-status)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -4747,12 +5074,16 @@ case "${1:-help}" in
     # flake. 90s comfortably exceeds the actor's worst-case hold.
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
-    if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
+    if [[ "${1:-}" != docker-clean && "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
        && "$COMPOSE_OVERRIDE" == docker-compose.production.yml ]]; then
       redis_managed_writer_consistency_guard || exit 1
       # Re-read the canonical pair under the lock (#3931), exactly as Redis does.
       turn_managed_writer_consistency_guard || exit 1
     fi
+    # This is deliberately inside the existing deploy transaction lock. A
+    # commissioned policy may change only outside a running deployment; all
+    # partial states refuse before NATS or Compose can mutate namespaces.
+    managed_egress_gate verify || exit 1
     ;;
 esac
 
@@ -4874,7 +5205,7 @@ case "${1:-help}" in
       echo "Done."
       exit 0
     fi
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD restart
+    cd "$DEPLOY_DIR" && managed_compose_mutate restart
     selfhost_post_up_check || exit 1
     selfhost_tls_ready_gate || exit 1
     echo "Done."
@@ -5177,7 +5508,7 @@ else:
       # set. The ownership check then observes Compose's actual configuration
       # before any service can start; all ordinary managed/self-host paths keep
       # their established build ordering below.
-      if [[ $STAGE_RESTORE_MODE -eq 0 ]] && ! (cd "$DEPLOY_DIR" && $COMPOSE_CMD build); then
+      if [[ $STAGE_RESTORE_MODE -eq 0 ]] && ! managed_compose_build build; then
         echo 'west-stage: stage image build failed; refusing to start services' >&2
         exit 1
       fi
@@ -5228,14 +5559,14 @@ else:
     if [[ $_has_control_plane -eq 1 ]]; then
       # Build while the previous control-plane is still serving. A slow or
       # failed image build must not extend the migration drain or leave it down.
-      (cd "$DEPLOY_DIR" && $COMPOSE_CMD build "${REBUILD_SCOPE[@]}") || exit 1
+      managed_compose_build build "${REBUILD_SCOPE[@]}" || exit 1
       echo "rebuild: draining the previous control-plane before its startup migrations"
       privacy_defaults_refuse_foreign_control_plane || exit 1
       activity_history_stop_control_plane || exit 1
       privacy_defaults_require_local_control_plane_drained || exit 1
-      cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
+      cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
     else
-      cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
+      managed_compose_build up -d --build --no-deps --wait --wait-timeout 180 "${REBUILD_SCOPE[@]}"
     fi
     selfhost_post_up_check || exit 1
     [[ $_rebuild_starts_coturn -eq 0 ]] || selfhost_tls_ready_gate || exit 1
@@ -5377,7 +5708,7 @@ else:
         exit 1
       fi
     fi
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --no-deps --pull never control-plane ./main storage-probe "$@"
+    control_plane_cli storage-probe "$@"
     ;;
 
   attachment-probe-cron-install)
@@ -6148,10 +6479,11 @@ else:
     # `localhost` probe (curl tries it first) and fake readiness (#3538).
     CP_PROBE_BASE="http://127.0.0.1:8080"
     COTURN_PROBE_HOST="${stage_private_address:-127.0.0.1}"
-    cp_ok=0; mp_ok=0; coturn_ok=0; tls_ok=0
+    egress_mode="$(managed_egress_mode)" || exit 1
+    cp_ok=0; mp_ok=0; coturn_ok=0; tls_ok=0; egress_ok=1
     cp_refresh_skipped=0; mp_refresh_skipped=0; coturn_refresh_skipped=0
     while [[ $(date +%s) -lt $DEADLINE ]]; do
-      cp_ok=0; mp_ok=0; coturn_ok=0; tls_ok=0
+      cp_ok=0; mp_ok=0; coturn_ok=0; tls_ok=0; egress_ok=1
       cp_refresh_skipped=0; mp_refresh_skipped=0; coturn_refresh_skipped=0
       # Gates on READINESS, not liveness (#3106). wait-healthy is the real
       # answer to "did this deploy succeed", and a control-plane that bound the
@@ -6167,6 +6499,10 @@ else:
         curl -sf "http://127.0.0.1:3000/health" >/dev/null 2>&1 && mp_ok=1
       fi
       nc -z -w2 "$COTURN_PROBE_HOST" 3478 >/dev/null 2>&1 && coturn_ok=1
+      if [[ "$egress_mode" == managed ]]; then
+        egress_ok=0
+        managed_egress_gate ready && egress_ok=1
+      fi
       if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
         tls_ok=1
       else
@@ -6203,7 +6539,7 @@ else:
         fi
       fi
       if (( $(date +%s) < DEADLINE )) &&
-          [[ $cp_ok -eq 1 && $mp_ok -eq 1 && $coturn_ok -eq 1 && $tls_ok -eq 1 ]]; then
+          [[ $cp_ok -eq 1 && $mp_ok -eq 1 && $coturn_ok -eq 1 && $tls_ok -eq 1 && $egress_ok -eq 1 ]]; then
         selfhost_post_up_check || exit 1
         if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
           echo "  ✓ all services healthy (control-plane + media-plane + coturn TLS)"
@@ -6274,6 +6610,8 @@ else:
         echo "    coturn STUN (:3478) failed" >&2
       fi
     fi
+    [[ "$egress_mode" != managed || $egress_ok -eq 1 ]] \
+      || echo '    managed egress readiness failed' >&2
     [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost || $tls_ok -eq 1 ]] \
       || echo "    coturn TLS listener proof failed" >&2
     dump_health_diagnostics
@@ -6328,12 +6666,13 @@ else:
     fi
     fi
 
+    managed_egress_gate verify || exit 1
     managed_production_nats_reconcile model-only || exit 1
     clear_activity_history_image_selector
     activity_history_invalidate_activation_receipt
     echo ""
     echo "Stopping all services and removing volumes..."
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD down -v
+    cd "$DEPLOY_DIR" && managed_compose_mutate down -v
     managed_production_nats_reconcile || exit 1
     echo ""
     # #1015: sync_releases no longer auto-called. If the server's
@@ -6341,7 +6680,7 @@ else:
     # OR run `concord-ctl.sh sync-releases` before invoking freshstart.
     echo "Rebuilding and starting fresh..."
     echo "Note: release assets NOT refreshed automatically (#1015). Run 'concord-ctl.sh sync-releases' or trigger sync-releases.yml AFTER freshstart completes to populate /opt/concord/releases/."
-    cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --build
+    managed_compose_build up -d --build
     if ! voice_enforcement_rollout_wait_control_plane \
       || ! voice_enforcement_rollout_wait_media \
       || ! voice_enforcement_rollout_activate; then
@@ -6401,14 +6740,6 @@ else:
     ;;
 
   docker-clean)
-    # Reject unknown arguments loudly — a typo like `--agressive` must not
-    # silently downgrade to conservative mode during incident response.
-    case "${2:-}" in
-      "") AGGRESSIVE=0 ;;
-      --aggressive) AGGRESSIVE=1 ;;
-      *) echo "docker-clean: unknown argument '${2}'. Only --aggressive is supported." >&2; exit 2 ;;
-    esac
-
     # Timestamp in the banner so week-to-week cron log entries are distinguishable.
     echo "=== Docker Cleanup — $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
     echo "Before:"
@@ -6446,9 +6777,9 @@ else:
       selfhost_storage_stop_stale_minio || exit 1
     fi
     if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
-      cd "$DEPLOY_DIR" && $COMPOSE_CMD stop
+      cd "$DEPLOY_DIR" && managed_compose_mutate stop
     else
-      cd "$DEPLOY_DIR" && $COMPOSE_CMD down
+      cd "$DEPLOY_DIR" && managed_compose_mutate down
     fi
     echo "Done."
     ;;
