@@ -242,11 +242,11 @@ func TestRefreshMachineIDTheft_ConcurrentMintDoesNotSurvive(t *testing.T) {
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE%'
+			  AND query LIKE '%SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE%'
 		)`).Scan(&waiting)
 		return err == nil && waiting
-	}, time.Second, 10*time.Millisecond,
-		"token-theft sweep must wait on the users-row lock held by the concurrent mint")
+	}, 2*time.Second, 10*time.Millisecond,
+		"token-theft enqueue must wait on the users-row lock held by the concurrent mint")
 
 	releaseMint()
 
@@ -272,13 +272,11 @@ func TestRefreshMachineIDTheft_ConcurrentMintDoesNotSurvive(t *testing.T) {
 	require.True(t, revokedAt.Valid, "the refresh session minted during the theft sweep must be revoked")
 }
 
-// TestRefreshMachineIDTheft_RevokeFailureLogsAndRejects is a regression for #2460.
-// A failed best-effort revocation must still reject the theft request and leave an
-// auditable, non-sensitive failure log.
+// A failed theft sweep must keep every admission path blocked until recovery.
 func TestRefreshMachineIDTheft_RevokeFailureLogsAndRejects(t *testing.T) {
 	ts := setupTS(t)
 	originalMachineID := uuid.New().String()
-	refreshToken, _ := registerAndGetRefreshToken(t, ts, "theftrevokeerror", originalMachineID)
+	refreshToken, userID := registerAndGetRefreshToken(t, ts, "theftrevokeerror", originalMachineID)
 
 	_, err := ts.DB.Exec(
 		`UPDATE refresh_tokens SET ip_address = '10.0.0.1', machine_id = $1 WHERE token_hash = $2`,
@@ -290,7 +288,9 @@ func TestRefreshMachineIDTheft_RevokeFailureLogsAndRejects(t *testing.T) {
 	differentMachineID := uuid.New().String()
 	logs := ts.CaptureLogs(t)
 	w := doRefreshWithMachineID(ts, refreshToken, differentMachineID, "10.0.0.99:5678")
-	require.Equal(t, http.StatusUnauthorized, w.Code)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.NotContains(t, w.Body.String(), "Session terminated")
+	assert.Contains(t, w.Body.String(), "session_revocation_pending")
 	logOutput := logs.String()
 	assert.Contains(t, logOutput, "Failed to revoke refresh tokens after token theft")
 	assert.NotContains(t, logOutput, originalMachineID)
@@ -299,6 +299,27 @@ func TestRefreshMachineIDTheft_RevokeFailureLogsAndRejects(t *testing.T) {
 	require.NotEmpty(t, theftLog)
 	assert.NotContains(t, theftLog, "10.0.0.1")
 	assert.NotContains(t, theftLog, "10.0.0.99")
+
+	var pending int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM token_theft_pending_revocations WHERE user_id = $1`, userID).Scan(&pending))
+	require.Equal(t, 1, pending)
+	// Model a lost marker: PostgreSQL must still deny after Redis state loss.
+	require.NoError(t, ts.Redis.Del(context.Background(), middleware.TokenTheftBlockedKey(userID)).Err())
+	blockedRefresh := doRefreshWithMachineID(ts, refreshToken, "", "10.0.0.99:5678")
+	assert.Equal(t, http.StatusUnauthorized, blockedRefresh.Code)
+	accessToken, err := auth.GenerateAccessToken(userID, testhelpers.TestJWTSecret, true, "", "")
+	require.NoError(t, err)
+	blockedAccess := ts.DoRequest("GET", "/api/v1/sessions", nil, testhelpers.AuthHeaders(accessToken))
+	assert.Equal(t, http.StatusServiceUnavailable, blockedAccess.Code)
+	assert.Contains(t, blockedAccess.Body.String(), "session_revocation_pending")
+
+	_, err = ts.DB.Exec(`DROP TRIGGER IF EXISTS token_theft_revoke_failure ON refresh_tokens`)
+	require.NoError(t, err)
+	require.NoError(t, auth.RecoverPendingTokenTheftRevocations(context.Background(), ts.DB, ts.Redis, logger.New("test")))
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM token_theft_pending_revocations WHERE user_id = $1`, userID).Scan(&pending))
+	assert.Zero(t, pending)
+	stillRevoked := doRefreshWithMachineID(ts, refreshToken, "", "10.0.0.99:5678")
+	assert.Equal(t, http.StatusUnauthorized, stillRevoked.Code)
 }
 
 func findLogLine(logOutput, marker string) string {

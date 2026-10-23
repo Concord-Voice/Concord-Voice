@@ -15,6 +15,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -26,8 +27,9 @@ import (
 func fenceWiredWSHandler(t *testing.T) (*Handler, *redis.Client) {
 	t.Helper()
 	rc := setupHubTestRedis(t)
+	db, _ := dbtest.SetupTestDB(t)
 	fence := credepoch.New(nil, rc, logger.NewWithWriter(io.Discard))
-	return NewHandler(nil, nil, rc, testJWTSecret, nil, fence, nil), rc
+	return NewHandler(nil, db, rc, testJWTSecret, nil, fence, nil), rc
 }
 
 func signedJWTWithClaims(t *testing.T, claims jwt.MapClaims) string {
@@ -106,13 +108,14 @@ func TestAuthenticateWS_JWTUnverifiedEmailRejected(t *testing.T) {
 
 func TestAuthenticateWS_JWTRedisOutageRejected(t *testing.T) {
 	userID := uuid.New()
+	db, _ := dbtest.SetupTestDB(t)
 	rc := redis.NewClient(&redis.Options{
 		Addr:        "127.0.0.1:1",
 		DialTimeout: 100 * time.Millisecond,
 		MaxRetries:  -1,
 	})
 	t.Cleanup(func() { assert.NoError(t, rc.Close()) })
-	h := NewHandler(nil, nil, rc, testJWTSecret, nil, nil, nil)
+	h := NewHandler(nil, db, rc, testJWTSecret, nil, nil, nil)
 	token := signedJWTWithClaims(t, jwt.MapClaims{
 		"user_id":        userID.String(),
 		"email_verified": true,

@@ -132,3 +132,23 @@ func TestAuthRequiredFailuresAlwaysSetClosedVerdicts(t *testing.T) {
 		})
 	}
 }
+
+func TestPendingTokenTheftUsesRecoveryResponseAndVerdict(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil)
+	abortLiveTokenStateError(c, ErrTokenTheftRevocationPending)
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "session_revocation_pending")
+	verdict, ok := NightwatchVerdictFromContext(c)
+	require.True(t, ok)
+	require.Equal(t, securityevent.ReasonTokenTheftSuspected, verdict.Reason)
+}
+
+func TestLocalTokenTheftPendingDeniesUntilReleased(t *testing.T) {
+	userID := "550e8400-e29b-41d4-a716-446655440000"
+	release := HoldLocalTokenTheftPending(userID)
+	require.ErrorIs(t, CheckTokenTheftBlocked(t.Context(), nil, nil, userID), ErrTokenTheftRevocationPending)
+	release()
+	require.False(t, LocalTokenTheftPending(userID))
+}

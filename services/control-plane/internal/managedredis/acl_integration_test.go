@@ -79,6 +79,7 @@ func TestRedisACLIntegration(t *testing.T) {
 	out, err := run.CombinedOutput()
 	require.NoErrorf(t, err, "start fixture: %s", out)
 	t.Cleanup(func() {
+		_ = exec.Command("docker", "exec", name, "chmod", "-R", "a+rwX", "/data").Run()
 		_ = exec.Command("docker", "rm", "-f", name).Run()
 	})
 	portOut, err := exec.Command("docker", "port", name, "6379/tcp").Output()
@@ -149,6 +150,31 @@ func TestRedisACLIntegration(t *testing.T) {
 	require.NoError(t, mp.Get(ctx, "voice:room_owner:acl-fixture").Err())
 	require.NoError(t, mp.MGet(ctx, "media:colour_draining:blue", "voice:room_owner:acl-fixture").Err())
 	require.NoError(t, cp.Eval(ctx, `return redis.call('GET', KEYS[1])`, []string{"session_revokes:acl-fixture"}).Err())
+	// Exercise the token theft fallback and cleanup scripts with the deployed ACL.
+	fallbackKey := "token_theft_pending_revocations:fallback:v2"
+	markerKey := "token_theft_blocked:acl-fixture"
+	conn := cp.Conn()
+	require.NoError(t, conn.Eval(ctx, `
+redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
+redis.call("SET", KEYS[2], ARGV[2])
+return 1`, []string{fallbackKey, markerKey}, "acl-fixture", "operation-fixture").Err())
+	local, err := conn.WaitAOF(ctx, 1, 0, 3*time.Second).Result()
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 0}, local)
+	require.NoError(t, conn.Close())
+	require.Equal(t, "operation-fixture", cp.HGet(ctx, fallbackKey, "acl-fixture").Val())
+	require.Equal(t, "operation-fixture", cp.Get(ctx, markerKey).Val())
+	require.NoError(t, cp.HGetAll(ctx, fallbackKey).Err())
+	require.NoError(t, cp.SMembers(ctx, "token_theft_pending_revocations:fallback").Err())
+	require.NoError(t, cp.Eval(ctx, `
+if redis.call("HGET", KEYS[1], ARGV[1]) == ARGV[2] then
+  redis.call("HDEL", KEYS[1], ARGV[1])
+end
+if redis.call("GET", KEYS[2]) == ARGV[2] then
+  redis.call("DEL", KEYS[2])
+end
+return 1`, []string{fallbackKey, markerKey}, "acl-fixture", "operation-fixture").Err())
+	require.Equal(t, int64(0), cp.Exists(ctx, markerKey).Val())
 
 	// A real overlapping ACL load preserves the keyspace and drops old AUTH only
 	// after exact acknowledgments and an observed zero-client drain.
@@ -410,6 +436,8 @@ func integrationDryRunArgs(command, key string) []any {
 		return []any{command, key}
 	case "HGET":
 		return []any{command, "attach_sess:acl-fixture", "status"}
+	case "HDEL":
+		return []any{command, "token_theft_pending_revocations:fallback:v2", "acl-fixture"}
 	case "HSET":
 		return []any{command, "attach_sess:acl-fixture", "status", "x"}
 	case "INCR":
@@ -434,6 +462,8 @@ func integrationDryRunArgs(command, key string) []any {
 		return []any{command, "attestation:acl-fixture", "x"}
 	case "WATCH":
 		return []any{command, "recovery_code:acl-fixture"}
+	case "WAITAOF":
+		return []any{command, "1", "0", "1000"}
 	case "ZADD":
 		return []any{command, "session_revokes:acl-fixture", "1", "x"}
 	case "ZCARD":

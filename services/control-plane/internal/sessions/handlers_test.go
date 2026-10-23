@@ -326,7 +326,7 @@ func TestRevokeAllSessions_EpochAdvanceAfterAuthenticationReturnsUnauthorized(t 
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(middleware.AuthRequired(testhelpers.TestJWTSecret, ts.Redis, nil))
+	router.Use(middleware.AuthRequired(testhelpers.TestJWTSecret, ts.Redis, ts.DB, nil))
 	router.Use(func(c *gin.Context) {
 		if _, updateErr := ts.DB.Exec(`UPDATE users SET credential_epoch = 'new-epoch' WHERE id = $1`, claims.UserID); updateErr != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)

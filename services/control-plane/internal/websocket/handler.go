@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -223,6 +224,27 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 			return
 		}
 	}
+	// The theft sweep can complete and clear its temporary deny marker while an
+	// upgrade is waiting for hub registration. Compare the durable generation
+	// captured before the first theft check, then repeat the pending-state gate.
+	// A sweep after this check is ordered after registration and disconnects us.
+	generation, err := h.readTokenTheftGeneration(c.Request.Context(), userID)
+	if err == nil {
+		initial, ok := c.Get(wsTheftGenerationContextKey)
+		snapshot, valid := initial.(int64)
+		if !ok || !valid || generation != snapshot {
+			err = fmt.Errorf("token theft generation changed during WebSocket registration")
+		} else {
+			err = middleware.CheckTokenTheftBlocked(c.Request.Context(), h.redis, h.db, userID.String())
+		}
+	}
+	if err != nil {
+		client.stopTokenExpiry()
+		log.Printf("Evicting WebSocket client for user %s: token theft state changed: %v", sanitizeLogValue(userID.String()), err)
+		client.requestUnregister()
+		client.closeRevokedConnection()
+		return
+	}
 	if client.tokenExpired() {
 		client.closeExpiredToken()
 		client.requestUnregister()
@@ -270,6 +292,10 @@ func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUI
 	if err != nil {
 		return uuid.Nil, "", fmt.Errorf("invalid user ID in ticket: %w", err)
 	}
+	generation, err := h.readTokenTheftGeneration(c.Request.Context(), userID)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
 	// A ticket is a 30-second bearer: apply the same user-disabled and
 	// credential-epoch gates as HTTP bearer auth (#2201). Pre-#2201 the ticket
 	// path checked neither, so a ticket minted just before a disable or a
@@ -291,6 +317,7 @@ func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUI
 	// fenced against a later reset (#2201, Codex #2397 review).
 	c.Set(wsCredEpochContextKey, ticketEpoch)
 	c.Set(wsDeadlineContextKey, expiresAt)
+	c.Set(wsTheftGenerationContextKey, generation)
 	return userID, sessionID, nil
 }
 
@@ -303,6 +330,23 @@ func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUI
 const wsCredEpochContextKey = "ws_cred_epoch"
 
 const wsDeadlineContextKey = "ws_deadline"
+
+const wsTheftGenerationContextKey = "ws_theft_generation"
+
+func (h *Handler) readTokenTheftGeneration(ctx context.Context, userID uuid.UUID) (int64, error) {
+	if h.db == nil {
+		return 0, errors.New("read token theft generation: database unavailable")
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var generation int64
+	if err := h.db.QueryRowContext(readCtx,
+		`SELECT COALESCE((SELECT token_theft_generation FROM users WHERE id = $1), 0)`, userID,
+	).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("read token theft generation: %w", err)
+	}
+	return generation, nil
+}
 
 // checkUserDisabled mirrors the HTTP middleware's immediate-effect denylist
 // gate (#1623) for WS upgrades: a present user_disabled key OR a Redis error
@@ -318,7 +362,7 @@ func (h *Handler) checkUserDisabled(c *gin.Context, userID string) error {
 	if exists > 0 {
 		return fmt.Errorf("account disabled")
 	}
-	return nil
+	return middleware.CheckTokenTheftBlocked(c.Request.Context(), h.redis, h.db, userID)
 }
 
 func extractBearerToken(c *gin.Context) string {
@@ -337,15 +381,17 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 	}
 	c.Set(wsCredEpochContextKey, verified.CredEpoch)
 	c.Set(wsDeadlineContextKey, verified.ExpiresAt)
+	c.Set(wsTheftGenerationContextKey, verified.TheftGeneration)
 	return verified.UserID, verified.SessionID, nil
 }
 
 // accessTokenAuth is what a fully validated access token proves about its bearer.
 type accessTokenAuth struct {
-	UserID    uuid.UUID
-	SessionID string
-	CredEpoch string
-	ExpiresAt time.Time
+	UserID          uuid.UUID
+	SessionID       string
+	CredEpoch       string
+	ExpiresAt       time.Time
+	TheftGeneration int64
 }
 
 // validateAccessToken is the single access-token gate shared by the JWT handshake
@@ -384,9 +430,13 @@ func (h *Handler) validateAccessToken(ctx context.Context, tokenString string) (
 	if err != nil {
 		return accessTokenAuth{}, err
 	}
+	generation, err := h.readTokenTheftGeneration(ctx, userID)
+	if err != nil {
+		return accessTokenAuth{}, err
+	}
 	// Share HTTP bearer auth's live disabled/email state while retaining the
 	// WebSocket policy that an explicitly unverified token is rejected here.
-	emailVerified, err := middleware.VerifyLiveTokenState(ctx, h.redis, userID.String(), claims)
+	emailVerified, err := middleware.VerifyLiveTokenState(ctx, h.redis, h.db, userID.String(), claims)
 	if err != nil {
 		return accessTokenAuth{}, err
 	}
@@ -399,7 +449,7 @@ func (h *Handler) validateAccessToken(ctx context.Context, tokenString string) (
 			return accessTokenAuth{}, fmt.Errorf("credential epoch check failed: %w", ferr)
 		}
 	}
-	return accessTokenAuth{UserID: userID, SessionID: sessionID, CredEpoch: tokenEpoch, ExpiresAt: expiresAt.Time}, nil
+	return accessTokenAuth{UserID: userID, SessionID: sessionID, CredEpoch: tokenEpoch, ExpiresAt: expiresAt.Time, TheftGeneration: generation}, nil
 }
 
 func (h *Handler) checkTokenBlacklist(ctx context.Context, claims jwt.MapClaims) error {

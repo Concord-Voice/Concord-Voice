@@ -18,6 +18,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -102,11 +103,12 @@ func authRequiredUnderTest(t *testing.T) *gin.Engine {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { assert.NoError(t, rdb.Close()) })
+	db, _ := dbtest.SetupTestDB(t)
 
 	r := gin.New()
 	// nil fence: the credential-epoch fence is NOT what rejects these tokens, and
 	// passing one would mask which guard actually fired.
-	r.GET("/protected", middleware.AuthRequired(tokenClassSecret, rdb, nil), func(c *gin.Context) {
+	r.GET("/protected", middleware.AuthRequired(tokenClassSecret, rdb, db, nil), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"user_id": c.GetString("user_id")})
 	})
 	return r

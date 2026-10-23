@@ -23,6 +23,11 @@ func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
 	t.Helper()
 
 	client := redistest.Client(t)
+	// The theft recovery path requires a local WAITAOF receipt. Match the
+	// AOF-enabled deployment even when CI supplies a stock Redis service.
+	if err := client.ConfigSet(context.Background(), "appendonly", "yes").Err(); err != nil {
+		t.Fatalf("testhelpers: failed to enable Redis AOF: %v", err)
+	}
 
 	if err := redistest.Reset(context.Background(), client); err != nil {
 		t.Fatalf("testhelpers: failed to reset the allocated test redis DB: %v", err)

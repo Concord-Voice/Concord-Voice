@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
 
 // TestAuthenticateViaTicket_DenylistIsSpellingInvariant pins the ticket rail's
@@ -44,7 +45,8 @@ import (
 // normalizes for in the first place. Defense in depth, now actually pinned.
 func TestAuthenticateViaTicket_DenylistIsSpellingInvariant(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
+	db, _ := dbtest.SetupTestDB(t)
+	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
 
 	userID := uuid.New()
 	ctx := context.Background()

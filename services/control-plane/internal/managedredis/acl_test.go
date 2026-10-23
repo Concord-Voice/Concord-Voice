@@ -1,11 +1,37 @@
 package managedredis
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestAbsentCommandInventoryDoesNotContradictGrantedACL(t *testing.T) {
+	var inventory struct {
+		ExcludedAbsentApplicationCommands []string `json:"excludedAbsentApplicationCommands"`
+	}
+	require.NoError(t, json.Unmarshal(aclManifestJSON, &inventory))
+	granted := make(map[string]bool)
+	for _, command := range checkedACLManifest.ConnectionCommands {
+		granted[command] = true
+	}
+	for _, command := range checkedACLManifest.OptionalConnectionCommands {
+		granted[command] = true
+	}
+	for _, selector := range checkedACLManifest.Services {
+		for _, command := range selector.Commands {
+			granted[command] = true
+		}
+	}
+	for _, command := range checkedACLManifest.BluegreenOperator.Commands {
+		granted[command] = true
+	}
+	for _, command := range inventory.ExcludedAbsentApplicationCommands {
+		require.False(t, granted[command], "command %s cannot be both granted and absent", command)
+	}
+}
 
 func TestMediaACLMatchesManifestAndKeepsOwnerDrainKeysReadOnly(t *testing.T) {
 	selector := checkedACLManifest.Services["media-plane"]

@@ -21,6 +21,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
 
 const (
@@ -322,8 +323,8 @@ func TestAuthenticateWebSocketNoAuth(t *testing.T) {
 
 func TestAuthenticateWebSocketJWTViaHeader(t *testing.T) {
 	userID := uuid.New()
-	// Success path reaches the #2201 user-disabled check, which needs Redis.
-	h := NewHandler(nil, nil, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
+	db, _ := dbtest.SetupTestDB(t)
+	h := NewHandler(nil, db, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
 
 	r, _ := http.NewRequest("GET", "/ws", nil)
@@ -338,8 +339,8 @@ func TestAuthenticateWebSocketJWTViaHeader(t *testing.T) {
 
 func TestAuthenticateWebSocketJWTViaQueryParam(t *testing.T) {
 	userID := uuid.New()
-	// Success path reaches the #2201 user-disabled check, which needs Redis.
-	h := NewHandler(nil, nil, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
+	db, _ := dbtest.SetupTestDB(t)
+	h := NewHandler(nil, db, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
 
 	r, _ := http.NewRequest("GET", wsTokenPath+token, nil)
@@ -348,6 +349,30 @@ func TestAuthenticateWebSocketJWTViaQueryParam(t *testing.T) {
 	gotID, _, err := h.authenticateWebSocket(c)
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
+}
+
+func TestAuthenticateWebSocketRejectsPendingTokenTheft(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	userID := dbtest.CreateUser(t, db)
+	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
+	jwtToken := generateTestJWT(t, userID.String(), testJWTSecret)
+
+	jwtRequest, _ := http.NewRequest("GET", wsTokenPath+jwtToken, nil)
+	_, _, err := h.authenticateWebSocket(newGinContext(jwtRequest))
+	require.NoError(t, err, "ordinary JWT admission must remain available")
+
+	_, err = db.Exec(`INSERT INTO token_theft_pending_revocations (user_id, operation_id) VALUES ($1, $2)`, userID, uuid.New())
+	require.NoError(t, err)
+	_, _, err = h.authenticateWebSocket(newGinContext(jwtRequest))
+	require.Error(t, err, "a pending database row must deny JWT admission without a Redis marker")
+
+	ticket := "pending-theft-ticket-" + uuid.NewString()
+	require.NoError(t, redisClient.Set(context.Background(), wsTicketKeyPfx+ticket,
+		testTicketValue(userID.String(), "", ""), 30*time.Second).Err())
+	ticketRequest, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
+	_, _, err = h.authenticateWebSocket(newGinContext(ticketRequest))
+	require.Error(t, err, "a pending database row must also deny ticket admission")
 }
 
 func TestAuthenticateWebSocketInvalidJWT(t *testing.T) {
@@ -516,7 +541,8 @@ func TestCheckTokenBlacklistNonBlacklistedToken(t *testing.T) {
 
 func TestAuthenticateViaTicketValid(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
+	db, _ := dbtest.SetupTestDB(t)
+	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
 
 	userID := uuid.New()
 	ticket := "test-ticket-valid"
@@ -535,7 +561,8 @@ func TestAuthenticateViaTicketValid(t *testing.T) {
 
 func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
+	db, _ := dbtest.SetupTestDB(t)
+	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
 
 	userID := uuid.New()
 	ticket := "test-ticket-session"

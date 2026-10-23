@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+If suspicious use of a sign-in session is detected, that account stays blocked
+until session revocation finishes, even after a temporary server error.
+
 The desktop's chat connection no longer drops and reconnects every 14 minutes
 while you're signed in.
 

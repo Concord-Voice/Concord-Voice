@@ -1342,7 +1342,9 @@ paths:
       description: 'Exchange a refresh token from the HttpOnly cookie or X-Refresh-Token header
         for a rotated access-token and refresh-token pair.
 
-        Implements single-use rotation with breach detection.
+        Implements single-use rotation with breach detection. Suspected theft blocks
+        the account while refresh-token revocation is pending; a failed sweep
+        returns 503 until authoritative revocation succeeds.
 
         Rate limit: 30 requests per minute (IP-based).
 
@@ -1396,13 +1398,25 @@ paths:
                 - $ref: '#/components/schemas/MfaChallenge'
                 - $ref: '#/components/schemas/AccountDisabledError'
         '401':
-          description: Invalid or expired refresh token, including a grace retry with an omitted or mismatched recorded X-Machine-Id
+          description: Invalid or expired refresh token, including a grace retry with an omitted or mismatched recorded X-Machine-Id, a pending theft block, or completed theft revocation
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Refresh could not verify the theft-recovery state because PostgreSQL or Redis is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Token theft was detected but authoritative refresh-token revocation has not completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /auth/register:
     post:
       tags:

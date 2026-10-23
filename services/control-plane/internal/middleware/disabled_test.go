@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
@@ -23,12 +24,13 @@ func liveTokenStateRedis(t *testing.T) *redis.Client {
 
 func TestVerifyLiveTokenState(t *testing.T) {
 	const userID = "11111111-1111-4111-8111-111111111111"
+	db, _ := dbtest.SetupTestDB(t)
 
 	t.Run("disabled key fails closed", func(t *testing.T) {
 		rdb := liveTokenStateRedis(t)
 		require.NoError(t, rdb.Set(context.Background(), UserDisabledKey(userID), "1", time.Minute).Err())
 
-		emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, userID, jwt.MapClaims{
+		emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, db, userID, jwt.MapClaims{
 			"email_verified": true,
 		})
 
@@ -47,7 +49,7 @@ func TestVerifyLiveTokenState(t *testing.T) {
 		})
 		t.Cleanup(func() { assert.NoError(t, rdb.Close()) })
 
-		emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, userID, jwt.MapClaims{
+		emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, db, userID, jwt.MapClaims{
 			"email_verified": true,
 		})
 
@@ -60,7 +62,7 @@ func TestVerifyLiveTokenState(t *testing.T) {
 	t.Run("explicit unverified claim is returned without error", func(t *testing.T) {
 		rdb := liveTokenStateRedis(t)
 
-		emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, userID, jwt.MapClaims{
+		emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, db, userID, jwt.MapClaims{
 			"email_verified": false,
 		})
 
@@ -78,7 +80,7 @@ func TestVerifyLiveTokenState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rdb := liveTokenStateRedis(t)
 
-			emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, userID, tc.claims)
+			emailVerified, err := VerifyLiveTokenState(context.Background(), rdb, db, userID, tc.claims)
 
 			require.NoError(t, err)
 			assert.True(t, emailVerified)

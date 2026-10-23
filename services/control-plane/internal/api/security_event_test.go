@@ -17,6 +17,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/alicebob/miniredis/v2"
@@ -120,6 +121,7 @@ func TestNightwatchObserverCountsOneControlDecisionOrFallback(t *testing.T) {
 }
 
 func TestNightwatchObserverDoesNotTreatNonCanonicalIdentityObservationAsTerminal(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
 	redisServer := miniredis.RunT(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
@@ -137,7 +139,7 @@ func TestNightwatchObserverDoesNotTreatNonCanonicalIdentityObservationAsTerminal
 	recorder := &eventRecorder{}
 	router := gin.New()
 	router.Use(nightwatchSecurityObserver(recorder))
-	router.POST("/api/v1/servers/:id/bans/:user_id", middleware.AuthRequired(testJWTSecret, redisClient, nil), func(c *gin.Context) {
+	router.POST("/api/v1/servers/:id/bans/:user_id", middleware.AuthRequired(testJWTSecret, redisClient, db, nil), func(c *gin.Context) {
 		if c.Query("terminal") == "1" {
 			middleware.MarkNightwatchVerdict(c, middleware.NightwatchVerdict{
 				EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied,

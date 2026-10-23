@@ -209,8 +209,9 @@ func TestClientAdmissionWaitsForEveryOwner(t *testing.T) {
 func TestHandleWebSocketAdmissionBeforeLookupAndUpgrade(t *testing.T) {
 	for _, global := range []bool{false, true} {
 		t.Run(fmt.Sprintf("global=%t", global), func(t *testing.T) {
+			db := setupHubTestDB(t)
 			rc := setupHubTestRedis(t)
-			hub := NewHub(nil, rc)
+			hub := NewHub(db, rc)
 			userID := uuid.New()
 			limit := maxConnectionsPerUser
 			if global {
@@ -225,7 +226,7 @@ func TestHandleWebSocketAdmissionBeforeLookupAndUpgrade(t *testing.T) {
 				require.True(t, ok)
 				t.Cleanup(release)
 			}
-			handler := NewHandler(hub, nil, rc, testJWTSecret, nil, nil, nil)
+			handler := NewHandler(hub, db, rc, testJWTSecret, nil, nil, nil)
 			response := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(response)
 			ctx.Request = httptest.NewRequest(http.MethodGet, wsTokenPath+generateTestJWT(t, userID.String(), testJWTSecret), nil)

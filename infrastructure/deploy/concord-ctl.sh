@@ -1788,16 +1788,17 @@ voice_enforcement_rollout_deploy() {
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build "${restore_pull[@]}" --wait \
     --wait-timeout 180 control-plane)
   voice_enforcement_rollout_wait_control_plane
-  voice_enforcement_rollout_cli deactivate
-
-  # The old media container is explicitly stopped before the new image is
-  # created or started.  A single compose up for CP+MP has ambiguous ordering
-  # and can leave old sockets unregistered during the handoff.
-  voice_enforcement_rollout_stop_media
+  # Keep the old media serving while an uncached image build runs.
   if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
     echo "voice-enforcement-rollout: building the new media-plane image"
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
   fi
+  voice_enforcement_rollout_cli deactivate
+
+  # The old media container is explicitly stopped before its replacement is
+  # created or started. A single compose up for CP+MP has ambiguous ordering
+  # and can leave old sockets unregistered during the handoff.
+  voice_enforcement_rollout_stop_media
   echo "voice-enforcement-rollout: starting the new media-plane"
   echo "voice-enforcement-rollout: waiting for media-plane liveness"
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build "${restore_pull[@]}" --wait \
@@ -1811,9 +1812,9 @@ voice_enforcement_rollout_deploy() {
 }
 
 voice_enforcement_rollout_media_rebuild() {
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
   voice_enforcement_rollout_cli deactivate
   voice_enforcement_rollout_stop_media
-  (cd "$DEPLOY_DIR" && $COMPOSE_CMD build media-plane)
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up -d --no-deps --no-build --wait \
     --wait-timeout 180 media-plane)
   voice_enforcement_rollout_wait_media

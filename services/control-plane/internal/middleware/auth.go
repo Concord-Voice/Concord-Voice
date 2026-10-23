@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,7 +49,7 @@ const (
 // the prior epoch (or lacking a cred_epoch claim post-rotation) are rejected.
 // A nil fence disables the check (tests that construct the middleware
 // directly); production always passes one.
-func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.Fence) gin.HandlerFunc {
+func AuthRequired(jwtSecret string, redisClient *redis.Client, db *sql.DB, fence *credepoch.Fence) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString, ok := extractBearerToken(c.GetHeader("Authorization"))
 		if !ok {
@@ -92,7 +93,7 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 			return
 		}
 
-		emailVerified, err := VerifyLiveTokenState(c.Request.Context(), redisClient, userID, claims)
+		emailVerified, err := VerifyLiveTokenState(c.Request.Context(), redisClient, db, userID, claims)
 		if err != nil {
 			abortLiveTokenStateError(c, err)
 			return
@@ -128,6 +129,12 @@ func credentialEpochError(c *gin.Context, fence *credepoch.Fence, claims jwt.Map
 }
 
 func abortLiveTokenStateError(c *gin.Context, err error) {
+	if errors.Is(err, ErrTokenTheftRevocationPending) {
+		MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, Reason: securityevent.ReasonTokenTheftSuspected})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Session revocation pending: retry later", "error_code": "session_revocation_pending"})
+		c.Abort()
+		return
+	}
 	if errors.Is(err, errAccountDisabled) {
 		abortAccountDisabled(c)
 		return
@@ -276,10 +283,80 @@ func canonicalUserID(claims jwt.MapClaims) (string, securityevent.ReasonCode, bo
 
 var errAccountDisabled = errors.New("account disabled")
 
+// ErrTokenTheftRevocationPending distinguishes a denied account from a store failure.
+var ErrTokenTheftRevocationPending = errors.New("token theft revocation pending")
+
+var localTokenTheftPending = struct {
+	sync.Mutex
+	users map[string]int
+}{users: make(map[string]int)}
+
+// HoldLocalTokenTheftPending closes the same-process admission gap while both
+// persistence stores are unavailable. Release it once an event reaches a store.
+func HoldLocalTokenTheftPending(userID string) func() {
+	localTokenTheftPending.Lock()
+	localTokenTheftPending.users[userID]++
+	localTokenTheftPending.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			localTokenTheftPending.Lock()
+			defer localTokenTheftPending.Unlock()
+			localTokenTheftPending.users[userID]--
+			if localTokenTheftPending.users[userID] == 0 {
+				delete(localTokenTheftPending.users, userID)
+			}
+		})
+	}
+}
+
+// LocalTokenTheftPending reports whether this process is holding admission
+// closed while a detected theft event has not reached a durable store.
+func LocalTokenTheftPending(userID string) bool {
+	localTokenTheftPending.Lock()
+	defer localTokenTheftPending.Unlock()
+	return localTokenTheftPending.users[userID] > 0
+}
+
+// TokenTheftBlockedKey is the immediate deny marker for a pending theft sweep.
+func TokenTheftBlockedKey(userID string) string { return "token_theft_blocked:" + userID }
+
+// CheckTokenTheftBlocked checks both stores on every admission. A missing Redis
+// marker alone cannot prove safety if PostgreSQL recorded the event but the
+// marker write failed, or if Redis restarted before the recovery worker ran.
+func CheckTokenTheftBlocked(ctx context.Context, redisClient *redis.Client, db *sql.DB, userID string) error {
+	if LocalTokenTheftPending(userID) {
+		return ErrTokenTheftRevocationPending
+	}
+	if redisClient == nil || db == nil {
+		return errors.New("token theft recovery store unavailable")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	exists, err := redisClient.Exists(checkCtx, TokenTheftBlockedKey(userID)).Result()
+	if err != nil {
+		return fmt.Errorf("check token theft marker: %w", err)
+	}
+	if exists > 0 {
+		return ErrTokenTheftRevocationPending
+	}
+	var pending bool
+	if err := db.QueryRowContext(checkCtx,
+		`SELECT EXISTS (SELECT 1 FROM token_theft_pending_revocations WHERE user_id = $1)`, userID,
+	).Scan(&pending); err != nil {
+		return fmt.Errorf("check pending token theft revocation: %w", err)
+	}
+	if pending {
+		return ErrTokenTheftRevocationPending
+	}
+	return nil
+}
+
 // VerifyLiveTokenState evaluates shared post-parse bearer-token state. A present
-// disabled-user key or a Redis error rejects fail closed; otherwise it returns
+// disabled-user or theft-pending state, or a store error, rejects fail closed; otherwise it returns
 // the token's backward-compatible email-verification value.
-func VerifyLiveTokenState(ctx context.Context, redisClient *redis.Client, userID string, claims jwt.MapClaims) (bool, error) {
+func VerifyLiveTokenState(ctx context.Context, redisClient *redis.Client, db *sql.DB, userID string, claims jwt.MapClaims) (bool, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
@@ -289,6 +366,9 @@ func VerifyLiveTokenState(ctx context.Context, redisClient *redis.Client, userID
 	}
 	if exists > 0 {
 		return false, errAccountDisabled
+	}
+	if err := CheckTokenTheftBlocked(checkCtx, redisClient, db, userID); err != nil {
+		return false, err
 	}
 	return emailVerifiedFromClaims(claims), nil
 }

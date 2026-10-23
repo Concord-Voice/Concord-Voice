@@ -147,10 +147,11 @@ func TestSessionRevoked_DB(t *testing.T) {
 func renewalValidatorHandler(t *testing.T) (*Handler, string) {
 	t.Helper()
 	rc := setupHubTestRedis(t)
+	db, _ := dbtest.SetupTestDB(t)
 	fence := credepoch.New(nil, rc, logger.NewWithWriter(io.Discard))
 	userID := uuid.NewString()
 	require.NoError(t, rc.Set(context.Background(), credepoch.Key(userID), "active:epoch-a", time.Minute).Err())
-	return NewHandler(nil, nil, rc, testJWTSecret, nil, fence, nil), userID
+	return NewHandler(nil, db, rc, testJWTSecret, nil, fence, nil), userID
 }
 
 func TestValidateAccessToken(t *testing.T) {

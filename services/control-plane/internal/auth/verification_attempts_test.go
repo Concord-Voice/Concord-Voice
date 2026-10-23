@@ -22,6 +22,7 @@ func setupAuthAttemptRedis(t *testing.T) *redis.Client {
 	t.Helper()
 
 	client := redistest.Client(t)
+	require.NoError(t, client.ConfigSet(context.Background(), "appendonly", "yes").Err())
 	require.NoError(t, redistest.Reset(context.Background(), client))
 
 	return client

@@ -242,6 +242,10 @@ func runControlPlane() (runErr error) {
 
 	// Start background cleanup job (reaps expired tokens, stale sessions, orphaned presence)
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	if err := auth.StartTokenTheftRecoveryWorker(cleanupCtx, db, redisClient, log, auth.TokenTheftRecoveryInterval); err != nil {
+		cleanupCancel()
+		return fmt.Errorf("start token theft recovery worker: %w", err)
+	}
 	defer cleanupCancel()
 	// Attestation cache work must outlive ordinary background cleanup until the
 	// HTTP listener has drained, then stop before its dependencies do.

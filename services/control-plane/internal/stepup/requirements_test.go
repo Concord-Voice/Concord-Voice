@@ -106,7 +106,7 @@ func TestRequirementsRoute_DeletedUserThroughAuthChain(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.GET("/api/v1/mfa/step-up",
-		middleware.AuthRequired(secret, rdb, credepoch.New(db, rdb, log)),
+		middleware.AuthRequired(secret, rdb, db, credepoch.New(db, rdb, log)),
 		middleware.RequireVerifiedEmail(),
 		middleware.RateLimitByUser(rdb, 20, time.Minute),
 		RequirementsHandler(db, log),

@@ -2,7 +2,9 @@ package websocket
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -141,4 +143,44 @@ func TestHandleWebSocketKeepsSocketWhenEpochUnchanged(t *testing.T) {
 	_, _, readErr := conn.ReadMessage()
 	require.NoError(t, readErr,
 		"a matching epoch must leave the socket open and serving frames")
+}
+
+// A completed sweep can remove its SQL row and Redis marker before the socket
+// reaches the hub. The durable generation still fences that registration.
+func TestHandleWebSocketEvictsWhenTheftSweepCompletesDuringRegistration(t *testing.T) {
+	hub, rc, userID, conn := startEvictionTestSocket(t, "theftevictyes")
+
+	_, err := hub.db.Exec(`UPDATE users SET token_theft_generation = token_theft_generation + 1 WHERE id = $1`, userID)
+	require.NoError(t, err)
+	blocked, err := rc.Exists(context.Background(), "token_theft_blocked:"+userID.String()).Result()
+	require.NoError(t, err)
+	require.Zero(t, blocked, "the transient marker has already cleared")
+	go hub.Run()
+
+	requireSocketClosedBeforeDeadline(t, conn)
+}
+
+func TestHandleWebSocketEvictsWhenTheftPendingDuringRegistration(t *testing.T) {
+	hub, _, userID, conn := startEvictionTestSocket(t, "theftevictpending")
+	_, err := hub.db.Exec(
+		`INSERT INTO token_theft_pending_revocations (user_id, operation_id) VALUES ($1, $2)`, userID, uuid.New(),
+	)
+	require.NoError(t, err)
+	go hub.Run()
+
+	requireSocketClosedBeforeDeadline(t, conn)
+}
+
+func requireSocketClosedBeforeDeadline(t *testing.T, conn *gorillaWS.Conn) {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
+	for {
+		_, _, readErr := conn.ReadMessage()
+		if readErr == nil {
+			continue // Hub bootstrap may send a frame before the handler evicts.
+		}
+		var netErr net.Error
+		require.False(t, errors.As(readErr, &netErr) && netErr.Timeout(), "socket closure must precede read deadline")
+		return
+	}
 }

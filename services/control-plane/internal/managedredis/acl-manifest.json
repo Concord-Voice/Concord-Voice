@@ -1,6 +1,6 @@
 {
   "sourceBaseline": "a1246d6b24d4311c2748a028bf7e286debe21250",
-  "note": "Checked source inventory at baseline plus managed candidate PING and Go primary ACL WHOAMI verification. Operator commands use a separate controller-admin ACL selector. Evidence: [internal]redis-acl-inventory.md. SCAN permits key-name enumeration; key patterns constrain values, not discovery.",
+  "note": "Checked source inventory at baseline plus managed candidate PING, Go primary ACL WHOAMI, and token-theft fallback WAITAOF verification. Operator commands use a separate controller-admin ACL selector. Evidence: [internal]redis-acl-inventory.md. SCAN permits key-name enumeration; key patterns constrain values, not discovery.",
   "connectionCommands": [
     "AUTH",
     "HELLO"
@@ -23,6 +23,7 @@
         "GETDEL",
         "HGET",
         "HGETALL",
+        "HDEL",
         "HLEN",
         "HSET",
         "INCR",
@@ -44,6 +45,7 @@
         "TYPE",
         "UNLINK",
         "UNWATCH",
+        "WAITAOF",
         "WATCH",
         "ZADD",
         "ZCARD",
@@ -51,6 +53,9 @@
       ],
       "keyPatterns": [
         "user_disabled:*",
+        "token_theft_blocked:*",
+        "token_theft_pending_revocations:fallback",
+        "token_theft_pending_revocations:fallback:v2",
         "blacklist:*",
         "auth_ban:ip:*",
         "auth_failures:ip:*",
@@ -200,7 +205,6 @@
     "CONFIG|GET",
     "PUBLISH",
     "SUBSCRIBE",
-    "HDEL",
     "HINCRBY",
     "SCRIPT|LOAD",
     "DISCARD",

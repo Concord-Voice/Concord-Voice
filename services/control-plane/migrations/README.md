@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000184)
+## Existing Migrations (000001–000185)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -294,6 +294,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000182 | billing_erasure_outbox | Pending Stripe Customer erasures with no user id or FK; down refuses any pending obligation |
 | 000183 | billing_ops_metrics | Admit the `billing_erasure_outbox_pending` gauge and `billing_drift_corrections_total` counter to the closed operations metric catalog (#2033) |
 | 000184 | feedback_screenshot_backend | Stores the selected backend in the screenshot lifecycle ledger for deferred offload; rollback refuses while live or potentially written vendor placements exist |
+| 000185 | token_theft_pending_revocations | Records pending theft-triggered refresh-token sweeps; rollback requires certified empty Redis fallbacks and an empty recovery table |
 
 ### Message key-version constraints (migrations 000171–000176, #2844)
 
@@ -482,6 +483,13 @@ before deploying code that emits either key. Its down migration follows the 0001
 protocol: under an `ACCESS EXCLUSIVE` lock on both metric tables it deletes only the
 two retired series, then restores the exact 000142 catalog. Unlike the 000178–000182
 downs it does not refuse, because the rows are telemetry rather than an obligation.
+
+Migration 000185 records pending token-theft refresh-token revocations. The service
+uses these rows to deny authentication while a failed sweep is retried. Its down
+migration requires a connection-local `concord.token_theft_redis_clearance=verified`
+setting after the rollback operator stops all recovery writers and confirms both
+Redis fallback namespaces are empty. It also refuses while any database recovery
+row remains. See the deployment runbook for the verification and down sequence.
 
 ## Troubleshooting
 

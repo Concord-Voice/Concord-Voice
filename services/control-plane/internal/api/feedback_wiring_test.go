@@ -339,6 +339,9 @@ func (c *feedbackScreenshotConn) ExecContext(context.Context, string, []driver.N
 }
 func (c *feedbackScreenshotConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	query = strings.TrimSpace(query)
+	if strings.HasPrefix(query, "SELECT EXISTS (SELECT 1 FROM token_theft_pending_revocations") && len(args) == 1 {
+		return &feedbackScreenshotRows{column: "exists", value: false}, nil
+	}
 	if strings.HasPrefix(query, "INSERT INTO media_files") && len(args) == 8 {
 		c.state.inserts.Add(1)
 		return &feedbackScreenshotRows{column: "id", value: args[0].Value}, nil

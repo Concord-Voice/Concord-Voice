@@ -131,6 +131,18 @@ func TestGraceRecovery_MatchingKnownSignalsRecoversSuccessor(t *testing.T) {
 	}
 }
 
+func TestGraceRecovery_PendingTokenTheftBlocksMatchingReplay(t *testing.T) {
+	ts := setupTS(t)
+	refresh, userID := registerAndGetRefreshToken(t, ts, "gracetheft", "")
+	_, err := ts.DB.Exec(`UPDATE refresh_tokens SET ip_address = '198.51.100.10', user_agent = 'agent-a' WHERE token_hash = $1`, auth.HashRefreshToken(refresh))
+	require.NoError(t, err)
+	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, nil)
+	require.Equal(t, http.StatusOK, refreshDirect(t, h, refresh, "", "198.51.100.10:1234", "agent-a").Code)
+	require.NoError(t, auth.EnqueueTokenTheftRevocation(context.Background(), ts.DB, userID))
+	w := refreshDirect(t, h, refresh, "", "198.51.100.10:1234", "agent-a")
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
 func TestGraceRecovery_StoredMachineIDRequiresExactPresentedMatch(t *testing.T) {
 	storedMachineID := "a0b1c2d3-e4f5-4a6b-8c9d-e0f1a2b3c4d5"
 	for _, tc := range []struct {
