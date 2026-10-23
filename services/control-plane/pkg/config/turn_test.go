@@ -16,23 +16,23 @@ import (
 
 func TestICEServersCheckedManagedFileUsesCurrentKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "active-turn-key")
-	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 32)), 0o600))
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", managedKeyMinLen)), 0o600))
 	cfg := &Config{TURNServerHost: turnHost, TURNSecretFile: path}
 
 	first, err := cfg.ICEServersChecked(turnUser1)
 	require.NoError(t, err)
 	require.Len(t, first, 4)
-	mac := hmac.New(sha1.New, []byte(strings.Repeat("a", 32)))
+	mac := hmac.New(sha1.New, []byte(strings.Repeat("a", managedKeyMinLen)))
 	_, err = mac.Write([]byte(first[1].Username))
 	require.NoError(t, err)
 	assert.Equal(t, base64.StdEncoding.EncodeToString(mac.Sum(nil)), first[1].Credential)
 
 	replacement := filepath.Join(filepath.Dir(path), "replacement")
-	require.NoError(t, os.WriteFile(replacement, []byte(strings.Repeat("b", 32)), 0o600))
+	require.NoError(t, os.WriteFile(replacement, []byte(strings.Repeat("b", managedKeyMinLen)), 0o600))
 	require.NoError(t, os.Rename(replacement, path))
 	second, err := cfg.ICEServersChecked(turnUser1)
 	require.NoError(t, err)
-	mac = hmac.New(sha1.New, []byte(strings.Repeat("b", 32)))
+	mac = hmac.New(sha1.New, []byte(strings.Repeat("b", managedKeyMinLen)))
 	_, err = mac.Write([]byte(second[1].Username))
 	require.NoError(t, err)
 	assert.Equal(t, base64.StdEncoding.EncodeToString(mac.Sum(nil)), second[1].Credential)
@@ -52,9 +52,12 @@ func TestICEServersCheckedManagedFileFailsClosed(t *testing.T) {
 	}{
 		{"empty", "", 0o600},
 		{"short", "short", 0o600},
-		{"newline", strings.Repeat("a", 32) + "\n", 0o600},
-		{"world-readable", strings.Repeat("a", 32), 0o644},
-		{"group-writable", strings.Repeat("a", 32), 0o660},
+		{"one byte under the managed minimum", strings.Repeat("a", managedKeyMinLen-1), 0o600},
+		{"one byte over the managed maximum", strings.Repeat("a", managedKeyMaxLen+1), 0o600},
+		{"space inside", strings.Repeat("a", 30) + " " + strings.Repeat("a", 20), 0o600},
+		{"newline", strings.Repeat("a", managedKeyMinLen) + "\n", 0o600},
+		{"world-readable", strings.Repeat("a", managedKeyMinLen), 0o644},
+		{"group-writable", strings.Repeat("a", managedKeyMinLen), 0o660},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NoError(t, os.WriteFile(path, []byte(tc.data), 0o600))
@@ -66,9 +69,41 @@ func TestICEServersCheckedManagedFileFailsClosed(t *testing.T) {
 	}
 	cfg.TURNSecret = strings.Repeat("l", 32)
 	require.NoError(t, os.Chmod(path, 0o600))
-	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 32)), 0o600))
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", managedKeyMinLen)), 0o600))
 	_, err = cfg.ICEServersChecked(turnUser1)
 	require.Error(t, err, "conflicting legacy key must not be used")
+}
+
+func TestICEServersCheckedManagedFileAcceptsFullManagedRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active-turn-key")
+	cfg := &Config{TURNServerHost: turnHost, TURNSecretFile: path}
+	for _, n := range []int{managedKeyMinLen, managedKeyMaxLen} {
+		require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("k", n)), 0o600))
+		servers, err := cfg.ICEServersChecked(turnUser1)
+		require.NoError(t, err, "a %d-byte managed key is valid", n)
+		require.Len(t, servers, 4)
+	}
+}
+
+func TestICEServersCheckedManagedFileRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real-key")
+	require.NoError(t, os.WriteFile(target, []byte(strings.Repeat("a", managedKeyMinLen)), 0o600))
+	link := filepath.Join(dir, "active-turn-key")
+	require.NoError(t, os.Symlink(target, link))
+	cfg := &Config{TURNServerHost: turnHost, TURNSecretFile: link}
+
+	servers, err := cfg.ICEServersChecked(turnUser1)
+	require.ErrorContains(t, err, "symlink")
+	assert.Empty(t, servers, "a symlinked active key is never followed, even to a valid key")
+}
+
+func TestICEServersLegacySecretKeepsItsOwnBounds(t *testing.T) {
+	// The managed 43-byte minimum does not apply to the legacy TURN_SECRET env path.
+	cfg := &Config{TURNServerHost: turnHost, TURNSecret: strings.Repeat("l", 32)}
+	servers, err := cfg.ICEServersChecked(turnUser1)
+	require.NoError(t, err)
+	require.Len(t, servers, 4)
 }
 
 func TestManagedTURNConfigurationRejectsRelativeOrDualSource(t *testing.T) {
@@ -79,6 +114,41 @@ func TestManagedTURNConfigurationRejectsRelativeOrDualSource(t *testing.T) {
 	require.ErrorContains(t, cfg.validate(), "cannot be combined")
 	cfg.TURNSecret = ""
 	require.ErrorContains(t, cfg.validate(), "requires TURN_SERVER_HOST")
+}
+
+func TestValidateProductionRequiresExactlyOneTURNSource(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "turn-key")
+	cases := []struct {
+		name    string
+		secret  string
+		file    string
+		wantErr string
+	}{
+		{"legacy secret only", strings.Repeat("l", 32), "", ""},
+		{"managed file only", "", keyFile, ""},
+		{"neither source", "", "", "exactly one of TURN_SECRET or TURN_SECRET_FILE"},
+		{"both sources", strings.Repeat("l", 32), keyFile, "cannot be combined"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validProductionConfig()
+			cfg.TURNServerHost = turnHost
+			cfg.TURNSecret = tc.secret   // pragma: allowlist secret
+			cfg.TURNSecretFile = tc.file // pragma: allowlist secret
+			err := cfg.validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+	t.Run("non-production tolerates neither source", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.Environment = "development"
+		cfg.TURNSecret = ""
+		require.NoError(t, cfg.validate())
+	})
 }
 
 const (

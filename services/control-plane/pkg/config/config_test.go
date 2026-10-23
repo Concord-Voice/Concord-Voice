@@ -396,6 +396,8 @@ func validProductionConfig() *Config { // #nosec G101 -- test fixture with fake 
 		},
 		SMTPHost:          "smtp.example.com",
 		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
+		// #3931 — production requires exactly one TURN credential source.
+		TURNSecret: "real-production-turn-secret", //nolint:gosec // G101: test fixture, not a real secret
 		// Satisfy the #725 MEDIA_PLANE_URL production guards: must be set,
 		// must not be the dev default, must not be the root zone.
 		MediaPlaneURL: "https://media.concordvoice.chat",

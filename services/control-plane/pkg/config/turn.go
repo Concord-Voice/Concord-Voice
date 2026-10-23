@@ -4,11 +4,20 @@ import (
 	"crypto/hmac"
 	"crypto/sha1" // #nosec G505 -- SHA1 is required by the TURN REST API credential spec (RFC 5389)
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"syscall"
 	"time"
+)
+
+// Managed active-key bounds. They mirror internal/managedturn (MinKeyLen,
+// MaxKeyLen), which writes the file; the legacy TURN_SECRET path is not
+// affected by them.
+const (
+	managedKeyMinLen = 43
+	managedKeyMaxLen = 127 // turn_secret.value is varchar(127)
 )
 
 // TURNCredentials holds time-limited HMAC credentials for coturn.
@@ -63,25 +72,33 @@ func (c *Config) ICEServersChecked(userID string) ([]ICEServer, error) {
 	if c.TURNSecret != "" || c.TURNServerHost == "" {
 		return nil, fmt.Errorf("managed TURN configuration is incomplete or conflicting")
 	}
-	// O_NONBLOCK so a FIFO (direct or via symlink) cannot park the admission
-	// handler in open(2) waiting for a writer; the IsRegular check then rejects it.
-	f, err := os.OpenFile(c.TURNSecretFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	// O_NOFOLLOW refuses a symlink at the final component: the writer only
+	// ever renames a regular file into place. O_NONBLOCK so a FIFO cannot park
+	// the admission handler in open(2) waiting for a writer; the IsRegular
+	// check then rejects it.
+	f, err := os.OpenFile(c.TURNSecretFile, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ELOOP) {
+		return nil, fmt.Errorf("managed TURN active key must not be a symlink")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("managed TURN active key unavailable: %w", err)
 	}
+	// Read-only descriptor: once the key is read, a close error cannot affect
+	// it, and refusing a voice join over one would be an outage for nothing.
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("managed TURN active key metadata unavailable: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o027 != 0 || info.Size() < 32 || info.Size() > 128 {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o027 != 0 ||
+		info.Size() < managedKeyMinLen || info.Size() > managedKeyMaxLen {
 		return nil, fmt.Errorf("managed TURN active key has invalid metadata")
 	}
-	key, err := io.ReadAll(io.LimitReader(f, 129))
+	key, err := io.ReadAll(io.LimitReader(f, managedKeyMaxLen+1))
 	if err != nil {
 		return nil, fmt.Errorf("managed TURN active key read failed: %w", err)
 	}
-	if int64(len(key)) != info.Size() || len(key) < 32 || len(key) > 128 {
+	if int64(len(key)) != info.Size() || len(key) < managedKeyMinLen || len(key) > managedKeyMaxLen {
 		return nil, fmt.Errorf("managed TURN active key changed during read")
 	}
 	for _, ch := range key {

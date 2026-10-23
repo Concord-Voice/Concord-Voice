@@ -61,6 +61,13 @@ if [[ "$ACTIVITY_HISTORY_REQUESTED_CONTRACT_MODE" == selfhost \
   exit 1
 fi
 
+# TURN_CREDENTIAL_MODE (#3931) comes ONLY from the canonical writer pair (root
+# .env + deploy.env.local). A caller-supplied value is captured and cleared here
+# so an exported variable can never select the managed model by itself; the
+# selector below refuses any disagreement with the canonical value.
+TURN_CREDENTIAL_MODE_REQUESTED="${TURN_CREDENTIAL_MODE-}"
+unset TURN_CREDENTIAL_MODE
+
 # Load runtime config. deploy.env (committed defaults like COMPOSE_OVERRIDE)
 # is read first, then deploy.env.local (machine-specific overrides like
 # VM_IP, DEPLOY_BRANCH) layers on top.
@@ -199,6 +206,7 @@ case "$REDIS_CREDENTIAL_MODE" in
     ;;
   *) echo 'redis-managed: REDIS_CREDENTIAL_MODE must be legacy or managed' >&2; exit 2 ;;
 esac
+
 COMPOSE_ENV_FILE_ARG=""
 COMPOSE_PRODUCTION_ARG=""
 [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]] \
@@ -282,7 +290,71 @@ if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
   unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   export DOCKER_HOST=unix:///var/run/docker.sock
 fi
-COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG}${COMPOSE_PROJECT_ARG} -f ${DEPLOY_DIR}/docker-compose.yml${COMPOSE_PRODUCTION_ARG} -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG}${COMPOSE_REDIS_MANAGED_ARG} ${COMPOSE_PROFILE_ARGS}"
+# Managed TURN credential custody (#3931). Same shape as the Redis selector:
+# legacy keeps the static TURN_SECRET path; managed layers
+# docker-compose.turn-managed.yml. PR-A ships this dormant: the mode is read
+# only from the canonical writer pair, and only provisioning (Task 3) can write
+# it there, so nothing activates it by accident.
+TURN_CREDENTIAL_MODE="${TURN_CREDENTIAL_MODE:-legacy}"
+turn_managed_writer_consistency_guard() {
+  local root_file="${CONFIG_ROOT}/.env" deploy_file="${CONFIG_DEPLOY_DIR}/deploy.env.local"
+  local key line root_value deploy_value root_count deploy_count
+  # The managed model has no other selectors yet; provisioning appends any it
+  # introduces here so both canonical writers must agree on them as well.
+  local keys=(TURN_CREDENTIAL_MODE)
+  [[ -f "$root_file" && ! -L "$root_file" && -f "$deploy_file" && ! -L "$deploy_file" ]] || {
+    echo 'turn-managed: canonical writer pair is missing; refusing before Compose' >&2
+    return 1
+  }
+  for key in "${keys[@]}"; do
+    root_count=0 deploy_count=0 root_value="" deploy_value=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "${key}="* ]]; then
+        root_count=$((root_count + 1))
+        root_value="${line#*=}"
+      fi
+    done < "$root_file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "${key}="* ]]; then
+        deploy_count=$((deploy_count + 1))
+        deploy_value="${line#*=}"
+      fi
+    done < "$deploy_file"
+    if [[ "$key" == TURN_CREDENTIAL_MODE && "$TURN_CREDENTIAL_MODE" == legacy \
+       && "$root_count" == 0 && "$deploy_count" == 0 ]]; then
+      return 0 # Existing legacy hosts predate the mode selector in both writers.
+    fi
+    # The canonical writer emits raw Compose values and Bash's @Q form respectively.
+    if [[ "$root_count" != 1 || "$deploy_count" != 1 || "$root_value" != "${!key:-}" || "$deploy_value" != "${!key@Q}" ]]; then
+      echo "turn-managed: canonical writers disagree on ${key}; refusing before Compose" >&2
+      return 1
+    fi
+  done
+}
+if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost \
+   && ( "$TURN_CREDENTIAL_MODE" != legacy || "$TURN_CREDENTIAL_MODE_REQUESTED" == managed ) ]]; then
+  echo 'turn-managed: managed TURN credentials are unavailable to self-host installs' >&2
+  exit 2
+fi
+if [[ -n "$TURN_CREDENTIAL_MODE_REQUESTED" && "$TURN_CREDENTIAL_MODE_REQUESTED" != "$TURN_CREDENTIAL_MODE" ]]; then
+  echo 'turn-managed: TURN_CREDENTIAL_MODE is read only from the canonical writer pair; refusing the caller environment value' >&2
+  exit 2
+fi
+case "$TURN_CREDENTIAL_MODE" in
+  legacy) COMPOSE_TURN_MANAGED_ARG="" ;;
+  managed)
+    if [[ "$COMPOSE_OVERRIDE" != docker-compose.production.yml ]]; then
+      echo 'turn-managed: managed TURN credentials require the production Compose override' >&2
+      exit 2
+    fi
+    # Dormant gate: refuse before any Compose model is composed unless BOTH
+    # canonical writers record the mode.
+    turn_managed_writer_consistency_guard || exit 1
+    COMPOSE_TURN_MANAGED_ARG=" -f ${DEPLOY_DIR}/docker-compose.turn-managed.yml"
+    ;;
+  *) echo 'turn-managed: TURN_CREDENTIAL_MODE must be legacy or managed' >&2; exit 2 ;;
+esac
+COMPOSE_CMD="docker compose ${COMPOSE_ENV_FILE_ARG}${COMPOSE_PROJECT_ARG} -f ${DEPLOY_DIR}/docker-compose.yml${COMPOSE_PRODUCTION_ARG} -f ${DEPLOY_DIR}/${COMPOSE_OVERRIDE}${COMPOSE_SELFHOST_ARG}${COMPOSE_REDIS_MANAGED_ARG}${COMPOSE_TURN_MANAGED_ARG} ${COMPOSE_PROFILE_ARGS}"
 
 # Read managed fleet identity as inert data. These values are intentionally
 # simple inventory tokens; do not source either canonical writer file here.
@@ -517,6 +589,356 @@ redis_managed_app_gid() {
   image_id="$(docker image inspect --format '{{.Id}}' "$image")" || return 1
   docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
     --cpus 0.1 --memory 64m --entrypoint id "$image_id" -g appuser
+}
+
+# ── Managed TURN runtime (#3931) ─────────────────────────────────────────────
+# The TURN shared key lives only in a dedicated host tmpfs and is written only
+# by the turn-secret-writer container (UID/GID 10005). coturn (65534:65533) and
+# the control plane mount their halves read-only. These paths are plain
+# assignments so the isolated fixtures can retarget them; they are never read
+# from the environment.
+TURN_RUNTIME_ROOT=/run/concord/turn-runtime
+TURN_RUNTIME_STATE_DIR=/var/lib/concord/turn-runtime
+TURN_WRITER_ID=10005
+TURN_COTURN_GID=65533
+
+# The writer UID/GID must be reserved to a private, locked, non-login host
+# account so no other principal can ever own the RAM key store (same posture as
+# the Redis controller identity).
+turn_managed_writer_host_identity() {
+  local user_by_name user_by_id enumerated_user group_by_name group_by_id enumerated_group
+  local name password_field uid gid gecos home shell group_name group_gid members lock_status
+  user_by_name="$(getent passwd turn-secret-writer 2>/dev/null)" || {
+    echo 'turn-managed: dedicated locked host writer account is unavailable' >&2; return 1;
+  }
+  user_by_id="$(getent passwd "$TURN_WRITER_ID" 2>/dev/null)" || {
+    echo 'turn-managed: writer host UID lookup failed' >&2; return 1;
+  }
+  group_by_name="$(getent group turn-secret-writer 2>/dev/null)" || {
+    echo 'turn-managed: dedicated host writer group is unavailable' >&2; return 1;
+  }
+  group_by_id="$(getent group "$TURN_WRITER_ID" 2>/dev/null)" || {
+    echo 'turn-managed: writer host GID lookup failed' >&2; return 1;
+  }
+  enumerated_user="$(getent passwd 2>/dev/null | awk -F: -v id="$TURN_WRITER_ID" '$3 == id { print }')" || {
+    echo 'turn-managed: cannot enumerate host UID reservations' >&2; return 1;
+  }
+  enumerated_group="$(getent group 2>/dev/null | awk -F: -v id="$TURN_WRITER_ID" '$3 == id { print }')" || {
+    echo 'turn-managed: cannot enumerate host GID reservations' >&2; return 1;
+  }
+  IFS=: read -r name password_field uid gid gecos home shell <<<"$user_by_name"
+  IFS=: read -r group_name password_field group_gid members <<<"$group_by_name"
+  [[ "$user_by_name" == "$user_by_id" && "$user_by_name" == "$enumerated_user" && \
+     "$group_by_name" == "$group_by_id" && "$group_by_name" == "$enumerated_group" && \
+     "$name" == turn-secret-writer && "$uid" == "$TURN_WRITER_ID" && "$gid" == "$TURN_WRITER_ID" && \
+     "$group_name" == turn-secret-writer && "$group_gid" == "$TURN_WRITER_ID" && -z "$members" && \
+     ( "$shell" == /usr/sbin/nologin || "$shell" == /sbin/nologin ) ]] || {
+    echo 'turn-managed: host writer UID/GID must be reserved to its private non-login account' >&2; return 1;
+  }
+  lock_status="$(LC_ALL=C passwd -S turn-secret-writer 2>/dev/null)" || {
+    echo 'turn-managed: cannot verify host writer password lock' >&2; return 1;
+  }
+  [[ "$lock_status" =~ ^turn-secret-writer[[:space:]]+(L|LK)[[:space:]] ]] || {
+    echo 'turn-managed: host writer password is not locked' >&2; return 1;
+  }
+}
+
+# The control plane reads the active key through its image's GID. Read it from
+# the SELECTED image rather than trusting a configured number (as the Redis
+# preflight does). The GID must not alias the writer, coturn or root.
+# With "build", an absent routine image is built first, as the start that
+# follows would build it (a pruned host has none). A pinned checkpoint image
+# (CONTROL_PLANE_IMAGE exported) is never built under its tag.
+turn_managed_control_gid() {
+  local build="${1:-}" model image image_id gid
+  model="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json)" || {
+    echo 'turn-managed: cannot render the Compose model to resolve the control-plane image' >&2; return 1;
+  }
+  image="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["control-plane"].get("image", ""))' <<<"$model")" || return 1
+  [[ -n "$image" ]] || {
+    echo 'turn-managed: selected control-plane image is unavailable in the Compose model' >&2; return 1;
+  }
+  if ! image_id="$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null)"; then
+    [[ "$build" == build && -z "${CONTROL_PLANE_IMAGE:-}" ]] \
+      && (cd "$DEPLOY_DIR" && $COMPOSE_CMD build control-plane </dev/null) >&2 \
+      && image_id="$(docker image inspect --format '{{.Id}}' "$image")" || {
+      echo 'turn-managed: selected control-plane image is unavailable locally' >&2; return 1;
+    }
+  fi
+  gid="$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --cpus 0.1 --memory 64m --entrypoint id "$image_id" -g appuser 2>/dev/null)" || {
+    echo 'turn-managed: cannot resolve the selected control-plane image GID' >&2; return 1;
+  }
+  [[ "$gid" =~ ^[1-9][0-9]*$ && "$gid" -le 65535 \
+     && "$gid" != "$TURN_WRITER_ID" && "$gid" != "$TURN_COTURN_GID" && "$gid" != 65534 ]] || {
+    echo 'turn-managed: control-plane GID is unsafe for the active-key directory' >&2; return 1;
+  }
+  printf '%s\n' "$gid"
+}
+
+# turn_managed_path_check PATH KIND MODES-LIST... -- verifies a non-symlink
+# directory or regular file whose "uid:gid:mode" is one of the listed values.
+turn_managed_path_check() {
+  local path="$1" kind="$2" actual
+  shift 2
+  [[ ! -L "$path" ]] || {
+    echo "turn-managed: ${path} must not be a symlink" >&2; return 1;
+  }
+  if [[ "$kind" == dir ]]; then
+    [[ -d "$path" ]] || { echo "turn-managed: required directory is absent: ${path}" >&2; return 1; }
+  else
+    [[ -f "$path" ]] || { echo "turn-managed: ${path} must be a regular file" >&2; return 1; }
+  fi
+  actual="$(stat -c '%u:%g:%a' "$path" 2>/dev/null || true)"
+  local expected
+  for expected in "$@"; do
+    [[ "$actual" == "$expected" ]] && return 0
+  done
+  echo "turn-managed: ${path} ownership/mode ${actual:-unknown} does not match the RAM layout" >&2
+  return 1
+}
+
+# Host RAM and ownership preflight. Runs before every writer operation and
+# before coturn can start: a key store that is not on tmpfs, or whose
+# ownership/modes are wrong, is refused rather than repaired.
+turn_managed_host_preflight() {
+  [[ "$TURN_CREDENTIAL_MODE" == managed ]] || return 0
+  local active_gid="$1" root="$TURN_RUNTIME_ROOT" state_dir="$TURN_RUNTIME_STATE_DIR"
+  local target fstype size writer="$TURN_WRITER_ID" coturn="$TURN_COTURN_GID"
+  turn_managed_writer_host_identity || return 1
+  command -v findmnt >/dev/null 2>&1 || {
+    echo 'turn-managed: findmnt is required to prove the key store is on host RAM' >&2
+    return 1
+  }
+  read -r target fstype size < <(findmnt -n -b -T "$root" -o TARGET,FSTYPE,SIZE 2>/dev/null || true) || true
+  [[ "${fstype:-}" == tmpfs && "${target:-}" == "$root" ]] || {
+    echo "turn-managed: ${root} is not a dedicated tmpfs mount; refusing disk fallback" >&2
+    return 1
+  }
+  # The store is bounded to the reviewed 8 MiB; a larger tmpfs lets database or
+  # journal growth take more host RAM than intended.
+  if ! [[ "${size:-}" =~ ^[1-9][0-9]{0,8}$ ]] || (( size > 8388608 )); then
+    echo "turn-managed: ${root} must be a tmpfs of at most 8 MiB (size=8m)" >&2
+    return 1
+  fi
+  turn_managed_path_check "$root" dir '0:0:700' || return 1
+  # db/ and active/ must be setgid (2750): the writer runs as 10005 with no
+  # capabilities, so new files can only get the coturn / control-plane group by
+  # inheriting it from the directory. Plain 750 is refused.
+  turn_managed_path_check "$root/db" dir "${writer}:${coturn}:2750" || return 1
+  turn_managed_path_check "$root/active" dir "${writer}:${active_gid}:2750" || return 1
+  # The files are absent on a cold host; once present they carry the exact modes.
+  if [[ -e "$root/db/turndb" || -L "$root/db/turndb" ]]; then
+    turn_managed_path_check "$root/db/turndb" file "${writer}:${coturn}:640" || return 1
+  fi
+  if [[ -e "$root/active/turn-key" || -L "$root/active/turn-key" ]]; then
+    turn_managed_path_check "$root/active/turn-key" file "${writer}:${active_gid}:440" || return 1
+  fi
+  [[ ! -L "${state_dir%/*}" ]] || {
+    echo 'turn-managed: persistent state parent is a symlink' >&2; return 1;
+  }
+  turn_managed_path_check "$state_dir" dir "${writer}:${writer}:700" || return 1
+  if [[ -e "$state_dir/state.json" || -L "$state_dir/state.json" ]]; then
+    turn_managed_path_check "$state_dir/state.json" file "${writer}:${writer}:600" || return 1
+  fi
+}
+
+# Resolve the control-plane GID and prove the host layout. Never reads stdin.
+# An optional "build" is passed to turn_managed_control_gid.
+turn_managed_prepare_writer() {
+  [[ "$TURN_CREDENTIAL_MODE" == managed ]] || return 0
+  local gid
+  gid="$(turn_managed_control_gid "${1:-}" </dev/null)" || return 1
+  turn_managed_host_preflight "$gid" </dev/null || return 1
+  TURN_MANAGED_ACTIVE_GID="$gid"
+}
+
+# One writer invocation. The caller's stdin reaches the container untouched: the
+# key never passes through a Bash variable, heredoc, here-string, argv or the
+# environment. Only a fixed op name and an optional numeric --generation are
+# ever placed on the command line.
+turn_managed_exec_writer() {
+  local -x TURN_ACTIVE_GID="${TURN_MANAGED_ACTIVE_GID:?}"
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile turn-writer run --rm -T --no-deps turn-secret-writer "$@")
+}
+
+turn_managed_usage() {
+  echo 'Usage: concord-ctl.sh turn-managed-{init-schema|status}' >&2
+  echo '       concord-ctl.sh turn-managed-{bootstrap|add-candidate|promote|rollback|recover} [--generation N]' >&2
+  echo '       concord-ctl.sh turn-managed-discard-unrecorded [--generation N]' >&2
+  echo '       key material is read from standard input only (init-schema, status and discard-unrecorded read none)' >&2
+}
+
+turn_managed_verb_locked() {
+  local verb="$1" op
+  shift
+  op="${verb#turn-managed-}"
+  local -a args=()
+  case "$op" in
+    init-schema|status)
+      [[ $# -eq 0 ]] || { turn_managed_usage; return 2; }
+      ;;
+    bootstrap|add-candidate|promote|rollback|recover|discard-unrecorded)
+      if [[ $# -eq 2 && "$1" == --generation && "$2" =~ ^[0-9]{1,18}$ ]]; then
+        args=(--generation "$2")
+      elif [[ $# -ne 0 ]]; then
+        turn_managed_usage; return 2
+      fi
+      ;;
+    *) turn_managed_usage; return 2 ;;
+  esac
+  [[ "$TURN_CREDENTIAL_MODE" == managed ]] || {
+    echo "turn-managed: ${verb} requires TURN_CREDENTIAL_MODE=managed in the canonical writer pair" >&2
+    return 2
+  }
+  turn_managed_prepare_writer || return 1
+  case "$op" in
+    init-schema|status)
+      turn_managed_exec_writer "$op" </dev/null
+      ;;
+    discard-unrecorded)
+      # Deletes unpublished, unrecorded rows left by a failed bootstrap or
+      # add-candidate. It takes no key: stdin is closed, never forwarded.
+      turn_managed_exec_writer "$op" ${args[@]+"${args[@]}"} </dev/null
+      ;;
+    *)
+      # `compose run -T` hands the container a pipe, so the writer's own
+      # terminal check cannot see a terminal here; a typed key would echo.
+      if [[ -t 0 ]]; then
+        echo 'turn-managed: keys must be piped on stdin, never typed at a terminal' >&2
+        return 2
+      fi
+      turn_managed_exec_writer "$op" ${args[@]+"${args[@]}"}
+      ;;
+  esac
+}
+
+# Managed `up`/restart: coturn must never start against a missing database
+# (coturn-entrypoint.sh refuses it). init-schema is idempotent and never touches
+# rows, so a restart over intact RAM keeps the key set and a cold reboot starts
+# coturn with zero rows, authenticating nothing until an exact-set recover.
+turn_managed_init_schema_before_coturn() {
+  [[ "$TURN_CREDENTIAL_MODE" == managed ]] || return 0
+  turn_managed_prepare_writer build || return 1
+  (cd "$DEPLOY_DIR" && $COMPOSE_CMD --profile turn-writer build turn-secret-writer </dev/null) || {
+    echo 'turn-managed: writer image build failed; refusing to start coturn' >&2
+    return 1
+  }
+  turn_managed_exec_writer init-schema </dev/null
+}
+
+# `compose restart` keeps each container's creation-time config, so after a
+# legacy-to-managed switch coturn and the control plane would keep the static
+# secret path. A managed restart therefore requires both containers to match
+# the effective model already; the first managed start goes through rebuild.
+turn_managed_restart_guard() {
+  local svc
+  if [[ "$TURN_CREDENTIAL_MODE" != managed ]]; then
+    # Switching back to legacy needs a rebuild too: restart would keep the
+    # managed --userdb and TURN_SECRET_FILE.
+    turn_managed_legacy_pair_clear ' and restart cannot remove it; use rebuild'
+    return
+  fi
+  for svc in coturn control-plane; do
+    turn_managed_runs_effective_config "$svc" || {
+      echo "turn-managed: ${svc} does not run the managed model and restart cannot apply it; use rebuild" >&2
+      return 1
+    }
+  done
+}
+
+# True only when exactly one container of SVC exists and carries the config
+# hash Compose would create now. Any read failure is false, never true.
+turn_managed_runs_effective_config() {
+  local svc="$1" want id have
+  want="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --hash "$svc" </dev/null)" || return 1
+  want="${want##* }"
+  id="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$svc" </dev/null)" || return 1
+  [[ -n "$id" && "$id" != *$'\n'* ]] || return 1
+  have="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$id" </dev/null)" || return 1
+  [[ -n "$want" && "$have" == "$want" ]]
+}
+
+# 0 when SVC's single container runs the managed model (coturn with --userdb,
+# the control plane with TURN_SECRET_FILE), 1 when it does not, 2 when that
+# cannot be read. The template prints only "managed", never an env value.
+turn_managed_container_is_managed() {
+  local svc="$1" id fmt out
+  case "$svc" in
+    coturn) fmt='{{range .Config.Cmd}}{{if eq (index (split . "=") 0) "--userdb"}}managed{{end}}{{end}}' ;;
+    control-plane) fmt='{{range .Config.Env}}{{if eq (index (split . "=") 0) "TURN_SECRET_FILE"}}managed{{end}}{{end}}' ;;
+    *) return 2 ;;
+  esac
+  id="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$svc" </dev/null)" || return 2
+  [[ -n "$id" && "$id" != *$'\n'* ]] || return 2
+  out="$(docker inspect --format "$fmt" "$id" </dev/null)" || return 2
+  [[ "$out" == *managed* ]] && return 0
+  return 1
+}
+
+# Legacy mode: 0 only when neither coturn nor the control plane still runs the
+# managed model; an unreadable container counts as managed. Only a host
+# provisioned for managed TURN has the RAM root, so other legacy hosts skip
+# the check and are unchanged. HINT finishes the refusal message.
+turn_managed_legacy_pair_clear() {
+  local hint="$1" svc rc
+  [[ -e "$TURN_RUNTIME_ROOT" ]] || return 0
+  for svc in coturn control-plane; do
+    rc=0
+    turn_managed_container_is_managed "$svc" || rc=$?
+    (( rc == 1 )) || {
+      echo "turn-managed: ${svc} still runs the managed model${hint}" >&2
+      return 1
+    }
+  done
+}
+
+# Lifecycle verbs other than rebuild and restart (Redis-managed prepare and
+# rebuild, Activity History activate and rollback, the voice-enforcement
+# deploy) can recreate the control plane alone. Under managed TURN they run
+# only once both halves already run the managed model, so the first managed
+# start stays an unscoped rebuild.
+turn_managed_pair_guard() {
+  if [[ "$TURN_CREDENTIAL_MODE" != managed ]]; then
+    # Switching back to legacy: a control plane recreated alone would issue
+    # static-secret credentials that a managed coturn rejects.
+    turn_managed_legacy_pair_clear '; run an unscoped rebuild first'
+    return
+  fi
+  local svc
+  for svc in coturn control-plane; do
+    turn_managed_container_is_managed "$svc" || {
+      echo "turn-managed: ${svc} does not run the managed model; run an unscoped rebuild first" >&2
+      return 1
+    }
+  done
+}
+
+# coturn and the control plane must change credential model together. A scoped
+# rebuild of one of them succeeds only when the other, left untouched, already
+# runs the selected model; a nonzero return means the pair would split. Only
+# the peer is checked: the rebuilt service may differ for routine reasons, such
+# as a new image tag.
+turn_managed_scoped_rebuild_pair() {
+  local has_coturn=0 has_cp=0 svc peer rc
+  for svc in "$@"; do
+    [[ "$svc" == coturn ]] && has_coturn=1
+    [[ "$svc" == control-plane ]] && has_cp=1
+  done
+  (( has_coturn != has_cp )) || return 0
+  peer=coturn
+  (( has_coturn )) && peer=control-plane
+  if [[ "$TURN_CREDENTIAL_MODE" == managed ]]; then
+    turn_managed_runs_effective_config "$peer"
+    return
+  fi
+  # Legacy: only a host provisioned for managed TURN has the RAM root, and
+  # only there can the peer still be managed. Other legacy hosts skip the
+  # check, so their routine scoped rebuilds are unchanged.
+  [[ -e "$TURN_RUNTIME_ROOT" ]] || return 0
+  rc=0
+  turn_managed_container_is_managed "$peer" || rc=$?
+  (( rc == 1 ))
 }
 
 # Load the TLS caller API only on verbs that need it. Help, stop/down, logs,
@@ -3767,7 +4189,7 @@ managed_production_nats_reconcile() {
 # Build only explicit services. In particular, neither the active colour nor
 # the unselected legacy service may be pulled in by an implicit Compose up.
 media_bluegreen_rebuild_locked() {
-  local snapshot active standby rendered plan deps rest scope_token ingress_ids start_cp=0 start_media=0 full=0 managed_apps_prepared=0
+  local snapshot active standby rendered plan deps rest scope_token ingress_ids start_cp=0 start_media=0 full=0 managed_apps_prepared=0 touches_turn_pair=0
   local -a deps_arr=() rest_arr=()
   if [[ $# -eq 0 ]]; then
     start_cp=1
@@ -3785,7 +4207,7 @@ media_bluegreen_rebuild_locked() {
   fi
   for scope_token in "$@"; do
     case "$scope_token" in
-      control-plane) start_cp=1 ;;
+      control-plane) start_cp=1; touches_turn_pair=1 ;;
       media-plane) start_media=1 ;;
       media-plane-blue|media-plane-green)
         if [[ "$scope_token" != "media-plane-${standby}" ]]; then
@@ -3793,10 +4215,17 @@ media_bluegreen_rebuild_locked() {
           return 1
         fi
         start_media=1 ;;
-      ops-agent|coturn|postgres|redis|nats|minio) ;;
+      coturn) touches_turn_pair=1 ;;
+      ops-agent|postgres|redis|nats|minio) ;;
       *) echo "rebuild: invalid or unknown service '${scope_token}'" >&2; return 2 ;;
     esac
   done
+  # Same coturn/control-plane pairing as the single-colour path, but this path
+  # cannot escalate a scope, so it refuses.
+  if (( full == 0 && touches_turn_pair == 1 )) && ! turn_managed_scoped_rebuild_pair "$@"; then
+    echo 'media-bluegreen: rebuild coturn and control-plane together, or run an unscoped rebuild' >&2
+    return 1
+  fi
   if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
     if (( start_cp == 1 )); then
       echo 'redis-managed: ordinary control-plane rebuild requires redis-managed-rebuild for the explicit full outage' >&2
@@ -3835,6 +4264,15 @@ print(" ".join(sorted(set(s) - closure - excluded)))
   # receipt, and a rejected cutover must leave the receipt and image pin intact.
   if [[ "$REDIS_CREDENTIAL_MODE" == managed ]] && (( start_media == 1 || start_cp == 1 )); then
     redis_managed_require_registered_state || return 1
+  fi
+  # A full rebuild starts coturn in its deps or rest stage, a scoped one only
+  # when named; either way the RAM database must exist first (#3931).
+  local starts_coturn=$full
+  for scope_token in "$@"; do
+    [[ "$scope_token" == coturn ]] && starts_coturn=1
+  done
+  if (( starts_coturn == 1 )); then
+    turn_managed_init_schema_before_coturn || return 1
   fi
   activity_history_routine_guard || return 1
   managed_production_nats_reconcile || return 1
@@ -4292,7 +4730,7 @@ case "${1:-help}" in
     DEPLOY_LOCK_WAIT_SECS=90
     acquire_deploy_transaction_lock "$@"
     ;;
-  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|redis-managed-prepare|redis-managed-rebuild)
+  rebuild|stage-restore|restart|stop|activity-history-activate|activity-history-rollback|voice-enforcement-rollout|media-reap|media-legacy-pause|media-legacy-resume|redis-managed-prepare|redis-managed-rebuild|turn-managed-init-schema|turn-managed-bootstrap|turn-managed-add-candidate|turn-managed-promote|turn-managed-rollback|turn-managed-recover|turn-managed-discard-unrecorded|turn-managed-status)
     # The two activity-history verbs belong here for the SAME reason the deploy
     # verbs do, and leaving them out was an omission rather than a decision: both
     # stop and start the control plane, and both then gate on health and image
@@ -4312,6 +4750,8 @@ case "${1:-help}" in
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
        && "$COMPOSE_OVERRIDE" == docker-compose.production.yml ]]; then
       redis_managed_writer_consistency_guard || exit 1
+      # Re-read the canonical pair under the lock (#3931), exactly as Redis does.
+      turn_managed_writer_consistency_guard || exit 1
     fi
     ;;
 esac
@@ -4409,6 +4849,8 @@ case "${1:-help}" in
 
   restart)
     redis_managed_host_preflight || exit 1
+    turn_managed_restart_guard || exit 1
+    turn_managed_init_schema_before_coturn || exit 1
     # #1015: sync_releases no longer auto-called. The sync-releases.yml
     # workflow is the canonical writer for /opt/concord/releases/.
     # If you need to refresh release assets, trigger the workflow OR
@@ -4440,12 +4882,18 @@ case "${1:-help}" in
 
   redis-managed-prepare)
     [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || { echo 'redis-managed-prepare requires REDIS_CREDENTIAL_MODE=managed' >&2; exit 2; }
+    turn_managed_pair_guard || exit 1
     redis_managed_prepare_locked "${@:2}" || exit $?
     ;;
 
   redis-managed-rebuild)
     [[ "$REDIS_CREDENTIAL_MODE" == managed ]] || { echo 'redis-managed-rebuild requires REDIS_CREDENTIAL_MODE=managed' >&2; exit 2; }
+    turn_managed_pair_guard || exit 1
     redis_managed_rebuild_locked "${@:2}" || exit $?
+    ;;
+
+  turn-managed-init-schema|turn-managed-bootstrap|turn-managed-add-candidate|turn-managed-promote|turn-managed-rollback|turn-managed-recover|turn-managed-discard-unrecorded|turn-managed-status)
+    turn_managed_verb_locked "$@" || exit $?
     ;;
 
   rebuild|stage-restore)
@@ -4692,6 +5140,11 @@ else:
       done
     fi
 
+    if [[ $_rebuild_scoped -eq 1 ]] && ! turn_managed_scoped_rebuild_pair "${REBUILD_SCOPE[@]}"; then
+      echo "rebuild: coturn and control-plane must run one TURN credential model — escalating to a full rebuild." >&2
+      _rebuild_scoped=0
+    fi
+
     # Decide from the effective scope, after dependency discovery can escalate
     # to a full rebuild. Admission must precede the routine receipt/image guard.
     _rebuild_starts_coturn=0
@@ -4707,6 +5160,9 @@ else:
     fi
     if [[ $_rebuild_starts_coturn -eq 1 ]]; then
       selfhost_tls_admit_gate || exit 1
+      # Managed TURN: the RAM database must exist (empty on a cold host) before
+      # coturn starts; this is the only place that creates it (#3931).
+      turn_managed_init_schema_before_coturn || exit 1
     fi
 
     # Unconditional, and deliberately BEFORE any scope branch: this is the
@@ -4827,12 +5283,14 @@ else:
 
   activity-history-activate)
     shift
+    turn_managed_pair_guard || exit 1
     activity_history_activate "$@"
     selfhost_post_up_check || exit 1
     ;;
 
   activity-history-rollback)
     shift
+    turn_managed_pair_guard || exit 1
     activity_history_rollback "$@"
     selfhost_post_up_check || exit 1
     ;;
@@ -4846,6 +5304,7 @@ else:
           echo 'Usage: concord-ctl.sh voice-enforcement-rollout deploy' >&2
           exit 2
         fi
+        turn_managed_pair_guard || exit 1
         media_shared_listeners_routine_guard || exit 1
         managed_production_nats_reconcile || exit 1
         voice_enforcement_rollout_deploy "$@"
@@ -5826,6 +6285,10 @@ else:
       echo 'redis-managed: freshstart bypasses the reviewed Redis identity recovery path; refusing volume wipe' >&2
       exit 1
     fi
+    if [[ "$TURN_CREDENTIAL_MODE" == managed ]]; then
+      echo 'turn-managed: freshstart bypasses the reviewed RAM key-store lifecycle; refusing volume wipe' >&2
+      exit 1
+    fi
     # skip-receipt: the receipt never authorizes freshstart's volume wipe — a
     # gate-true freshstart still requires live one-container proof (#2326).
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" != selfhost ]]; then
@@ -5859,6 +6322,9 @@ else:
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == managed \
        && "$COMPOSE_OVERRIDE" == docker-compose.production.yml ]]; then
       redis_managed_writer_consistency_guard || exit 1
+      # The prompt above is unbounded: a TURN mode written meanwhile must not
+      # reach the wipe with the model computed before it (#3931).
+      turn_managed_writer_consistency_guard || exit 1
     fi
     fi
 
@@ -5996,6 +6462,9 @@ else:
     echo "  redis-managed-prepare --first-activation | --recover | --recover-lost-state <proof.json>"
     echo "                 Explicit stopped activation or reviewed recovery"
     echo "  redis-managed-rebuild [--resume]   Planned full app outage or resume bound stopped containers"
+    echo "  turn-managed-{init-schema|bootstrap|add-candidate|promote|rollback|recover|discard-unrecorded|status} [--generation N]"
+    echo "                 Managed TURN key custody (#3931). Key material is read from stdin only;"
+    echo "                 the canonical writer pair must record TURN_CREDENTIAL_MODE=managed"
     echo "  status         Show running containers, health checks, last deploy metadata"
     echo "  logs           Tail service logs (pass service name to filter, e.g. 'logs control-plane')"
     echo "  restart        Restart all services (no auto-sync since #1015)"

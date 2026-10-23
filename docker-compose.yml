@@ -98,10 +98,16 @@ services:
     # absolute paths from the mounted cert dir so the DTLS/TLS listeners
     # don't fall through to coturn's default CWD lookup (which emits
     # "cannot find certificate file" + "//turn_server_cert.pem" warnings).
+    # TURN_SECRET is no longer rejected by a Compose `:?` guard: interpolation runs
+    # before merging, so it would also reject the managed model (#3931), whose
+    # override carries no static secret. coturn-entrypoint.sh refuses to start a
+    # command that has neither a non-empty --static-auth-secret nor the managed
+    # --userdb, so the legacy path stays fail-loud.
+    entrypoint: ["/bin/sh", "/usr/local/bin/coturn-entrypoint.sh"]
     command: >
       turnserver
         -c /etc/coturn/turnserver.conf
-        --static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set - copy .env.example to .env}
+        --static-auth-secret=${TURN_SECRET:-}
         --realm=${TURN_REALM:-concordvoice.chat}
         --listening-ip=0.0.0.0
         --external-ip=${PUBLIC_IP:?PUBLIC_IP must be set to the host's public IP}
@@ -114,6 +120,7 @@ services:
       - "49152-49252:49152-49252/udp"  # TURN relay range
     volumes:
       - ./infrastructure/docker/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./infrastructure/docker/coturn/coturn-entrypoint.sh:/usr/local/bin/coturn-entrypoint.sh:ro
       # Set COTURN_CERTS_DIR in .env to choose the host directory mounted at /etc/coturn/certs.
       # Production sets it to /opt/concord/certs/coturn (real cert files copied from the
       # certbot deploy hook). Dev defaults to the repo placeholder directory — place a
@@ -257,7 +264,7 @@ services:
       TURN_SERVER_HOST: ${TURN_SERVER_HOST:-localhost}
       # Room placement stays disabled until the reviewed first-activation gate.
       ROOM_PLACEMENT_ENABLED: "${ROOM_PLACEMENT_ENABLED:-false}"
-      TURN_SECRET: ${TURN_SECRET:?}
+      TURN_SECRET: ${TURN_SECRET:-}
       TURN_REALM: ${TURN_REALM:-concordvoice.chat}
       MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-}
       SMTP_HOST: ${SMTP_HOST:-smtp.resend.com}

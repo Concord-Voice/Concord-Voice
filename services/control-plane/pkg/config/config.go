@@ -1273,6 +1273,14 @@ func (c *Config) validateProduction() error {
 			"DATABASE_URL must be set to a secure value in production. The default dev connection string is not allowed."},
 		{c.RedisCredentialMode != "managed" && c.RedisURL == defaultDevRedisURL(),
 			"REDIS_URL must be set to a secure value in production. The default dev connection string is not allowed."},
+		// #3931 — exactly one TURN credential source. Legacy deployments carry
+		// TURN_SECRET; the managed runtime carries TURN_SECRET_FILE (compose
+		// blanks TURN_SECRET there). Neither would silently degrade voice to
+		// STUN-only now that the compose :? guards no longer catch it, and both
+		// would leave the active key ambiguous. The both-set case is also
+		// rejected earlier, regardless of environment.
+		{(c.TURNSecret == "") == (c.TURNSecretFile == ""),
+			"exactly one of TURN_SECRET or TURN_SECRET_FILE must be set in production. Neither leaves voice with no TURN credential source; both leaves the active key ambiguous."},
 		{c.MFAEncryptionKey == devMFAEncKey,
 			"MFA_ENCRYPTION_KEY must be set to a secure value in production. The default dev key is not allowed. Generate with: openssl rand -hex 32"},
 		{c.StorageSecretKey == devMinIOSecretKey, // #nosec G101 -- dev default comparison

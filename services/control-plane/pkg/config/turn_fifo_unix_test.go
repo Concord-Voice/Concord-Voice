@@ -20,7 +20,7 @@ func TestICEServersCheckedManagedFileRejectsFIFO(t *testing.T) {
 	link := filepath.Join(dir, "linked-key")
 	require.NoError(t, syscall.Symlink(fifo, link))
 
-	for _, path := range []string{fifo, link} {
+	for path, want := range map[string]string{fifo: "invalid metadata", link: "symlink"} {
 		cfg := &Config{TURNServerHost: turnHost, TURNSecretFile: path}
 		done := make(chan error, 1)
 		go func() {
@@ -30,7 +30,7 @@ func TestICEServersCheckedManagedFileRejectsFIFO(t *testing.T) {
 		}()
 		select {
 		case err := <-done:
-			require.ErrorContains(t, err, "invalid metadata")
+			require.ErrorContains(t, err, want)
 		case <-time.After(2 * time.Second):
 			t.Fatalf("ICEServersChecked blocked on FIFO %s", path)
 		}
