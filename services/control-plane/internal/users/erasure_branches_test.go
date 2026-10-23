@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
@@ -56,15 +57,25 @@ func TestPublishErasureClearedIsBestEffort(t *testing.T) {
 
 	t.Run("no nats wired", func(t *testing.T) {
 		s := &AccountService{log: logger.New("test")}
-		require.NotPanics(t, func() { s.publishErasureCleared(principal) })
+		s.SetErasureClearKey(erasureclear.DeriveKey("synthetic-test-secret"))
+		require.NotPanics(t, func() { s.publishErasureCleared(principal, nil) })
 	})
 
 	t.Run("publish failure is logged, never returned", func(t *testing.T) {
 		s := &AccountService{log: logger.New("test")}
 		s.SetNATS(&natsclient.Client{})
-		require.NotPanics(t, func() { s.publishErasureCleared(principal) },
+		s.SetErasureClearKey(erasureclear.DeriveKey("synthetic-test-secret"))
+		require.NotPanics(t, func() { s.publishErasureCleared(principal, nil) },
 			"a failed cross-replica clear must not fail a request whose account is already erased")
 	})
+}
+
+func TestErasureClearPublisherRequiresAuthenticationKey(t *testing.T) {
+	s := &AccountService{nats: &natsclient.Client{}}
+	require.False(t, s.HasErasureClearPublisher(),
+		"the boot guard must reject a publisher that cannot seal an audience")
+	s.SetErasureClearKey(erasureclear.DeriveKey("synthetic-test-secret"))
+	require.True(t, s.HasErasureClearPublisher())
 }
 
 // noopErasureCapture satisfies the capture interface without touching a

@@ -3,6 +3,7 @@ package voice_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	concordws "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -315,6 +317,8 @@ func TestServerVoiceTerminalOutbox_RemoteErasureClearInvalidatesAdmission(t *tes
 	synchronizeVoiceWireClient(t, conn)
 
 	subA := newTestSubscriberWithHub(ts, hubA)
+	erasureKey := erasureclear.DeriveKey("synthetic-test-secret")
+	subA.SetErasureClearKey(erasureKey)
 	require.NoError(t, subA.DrainServerVoiceTerminalOutboxCandidateForTest(
 		context.Background(), uuid.MustParse(channelID), uuid.MustParse(erasedUser.ID), op,
 	))
@@ -328,7 +332,13 @@ func TestServerVoiceTerminalOutbox_RemoteErasureClearInvalidatesAdmission(t *tes
 	erasing := users.NewAccountService(ts.DB, logger.New("erasing-replica"))
 	erasing.SetAudienceFence(hubB)
 	require.NoError(t, erasing.DeleteAccount(context.Background(), erasedUser.ID))
-	subA.HandlePresenceErasureClearedForTest([]byte(`{"user_id":"` + erasedUser.ID + `"}`))
+	envelope, err := erasureclear.Seal(erasureKey, erasedUser.ID, 0, nil)
+	require.NoError(t, err)
+	clearEvent, err := json.Marshal(map[string]any{
+		"user_id": erasedUser.ID, "chunk": 0, "audience": envelope,
+	})
+	require.NoError(t, err)
+	subA.HandlePresenceErasureClearedForTest(clearEvent)
 	close(checker.release)
 
 	require.Eventually(t, func() bool {

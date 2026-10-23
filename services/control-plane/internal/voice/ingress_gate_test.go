@@ -525,15 +525,8 @@ func TestOversizedPayloadsAreRefusedBeforeParsing(t *testing.T) {
 	require.Equal(t, 1, admitted, "a full-room heartbeat is admitted")
 }
 
-// The ACCEPTED RESIDUAL, made executable rather than only documented.
-//
-// erasureBudget is replica-wide and distinct UUIDs bypass the dedup window, so
-// a flood of distinct forged identifiers exhausts the burst and can shed a
-// GENUINE clear. That is documented in the erasure constant block as
-// unfixable without bus authentication (#2857) -- resizing cannot distinguish
-// forged from genuine. Asserting it keeps the residual honest: if someone
-// later "fixes" it by resizing, this still fails and points at the reasoning.
-func TestDistinctUUIDFloodCanShedAGenuineClear_AcceptedResidual(t *testing.T) {
+// Unsigned, distinct-UUID floods cannot spend the authenticated erasure budget.
+func TestDistinctUnsignedUUIDFloodCannotShedAGenuineClear(t *testing.T) {
 	var o erasureClearObserver
 	s := gatedErasureSubscriber(&o)
 	s.db = withTestDB(t)
@@ -544,12 +537,8 @@ func TestDistinctUUIDFloodCanShedAGenuineClear_AcceptedResidual(t *testing.T) {
 	}
 
 	genuine := uuid.New()
-	s.handlePresenceErasureCleared([]byte(`{"user_id":"` + genuine.String() + `"}`))
+	s.handlePresenceErasureCleared(signedErasureClearPayload(t, genuine))
 
-	require.NotContains(t, o.cleared, genuine,
-		"ACCEPTED RESIDUAL: a distinct-UUID flood sheds a genuine clear. This is "+
-			"not a bug to fix by resizing -- a genuine and a forged clear are "+
-			"byte-identical and the existence probe cannot separate them either, "+
-			"so the only real fix is authenticating the bus (#2857). If this "+
-			"assertion ever fails, the residual closed and the docs must follow.")
+	require.Contains(t, o.cleared, genuine,
+		"an unsigned flood must not consume the budget reserved for authenticated clears")
 }

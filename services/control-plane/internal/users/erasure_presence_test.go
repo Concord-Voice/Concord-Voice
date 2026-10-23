@@ -102,6 +102,6 @@ func TestErasureFailsClosedOnCaptureFailure(t *testing.T) {
 // drift. If this ever changes, the voice subscriber stops listening and the
 // cross-replica clear silently stops working with every test still green.
 func TestErasureClearSubjectIsStable(t *testing.T) {
-	require.Equal(t, "presence.erasure.cleared", users.NATSSubjectPresenceErasureCleared)
+	require.Equal(t, "presence.erasure.cleared.v2", users.NATSSubjectPresenceErasureCleared)
 	require.NotEqual(t, uuid.Nil.String(), users.NATSSubjectPresenceErasureCleared)
 }

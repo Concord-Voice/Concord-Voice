@@ -15,8 +15,8 @@ import (
 
 // Ingress admission bounds for the two NATS doors this package subscribes to
 // (#2854 stage B1). The bus carries no per-service authorization -- the
-// media-plane, which terminates untrusted WebRTC traffic, shares it -- so
-// nothing upstream bounds how much work a forged publish can buy.
+// media-plane, which terminates untrusted WebRTC traffic, shares it. Erasure
+// events now authenticate their encrypted audience before reaching these gates.
 //
 // These are security bounds and are therefore const, never configuration,
 // following the internal/presencecapture precedent recorded in
@@ -24,39 +24,11 @@ import (
 // operator-tunable ingress budget is an operator-tunable DoS window.
 const (
 	// Erasure door. POST /api/v1/privacy/erase-account is gated at 3 per user
-	// per 24h, there is one publish per successful erasure, and there is no bulk
-	// path and no sweeper. Honest sustained rate is a handful per DAY, so 10/s
-	// sits roughly four orders of magnitude above honest peak while satisfying
-	// epic #1236 section 11.4 (10 total per second) literally.
-	//
-	// ACCEPTED RESIDUAL, stated because an earlier revision of the design
-	// dismissed it on false reasoning. This is ONE GLOBAL bucket, and dedup only
-	// defends the same-UUID case, so a flood of DISTINCT random UUIDs consumes
-	// every token and can shed a GENUINE erasure clear -- a right-to-erasure
-	// suppression at roughly 10 messages per second. The design's R8 rejected a
-	// resync latch by arguing an honest clear can only be shed by 32 SIMULTANEOUS
-	// distinct-user erasures, which the 3-per-24h publisher gate makes
-	// unreachable. That argument bounds honest PUBLISHERS and the attacker is not
-	// one.
-	//
-	// PoC-proven, not theorised: 1000 distinct forged UUIDs admit exactly the
-	// burst and the genuine clear that follows is shed as ingress_budget, while
-	// the identical clear with no flood running is not shed at all. Attacker
-	// cost is roughly 11 messages per second.
-	//
-	// The budget is kept anyway because the alternative is worse: with no budget
-	// the same flood performs unbounded O(Rich Presence clients) fan-out per
-	// message, which is how PR #2855 already ended up with a queue-saturation
-	// path to the same suppression. B1 makes that suppression cheaper and more
-	// total; it does not create it.
-	//
-	// There is NO discriminator available at this boundary. A genuine clear and
-	// a forged one are byte-identical, and the existence probe cannot separate
-	// them either, since a random UUID that was never a user reads as absent
-	// exactly like an erased one. Telling them apart requires authenticating
-	// the bus, which is #2857. Do not attempt to fix this by resizing the
-	// budget: any budget an attacker can saturate suppresses honest traffic,
-	// which is the same reasoning that removed the new-room gate below.
+	// per 24h. A successful erasure emits one authenticated message per bounded
+	// audience batch. Unsigned NATS publishes fail before this budget. Valid
+	// replays are deduplicated by sender and batch. The budget charges batch zero
+	// only, so one large genuine audience cannot exhaust the bucket before its
+	// later batches arrive.
 	erasureBudgetRefill = time.Second / 10
 	erasureBudgetBurst  = 32
 

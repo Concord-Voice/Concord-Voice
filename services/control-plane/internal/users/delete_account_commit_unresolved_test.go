@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -51,6 +52,8 @@ func (c *commitUnresolvedCapture) Complete(
 func (*commitUnresolvedCapture) Abandon(presencecapture.Plan, presencecapture.Cause) {}
 
 var _ presencecapture.GraphPresenceCapture = (*commitUnresolvedCapture)(nil)
+
+const unresolvedErasureClearTestSecret = "synthetic-test-secret"
 
 // observeErasureClear uses the real control-plane NATS client so this
 // regression observes the cross-replica privacy clear rather than merely
@@ -100,11 +103,21 @@ func observeErasureClear(t *testing.T, expectedUserID uuid.UUID) (*natsclient.Cl
 	return publisher, clears
 }
 
-func requireErasureClear(t *testing.T, clears <-chan map[string]interface{}, userID uuid.UUID) {
+func requireErasureClear(t *testing.T, clears <-chan map[string]interface{}, userID uuid.UUID, wantViewers ...uuid.UUID) {
 	t.Helper()
 	select {
 	case payload := <-clears:
 		assert.Equal(t, userID.String(), payload["user_id"])
+		require.Equal(t, float64(0), payload["chunk"])
+		envelope, ok := payload["audience"].(string)
+		require.True(t, ok, "clear must carry an authenticated audience")
+		viewers, err := erasureclear.Open(erasureclear.DeriveKey(unresolvedErasureClearTestSecret), userID.String(), 0, envelope)
+		require.NoError(t, err)
+		wantIDs := make([]string, 0, len(wantViewers))
+		for _, viewer := range wantViewers {
+			wantIDs = append(wantIDs, viewer.String())
+		}
+		assert.ElementsMatch(t, wantIDs, viewers, "publisher must carry the captured pre-erasure audience")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for cross-replica erasure-clear event")
 	}
@@ -124,8 +137,16 @@ func TestDeleteAccountCommitUnresolvedPreservesPrivacyOutputButGatesMedia(t *tes
 			db, cleanup := testdb.SetupTestDB(t)
 			t.Cleanup(cleanup)
 			owner, erased := testdb.CreateUser(t, db), testdb.CreateUser(t, db)
+			authorizedViewer := testdb.CreateUser(t, db)
+			testdb.CreateUser(t, db) // Unrelated account must not appear in the envelope.
+			_, err := db.Exec(`INSERT INTO friendships (requester_id, addressee_id, status)
+					VALUES ($1, $2, 'accepted')`, erased, authorizedViewer)
+			require.NoError(t, err)
+			_, err = db.Exec(`INSERT INTO user_presence_settings (user_id, custom_text_tier)
+					VALUES ($1, 1)`, erased)
+			require.NoError(t, err)
 			serverID := uuid.New()
-			_, err := db.Exec(`INSERT INTO servers (id, name, owner_id)
+			_, err = db.Exec(`INSERT INTO servers (id, name, owner_id)
 				VALUES ($1, 'unresolved-erasure', $2)`, serverID, owner)
 			require.NoError(t, err)
 			_, err = db.Exec(`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2)`, serverID, erased)
@@ -149,6 +170,7 @@ func TestDeleteAccountCommitUnresolvedPreservesPrivacyOutputButGatesMedia(t *tes
 			service.SetGraphPresenceCapture(&commitUnresolvedCapture{commit: tc.commit})
 			publisher, erasureClears := observeErasureClear(t, erased)
 			service.SetNATS(publisher)
+			service.SetErasureClearKey(erasureclear.DeriveKey(unresolvedErasureClearTestSecret))
 			var broadcasts [][2]string
 			service.SetChannelDeletedBroadcaster(func(server, channel string) {
 				broadcasts = append(broadcasts, [2]string{server, channel})
@@ -165,7 +187,7 @@ func TestDeleteAccountCommitUnresolvedPreservesPrivacyOutputButGatesMedia(t *tes
 				"an unknown commit must still clear captured presence state")
 			assert.Equal(t, [][2]string{{serverID.String(), channelID.String()}}, broadcasts,
 				"the captured incomplete-channel fanout is a fail-closed privacy clear")
-			requireErasureClear(t, erasureClears, erased)
+			requireErasureClear(t, erasureClears, erased, authorizedViewer)
 			if tc.wantMedia {
 				require.Len(t, reclaimed, 1)
 				assert.Equal(t, attachmentKey, reclaimed[0].Key)

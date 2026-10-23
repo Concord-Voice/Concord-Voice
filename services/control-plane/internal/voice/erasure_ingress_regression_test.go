@@ -14,15 +14,9 @@ package voice
 // through for a live account. The exploit was live, not theoretical, so these
 // inversions lock a demonstrated class rather than a hypothesis.
 //
-// VACUITY WARNING, DO NOT DELETE. The issue's headline criterion -- "a forged
-// burst disconnects ZERO clients" -- is ALREADY GREEN on the pre-fix tree:
-// #2840 replaced the fleet-wide disconnect with a targeted clear, and #2855 made
-// the fan-out non-closing. A test asserting only the disconnect count therefore
-// cannot fail on the code it targets; it would pass identically with every gate
-// B1 adds deleted. Every assertion below is on ADMITTED COUNT or QUERY COUNT --
-// the dimension B1 actually changes. The disconnect counter is asserted only as
-// a secondary guard against a regression in the OTHER direction, never as the
-// property under test.
+// VACUITY WARNING, DO NOT DELETE. A disconnect-only assertion was green before
+// the ingress gate and remains green now. The tests below check admitted clears
+// or existence queries; the disconnect count is only a secondary guard.
 
 import (
 	"database/sql"
@@ -40,7 +34,8 @@ import (
 const erasureFloodBurst = 257
 
 // forgedErasureClear builds the exact wire payload the PoC forges: a well-formed
-// envelope naming a UUID that was never an account.
+// legacy envelope naming a UUID that was never an account. The authenticated
+// subscriber now rejects it before the budget or existence lookup.
 func forgedErasureClear(id uuid.UUID) []byte {
 	return []byte(`{"user_id":"` + id.String() + `"}`)
 }
@@ -59,9 +54,8 @@ func brokenLookupDB(t *testing.T) *sql.DB {
 // Inversion of PoC assertion 1.
 //
 // Pre-fix: 257 forged distinct-UUID messages reached the sink 257 times -- one
-// fan-out bought per message, at no cost to the attacker. Distinct UUIDs are
-// what make this the dedup window's blind spot, so the budget is the only gate
-// that can answer it.
+// fan-out bought per message, at no cost to the attacker. The new envelope
+// authentication rejects the same attack before the budget and dedup window.
 func TestForgedErasureBurstNoLongerBuysOneFanOutPerMessage(t *testing.T) {
 	var o erasureClearObserver
 	s := gatedErasureSubscriber(&o)
@@ -76,8 +70,8 @@ func TestForgedErasureBurstNoLongerBuysOneFanOutPerMessage(t *testing.T) {
 		erasureFloodBurst, erasureFloodBurst)
 	require.LessOrEqual(t, len(o.cleared), erasureBudgetBurst,
 		"the burst plus a small refill allowance is the ceiling")
-	require.NotEmpty(t, o.cleared,
-		"the gate must throttle the path, not silence it -- a genuine clear still lands")
+	require.Empty(t, o.cleared,
+		"unsigned forged clears must never reach the fan-out")
 	require.Zero(t, o.disconnects,
 		"secondary guard only; see the VACUITY WARNING at the top of this file")
 }
@@ -93,7 +87,7 @@ func TestReplayedErasureClearReachesTheSinkExactlyOnce(t *testing.T) {
 	s := gatedErasureSubscriber(&o)
 	s.db = withTestDB(t)
 
-	captured := forgedErasureClear(uuid.New())
+	captured := signedErasureClearPayload(t, uuid.New())
 	for range erasureFloodBurst {
 		s.handlePresenceErasureCleared(captured)
 	}
@@ -129,7 +123,7 @@ func TestErasureClearStillProceedsOnALookupFailureButIsBudgetBounded(t *testing.
 		s.db = brokenLookupDB(t)
 
 		erased := uuid.New()
-		s.handlePresenceErasureCleared(forgedErasureClear(erased))
+		s.handlePresenceErasureCleared(signedErasureClearPayload(t, erased))
 
 		require.Equal(t, []uuid.UUID{erased}, o.cleared,
 			"a database fault must not suppress a legitimate erasure clear -- "+
@@ -142,7 +136,7 @@ func TestErasureClearStillProceedsOnALookupFailureButIsBudgetBounded(t *testing.
 		s.db = brokenLookupDB(t)
 
 		for range erasureFloodBurst {
-			s.handlePresenceErasureCleared(forgedErasureClear(uuid.New()))
+			s.handlePresenceErasureCleared(signedErasureClearPayload(t, uuid.New()))
 		}
 
 		require.Less(t, len(o.cleared), erasureFloodBurst,

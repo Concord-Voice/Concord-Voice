@@ -7,6 +7,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/fxamacker/cbor/v2 v2.9.6
 	github.com/gin-gonic/gin v1.12.0
+	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/go-webauthn/webauthn v0.18.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/golang-migrate/migrate/v4 v4.20.1
@@ -25,6 +26,7 @@ require (
 	golang.org/x/image v0.47.0
 	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -37,7 +39,6 @@ require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.16 // indirect
 	github.com/gin-contrib/sse v1.1.2 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-playground/locales v0.14.2 // indirect
 	github.com/go-playground/universal-translator v0.18.2 // indirect
 	github.com/go-playground/validator/v10 v10.30.5 // indirect
@@ -76,7 +77,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.32.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/ini.v1 v1.67.3 // indirect

@@ -381,22 +381,10 @@ func (h *Hub) disconnectAllPrivacyCriticalClients(ctx context.Context) error {
 	return errors.Join(disconnectErr, ctx.Err())
 }
 
-// ClearErasedSenderCustomText broadcasts a Custom Status clear for ONE sender to
-// every local Rich Presence client, without computing an audience and without
-// disconnecting anyone.
-//
-// It exists for account erasure, where neither of the other two options works.
-// ClearCustomTextForPresenceAudience cannot: it recomputes the audience from the
-// database, and after erasure the sender's rows have cascaded away, so it would
-// resolve an empty set and clear nobody. A fleet-wide DISCONNECT can, but makes
-// the triggering message a denial-of-service primitive — the red-team PoCs on
-// PR #2840 proved a forged publish carrying any random UUID, an unbounded replay
-// of a genuine one, and a lookup error all reached that sink.
-//
-// A clear frame makes the action PROPORTIONAL to the claim. A client that never
-// held this sender's status ignores the frame, so a forged or replayed message
-// for an arbitrary id is inert rather than destructive, and the honest cost is
-// one small frame per connected client instead of a fleet-wide reconnect storm.
+// ClearErasedSenderCustomText sends a Custom Status clear for one erased sender
+// only to the pre-erasure authorized audience carried by the cross-replica
+// event. The audience must be captured before the erasure cascade destroys the
+// graph and settings rows; recomputing it here would always return empty.
 //
 // Delivery is best-effort per client and DROPS rather than disconnecting —
 // deliberately unlike sendPrivacyClearToUsers, which closes on a full queue.
@@ -414,19 +402,10 @@ func (h *Hub) disconnectAllPrivacyCriticalClients(ctx context.Context) error {
 // no persist middleware) and the erased user has cascaded out of the viewer's
 // friend and member lists, so it is a stale string rather than live disclosure.
 //
-// Closing on overflow instead made the fan-out a denial-of-service primitive:
-// the bus is unauthenticated and the fan-out unconditional, so 257 forged
-// messages disconnected every Rich Presence client on the replica and left each
-// one permanently in the disconnect branch.
-//
-// What dropping does NOT buy, so no later reader assumes it: a forged clear is
-// not inert. The fan-out is still unconditional, so a burst still costs one
-// frame per connected client, and an attacker who saturates a viewer's queue can
-// make a GENUINE clear be dropped, leaving the erased status resident. Those are
-// accepted here and closed by stage B1's rate limit at the NATS subscriber
-// dispatch boundary, which stops a burst before it reaches any client. B2 is not
-// safe to sit on indefinitely without B1. #2854 stage B2.
-func (h *Hub) ClearErasedSenderCustomText(senderID uuid.UUID) {
+// Closing on overflow made the former unconditional fan-out a denial-of-service
+// primitive: 257 forged messages disconnected every Rich Presence client on
+// the replica. Keep this scoped clear non-disconnecting on a full queue.
+func (h *Hub) ClearErasedSenderCustomText(senderID uuid.UUID, audience map[uuid.UUID]bool) {
 	// Fail closed on a nil receiver rather than panicking, matching the
 	// TopologyRail methods: a hub-less replica has no local clients to clear, and
 	// a panic inside a NATS callback would take the subscriber down.
@@ -442,28 +421,31 @@ func (h *Hub) ClearErasedSenderCustomText(senderID uuid.UUID) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	dropped := 0
-	for _, client := range h.clients {
-		if !activityRichPresenceClient(client) {
-			continue
-		}
-		// enqueueOutboundBootstrapSafe never closes the client and never touches
-		// the reconnect-replacement buffer.
-		//
-		// Plain enqueueOutbound is NOT used here. Its first act is
-		// bufferBootstrapLive, so for a client inside its replacement window a
-		// forged burst latches bootstrapFailed (or inflates completeClientBootstrap's
-		// capacity preflight) and the bootstrap path disconnects the client on its
-		// own goroutine — the same fleet-wide disconnect, moved off the fan-out and
-		// out of sight of a fan-out-only assertion. That variant is CHEAPER than the
-		// one this stage removed (256 vs 257), independent of Send capacity, and
-		// self-sustaining, because each disconnect returns the victim to a
-		// replacement window. Proven by PoC before it shipped.
-		//
-		// enqueuePrivacyCritical is NOT used here either — its close-on-overflow arm
-		// is correct only for sendPrivacyClearToUsers, where the frame carries an
-		// authorization revocation.
-		if !client.enqueueOutboundBootstrapSafe(data) {
-			dropped++
+	for viewerID := range audience {
+		for clientID := range h.userClients[viewerID] {
+			client, ok := h.clients[clientID]
+			if !ok || !activityRichPresenceClient(client) {
+				continue
+			}
+			// enqueueOutboundBootstrapSafe never closes the client and never touches
+			// the reconnect-replacement buffer.
+			//
+			// Plain enqueueOutbound is NOT used here. Its first act is
+			// bufferBootstrapLive, so for a client inside its replacement window a
+			// forged burst latches bootstrapFailed (or inflates completeClientBootstrap's
+			// capacity preflight) and the bootstrap path disconnects the client on its
+			// own goroutine — the same fleet-wide disconnect, moved off the fan-out and
+			// out of sight of a fan-out-only assertion. That variant is CHEAPER than the
+			// one this stage removed (256 vs 257), independent of Send capacity, and
+			// self-sustaining, because each disconnect returns the victim to a
+			// replacement window. Proven by PoC before it shipped.
+			//
+			// enqueuePrivacyCritical is NOT used here either — its close-on-overflow arm
+			// is correct only for sendPrivacyClearToUsers, where the frame carries an
+			// authorization revocation.
+			if !client.enqueueOutboundBootstrapSafe(data) {
+				dropped++
+			}
 		}
 	}
 	if dropped > 0 {

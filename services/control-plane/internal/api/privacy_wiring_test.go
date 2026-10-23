@@ -20,7 +20,7 @@ func TestBuildPrivacyHandler_ConstructsHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	log := logger.New("test")
 
-	h, account := buildPrivacyHandler(nil, nil, log, nil, nil, nil, nil)
+	h, account := buildPrivacyHandler(nil, nil, log, nil, nil, nil, nil, "test-secret")
 	require.NotNil(t, h, "buildPrivacyHandler must return a non-nil handler")
 	require.NotNil(t, account, "the account service is returned so the boot guard can check it")
 	require.False(t, account.HasGraphPresenceCapture(),
@@ -34,7 +34,7 @@ func TestBuildPrivacyHandler_NilLogger(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	require.NotPanics(t, func() {
-		h, account := buildPrivacyHandler(nil, nil, nil, nil, nil, nil, nil)
+		h, account := buildPrivacyHandler(nil, nil, nil, nil, nil, nil, nil, "test-secret")
 		require.NotNil(t, h)
 		require.NotNil(t, account)
 	})
@@ -48,7 +48,7 @@ func TestBuildPrivacyHandler_NilLogger(t *testing.T) {
 func TestBuildPrivacyHandler_WiresTheErasureClearPublisher(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	_, account := buildPrivacyHandler(nil, nil, logger.New("test"), nil, nil, nil, &natsclient.Client{})
+	_, account := buildPrivacyHandler(nil, nil, logger.New("test"), nil, nil, nil, &natsclient.Client{}, "test-secret")
 
 	require.True(t, account.HasErasureClearPublisher(),
 		"buildPrivacyHandler must wire the erasure-clear publisher when a client exists")

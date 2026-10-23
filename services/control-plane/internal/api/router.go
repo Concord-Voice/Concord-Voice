@@ -20,6 +20,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedback"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
@@ -1305,7 +1306,7 @@ func NewRouter(
 		dangerousActionGateGap(channelsHandler, membersHandler, rbacHandler, mediaHandler) == "")
 	updatesHandler := updates.NewHandler(cfg, log)
 	privacyHandler, accountService := buildPrivacyHandler(
-		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient)
+		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient, cfg.MFAEncryptionKey)
 
 	// The erasure drain (#2448). Wired here rather than beside the DM rail for
 	// the same reason the guard below runs here: accountService does not exist
@@ -1385,6 +1386,7 @@ func NewRouter(
 
 	// Start NATS voice event subscriber
 	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
+	voiceSub.SetErasureClearKey(erasureclear.DeriveKey(cfg.MFAEncryptionKey))
 	voiceSub.SetLifecyclePlacementEnabled(roomPlacementEnabled)
 	voiceSub.SetOpsCounters(opsCounters)
 	voiceSub.SetTierViolationRecorder(violationRecorder)
@@ -1398,13 +1400,16 @@ func NewRouter(
 		// voice.joined lands (CV-CAN-007 P1).
 		voiceSub.SetPermissionEnforcer(voicePermEnforcer)
 		if subErr := voiceSub.Subscribe(); subErr != nil {
-			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
-		} else {
-			activePlanReconciler.SetServerVoiceCleanup(
-				voiceSub.ReconcileStaleServerVoiceParticipants,
-			)
-			voicePermEnforcer.AddCloseHook(voiceSub.Close)
+			// Account erasure can commit after this router starts serving. A
+			// replica without its clear subscription would leave that sender's
+			// Custom Status visible to connected viewers indefinitely.
+			return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+				fmt.Errorf("subscribe to voice NATS events: %w", subErr)
 		}
+		activePlanReconciler.SetServerVoiceCleanup(
+			voiceSub.ReconcileStaleServerVoiceParticipants,
+		)
+		voicePermEnforcer.AddCloseHook(voiceSub.Close)
 	}
 	requireServerVoiceCleanupWired(log, activePlanReconciler)
 	requireActivePlanCleanupsWired(log, activePlanReconciler)

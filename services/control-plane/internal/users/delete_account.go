@@ -12,6 +12,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -120,8 +121,9 @@ type ActivePlanDrain interface {
 // the caller's string post-commit, where a parse failure would have nowhere to
 // go but a log line on a path that has already succeeded.
 type drainedObligation struct {
-	subject    uuid.UUID
-	categories []presence.Category
+	subject            uuid.UUID
+	categories         []presence.Category
+	customTextAudience map[uuid.UUID]bool
 }
 
 type committedAccountDeletion struct {
@@ -174,6 +176,9 @@ type AccountService struct {
 	// not republished on a heartbeat. nil leaves that gap open, so the boot path
 	// must wire it.
 	nats *natsclient.Client
+	// erasureClearKey protects the audience carried over the shared NATS
+	// bus. It is derived from the deployment secret with a dedicated context.
+	erasureClearKey []byte
 }
 
 // NewAccountService constructs an AccountService. The logger is optional;
@@ -421,7 +426,7 @@ func (s *AccountService) runPostCommitObligations(
 	// Cross-replica Custom Status clear (#2447). It follows the commit terminal;
 	// an unresolved outcome clears fail-closed because stale disclosure is worse
 	// than a proportional reset for an account that may still exist.
-	s.publishErasureCleared(userID)
+	s.publishErasureCleared(userID, drained.customTextAudience)
 	s.transferDrainedActivePlans(ctx, drained)
 	s.reclaimErasedMedia(ctx, userID, commitUnresolved, stranded)
 	if s.channelDeleted == nil {
@@ -525,6 +530,11 @@ func (s *AccountService) deleteAccountTx(
 		return nil, nil, nil, drainedObligation{}, erasedMedia{}, fmt.Errorf(
 			"delete account: capture presence: %w", captureErr)
 	}
+	customTextAudience, audienceErr := presence.ComputeCustomTextAudience(ctx, tx, creatorID)
+	if audienceErr != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{}, fmt.Errorf(
+			"delete account: capture custom-text audience: %w", audienceErr)
+	}
 
 	// Drain the durable active-category obligation under the user-row lock, and
 	// BEFORE the DELETE below.
@@ -540,6 +550,7 @@ func (s *AccountService) deleteAccountTx(
 	if drainErr != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, drainErr
 	}
+	drained.customTextAudience = customTextAudience
 	if err := s.captureErasurePrivateCallPlans(ctx, tx, currentCandidates); err != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, err
 	}
@@ -922,10 +933,17 @@ func (s *AccountService) HasGraphPresenceCapture() bool { return s.graphPresence
 // only observer of `s.nats`'s assignment, after which deleting `s.nats = c`
 // kills the erasure clear on every replica with every test still green. Fix the
 // connection, not the guard.
-func (s *AccountService) HasErasureClearPublisher() bool { return s.nats != nil }
+func (s *AccountService) HasErasureClearPublisher() bool {
+	return s.nats != nil && len(s.erasureClearKey) == 32
+}
 
 // SetNATS wires the cross-replica erasure-clear publisher.
 func (s *AccountService) SetNATS(c *natsclient.Client) { s.nats = c }
+
+// SetErasureClearKey wires the key used to authenticate cross-replica clears.
+func (s *AccountService) SetErasureClearKey(key []byte) {
+	s.erasureClearKey = append(s.erasureClearKey[:0], key...)
+}
 
 // NATSSubjectPresenceErasureCleared fans an account erasure out to every replica
 // so viewers still holding the erased principal's Custom Status drop it.
@@ -935,7 +953,7 @@ func (s *AccountService) SetNATS(c *natsclient.Client) { s.nats = c }
 // would let the two drift and publish into a subject nothing listens on.
 //
 // Core NATS, so at-most-once. See publishErasureCleared for the residual.
-const NATSSubjectPresenceErasureCleared = "presence.erasure.cleared"
+const NATSSubjectPresenceErasureCleared = "presence.erasure.cleared.v2"
 
 // captureErasureAlreadyGated captures the erased principal's pre-cascade
 // audience on a transaction whose sender gate the caller ALREADY holds.
@@ -973,7 +991,7 @@ func (s *AccountService) captureErasureAlreadyGated(
 }
 
 // publishErasureCleared tells every replica to drop the erased principal's
-// already-delivered Custom Status.
+// already-delivered Custom Status only for its captured authorized viewers.
 //
 // Why this exists at all: SuppressAllActivityAlreadyGated deletes only
 // CategoryServerVoice and CategoryPrivateCall and never touches Custom Status,
@@ -1007,13 +1025,32 @@ func (s *AccountService) captureErasureAlreadyGated(
 // re-derive against. internal/attestation accepts the same semantics for
 // registry revocation. Upgrade path if that residual ever matters: JetStream, or
 // a durable FK-free clear ledger the replicas replay on reconnect.
-func (s *AccountService) publishErasureCleared(userID string) {
+func (s *AccountService) publishErasureCleared(userID string, audience map[uuid.UUID]bool) {
 	if s.nats == nil {
 		return
 	}
-	if err := s.nats.Publish(NATSSubjectPresenceErasureCleared, map[string]interface{}{
-		"user_id": userID,
-	}); err != nil && s.log != nil {
+	viewerIDs := make([]string, 0, len(audience))
+	for viewerID := range audience {
+		viewerIDs = append(viewerIDs, viewerID.String())
+	}
+	deliveryFailed := false
+	for chunk, viewers := range erasureclear.Batches(viewerIDs) {
+		envelope, sealErr := erasureclear.Seal(s.erasureClearKey, userID, chunk, viewers)
+		if sealErr != nil {
+			if s.log != nil {
+				s.log.Error("Cross-replica presence clear failed", "failure_class", "sealing")
+			}
+			return
+		}
+		if err := s.nats.Publish(NATSSubjectPresenceErasureCleared, map[string]interface{}{
+			"user_id":  userID,
+			"chunk":    chunk,
+			"audience": envelope,
+		}); err != nil {
+			deliveryFailed = true
+		}
+	}
+	if deliveryFailed && s.log != nil {
 		s.log.Error("Cross-replica presence clear failed", "failure_class", "delivery")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -49,19 +50,19 @@ func gatedErasureSubscriber(o *erasureClearObserver) *NATSSubscriber {
 // disconnect with a targeted clear and #2855 made the fan-out non-closing. A
 // test written only to the issue's headline criterion cannot fail on the code
 // it targets. The non-vacuous dimension is ADMITTED COUNT.
-func TestForgedDistinctUUIDBurstIsBudgetBounded(t *testing.T) {
+func TestAuthenticatedDistinctUUIDBurstIsBudgetBounded(t *testing.T) {
 	var o erasureClearObserver
 	s := gatedErasureSubscriber(&o)
 	s.db = withTestDB(t)
 
 	for range 1000 {
 		s.handlePresenceErasureCleared(
-			[]byte(`{"user_id":"` + uuid.New().String() + `"}`))
+			signedErasureClearPayload(t, uuid.New()))
 	}
 
-	require.Zero(t, o.disconnects, "no forged message may reach a fleet disconnect")
+	require.Zero(t, o.disconnects, "no erasure message may reach a fleet disconnect")
 	require.LessOrEqual(t, len(o.cleared), erasureBudgetBurst,
-		"1000 forged messages must not buy 1000 fan-outs; the burst plus a small "+
+		"1000 authenticated messages must not buy 1000 fan-outs; the burst plus a small "+
 			"refill allowance is the ceiling")
 	require.NotEmpty(t, o.cleared, "the gate must throttle the path, not silence it")
 }
@@ -76,7 +77,7 @@ func TestReplayOfOneUUIDCostsAtMostOneExistenceQuery(t *testing.T) {
 	queries := 0
 	s.erasureExistenceProbedHook = func() { queries++ }
 
-	payload := []byte(`{"user_id":"` + uuid.New().String() + `"}`)
+	payload := signedErasureClearPayload(t, uuid.New())
 	for range 1000 {
 		s.handlePresenceErasureCleared(payload)
 	}
@@ -94,13 +95,13 @@ func TestAFloodOfOneUUIDDoesNotStarveAGenuineClearForAnother(t *testing.T) {
 	s := gatedErasureSubscriber(&o)
 	s.db = withTestDB(t)
 
-	flooded := []byte(`{"user_id":"` + uuid.New().String() + `"}`)
+	flooded := signedErasureClearPayload(t, uuid.New())
 	for range 1000 {
 		s.handlePresenceErasureCleared(flooded)
 	}
 
 	genuine := uuid.New()
-	s.handlePresenceErasureCleared([]byte(`{"user_id":"` + genuine.String() + `"}`))
+	s.handlePresenceErasureCleared(signedErasureClearPayload(t, genuine))
 
 	require.Contains(t, o.cleared, genuine,
 		"a replay flood must not consume the budget a genuine clear needs")
@@ -124,7 +125,7 @@ func TestARejectedClearDoesNotPoisonTheDedupSlot(t *testing.T) {
 	s := gatedErasureSubscriber(&o)
 	s.db = db
 
-	payload := []byte(`{"user_id":"` + live.String() + `"}`)
+	payload := signedErasureClearPayload(t, live)
 	s.handlePresenceErasureCleared(payload)
 	require.Empty(t, o.cleared,
 		"precondition: a still-existing user's clear is rejected")
@@ -175,18 +176,47 @@ func TestAnUnverifiedAcceptDoesNotOccupyTheDedupSlot(t *testing.T) {
 	s.db = brokenLookupDB(t)
 
 	victim := uuid.New()
-	payload := []byte(`{"user_id":"` + victim.String() + `"}`)
+	payload := signedErasureClearPayload(t, victim)
 	s.handlePresenceErasureCleared(payload)
 	require.Len(t, o.cleared, 1,
 		"precondition: the unverified arm still proceeds, which is deliberate")
 
-	// The database recovers and the victim is genuinely erased. Their real clear
-	// must NOT be deduped away by the forged one.
+	// The database recovers and the victim is genuinely erased. The real
+	// publisher seals a new event with a fresh nonce; the earlier unverified
+	// event must not have occupied the sender/chunk slot.
 	s.db = withTestDB(t)
-	s.handlePresenceErasureCleared(payload)
+	s.handlePresenceErasureCleared(signedErasureClearPayload(t, victim))
 
 	require.Len(t, o.cleared, 2,
 		"a genuine clear must survive a forged unverified accept for the same id")
+}
+
+func TestUnverifiedLaterBatchReplayIsShedBeforeAnotherLookup(t *testing.T) {
+	var o erasureClearObserver
+	s := gatedErasureSubscriber(&o)
+	s.db = brokenLookupDB(t)
+	viewers := make([]uuid.UUID, erasureclear.MaxViewersPerEvent)
+	for i := range viewers {
+		viewers[i] = uuid.New()
+	}
+	payload := signedErasureClearChunkPayload(t, uuid.New(), 1, viewers...)
+	shed := ""
+	s.ingressShedObservedHook = func(class string) { shed = class }
+	s.handlePresenceErasureCleared(payload)
+	require.Len(t, o.cleared, 1)
+	require.Len(t, o.audiences[0], len(viewers))
+
+	// A replay is recognized before even opening its JWE. Changing the key
+	// would make authentication fail if the handler reached that work again.
+	s.erasureClearKey = nil
+
+	for range erasureBudgetBurst*3 - 1 {
+		s.handlePresenceErasureCleared(payload)
+	}
+
+	require.Equal(t, "replay", shed)
+	require.Len(t, o.cleared, 1,
+		"one captured authenticated later batch must not bypass the budget on every replay")
 }
 
 // The aggregation invariant is guarded at TWO call sites -- erasureShed and

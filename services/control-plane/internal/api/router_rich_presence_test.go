@@ -14,6 +14,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestErasureClearAuthenticationUsesAControlPlaneOnlySecret(t *testing.T) {
+	source, err := os.ReadFile("router.go")
+	require.NoError(t, err)
+	text := string(source)
+	require.Contains(t, text,
+		"voiceSub.SetErasureClearKey(erasureclear.DeriveKey(cfg.MFAEncryptionKey))")
+	require.NotContains(t, text,
+		"voiceSub.SetErasureClearKey(erasureclear.DeriveKey(cfg.JWTSecret))",
+		"the media plane has JWT_SECRET and must not be able to forge erasure audiences")
+	require.Contains(t, text,
+		"wireDMBlockReconciler(db, log, purgeEngine, activePlanReconciler, hub, natsClient, cfg.JWTSecret)",
+		"cross-service voice-ejection proofs must keep the secret shared with the media plane")
+}
+
 func TestDMVoiceCallLeaseVerifierMatchesOnlyTheCurrentExactLease(t *testing.T) {
 	// The DB index is allocated per process by redistest (#2680); the hand-pinned
 	// DB 15 this used to carry was shared with every other concurrent test binary.

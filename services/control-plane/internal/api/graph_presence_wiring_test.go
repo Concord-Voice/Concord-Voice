@@ -15,6 +15,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
@@ -72,14 +73,15 @@ func deliverableActivePlanRail() *activepresence.Rail {
 		activepresence.NewReconciler(nil, nil, nil, nil, inertActiveDeliverer{}, nil), nil)
 }
 
-// fullyWiredErasureService is the erasure consumer with all FOUR of its arms
-// attached. It is a builder rather than four inline calls because the unwire
+// fullyWiredErasureService is the erasure consumer with every required arm
+// attached. It is a builder rather than inline calls because the unwire
 // table below drops one arm at a time, and a case that dropped an arm from a
 // service missing another would prove nothing about the arm it names.
 func fullyWiredErasureService() *users.AccountService {
 	service := &users.AccountService{}
 	service.SetGraphPresenceCapture(nopCapture{})
 	service.SetNATS(&natsclient.Client{})
+	service.SetErasureClearKey(erasureclear.DeriveKey("synthetic-test-secret"))
 	service.SetActivePlanRail(deliverableActivePlanRail())
 	service.SetAudienceFence(websocket.NewHub(nil, nil))
 	return service
@@ -150,6 +152,11 @@ func TestGraphPresenceGuardDetectsEachUnwiredConsumer(t *testing.T) {
 			// without NATS must fail", which conflated the two.
 			fresh := fullyWiredErasureService()
 			fresh.SetNATS(nil)
+			c.erasure = fresh
+		},
+		"erasure clear authentication key": func(c *graphPresenceConsumers) {
+			fresh := fullyWiredErasureService()
+			fresh.SetErasureClearKey(nil)
 			c.erasure = fresh
 		},
 		// #2448. An unwired dm rail is the worst of the set: DeleteGroup would

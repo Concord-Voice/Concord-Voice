@@ -17,7 +17,7 @@ import (
 )
 
 // Regression locks for #2854 stage B2: a forged or replayed
-// `presence.erasure.cleared` burst must never convert
+// erasure-clear burst must never convert
 // Hub.ClearErasedSenderCustomText's unconditional fan-out into a fleet-wide
 // Rich Presence disconnect.
 //
@@ -144,11 +144,11 @@ func TestClearErasedSenderCustomText_ForgedBurstBeyondSendCapacityDisconnectsNob
 	require.Equal(t, 0, countClosedErasureClearSockets(victims),
 		"precondition: every bystander starts connected")
 
-	// Each iteration is ONE forged publish of {"user_id":"<random uuid>"} on the
-	// unauthenticated `presence.erasure.cleared` subject.
+	// Each iteration drives one accepted clear at the Hub sink, independent of
+	// NATS authentication, to exercise queue saturation directly.
 	const burst = erasureClearSendCapacity + 1
 	for i := 0; i < burst; i++ {
-		hub.ClearErasedSenderCustomText(uuid.New())
+		hub.ClearErasedSenderCustomText(uuid.New(), allErasureClearViewers(hub))
 	}
 
 	t.Run("no bystander is disconnected by the overflow", func(t *testing.T) {
@@ -236,7 +236,7 @@ func TestClearErasedSenderCustomText_ForgedBurstDuringReconnectDisconnectsNobody
 
 	const burst = clientBootstrapBufferedFrameLimit + 1
 	for i := 0; i < burst; i++ {
-		hub.ClearErasedSenderCustomText(uuid.New())
+		hub.ClearErasedSenderCustomText(uuid.New(), allErasureClearViewers(hub))
 	}
 
 	t.Run("the burst never latches bootstrapFailed", func(t *testing.T) {
@@ -285,7 +285,7 @@ func TestClearErasedSenderCustomText_ForgedBurstDisconnectsNoReconnectingClient(
 
 	const burst = clientBootstrapBufferedFrameLimit + 1
 	for i := 0; i < burst; i++ {
-		hub.ClearErasedSenderCustomText(uuid.New())
+		hub.ClearErasedSenderCustomText(uuid.New(), allErasureClearViewers(hub))
 	}
 	for i, victim := range victims {
 		completed, _ := driveErasureClearBootstrapCompletion(t, hub, victim)
@@ -326,7 +326,7 @@ func TestClearErasedSenderCustomText_ReconnectSurvivalIsIndependentOfSendQueueCa
 
 	const burst = clientBootstrapBufferedFrameLimit + 1
 	for i := 0; i < burst; i++ {
-		hub.ClearErasedSenderCustomText(uuid.New())
+		hub.ClearErasedSenderCustomText(uuid.New(), allErasureClearViewers(hub))
 	}
 
 	t.Run("the burst is dropped without consuming queue capacity", func(t *testing.T) {
@@ -362,7 +362,7 @@ func TestClearErasedSenderCustomText_ThousandMessageBurstDisconnectsNobody(t *te
 
 	const burst = 1000
 	for i := 0; i < burst; i++ {
-		hub.ClearErasedSenderCustomText(uuid.New())
+		hub.ClearErasedSenderCustomText(uuid.New(), allErasureClearViewers(hub))
 	}
 
 	t.Run("no bystander is disconnected by the burst", func(t *testing.T) {
@@ -399,7 +399,7 @@ func TestClearErasedSenderCustomText_FullSendQueueDropsFrameWithoutClosingClient
 	require.Len(t, client.Send, 1, "precondition: the send queue is full")
 	require.True(t, erasureClearSocketOpen(client), "precondition: the client starts connected")
 
-	hub.ClearErasedSenderCustomText(uuid.New())
+	hub.ClearErasedSenderCustomText(uuid.New(), allErasureClearViewers(hub))
 
 	t.Run("the client is not closed", func(t *testing.T) {
 		assert.True(t, erasureClearSocketOpen(client),
@@ -413,6 +413,14 @@ func TestClearErasedSenderCustomText_FullSendQueueDropsFrameWithoutClosingClient
 	})
 }
 
+func allErasureClearViewers(hub *Hub) map[uuid.UUID]bool {
+	audience := make(map[uuid.UUID]bool, len(hub.userClients))
+	for viewerID := range hub.userClients {
+		audience[viewerID] = true
+	}
+	return audience
+}
+
 // TestClearErasedSenderCustomText_DeliversClearFrameToRichPresenceClient is the
 // happy path: with capacity available the fan-out still delivers.
 func TestClearErasedSenderCustomText_DeliversClearFrameToRichPresenceClient(t *testing.T) {
@@ -421,7 +429,7 @@ func TestClearErasedSenderCustomText_DeliversClearFrameToRichPresenceClient(t *t
 	client.activityRichPresenceCapable = true
 	erasedSender := uuid.New()
 
-	hub.ClearErasedSenderCustomText(erasedSender)
+	hub.ClearErasedSenderCustomText(erasedSender, allErasureClearViewers(hub))
 
 	expected, err := marshalCustomTextFrame(erasedSender, nil)
 	require.NoError(t, err)
@@ -444,7 +452,7 @@ func TestClearErasedSenderCustomText_SkipsClientWithoutRichPresenceCapability(t 
 	capable.activityRichPresenceCapable = true
 	erasedSender := uuid.New()
 
-	hub.ClearErasedSenderCustomText(erasedSender)
+	hub.ClearErasedSenderCustomText(erasedSender, allErasureClearViewers(hub))
 
 	t.Run("the non-rich-presence client receives nothing", func(t *testing.T) {
 		assert.Empty(t, legacy.Send, "a non-rich-presence client must receive nothing")
@@ -480,7 +488,7 @@ func TestClearErasedSenderCustomText_DeliversOneFrameToEveryCapableClient(t *tes
 	}
 
 	erasedSender := uuid.New()
-	hub.ClearErasedSenderCustomText(erasedSender) // ONE bus message
+	hub.ClearErasedSenderCustomText(erasedSender, allErasureClearViewers(hub)) // ONE bus message
 
 	expected, err := marshalCustomTextFrame(erasedSender, nil)
 	require.NoError(t, err)
@@ -495,10 +503,39 @@ func TestClearErasedSenderCustomText_DeliversOneFrameToEveryCapableClient(t *tes
 	}
 }
 
+func TestClearErasedSenderCustomText_DeliversOnlyToPreErasureAudience(t *testing.T) {
+	hub := NewHub(nil, nil)
+	erasedSender := uuid.MustParse("11111111-2222-4333-8444-555555555555")
+	authorizedViewerID := uuid.MustParse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+	unrelatedViewerID := uuid.MustParse("99999999-8888-4777-8666-555555555555")
+
+	// authorizedViewerID is the sole member of the erased sender's captured
+	// pre-erasure Custom Status audience. Passing that audience is the
+	// authorization boundary that distinguishes this viewer from the unrelated
+	// one below.
+	authorizedAudience := map[uuid.UUID]bool{authorizedViewerID: true}
+	require.True(t, authorizedAudience[authorizedViewerID],
+		"precondition: the authorized viewer is in the captured audience")
+	require.False(t, authorizedAudience[unrelatedViewerID],
+		"precondition: the unrelated viewer is outside the captured audience")
+
+	authorizedViewer := connectClient(hub, authorizedViewerID)
+	authorizedViewer.activityRichPresenceCapable = true
+	unrelatedViewer := connectClient(hub, unrelatedViewerID)
+	unrelatedViewer.activityRichPresenceCapable = true
+
+	hub.ClearErasedSenderCustomText(erasedSender, authorizedAudience)
+
+	const audienceOnly = "a post-erasure Custom Status clear is delivered only to connected Rich Presence clients whose user IDs were in the erased sender's pre-erasure authorized Custom Status audience; an unrelated opted-in client receives no frame"
+	assert.Len(t, authorizedViewer.Send, 1,
+		"%s: the authorized-viewer delivery is the positive control", audienceOnly)
+	assert.Empty(t, unrelatedViewer.Send, audienceOnly)
+}
+
 // TestClearErasedSenderCustomText_NilHubReceiverIsNoOp locks the fail-closed
 // nil-receiver guard: a hub-less replica has no local clients to clear, and a
 // panic inside the NATS callback would take the subscriber down.
 func TestClearErasedSenderCustomText_NilHubReceiverIsNoOp(t *testing.T) {
 	var hub *Hub
-	assert.NotPanics(t, func() { hub.ClearErasedSenderCustomText(uuid.New()) })
+	assert.NotPanics(t, func() { hub.ClearErasedSenderCustomText(uuid.New(), nil) })
 }

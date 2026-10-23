@@ -2,6 +2,7 @@ package voice
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -9,10 +10,60 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
+
+var erasureClearTestKey = erasureclear.DeriveKey("synthetic-erasure-clear-test-secret")
+
+func signedErasureClearPayload(t *testing.T, erased uuid.UUID, viewers ...uuid.UUID) []byte {
+	return signedErasureClearChunkPayload(t, erased, 0, viewers...)
+}
+
+func signedErasureClearChunkPayload(t *testing.T, erased uuid.UUID, chunk int, viewers ...uuid.UUID) []byte {
+	t.Helper()
+	viewerIDs := make([]string, 0, len(viewers))
+	for _, viewer := range viewers {
+		viewerIDs = append(viewerIDs, viewer.String())
+	}
+	envelope, err := erasureclear.Seal(erasureClearTestKey, erased.String(), chunk, viewerIDs)
+	require.NoError(t, err)
+	payload, err := json.Marshal(map[string]any{
+		"user_id": erased.String(), "chunk": chunk, "audience": envelope,
+	})
+	require.NoError(t, err)
+	return payload
+}
+
+func TestPresenceErasureClearAdmitsEveryAuthenticatedChunkOnce(t *testing.T) {
+	erased, first, second := uuid.New(), uuid.New(), uuid.New()
+	var o erasureClearObserver
+	s := gatedErasureSubscriber(&o)
+	s.db = withTestDB(t)
+	firstPayload := signedErasureClearChunkPayload(t, erased, 0, first)
+	secondPayload := signedErasureClearChunkPayload(t, erased, 1, second)
+
+	s.handlePresenceErasureCleared(firstPayload)
+	s.handlePresenceErasureCleared(firstPayload)
+	s.handlePresenceErasureCleared(secondPayload)
+
+	require.Equal(t, []map[uuid.UUID]bool{{first: true}, {second: true}}, o.audiences,
+		"each authenticated batch must reach only its own viewers and a replay must be ignored")
+}
+
+func TestPresenceErasureClearLargeAudienceDoesNotExhaustFirstBatchBudget(t *testing.T) {
+	erased := uuid.New()
+	var o erasureClearObserver
+	s := gatedErasureSubscriber(&o)
+	s.db = withTestDB(t)
+	for chunk := range erasureBudgetBurst + 1 {
+		s.handlePresenceErasureCleared(signedErasureClearChunkPayload(t, erased, chunk, uuid.New()))
+	}
+	require.Len(t, o.audiences, erasureBudgetBurst+1,
+		"all authenticated audience batches must reach their viewers even beyond the first-batch budget")
+}
 
 // erasureClearObserver records BOTH sinks the handler could reach: the targeted
 // clear it is supposed to use, and the fleet-wide disconnect it must never use.
@@ -25,14 +76,19 @@ import (
 // (CodeRabbit, PR #2840).
 type erasureClearObserver struct {
 	cleared     []uuid.UUID
+	audiences   []map[uuid.UUID]bool
 	disconnects int
 }
 
 func newErasureClearSubscriber(o *erasureClearObserver) *NATSSubscriber {
 	return &NATSSubscriber{
-		log:                                  logger.New("test"),
-		clearErasedSenderHook:                func(id uuid.UUID) { o.cleared = append(o.cleared, id) },
+		log: logger.New("test"),
+		clearErasedSenderHook: func(id uuid.UUID, audience map[uuid.UUID]bool) {
+			o.cleared = append(o.cleared, id)
+			o.audiences = append(o.audiences, audience)
+		},
 		disconnectAllRichPresenceClientsHook: func() { o.disconnects++ },
+		erasureClearKey:                      erasureClearTestKey,
 	}
 }
 
@@ -48,14 +104,17 @@ func withTestDB(t *testing.T) *sql.DB {
 // The accept path must actually CLEAR, and clear the sender it was told about.
 func TestPresenceErasureClearClearsTheNamedSender(t *testing.T) {
 	erased := uuid.New()
+	viewer := uuid.New()
 	var o erasureClearObserver
 	s := newErasureClearSubscriber(&o)
 	s.db = withTestDB(t) // the row was never inserted, exactly as after an erasure
 
-	s.handlePresenceErasureCleared([]byte(`{"user_id":"` + erased.String() + `"}`))
+	s.handlePresenceErasureCleared(signedErasureClearPayload(t, erased, viewer))
 
 	require.Equal(t, []uuid.UUID{erased}, o.cleared,
 		"an erased account's clear must reach the targeted sink, naming that sender")
+	require.Equal(t, []map[uuid.UUID]bool{{viewer: true}}, o.audiences,
+		"the sink must receive only the audience captured before erasure")
 	require.Zero(t, o.disconnects,
 		"and must never reach the fleet-wide disconnect")
 }
@@ -76,7 +135,7 @@ func TestPresenceErasureClearRejectsALiveAccount(t *testing.T) {
 	s := newErasureClearSubscriber(&o)
 	s.db = db
 
-	s.handlePresenceErasureCleared([]byte(`{"user_id":"` + live.String() + `"}`))
+	s.handlePresenceErasureCleared(signedErasureClearPayload(t, live))
 
 	require.Empty(t, o.cleared, "a live account's status must not be cleared")
 	require.Zero(t, o.disconnects)
@@ -91,6 +150,7 @@ func TestPresenceErasureClearRejectsBadPayloads(t *testing.T) {
 		"empty id":     `{"user_id":""}`,
 		"not a uuid":   `{"user_id":"definitely-not-a-uuid"}`,
 		"wrong type":   `{"user_id":42}`,
+		"bad viewer":   `{"user_id":"` + uuid.NewString() + `","audience":"invalid"}`,
 		"null payload": `null`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -104,6 +164,51 @@ func TestPresenceErasureClearRejectsBadPayloads(t *testing.T) {
 			require.Zero(t, o.disconnects, "and must not escalate to a disconnect")
 		})
 	}
+}
+
+func TestPresenceErasureClearRejectsForgedAudienceBeforeLookup(t *testing.T) {
+	erased := uuid.New()
+	viewer := uuid.New()
+	var o erasureClearObserver
+	s := newErasureClearSubscriber(&o) // no database: authentication precedes lookup
+	payload, err := json.Marshal(map[string]any{
+		"user_id": erased.String(), "audience": viewer.String(),
+	})
+	require.NoError(t, err)
+
+	s.handlePresenceErasureCleared(payload)
+
+	require.Empty(t, o.cleared,
+		"an unauthenticated audience must not reach the erasure-clear sink")
+}
+
+func TestPresenceErasureClearRejectsOversizedPayloadBeforeParsing(t *testing.T) {
+	var o erasureClearObserver
+	s := newErasureClearSubscriber(&o)
+	shed := ""
+	s.ingressShedObservedHook = func(class string) { shed = class }
+
+	s.handlePresenceErasureCleared(make([]byte, erasureclear.MaxEventPayloadBytes+1))
+
+	require.Equal(t, "oversized_payload", shed)
+	require.Empty(t, o.cleared)
+}
+
+func TestPresenceErasureClearRejectsAuthenticatedInvalidViewer(t *testing.T) {
+	erased := uuid.New()
+	envelope, err := erasureclear.Seal(erasureClearTestKey, erased.String(), 0, []string{"not-a-uuid"})
+	require.NoError(t, err)
+	payload, err := json.Marshal(map[string]any{
+		"user_id": erased.String(), "chunk": 0, "audience": envelope,
+	})
+	require.NoError(t, err)
+	var o erasureClearObserver
+	s := newErasureClearSubscriber(&o)
+	s.db = withTestDB(t)
+
+	s.handlePresenceErasureCleared(payload)
+
+	require.Empty(t, o.cleared, "a malformed viewer inside an authenticated event must reach no sink")
 }
 
 // Without a database the claim cannot be authorized at all, so it is refused
@@ -150,7 +255,7 @@ func TestErasureClearNeverFleetDisconnects(t *testing.T) {
 // constant rather than a local literal — this pins that value so a rename cannot
 // silently orphan the subscription.
 func TestErasureClearSubjectMatchesThePublisher(t *testing.T) {
-	require.Equal(t, "presence.erasure.cleared", users.NATSSubjectPresenceErasureCleared)
+	require.Equal(t, "presence.erasure.cleared.v2", users.NATSSubjectPresenceErasureCleared)
 }
 
 // A lookup error must fail OPEN — proceed with the clear rather than suppress
@@ -166,7 +271,7 @@ func TestPresenceErasureClearProceedsWhenTheLookupFails(t *testing.T) {
 	s := newErasureClearSubscriber(&o)
 	s.db = db
 
-	s.handlePresenceErasureCleared([]byte(`{"user_id":"` + erased.String() + `"}`))
+	s.handlePresenceErasureCleared(signedErasureClearPayload(t, erased))
 
 	require.Equal(t, []uuid.UUID{erased}, o.cleared,
 		"a lookup error must not suppress a legitimate clear")

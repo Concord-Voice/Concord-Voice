@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/privacy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
@@ -31,6 +32,7 @@ func buildPrivacyHandler(
 	hub *websocket.Hub,
 	graphPresence presencecapture.GraphPresenceCapture,
 	natsClient *natsclient.Client,
+	controlPlaneSecret string,
 ) (*privacy.Handler, *users.AccountService) {
 	account := users.NewAccountService(db, log)
 	account.SetActivitySettingsCleanupHandler(activityCleanup)
@@ -39,6 +41,7 @@ func buildPrivacyHandler(
 	// service itself rather than trusting that this line still exists.
 	account.SetGraphPresenceCapture(graphPresence)
 	account.SetNATS(natsClient)
+	account.SetErasureClearKey(erasureclear.DeriveKey(controlPlaneSecret))
 	// #2992: the erasure transaction brackets the presence-audience fence, so an
 	// audience computed against the pre-erasure graph cannot be delivered. Returned
 	// alongside the handler so the router's boot guard can interrogate the service

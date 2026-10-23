@@ -20,6 +20,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ingressbudget"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -46,6 +47,7 @@ type NATSSubscriber struct {
 	roomPlacement       *roomplacement.Selector
 	tempGrant           *tempGrantManager
 	activity            *presence.ActivityService
+	erasureClearKey     []byte
 	opsCounters         *opsmetrics.Counters
 	lifecycleDispatchMu sync.Mutex
 	lifecycleDispatcher *voiceLifecycleDispatcher
@@ -97,7 +99,7 @@ type NATSSubscriber struct {
 	// even when the handler never reaches the sink at all. That is precisely
 	// how the erasure-clear tests went vacuous when this handler stopped
 	// disconnecting and started clearing (CodeRabbit, PR #2840).
-	clearErasedSenderHook func(uuid.UUID)
+	clearErasedSenderHook func(uuid.UUID, map[uuid.UUID]bool)
 	// Ingress admission control for the two NATS doors this subscriber
 	// registers (#2854 stage B1). Constants and gate logic live in
 	// ingress_gate.go.
@@ -4040,6 +4042,11 @@ func NewNATSSubscriber(
 	}
 }
 
+// SetErasureClearKey wires the key used to authenticate cross-replica clears.
+func (s *NATSSubscriber) SetErasureClearKey(key []byte) {
+	s.erasureClearKey = append(s.erasureClearKey[:0], key...)
+}
+
 // staleServerVoiceDiscoverySQL finds Server Voice rows whose database-observed
 // lease has expired. The cutoff is read ONCE per pass in a MATERIALIZED CTE
 // rather than written inline against the column.
@@ -5305,25 +5312,20 @@ func (s *NATSSubscriber) Subscribe() error {
 // Defence in depth, not the barrier — "absent" is true of every id that was
 // never a user, so this cannot distinguish a forged id from an erased one.
 //
-// The barrier is the INGRESS BUDGET, not the inertness of the action (#2854
-// stage B1). A single admitted clear is inert for any client that never held
-// the sender's status, but that is a PER-CLIENT property and it does not hold
-// in aggregate: every admitted clear costs one enqueue per Rich Presence client
-// on this replica, under the hub's read lock. Unmetered, that is what a forged
-// flood was buying. This comment previously named the action's inertness as the
-// barrier, which was true when written and became false once #2855 made the
-// fan-out the cost centre.
+// The authenticated audience is the authorization barrier. The ingress budget
+// and ciphertext replay window separately bound work from the shared bus;
+// clearing one viewer is not free when repeated across a large audience.
 //
 // A lookup error therefore still reports "not present" and lets the clear
 // proceed: an unreachable database must not suppress a legitimate erasure
 // clear, which has no TTL and converges only at the viewer's next
-// presence_snapshot. The budget is what makes that arm affordable.
+// presence_snapshot. Exact-envelope dedup bounds replay on that arm.
 // The second return reports whether the answer was actually VERIFIED. It is not
 // decoration: the proceed-on-read-error arm returns "not present" without having
 // established anything, and the caller must not treat an unverified accept as
-// grounds to occupy that principal's dedup slot.
+// grounds to occupy that principal's sender/chunk dedup slot.
 //
-// Without the distinction, a forged clear naming a LIVE user, sent during a
+// Without the distinction, a premature clear naming a LIVE user, sent during a
 // database blip, took the fail-open arm, was accepted, and MARKED that user --
 // so their genuine clear, issued after their real erasure minutes later, was
 // deduped away. That is the exact hazard the mark-on-accept-only rule exists to
@@ -5343,8 +5345,8 @@ func (s *NATSSubscriber) erasedAccountStillExists(erased uuid.UUID) (stillExists
 	).Scan(&stillExists)
 	if queryErr != nil {
 		// Report WHY the probe failed, not merely that it did. This is the
-		// fail-open arm on a right-to-erasure route, and verified=false disables
-		// dedup for the message, so this line is the only signal that
+		// fail-open arm on a right-to-erasure route, and verified=false prevents
+		// sender/chunk dedup, so this line is the only signal that
 		// verification stopped working -- an operator who cannot tell a deadline
 		// from an unavailable pool has two different pages collapsed into one.
 		//
@@ -5405,7 +5407,7 @@ func (s *NATSSubscriber) unwindLifecycleSubscription(
 }
 
 // handlePresenceErasureCleared retracts an erased principal's already-delivered
-// Custom Status on THIS replica, as a targeted clear naming that one sender.
+// Custom Status on THIS replica, as a targeted clear to captured viewers only.
 //
 // It does NOT disconnect. An earlier revision of this comment said it "reuses
 // the conservative disconnect rather than a targeted clear" and proposed
@@ -5416,11 +5418,18 @@ func (s *NATSSubscriber) unwindLifecycleSubscription(
 // and this function had none. Reconciled in #2854 stage B1.
 //
 // Admission ordering is load-bearing and is asserted by tests, not merely
-// described here: dedup, then budget, then the nil-database refusal, then the
-// existence check, and only then the dedup mark. See the comments at each step.
+// described here: payload bound, accepted-envelope dedup, authentication,
+// sender/chunk dedup, budget, nil-database refusal, existence check, then the
+// appropriate accept-path dedup marks.
 func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
+	if len(data) > erasureclear.MaxEventPayloadBytes {
+		s.erasureShed("oversized_payload")
+		return
+	}
 	var payload struct {
-		UserID string `json:"user_id"`
+		UserID   string `json:"user_id"`
+		Chunk    int    `json:"chunk"`
+		Audience string `json:"audience"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		// Aggregated, not per message. These two arms sit AHEAD of the dedup and
@@ -5436,38 +5445,63 @@ func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
 		s.erasureShed("invalid_user") // aggregated -- see the note above
 		return
 	}
+	// Only accepted, authenticated envelopes enter this replay window. A repeat
+	// can be shed before JWE decrypts or rebuilds its potentially large audience.
+	fingerprint := erasureclear.Fingerprint(payload.Audience)
+	envelopeKey := fmt.Sprintf("envelope:%x", fingerprint)
+	if s.erasureSeen.Seen(envelopeKey) {
+		s.erasureShed("replay")
+		return
+	}
+	viewerIDs, openErr := erasureclear.Open(s.erasureClearKey, payload.UserID, payload.Chunk, payload.Audience)
+	if openErr != nil {
+		s.erasureShed("invalid_envelope")
+		return
+	}
+	audience := make(map[uuid.UUID]bool, len(viewerIDs))
+	for _, rawViewerID := range viewerIDs {
+		viewerID, parseErr := uuid.Parse(rawViewerID)
+		if parseErr != nil || viewerID == erased {
+			s.erasureShed("invalid_viewer")
+			return
+		}
+		audience[viewerID] = true
+	}
 
 	// Ingress admission (#2854 B1). DEDUP BEFORE BUDGET, deliberately.
 	//
 	// The cheapest high-amplification attack is replaying one captured message.
 	// Rejecting it here costs the attacker everything and costs the budget
-	// nothing, so a genuine clear arriving during a same-UUID flood still has
+	// nothing, so a genuine clear arriving during a same-chunk replay still has
 	// budget to spend. Budget-first starves it -- which is why the ordering is
 	// locked by TestAFloodOfOneUUIDDoesNotStarveAGenuineClearForAnother rather
 	// than merely commented.
 	//
 	// Both also sit ahead of the database round-trip below, so a replay costs
 	// zero queries.
-	if s.erasureSeen.Seen(erased.String()) {
+	chunkKey := fmt.Sprintf("%s:%d", erased, payload.Chunk)
+	// A read error accepts the clear without marking the sender/chunk slot, so
+	// a later genuine deletion remains admissible. The same captured envelope
+	// must still be shed before another database probe or fan-out. A real later
+	// publish has a fresh nonce and therefore a different fingerprint.
+	if s.erasureSeen.Seen(chunkKey) {
 		s.erasureShed("replay")
 		return
 	}
-	if !s.erasureBudget.Allow() {
+	// The envelope authenticates the chunk number. Charge the sender's first
+	// batch to the global budget; later batches must not consume one token each
+	// and strand large, otherwise legitimate audiences after batch 32 would
+	// keep stale status for the rest of the session.
+	if payload.Chunk == 0 && !s.erasureBudget.Allow() {
 		s.erasureShed("ingress_budget")
 		return
 	}
 
 	// Confirm the account is actually gone before acting.
 	//
-	// A UUID check alone is only syntactic, and this handler's blast radius is
-	// every Rich Presence client on this replica. NATS carries no per-service
-	// authorization in this deployment (the media-plane, which terminates
-	// untrusted WebRTC traffic, shares the same bus), so a syntactically valid
-	// message from anywhere on that network would otherwise be an arbitrarily
-	// repeatable fleet-wide session-teardown primitive. The users row is the
-	// authoritative post-erasure signal, and it makes a forged or replayed
-	// message a no-op (security review, PR #2840; also raised by Gitar and the
-	// RBAC review).
+	// The encrypted envelope above authenticates the audience and sender on the
+	// shared NATS bus. The users row is a second, authoritative post-erasure
+	// check: a valid but premature event must not clear a live account.
 	//
 	// TWO DIFFERENT QUESTIONS, TWO DIFFERENT ANSWERS. This block previously
 	// stated both in adjacent paragraphs using "open" and "closed" in opposite
@@ -5498,43 +5532,37 @@ func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
 
 	// A targeted CLEAR for this one sender, not a fleet-wide disconnect.
 	//
-	// The disconnect was a denial-of-service primitive: red-team PoCs on PR #2840
-	// proved a forged publish carrying ANY random UUID reached it (the existence
-	// check accepts "absent", and every id that was never a user is absent), that
-	// a genuine message could be replayed without bound, and that a lookup error
-	// fell open into it. Making the action proportional to the claim removes all
-	// three at once — a client that never held this sender's status ignores the
-	// frame, so a forged or replayed clear is inert rather than destructive.
+	// The former disconnect was a denial-of-service primitive reached by forged
+	// or replayed messages. This clear is limited to authenticated viewer batches
+	// and remains non-disconnecting when a client queue is full.
 	//
 	// The existence check above is retained as defence in depth, not as the
 	// barrier: it rejects the one case it genuinely proves wrong, a clear naming
 	// an account that still exists.
 	// Mark ONLY here, on the accept path (#2854 B1). Marking on any rejection
-	// arm would let a forged clear naming a still-existing user occupy that
-	// user's dedup slot and suppress their genuine clear after the real erasure.
+	// arm would let a premature event naming a still-existing user occupy that
+	// user's dedup slot and suppress its clear after the real erasure.
 	// Locked by TestARejectedClearDoesNotPoisonTheDedupSlot.
 	//
 	// This is why ingressbudget.Window splits Seen from Mark: a combined
 	// SeenOrMark would make the invariant inexpressible at the type level.
-	// Mark only on a VERIFIED accept. The proceed-on-read-error arm above
-	// accepts without having established anything, and marking there would let a
-	// forged clear naming a LIVE user occupy that user's slot during a database
-	// blip and suppress their genuine clear after the real erasure (finding C6).
-	// An unverified accept therefore still clears -- that posture is deliberate
-	// and unchanged -- it simply buys no dedup credit.
+	// Mark the sender/chunk key only on a VERIFIED accept. An unverified accept
+	// cannot reserve that slot against a later real deletion (finding C6), but
+	// its exact authenticated ciphertext is marked to shed captured-message
+	// replays during a database outage.
 	if verified {
-		s.erasureSeen.Mark(erased.String())
+		s.erasureSeen.Mark(chunkKey)
 	}
+	s.erasureSeen.Mark(envelopeKey)
 	// This replica may have a Server Voice delivery for this sender already
 	// between its subject-state check and final admission. Fence that sender only:
-	// forged distinct UUIDs are admissible at this untrusted NATS boundary and
-	// must not churn unrelated lifecycle retries.
+	// each accepted event must not churn unrelated lifecycle retries.
 	if s.hub != nil {
 		s.hub.InvalidateServerVoiceParticipantDelivery(erased)
 	}
 
 	if s.clearErasedSenderHook != nil {
-		s.clearErasedSenderHook(erased)
+		s.clearErasedSenderHook(erased, audience)
 		return
 	}
 	// Kept for its diagnostic value only: it tells an operator a clear was
@@ -5550,7 +5578,7 @@ func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
 		s.log.Error("Presence erasure clear skipped", "failure_class", "no_hub")
 		return
 	}
-	s.hub.ClearErasedSenderCustomText(erased)
+	s.hub.ClearErasedSenderCustomText(erased, audience)
 }
 
 // handleVoiceLifecycleDispatchOverflow reports dispatcher drops. It does NOT
