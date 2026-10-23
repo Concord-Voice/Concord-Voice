@@ -75,6 +75,14 @@ func (s *Service) CheckoutSession(c *gin.Context) {
 		abortWebhook(c, http.StatusServiceUnavailable, portalErrUnavailable)
 		return
 	}
+	// Uncached, like the price: the coupon is what the session applies.
+	if s.foundersActive() {
+		if err := s.verifyFoundersCoupon(ctx); err != nil {
+			s.logCatalogFailure(err)
+			abortWebhook(c, http.StatusServiceUnavailable, portalErrUnavailable)
+			return
+		}
+	}
 	if !s.checkoutPreconditions(c, userID) {
 		return
 	}

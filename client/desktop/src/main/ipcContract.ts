@@ -300,8 +300,18 @@
  *        below 31 omits them, which leaves the modal without a security key, without
  *        the server check and on the strongest method — the pre-31 behaviour.
  *        Capability, not demand.
+ * - v32: `billing:open` opens Stripe's hosted Checkout or Customer Portal in a
+ *        modal sheet (#1305, #2033 PR-3b). Main validates the sender frame and
+ *        requires the URL's host to be exactly the kind's Stripe host; the view
+ *        is sandboxed with no preload on an in-memory partition, and its main
+ *        frame may navigate only to Stripe's hosts.
+ *
+ *        The SERVER's spaIpcContract stays 19: the renderer feature-detects
+ *        `typeof globalThis.electron?.openBilling === 'function'`, and a shell
+ *        below 32 gets no paid controls (no OS-browser fallback, spec R41).
+ *        Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 31;
+export const IPC_CONTRACT_VERSION = 32;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.

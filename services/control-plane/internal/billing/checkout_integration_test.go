@@ -231,6 +231,33 @@ func TestCheckout_ArchivedPriceIs503(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, postCheckout(env.Svc, dbtest.CreateUser(t, env.DB), `{"plan":"wing","interval":"month"}`).Code)
 }
 
+func TestCheckout_FoundersCouponDriftIs503(t *testing.T) {
+	for field, edit := range couponDrifts {
+		t.Run(field, func(t *testing.T) {
+			env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+			driftCoupon(env.Fake, edit)
+			requireError(t, postCheckout(env.Svc, dbtest.CreateUser(t, env.DB), bodyWingYearly), http.StatusServiceUnavailable, "billing_unavailable")
+			assert.Empty(t, env.Fake.writes(), "no Customer and no session")
+		})
+	}
+}
+
+// Checkout reads the coupon itself: a /plans response cached before the drift
+// does not let a purchase through.
+func TestCheckout_FoundersCouponCheckedUncached(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	require.Equal(t, http.StatusOK, getPlans(env.Svc, uuid.New()).Code)
+	driftCoupon(env.Fake, couponDrifts["percent_off"])
+	requireError(t, postCheckout(env.Svc, dbtest.CreateUser(t, env.DB), bodyWingYearly), http.StatusServiceUnavailable, "billing_unavailable")
+}
+
+func TestCheckout_FoundersEndedIgnoresCoupon(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	*env.Now = testCutoff
+	driftCoupon(env.Fake, nil)
+	assert.Equal(t, http.StatusCreated, postCheckout(env.Svc, dbtest.CreateUser(t, env.DB), bodyWingYearly).Code)
+}
+
 func TestCheckout_DeletedCustomerSelfHeals(t *testing.T) {
 	for name, body := range map[string]string{
 		"param customer": customerMissingParamBody,

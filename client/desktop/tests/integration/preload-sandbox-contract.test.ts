@@ -84,4 +84,10 @@ describe('preload sandbox contract (integration)', () => {
     );
     expect(content).not.toMatch(/exposeInMainWorld\([^,]+,\s*ipcRenderer\s*\)/);
   });
+
+  it('exposes the billing launcher channel (#1305)', () => {
+    const content = readFileSync(preloadPath, 'utf-8');
+    expect(content).toContain('billing:open');
+    expect(content).toMatch(/openBilling[\s\S]*ipcRenderer\.invoke\(['"]billing:open['"]/);
+  });
 });

@@ -8,6 +8,8 @@ import { cancelActiveAppleFlow } from './oauth/apple/appleFlow';
 import { cancelActiveGoogleFlow } from './oauth/google/googleFlow';
 import { registerAttestationIpc } from './ipc/attestation';
 import { registerAudiocapIpc } from './ipc/audiocap';
+import { registerBillingIpc } from './ipc/billing';
+import { isBillingWebContents } from './billing/billingWindow';
 import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/windowControls';
 import { initTray, destroyTray, isTrayActive } from './tray';
 import {
@@ -1629,6 +1631,8 @@ app.whenReady().then(async () => {
   // `registerWindowControlsIpc(() => mainWindow)`: `createWindow` has not run yet here, and
   // the `closed` handler nulls the variable.
   registerAudiocapIpc(getRemoteSpaBaseUrl, () => mainWindow);
+  // Billing launcher (#1305): sender-fenced, Stripe-host-validated, opens a modal sheet.
+  registerBillingIpc(getRemoteSpaBaseUrl, () => mainWindow);
   // Permission request handler: explicitly allow app-required permissions, deny risky ones.
   // Notifications are allowed (JIT-managed by permissionManager #197).
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
@@ -3151,6 +3155,8 @@ app.on('web-contents-created', (_, contents) => {
   contents.setWindowOpenHandler(externalizeWindowOpen);
 
   contents.on('will-navigate', (event, navigationUrl) => {
+    // The billing view runs its own Stripe-only gate (billing/billingWindow.ts).
+    if (isBillingWebContents(contents)) return;
     let parsedUrl: URL;
     try {
       parsedUrl = new URL(navigationUrl);

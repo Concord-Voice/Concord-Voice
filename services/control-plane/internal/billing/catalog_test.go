@@ -290,3 +290,61 @@ func TestResolvePrice_UncachedAndActiveOnly(t *testing.T) {
 	_, err = env.Svc.resolvePrice(t.Context(), "platinum", "month")
 	assert.ErrorIs(t, err, errUnknownPlan)
 }
+
+// couponDrifts are the founders-coupon edits the runtime check refuses; nil
+// removes the coupon.
+var couponDrifts = map[string]func(*fakeCoupon){
+	"percent_off":     func(c *fakeCoupon) { c.PercentOff = 40 },
+	"duration":        func(c *fakeCoupon) { c.Duration = "once" },
+	"applies_to":      func(c *fakeCoupon) { c.AppliesTo = &fakeCouponAppliesTo{Products: []string{"prod_S"}} },
+	"redeem_by":       func(c *fakeCoupon) { c.RedeemBy = testCutoff.Unix() },
+	"max_redemptions": func(c *fakeCoupon) { c.MaxRedemptions = 5 },
+	"valid":           func(c *fakeCoupon) { c.Valid = false },
+	"missing":         nil,
+}
+
+func driftCoupon(f *fakeStripe, edit func(*fakeCoupon)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if edit == nil {
+		delete(f.coupons, CouponFoundersID)
+		return
+	}
+	edit(f.coupons[CouponFoundersID])
+}
+
+func TestPlans_FoundersCouponDriftIs503(t *testing.T) {
+	for field, edit := range couponDrifts {
+		t.Run(field, func(t *testing.T) {
+			env := newPlanEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+			driftCoupon(env.Fake, edit)
+			w := getPlans(env.Svc, uuid.New())
+			assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+			assert.JSONEq(t, `{"error":"catalog_unavailable"}`, w.Body.String())
+			assert.Contains(t, env.Logs.String(), "founders-50 coupon", "the log names the coupon")
+			want := "field " + field // "field valid" so a stray "invalid" cannot match
+			if edit == nil {
+				want = "coupon missing"
+			}
+			assert.Contains(t, env.Logs.String(), want, "the log names the drifted field")
+		})
+	}
+}
+
+func TestPlans_FoundersEndedIgnoresCoupon(t *testing.T) {
+	env := newPlanEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	*env.Now = testCutoff
+	driftCoupon(env.Fake, nil)
+	assert.Equal(t, http.StatusOK, getPlans(env.Svc, uuid.New()).Code)
+	assert.Empty(t, env.Fake.requestsTo(http.MethodGet, "/v1/coupons/"+CouponFoundersID), "no coupon read once founders pricing ended")
+}
+
+func TestPlans_FoundersCouponStripeErrorIs503(t *testing.T) {
+	env := newPlanEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	env.Fake.failOn(http.MethodGet, "/v1/coupons/"+CouponFoundersID, http.StatusInternalServerError, serverErrorBody)
+	w := getPlans(env.Svc, uuid.New())
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.JSONEq(t, `{"error":"catalog_unavailable"}`, w.Body.String())
+	assert.Contains(t, env.Logs.String(), "reading the founders-50 coupon from Stripe failed", "a coupon read failure is logged as one")
+	assert.NotContains(t, env.Logs.String(), "price catalog failed")
+}

@@ -163,8 +163,34 @@ func (s *Service) catalog(ctx context.Context) ([]sellablePrice, error) {
 		}
 		prices = append(prices, sellablePrice{plan: o.plan, interval: string(o.interval), currency: string(p.Currency), unitAmount: p.UnitAmount})
 	}
+	if s.foundersActive() {
+		if err := s.verifyFoundersCoupon(ctx); err != nil {
+			return nil, err
+		}
+	}
 	s.catalogCache.set(prices, s.now().Add(catalogCacheTTL))
 	return prices, nil
+}
+
+// errCouponUnavailable means founders pricing is active but the founders-50
+// coupon is missing or differs from the catalog, so the discount /plans
+// advertises is not the one Checkout would apply.
+var errCouponUnavailable = errors.New("billing: the founders-50 coupon is missing or does not match")
+
+// verifyFoundersCoupon reads founders-50 from Stripe and checks it with the
+// bootstrap's own rule (Codex review of #4045, deferred to PR-3b).
+func (s *Service) verifyFoundersCoupon(ctx context.Context) error {
+	coupon, err := findCoupon(ctx, s.Stripe)
+	switch {
+	case err != nil:
+		return withStage("retrieve_coupon", err)
+	case coupon == nil:
+		return fmt.Errorf("%w: coupon missing", errCouponUnavailable)
+	}
+	if field := couponMismatch(coupon); field != "" {
+		return fmt.Errorf("%w: field %s", errCouponUnavailable, field)
+	}
+	return nil
 }
 
 // planEntry is one element of the /plans response.
@@ -224,9 +250,19 @@ func (s *Service) Plans(c *gin.Context) {
 // the lookup key so the operator can fix the catalog (runbook); a Stripe
 // failure logs its class and stage.
 func (s *Service) logCatalogFailure(err error) {
+	if errors.Is(err, errCouponUnavailable) {
+		s.Log.Error("billing: the founders-50 coupon is missing or does not match the catalog; check it in the Dashboard (runbook)",
+			"detail", err.Error())
+		return
+	}
 	if errors.Is(err, errPriceUnavailable) {
 		s.Log.Error("billing: the Stripe price catalog is incomplete or does not match; run the Stripe bootstrap or check for archived prices",
 			"detail", err.Error())
+		return
+	}
+	if errorStage(err) == "retrieve_coupon" {
+		s.Log.Error("billing: reading the founders-50 coupon from Stripe failed",
+			logKeyErrorClass, errorClass(err), logKeyStage, "retrieve_coupon")
 		return
 	}
 	s.Log.Error("billing: reading the Stripe price catalog failed",

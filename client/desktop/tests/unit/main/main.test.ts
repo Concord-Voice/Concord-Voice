@@ -366,6 +366,12 @@ vi.mock('../../../src/main/permissionManager', () => ({
   registerIpcHandlers: vi.fn(),
 }));
 
+vi.mock('../../../src/main/billing/billingWindow', () => ({
+  isBillingWebContents: vi.fn(() => false),
+  openBillingWindow: vi.fn(),
+  validateBillingUrl: vi.fn(),
+}));
+
 // ── Import + extract ───────────────────────────────────────────────────
 
 type HandlerFn = (...args: unknown[]) => unknown;
@@ -4647,6 +4653,27 @@ describe('main.ts', () => {
       const event2 = { preventDefault: vi.fn() };
       willNavigate(event2, 'https://evil.com/steal');
       expect(event2.preventDefault).toHaveBeenCalled();
+    });
+
+    it('leaves the billing launcher view to its own Stripe gate (#1305)', async () => {
+      const { app, shell } = await import('electron');
+      const { isBillingWebContents } = await import('../../../src/main/billing/billingWindow');
+      const webContentsCreated = (app.on as Mock).mock.calls.find(
+        (c: unknown[]) => c[0] === 'web-contents-created'
+      );
+      const mockContents = createMockContents();
+      webContentsCreated![1]({}, mockContents);
+      const willNavigate = mockContents.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'will-navigate'
+      )![1] as (event: { preventDefault: () => void }, url: string) => void;
+
+      (shell.openExternal as Mock).mockClear();
+      (isBillingWebContents as Mock).mockReturnValueOnce(true);
+      const event = { preventDefault: vi.fn() };
+      willNavigate(event, 'https://pay.concordvoice.com/c/pay/cs_test_a1');
+      expect(isBillingWebContents).toHaveBeenCalledWith(mockContents);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+      expect(shell.openExternal).not.toHaveBeenCalled();
     });
 
     it('externalizes https: navigation in dev mode after preventDefault', async () => {

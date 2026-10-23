@@ -444,6 +444,23 @@ contextBridge.exposeInMainWorld('electron', {
       reason?: 'untrusted-sender' | 'invalid-args' | 'too-large' | 'write-failed';
     }>,
 
+  // Open Stripe Checkout or the Customer Portal in a modal launcher window
+  // (#1305, IPC contract 32). Main re-checks the sender frame and requires the
+  // URL's host to be exactly the Stripe custom domain; it resolves when the
+  // window closes. A shell below 32 lacks this, and the renderer shows no paid
+  // controls (no OS-browser fallback, spec R41).
+  openBilling: (req: { kind: 'checkout' | 'portal'; url: string }) =>
+    ipcRenderer.invoke('billing:open', req) as Promise<{
+      result:
+        | 'success'
+        | 'cancel'
+        | 'already_subscribed'
+        | 'returned'
+        | 'closed'
+        | 'load_failed'
+        | 'busy';
+    }>,
+
   // SSO loopback HTTP server bridge (#270, extended for Apple in #271): main
   // process owns a 127.0.0.1 ephemeral-port server that captures the OAuth
   // callback. Renderer drives the provider redirect via the system browser
@@ -888,6 +905,14 @@ export interface ElectronAPI {
     ok: boolean;
     canceled?: boolean;
     reason?: 'untrusted-sender' | 'invalid-args' | 'too-large' | 'write-failed';
+  }>;
+
+  // Open Stripe Checkout or the Customer Portal in the billing launcher (#1305).
+  // Optional: absent on shells below IPC contract 32, so callers must
+  // feature-detect it and hide paid controls when it is missing.
+  openBilling?: (req: { kind: 'checkout' | 'portal'; url: string }) => Promise<{
+    result:
+      'success' | 'cancel' | 'already_subscribed' | 'returned' | 'closed' | 'load_failed' | 'busy';
   }>;
 
   // SSO loopback HTTP server bridge (#270, extended for Apple in #271)
