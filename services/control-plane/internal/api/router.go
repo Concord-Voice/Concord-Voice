@@ -1771,6 +1771,16 @@ func NewRouter(
 				subscriptionsHandler.GetMe,
 			)
 
+			// Sellable plans (#2033 PR-3): pending-OK like /subscriptions/me, so
+			// the Settings page can show prices before email verification.
+			// Buying needs a verified email (checkout-session, below).
+			if billingSvc != nil {
+				authRequired.GET("/billing/plans",
+					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+					billingSvc.Plans,
+				)
+			}
+
 			// Privacy endpoints — GDPR Article 17 erasure.
 			// Mounted in the pending-OK tier so users can erase their data
 			// even before email verification completes.
@@ -1800,6 +1810,12 @@ func NewRouter(
 				protected.POST("/billing/portal-session",
 					middleware.RateLimitByUser(redis, 10, 10*time.Minute),
 					billingSvc.PortalSession,
+				)
+				// Stripe Checkout (#2033 PR-3): gated by BILLING_PURCHASE_MODE
+				// inside the handler.
+				protected.POST("/billing/checkout-session",
+					middleware.RateLimitByUser(redis, 5, 10*time.Minute),
+					billingSvc.CheckoutSession,
 				)
 			}
 			// WebSocket ticket (short-lived, single-use)

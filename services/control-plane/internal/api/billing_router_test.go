@@ -25,6 +25,8 @@ const (
 	billingWebhookPath = "/api/v1/billing/stripe/webhook"
 	billingPortalPath  = "/api/v1/billing/portal-session"
 	billingMePath      = "/api/v1/subscriptions/me"
+	billingPlansPath   = "/api/v1/billing/plans"
+	billingCheckout    = "/api/v1/billing/checkout-session"
 )
 
 // billingRouter builds the production router (api.NewRouter) over the test
@@ -82,18 +84,35 @@ func TestRouter_BillingRoutesOnlyWhenConfigured(t *testing.T) {
 		router := billingRouter(t, ts, config.InstanceTypeSaaS, false)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingWebhookPath, "{}", badSignature).Code)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingPortalPath, "{}", jsonHeader).Code)
+		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodGet, billingPlansPath, "", nil).Code)
+		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingCheckout, "{}", jsonHeader).Code)
 	})
 
 	t.Run("self-hosted with keys: neither route exists", func(t *testing.T) {
 		router := billingRouter(t, ts, config.InstanceTypeSelfHosted, true)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingWebhookPath, "{}", badSignature).Code)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingPortalPath, "{}", jsonHeader).Code)
+		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodGet, billingPlansPath, "", nil).Code)
+		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingCheckout, "{}", jsonHeader).Code)
 	})
 
 	t.Run("test key: webhook rejects a bad signature, portal needs auth", func(t *testing.T) {
 		router := billingRouter(t, ts, config.InstanceTypeSaaS, true)
 		assert.Equal(t, http.StatusBadRequest, serve(router, http.MethodPost, billingWebhookPath, "{}", badSignature).Code)
 		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodPost, billingPortalPath, "{}", jsonHeader).Code)
+		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodGet, billingPlansPath, "", nil).Code)
+		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodPost, billingCheckout, "{}", jsonHeader).Code)
+	})
+
+	// Buying needs a verified email; the verified-email gate answers before
+	// the handler, so no Stripe call is made.
+	t.Run("test key: checkout refuses an unverified user", func(t *testing.T) {
+		router := billingRouter(t, ts, config.InstanceTypeSaaS, true)
+		pending := ts.CreateTestUserUnverified(t, "billing-pending")
+		headers := testhelpers.AuthHeaders(pending.AccessToken)
+		headers.Set("Content-Type", "application/json")
+		w := serve(router, http.MethodPost, billingCheckout, `{"plan":"wing","interval":"year"}`, headers)
+		assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
 	})
 }
 

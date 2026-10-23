@@ -48,6 +48,16 @@ type fakeStripe struct {
 	// an Idempotency-Key whose object was since deleted: a "created" object
 	// that nothing stores, so a later retrieve finds no such object.
 	replayed map[string]bool
+	// Checkout (PR-3): customerKeys maps an Idempotency-Key to the customer it
+	// created, so a replayed create returns the same id, as Stripe does.
+	// missingOnSession maps a customer to the resource_missing body its next
+	// session create answers. onCustomerCreate, when set, runs
+	// after a customer create is stored and before it is answered.
+	customerKeys     map[string]string
+	missingOnSession map[string]string
+	onCustomerCreate func()
+	// onSessionCreate, when set, runs after a session create is stored.
+	onSessionCreate func()
 }
 
 type fakeRequest struct {
@@ -153,11 +163,12 @@ type fakeDiscountSource struct {
 }
 
 type fakeSession struct {
-	ID       string `json:"id"`
-	Object   string `json:"object"`
-	Customer string `json:"customer"`
-	Status   string `json:"status"`
-	URL      string `json:"url"`
+	ID        string `json:"id"`
+	Object    string `json:"object"`
+	Customer  string `json:"customer"`
+	Status    string `json:"status"`
+	URL       string `json:"url"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
 type fakePortalSession struct {
@@ -207,6 +218,8 @@ func newFakeStripe(t *testing.T) *fakeStripe {
 		replayed:  map[string]bool{},
 
 		deletedCustomers: map[string]bool{},
+		customerKeys:     map[string]string{},
+		missingOnSession: map[string]string{},
 	}
 }
 
@@ -252,6 +265,8 @@ func (f *fakeStripe) handler() http.Handler {
 	mux.HandleFunc("GET /v1/checkout/sessions", f.listSessions)
 	mux.HandleFunc("POST /v1/checkout/sessions/{id}/expire", f.expireSession)
 	mux.HandleFunc("POST /v1/billing_portal/sessions", f.createPortalSession)
+	mux.HandleFunc("POST /v1/customers", f.createCustomer)
+	mux.HandleFunc("POST /v1/checkout/sessions", f.createSession)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()

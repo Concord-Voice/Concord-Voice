@@ -114,7 +114,7 @@ func (p *portalConfigCache) clear() {
 
 // PortalSession is the Gin handler for POST /api/v1/billing/portal-session.
 func (s *Service) PortalSession(c *gin.Context) {
-	req, ok := bindPortalRequest(c)
+	req, ok := bindStrictJSON(c, portalMaxBody, func(r portalRequest) bool { return validPortalFlow(r.Flow) })
 	if !ok {
 		return
 	}
@@ -150,28 +150,29 @@ func (s *Service) PortalSession(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"url": session.URL})
 }
 
-// bindPortalRequest applies the byte cap and the strict full-document read
-// this repo requires of every JSON handler (compare dm's expiration request):
+// bindStrictJSON applies the byte cap and the strict full-document read this
+// repo requires of every JSON handler (compare dm's expiration request):
 // MaxBytesReader alone is not enough, because the decoder may stop after the
 // first value without reading the rest, so the cached body is re-checked with
-// json.Valid. 413 is decided before 400.
-func bindPortalRequest(c *gin.Context) (portalRequest, bool) {
-	var req portalRequest
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, portalMaxBody)
+// json.Valid. 413 is decided before 400. valid checks the decoded fields; a
+// false is the same 400. The Portal and Checkout share it.
+func bindStrictJSON[T any](c *gin.Context, limit int64, valid func(T) bool) (T, bool) {
+	var req, zero T
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			abortWebhook(c, http.StatusRequestEntityTooLarge, portalErrTooLarge)
-			return portalRequest{}, false
+			return zero, false
 		}
 		abortWebhook(c, http.StatusBadRequest, portalErrInvalid)
-		return portalRequest{}, false
+		return zero, false
 	}
 	body, _ := c.Get(gin.BodyBytesKey)
 	raw, isBytes := body.([]byte)
-	if !isBytes || !json.Valid(raw) || !validPortalFlow(req.Flow) {
+	if !isBytes || !json.Valid(raw) || !valid(req) {
 		abortWebhook(c, http.StatusBadRequest, portalErrInvalid)
-		return portalRequest{}, false
+		return zero, false
 	}
 	return req, true
 }

@@ -244,7 +244,7 @@ func (s *Service) expireOpenSessions(ctx context.Context, cusID string) error {
 		case isSessionNoLongerOpen(err):
 			s.logSessionNoLongerOpen(id, err)
 		default:
-			return withStage("expire_session", fmt.Errorf("billing: outbox: expire checkout session: %w", err))
+			return withStage("expire_session", fmt.Errorf("billing: expire checkout session: %w", err))
 		}
 	}
 	return nil

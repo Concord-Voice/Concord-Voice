@@ -13573,6 +13573,193 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /billing/plans:
+    get:
+      tags:
+      - Platform
+      summary: List the sellable subscription plans
+      description: 'Returns the four sellable plans (Supersonic and Wing, monthly
+        and yearly) with their Stripe prices, and whether the caller may buy one now
+        (#2033). Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Pending users (email not
+        yet verified) may call it.
+
+
+        `purchase_available` follows `BILLING_PURCHASE_MODE`: false when the mode is
+        `off` or the caller is not on the allowlist, true when the mode is `on` or the
+        caller is allowlisted. The two "false" causes are not told apart. While
+        founders pricing runs (before `FOUNDERS_PRICING_ENDS_AT`), `founders.ends_at`
+        and each plan''s `founders_unit_amount` are present; the founders amount is
+        half the unit amount rounded down to a whole cent.
+
+
+        The catalog is read from Stripe and cached for 60 seconds. It is never
+        partial: if any of the four prices is missing, archived or does not match,
+        the answer is 503 `catalog_unavailable`. The response is `Cache-Control: no-store`.
+
+
+        Rate limit: 30 requests per minute.
+
+        '
+      operationId: listBillingPlans
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: The plan catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [purchase_available, founders, plans]
+                properties:
+                  purchase_available:
+                    type: boolean
+                    description: Whether the caller may start a Checkout now
+                  founders:
+                    type: object
+                    required: [active]
+                    properties:
+                      active:
+                        type: boolean
+                      ends_at:
+                        type: string
+                        format: date-time
+                        description: When founders pricing ends. Present only while active.
+                  plans:
+                    type: array
+                    minItems: 4
+                    maxItems: 4
+                    description: Supersonic monthly, Supersonic yearly, Wing monthly, Wing yearly, in that order
+                    items:
+                      type: object
+                      required: [plan, interval, currency, unit_amount]
+                      properties:
+                        plan:
+                          type: string
+                          enum: [supersonic, wing]
+                        interval:
+                          type: string
+                          enum: [month, year]
+                        currency:
+                          type: string
+                          enum: [usd]
+                        unit_amount:
+                          type: integer
+                          format: int64
+                          description: Price per interval in cents
+                        founders_unit_amount:
+                          type: integer
+                          format: int64
+                          description: Founders price per interval in cents, rounded down. Present only while founders pricing is active.
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`catalog_unavailable`: Stripe could not be read, or a catalog price is missing, archived or mismatched'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/checkout-session:
+    post:
+      tags:
+      - Platform
+      summary: Start a Stripe Checkout for a plan
+      description: 'Returns a Stripe Checkout URL for the chosen plan and interval
+        (#2033). Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Requires a verified email.
+
+
+        Gated by `BILLING_PURCHASE_MODE`: when the mode is `off` or the caller is not
+        on the allowlist, the answer is 503 `purchase_unavailable` (one body for both).
+        The server picks everything else: the active Stripe price for the plan, the
+        caller''s Stripe Customer (created on first use, with no email or name), the
+        founders discount while founders pricing runs, card as the only payment
+        method, a 35-minute expiry, and fixed return URLs. Any open Checkout of the
+        caller is expired first.
+
+
+        Rate limit: 5 requests per 10 minutes.
+
+        '
+      operationId: createBillingCheckoutSession
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan, interval]
+              properties:
+                plan:
+                  type: string
+                  enum: [supersonic, wing]
+                interval:
+                  type: string
+                  enum: [month, year]
+      responses:
+        '201':
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expires_at]
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                    description: One-time Stripe-hosted Checkout URL
+                  expires_at:
+                    type: string
+                    format: date-time
+                    description: When the session stops accepting payment
+        '400':
+          description: '`invalid_request`: the body is not exactly one JSON object naming a sold plan and interval'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: '`manage_existing`: the caller already has a live Stripe subscription; manage it in the Portal'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`purchase_unavailable`: purchasing is off or the caller is not allowlisted. `billing_unavailable`: Stripe failed, the price for the plan is not active, or the account was erased during the request.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/audit-log:
     get:
       tags:

@@ -67,6 +67,9 @@ type Service struct {
 	// portalConfig caches the resolved Customer Portal configuration id (Task 6).
 	portalConfig portalConfigCache
 
+	// catalogCache holds the last successful /plans catalog (PR-3).
+	catalogCache catalogCache
+
 	// discovery remembers when the drift worker last checked each Stripe
 	// customer for subscriptions it holds no row for, so every candidate gets a
 	// turn. It lives in process memory (replicas are pinned to 1; a restart only
