@@ -56,18 +56,7 @@ func (s *Store) step11(ctx context.Context, st *txState, d policy.Decision, newS
 	entry := ac.EntryDigest(rb)
 	var drb, dsig []byte
 	if rq.DI != nil {
-		if newSet == nil {
-			newSet = h.DeviceSet
-		}
-		sd, err := ac.DeviceSetDigest(newSet)
-		if err != nil {
-			return s.storeError()
-		}
-		drb = ac.DeviceResult{RealmID: res.RealmID, AccountID: res.AccountID, RequestID: res.RequestID,
-			DeviceIntentDigest: rq.D, Op: res.Op, Dseq: h.Dseq + 1, // #7 "": attached (DoR:446, B1-D9)
-			PrevDeviceEntryDigest: h.DeviceHead, ChainSeq: res.Seq, ChainEntryDigest: entry, DeviceSetDigest: sd,
-			IssuedAtMs: st.now, DelegationGen: st.sig.Gen, DelegationSerial: st.sig.Serial}.Encode()
-		if drb == nil {
+		if drb, newSet = attachedResult(st, res, entry, newSet); drb == nil {
 			return s.storeError()
 		}
 		if dsig, err = signer.SignAndVerify(s.sig, drb); err != nil {
@@ -90,12 +79,35 @@ func (s *Store) step11(ctx context.Context, st *txState, d policy.Decision, newS
 		Body: ac.Committed{Result: rb, ResultSig: rsig, DeviceResult: drb, DeviceResultSig: dsig}.Encode()}
 }
 
+// attachedResult is the device result step 11 signs for a published op with a
+// device part, attached (#7 "", DoR:446, B1-D9), and the private set it names:
+// newSet, or the head's own set when step 8a left it unchanged. drb is nil
+// when the set or the result does not encode. Import replays the attached
+// entry against it byte for byte (import.go: attachedEntry).
+func attachedResult(st *txState, res ac.Result, entry, newSet []byte) (drb, set []byte) {
+	h := st.h
+	if newSet == nil {
+		newSet = h.DeviceSet
+	}
+	sd, err := ac.DeviceSetDigest(newSet)
+	if err != nil {
+		return nil, newSet
+	}
+	return ac.DeviceResult{RealmID: res.RealmID, AccountID: res.AccountID, RequestID: res.RequestID,
+		DeviceIntentDigest: st.rq.D, Op: res.Op, Dseq: h.Dseq + 1, PrevDeviceEntryDigest: h.DeviceHead,
+		ChainSeq: res.Seq, ChainEntryDigest: entry, DeviceSetDigest: sd, IssuedAtMs: st.now,
+		DelegationGen: st.sig.Gen, DelegationSerial: st.sig.Serial}.Encode(), newSet
+}
+
 // signedOut is what step 11 signed: the encoded result and its signature, its
 // entry digest, and the device result and its signature (nil when no DI).
 type signedOut struct {
 	rb, rsig, entry, drb, dsig []byte
 }
 
+// writeEvents inserts the published event and, with a device part, its
+// attached entry. imported is st.replay: true only for import's replay of a
+// retained result (B3-D5), false for every result this process signs.
 func (s *Store) writeEvents(ctx context.Context, st *txState, res ac.Result, so signedOut) error {
 	rq := st.rq
 	rb, rsig, entry, drb, dsig := so.rb, so.rsig, so.entry, so.drb, so.dsig
@@ -103,10 +115,10 @@ func (s *Store) writeEvents(ctx context.Context, st *txState, res ac.Result, so 
 	b.Result, b.ResultSig = rb, rsig
 	if _, err := st.tx.ExecContext(ctx, `INSERT INTO authority.account_events (account_id, seq, restore_epoch, request_id,
 		intent_digest, op, bundle, cp_evidence, entry_digest, prev_entry_digest, delegation_gen, delegation_serial,
-		issued_at_ms, asserted_at_ms, imported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, false)`,
+		issued_at_ms, asserted_at_ms, imported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 		res.AccountID, i64(res.Seq), i64(st.restoreEpoch), res.RequestID, rq.IntentDigest, res.Op, b.Encode(),
 		rq.Sub.CPEvidence, entry, nilIfEmpty(res.PrevEntryDigest), i64(res.DelegationGen), i64(res.DelegationSerial),
-		i64(st.now), i64(rq.AZ.AssertedAtMs)); err != nil {
+		i64(st.now), i64(rq.AZ.AssertedAtMs), st.replay); err != nil {
 		return err
 	}
 	if drb == nil {
@@ -116,9 +128,9 @@ func (s *Store) writeEvents(ctx context.Context, st *txState, res ac.Result, so 
 		DeviceResult: drb, DeviceResultSig: dsig} // cp_authz "": the published bundle carries it (DoR:509, B1-D9)
 	_, err := st.tx.ExecContext(ctx, `INSERT INTO authority.device_events (account_id, dseq, request_id, device_intent_digest,
 		op, chain_seq, chain_entry_digest, bundle, cp_evidence, entry_digest, prev_entry_digest, issued_at_ms,
-		delegation_gen, delegation_serial, imported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, $12, $13, false)`,
+		delegation_gen, delegation_serial, imported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, $12, $13, $14)`,
 		res.AccountID, i64(st.h.Dseq+1), res.RequestID, rq.D, res.Op, i64(res.Seq), entry, db.Encode(),
-		ac.Digest(drb), nilIfEmpty(st.h.DeviceHead), i64(st.now), i64(res.DelegationGen), i64(res.DelegationSerial))
+		ac.Digest(drb), nilIfEmpty(st.h.DeviceHead), i64(st.now), i64(res.DelegationGen), i64(res.DelegationSerial), st.replay)
 	return err
 }
 
@@ -146,10 +158,12 @@ func applyCommit(st *txState, d policy.Decision, res ac.Result, entry, newSet, d
 		h.EKGen = rq.EKB.EKGeneration
 	}
 	h.PendErase, h.PendingRecover = pending && d.Row.N == 18, pending && d.Row.N == 20
+	prevFloor := h.ActFloor // read before the reset: carryFloor needs the head's floor, not the commit's
 	h.ActBase, h.ActG, h.ActUnavailBase, h.ActFloor, h.PendEpoch = nil, nil, nil, nil, nil
 	if pending {
 		armActivation(st, d)
 	}
+	h.ActFloor = carryFloor(h.ActFloor, prevFloor, st.now)
 	cancelTimes(st, d, from)
 	if d.Row.N == 1 { // enroll_new opens an initial segment
 		h.Segment, h.SegmentRoot = ac.AssuranceInitial, res.ActiveRoot
@@ -175,6 +189,34 @@ func armActivation(st *txState, d policy.Decision) {
 	if d.Row.N == 2 || d.Row.N == 3 || d.Row.N == 11 || d.Row.N == 20 {
 		h.PendEpoch = nilIfEmpty(rq.Ev.CredentialEpochDigest)
 	}
+}
+
+// carryFloor is the head's activation_floor_ms after a commit: the later of
+// armed, the floor this commit armed itself (nil when none), and prev, the
+// head's floor before the commit, when db_now has not yet reached prev.
+//
+// The invariant: no commit lowers a floor db_now has not passed. A floor is a
+// private lower bound on the next activation (VisibleInstant takes the max;
+// the signed result's activation_not_before_ms never includes it), raised
+// with GREATEST by reconcile-complete (D-186) and clear-held's L1 exit (T + G′,
+// DoR:1731), and armed by row 18 (armActivation). Clear-held floors an A or S
+// head, which has no activation, so the floor only binds if it survives to the
+// commit that proposes one: DoR:1766 (D-146) has the next replace_root activate
+// with it. Δ + G may be far below G′ (17 minutes in the test realm against
+// 24 h), so dropping it activates that replacement early. What breaks it: a commit that
+// resets the floor without carrying it (the bug this closes); armed
+// overwriting prev, or prev overwriting armed, rather than the later of the
+// two; or a floor carried after db_now passed it, which bounds nothing still
+// to come and would keep a spent column alive on every later head.
+func carryFloor(armed, prev *uint64, now uint64) *uint64 {
+	if prev == nil || *prev <= now {
+		return armed
+	}
+	if armed != nil && *armed >= *prev {
+		return armed
+	}
+	f := *prev
+	return &f
 }
 
 // cancelTimes stamps or clears the cancel times. from is the head's published

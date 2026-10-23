@@ -29,19 +29,13 @@ func (h *headRow) set() (ac.DeviceSet, []byte, error) {
 // decide is steps 8–11.
 func (s *Store) decide(ctx context.Context, st *txState) Outcome {
 	rq, h := st.rq, st.h
-	if rq.Class != classCancel && h.RecoverGuardUntilMs != nil && *h.RecoverGuardUntilMs > st.now { // D-271
+	if recoverGuardBusy(st) { // D-271
 		return errorOutcome(503, ac.ErrorBusy)
 	}
-	ds, _, err := h.set()
+	d, ds, err := admit(st)
 	if err != nil {
 		return s.storeError()
 	}
-	ev := ac.EvidenceOf(rq.Ev)
-	ev.PoP, ev.RecoveryKeyBound = rq.PoP, len(ds.RecoveryKey) > 0
-	ev.LegacyPinLive = !h.PinRevoked // B1-D35: row 4's PoP floor needs the from-state's pin unrevoked
-	d := policy.Admit(policy.Input{Head: h.policyHead(st.inPop), Bundle: bundleOf(rq.Sub), Intent: rq.Intent,
-		Actor: rq.AZ.Actor, Evidence: ev, EKBinding: rq.EKB, EKBindingBytes: rq.Sub.EKBinding,
-		EpochDigest: rq.Ev.CredentialEpochDigest, Scope: st.sig.D.Scope, DBNowMs: st.now})
 	if d.Refusal != "" {
 		return s.refuseMaybeArm(ctx, st, ds, d.Refusal)
 	}
@@ -59,6 +53,24 @@ func (s *Store) decide(ctx context.Context, st *txState) Outcome {
 		return out
 	}
 	return s.step11(ctx, st, d, newSet)
+}
+
+// admit is step 8's policy decision on st's request against st's normalized
+// head, and the head's private set. The commit path and import's replay
+// (import.go) both decide through it, so the two cannot build a different
+// policy input for one request (B3-D4).
+func admit(st *txState) (policy.Decision, ac.DeviceSet, error) {
+	rq, h := st.rq, st.h
+	ds, _, err := h.set()
+	if err != nil {
+		return policy.Decision{}, ac.DeviceSet{}, err
+	}
+	ev := ac.EvidenceOf(rq.Ev)
+	ev.PoP, ev.RecoveryKeyBound = rq.PoP, len(ds.RecoveryKey) > 0
+	ev.LegacyPinLive = !h.PinRevoked // B1-D35: row 4's PoP floor needs the from-state's pin unrevoked
+	return policy.Admit(policy.Input{Head: h.policyHead(st.inPop), Bundle: bundleOf(rq.Sub), Intent: rq.Intent,
+		Actor: rq.AZ.Actor, Evidence: ev, EKBinding: rq.EKB, EKBindingBytes: rq.Sub.EKBinding,
+		EpochDigest: rq.Ev.CredentialEpochDigest, Scope: st.sig.D.Scope, DBNowMs: st.now}), ds, nil
 }
 
 // verifyHeadSigs: sig_current_root and rotate_ek's ek-binding signature under
@@ -293,15 +305,36 @@ func bindSigMatches(ctx context.Context, st *txState) (bool, error) {
 	return false, rows.Err()
 }
 
-// step9: db_now ≥ max(issued_at) over the account's published and private
-// entries (D-36), and this node's RSK is listed in the signing delegation (T10).
-func (s *Store) step9(ctx context.Context, st *txState) (Outcome, bool) {
+// recoverGuardBusy is D-271's guard: a non-cancel while a stale recover's
+// guard is armed past db_now. Live it is 503 busy; import's replay holds the
+// account on it, since the guard only moves later (refuseMaybeArm arms it,
+// nothing clears it, and import replays no refusal), so a head the original
+// commit passed it on passes it here.
+func recoverGuardBusy(st *txState) bool {
+	h := st.h
+	return st.rq.Class != classCancel && h.RecoverGuardUntilMs != nil && *h.RecoverGuardUntilMs > st.now
+}
+
+// issuedNotBefore is step 9's first clause (D-36): db_now ≥ max(issued_at)
+// over the account's published head and its private entries. Live a failure
+// is 503 clock; import's replay holds the account, at the result's issued_at.
+func issuedNotBefore(ctx context.Context, st *txState) (bool, error) {
 	var devMax int64
 	if err := st.tx.QueryRowContext(ctx, `SELECT COALESCE(max(issued_at_ms), 0) FROM authority.device_events WHERE account_id = $1`,
 		st.h.AccountID).Scan(&devMax); err != nil {
+		return false, err
+	}
+	return st.now >= st.h.IssuedAtMs && st.now >= u64(devMax), nil
+}
+
+// step9: db_now ≥ max(issued_at) over the account's published and private
+// entries (D-36), and this node's RSK is listed in the signing delegation (T10).
+func (s *Store) step9(ctx context.Context, st *txState) (Outcome, bool) {
+	ok, err := issuedNotBefore(ctx, st)
+	if err != nil {
 		return s.storeError(), true
 	}
-	if st.now < st.h.IssuedAtMs || st.now < u64(devMax) {
+	if !ok {
 		s.nonClient503.Store(true)
 		return errorOutcome(503, ac.ErrorClock), true
 	}

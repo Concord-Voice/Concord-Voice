@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 )
@@ -17,8 +18,9 @@ type PurgeReport struct {
 // up to 100 candidates per batch, keyset-paged, until a batch comes back
 // short or the 20-s budget ends; then last_purge_at, in both cases (§3.2.4).
 // Each function call is its own transaction under the store's timeouts
-// (purgeCall), taking L1 inside purge_erased; one the budget or a timeout cuts
-// off rolls back whole.
+// (purgeCall, purgeAccount); one the budget or a timeout cuts off rolls back
+// whole. purge_erased takes L1 itself, after meta; purgeAccount takes L1 first,
+// so a purge keeps the one lock order (the heads, then meta: operatorRun).
 func (s *Store) Purge(ctx context.Context) (PurgeReport, error) {
 	ctx, cancel := context.WithTimeoutCause(ctx, s.purgeBudget, errPurgeBudget)
 	defer cancel()
@@ -61,8 +63,8 @@ func (s *Store) purgeBatches(ctx context.Context, rep *PurgeReport) error {
 			return err
 		}
 		for _, id := range cands {
-			var ok bool
-			if err := s.purgeCall(ctx, &ok, `SELECT authority.purge_erased($1)`, id); err != nil {
+			ok, err := s.purgeAccount(ctx, id)
+			if err != nil {
 				return err
 			}
 			if ok {
@@ -78,11 +80,36 @@ func (s *Store) purgeBatches(ctx context.Context, rep *PurgeReport) error {
 	return ctx.Err()
 }
 
-// purgeCall runs one purge function in its own transaction with the store's
-// lock and statement timeouts (B1-D3, DoR §3.2.1), so a call blocked on L1
-// fails at 2 s instead of spending the run's budget while it holds meta FOR
-// SHARE. The error leaves last_purge_at unset, so the purge stays due.
+// purgeCall runs one purge function in its own transaction (purgeTx).
 func (s *Store) purgeCall(ctx context.Context, dst any, q string, arg any) error {
+	return s.purgeTx(ctx, func(tx *sql.Tx) error { return tx.QueryRowContext(ctx, q, arg).Scan(dst) })
+}
+
+// purgeAccount is purge_erased(id) in its own transaction (purgeTx), with L1
+// taken first. purge_erased (000001) locks meta FOR SHARE and then the head, the
+// reverse of reconcile/required and reconcile-complete, which take the heads
+// and then update meta: the two deadlock (40P01) when a hold-req names an
+// account due for purge. Holding L1 before the call puts the purge in the one
+// lock order; the function's own FOR UPDATE then re-takes a lock this
+// transaction already holds, and its B1-D30 read of meta still lasts until the
+// commit. A caller of purge_erased that skips this step reintroduces the
+// inversion, so this is its only caller.
+func (s *Store) purgeAccount(ctx context.Context, id string) (bool, error) {
+	var ok bool
+	err := s.purgeTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, id); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT authority.purge_erased($1)`, id).Scan(&ok)
+	})
+	return ok, err
+}
+
+// purgeTx runs fn in its own transaction with the store's lock and statement
+// timeouts (B1-D3, DoR §3.2.1), so a call blocked on L1 fails at 2 s instead of
+// spending the run's budget. The error leaves last_purge_at unset, so the
+// purge stays due.
+func (s *Store) purgeTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -91,7 +118,7 @@ func (s *Store) purgeCall(ctx context.Context, dst any, q string, arg any) error
 	if err := setLocalTimeouts(ctx, tx); err != nil {
 		return err
 	}
-	if err := tx.QueryRowContext(ctx, q, arg).Scan(dst); err != nil {
+	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

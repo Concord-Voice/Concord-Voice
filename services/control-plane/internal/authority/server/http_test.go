@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -571,17 +572,44 @@ func TestBodyCaps(t *testing.T) {
 	}
 }
 
-// B2-D5: before PR-B3, an operator verb is 501 with no body; another error is 503 store.
-func TestOperatorVerbsBeforeB3(t *testing.T) {
-	for _, target := range []string{"/v1/legacy-population", "/v1/reconcile/required", "/v1/reconcile/import", "/v1/reconcile/hold"} {
-		f := &fake{opErr: store.ErrNotImplemented}
-		s, leaf := testServer(t, f)
-		if w := do(s, leaf, "POST", target, []byte("x")); w.Code != 501 || w.Body.Len() != 0 || f.noted != 0 {
-			t.Errorf("%s not implemented: %d %q noted=%d", target, w.Code, w.Body.Bytes(), f.noted)
-		}
-		f.opErr = errors.New("db down")
-		if w := do(s, leaf, "POST", target, []byte("x")); w.Code != 503 || !bytes.Equal(w.Body.Bytes(), envelope(ac.ErrorStore)) || f.noted != 1 {
-			t.Errorf("%s failing: %d %q noted=%d", target, w.Code, w.Body.Bytes(), f.noted)
+// B3-D6: each operator route maps the store's own refusals itself; a sentinel
+// wrapped with %w maps the same.
+func TestOperatorErrorMapping(t *testing.T) {
+	type want struct {
+		code  int
+		body  []byte // nil: an empty body
+		noted int
+	}
+	cases := []struct {
+		name string
+		err  error
+		want want
+	}{
+		{"sealed", store.ErrSealed, want{409, nil, 0}},
+		{"reconciled", store.ErrReconciled, want{409, nil, 0}},
+		{"bad authz", store.ErrBadAuthz, want{400, envelope(ac.ErrorBadAuthz), 0}},
+		{"other error", errors.New("db down"), want{503, envelope(ac.ErrorStore), 1}},
+	}
+	targets := []string{"/v1/legacy-population", "/v1/reconcile/required", "/v1/reconcile/import", "/v1/reconcile/hold"}
+	for _, target := range targets {
+		for _, c := range cases {
+			for _, wrapped := range []bool{false, true} {
+				err := c.err
+				if wrapped {
+					err = fmt.Errorf("x: %w", c.err)
+				}
+				f := &fake{opErr: err}
+				s, leaf := testServer(t, f)
+				w := do(s, leaf, "POST", target, []byte("x"))
+				bodyOK := bytes.Equal(w.Body.Bytes(), c.want.body)
+				if c.want.body == nil {
+					bodyOK = w.Body.Len() == 0
+				}
+				if w.Code != c.want.code || !bodyOK || f.noted != c.want.noted {
+					t.Errorf("%s, %s (wrapped %v): %d %q noted=%d, want %d %q noted=%d",
+						target, c.name, wrapped, w.Code, w.Body.Bytes(), f.noted, c.want.code, c.want.body, c.want.noted)
+				}
+			}
 		}
 	}
 }
@@ -993,6 +1021,36 @@ func TestAccountRoutesNeverLogTheAccount(t *testing.T) {
 		}
 		if bytes.Contains(buf.Bytes(), []byte(testAccount)) || bytes.ContainsAny(buf.Bytes(), "/") {
 			t.Errorf("%s: logged %s", target, buf.Bytes())
+		}
+	}
+}
+
+// The operator routes' prologue refusals (not_leader, disk, busy, replication)
+// reach the wire with the store's own status and ac code, wrapped or not,
+// never flattened to 503 store. The store has already set its own tick leg
+// (hardFloorCheck, replicationError), and the server counts nothing for a
+// store-returned 503 outcome on Submit either (serve's standby gate, reply,
+// sendable count only a panic, a late result or an invalid status), so noted
+// stays 0 here too.
+func TestOperatorRoutesKeepStoreCodes(t *testing.T) {
+	targets := []string{"/v1/legacy-population", "/v1/reconcile/required", "/v1/reconcile/import", "/v1/reconcile/hold"}
+	codes := []ac.ErrorCode{ac.ErrorNotLeader, ac.ErrorDisk, ac.ErrorBusy, ac.ErrorReplication}
+	for _, target := range targets {
+		for _, code := range codes {
+			for _, wrapped := range []bool{false, true} {
+				var err error = store.OutcomeError{Outcome: store.Outcome{HTTP: http.StatusServiceUnavailable,
+					Kind: store.KindError, Code: string(code), Body: envelope(code)}}
+				if wrapped {
+					err = fmt.Errorf("x: %w", err)
+				}
+				f := &fake{opErr: err}
+				s, leaf := testServer(t, f)
+				w := do(s, leaf, "POST", target, []byte("x"))
+				if w.Code != 503 || !bytes.Equal(w.Body.Bytes(), envelope(code)) || f.noted != 0 {
+					t.Errorf("%s, %s (wrapped %v): %d %q noted=%d, want 503 %q noted=0",
+						target, code, wrapped, w.Code, w.Body.Bytes(), f.noted, envelope(code))
+				}
+			}
 		}
 	}
 }

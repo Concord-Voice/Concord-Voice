@@ -44,6 +44,68 @@ func AcquireServeLock(ctx context.Context, db *sql.DB) (*ServeLock, error) {
 // Ping fails once the lock's session is gone, and with it the lock (D-171).
 func (l *ServeLock) Ping(ctx context.Context) error { return l.conn.PingContext(ctx) }
 
+// ErrServeLockLost means the serve lock's session ended, or stopped
+// answering, while an owner verb held the lock. The lock went with the
+// session, so a serve, migrate or owner verb on this node could take it
+// beside the verb.
+var ErrServeLockLost = errors.New("authority store: the serve lock's session ended")
+
+// Watch is a lock holder's version of serve's lock ping (B2-D21): the
+// context it returns is ctx, cancelled with ErrServeLockLost as its cause
+// once a Ping of the lock's session fails or does not answer within
+// RolePollInterval, the bound serve's role poll puts on its own ping. It
+// pings every ServeLockWatchInterval. stop cancels the context and waits for
+// the watch to end, so the lock's connection is idle again; call it once the
+// work is done and before Release. Read context.Cause (lockLost) before stop,
+// which cancels the context with no cause of its own.
+//
+// What it bounds: work under the context learns of a lost session within one
+// interval plus a ping. A transaction begun under it cannot commit once the
+// context is cancelled (database/sql rolls it back), but a commit already
+// sent in that window is not undone. A ping that does not answer in time
+// cancels too: the holder cannot then show that it still holds the lock.
+func (l *ServeLock) Watch(ctx context.Context) (context.Context, func()) {
+	wctx, cancel := context.WithCancelCause(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(ServeLockWatchInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-t.C:
+			}
+			pctx, pcancel := context.WithTimeout(wctx, RolePollInterval)
+			err := l.Ping(pctx)
+			pcancel()
+			if err != nil && wctx.Err() == nil { // not a ping cut short by ctx or stop
+				cancel(fmt.Errorf("%w: %w", ErrServeLockLost, err))
+				return
+			}
+		}
+	}()
+	return wctx, func() {
+		cancel(nil)
+		<-done
+	}
+}
+
+// lockLost is err, joined with ErrServeLockLost when ctx, a Watch context,
+// was cancelled because the lock's session ended: a statement that
+// cancellation cut short reports only context.Canceled, which names no cause.
+// A nil err stays nil, since the work finished.
+func lockLost(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if cause := context.Cause(ctx); errors.Is(cause, ErrServeLockLost) {
+		return errors.Join(cause, err)
+	}
+	return err
+}
+
 // Release unlocks, then discards the session rather than pooling it. A
 // session-level lock dies with its session, so the lock is gone even when the
 // unlock fails on a session that is still alive; Close alone would pool that

@@ -35,7 +35,20 @@ func (s *Store) trustFor(ctx context.Context, q queryer) (*ac.Trust, map[string]
 	if s.trust != nil && s.trustKey == key {
 		return s.trust, s.trustAccepted, nil
 	}
-	tr, err := ac.NewTrust(s.anchors)
+	tr, accepted, err := buildTrust(ctx, q, s.anchors)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.trust, s.trustKey, s.trustAccepted = tr, key, accepted
+	return tr, accepted, nil
+}
+
+// buildTrust is trustFor's build, uncached: A2's Trust over anchors and every
+// installed succession and delegation, and the msg digests of the delegation
+// rows it accepted. The owner verbs build through it too (B3-D10), so a verb
+// judges installed trust exactly as serve does.
+func buildTrust(ctx context.Context, q queryer, anchors ac.Anchors) (*ac.Trust, map[string]bool, error) {
+	tr, err := ac.NewTrust(anchors)
 	if err != nil {
 		return nil, nil, errors.Join(errSigner, err) // the anchors are unusable, not the database
 	}
@@ -46,7 +59,6 @@ func (s *Store) trustFor(ctx context.Context, q queryer) (*ac.Trust, map[string]
 	if err != nil {
 		return nil, nil, err
 	}
-	s.trust, s.trustKey, s.trustAccepted = tr, key, accepted
 	return tr, accepted, nil
 }
 

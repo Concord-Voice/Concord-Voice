@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
+	"errors"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -53,8 +55,8 @@ func TestTransportParameters(t *testing.T) {
 // database is now in recovery. The store's per-request check decides: 503
 // not_leader and no signed byte, on a commit and on a read. The role poll and
 // the tick sit an hour away, so nothing but the per-request check can notice
-// the demotion. B2 scope only: B3's operator verbs join this test with B3
-// (R3).
+// the demotion. The operator routes join it (B3 R3): legacy-population,
+// reconcile/required, /import and /hold.
 func TestStaleLeaderAtomicStillRefusesInRecovery(t *testing.T) {
 	slowLoops(t)
 	var recovering atomic.Bool
@@ -65,18 +67,63 @@ func TestStaleLeaderAtomicStillRefusesInRecovery(t *testing.T) {
 	if m := getSigner(t, c, s.r.addr); m.Role != "leader" {
 		t.Fatalf("before the demotion: role %q, want leader", m.Role)
 	}
+	// The operator routes (B3, R3). Each body must DECODE: the prologue decodes
+	// before it takes a connection, so a body that does not decode is 400 on a
+	// leader and in recovery alike and says nothing about the leader check. The
+	// seal and the committed account give them one: a legacy-batch row, and the
+	// account's seq-1 bundle as a hold-req bundle and as an import-item.
+	if _, err := s.f.Owner.Exec(`UPDATE authority.meta SET legacy_sealed_at = clock_timestamp(), population_digest = $1`,
+		bytes.Repeat([]byte{4}, 48)); err != nil {
+		t.Fatal(err)
+	}
+	acct := s.rl.NewAccount(t)
+	s.commit(t, c, acct, acct.EnrollNew(t).Bytes)
+	var bundle, evidence, devBundle []byte
+	var op string
+	if err := s.f.App.QueryRow(`SELECT bundle, cp_evidence, op FROM authority.account_events WHERE account_id = $1 AND seq = 1`,
+		acct.ID).Scan(&bundle, &evidence, &op); err != nil {
+		t.Fatal(err)
+	}
+	// enroll_new is an attached op: its import-item carries the device entry too.
+	if err := s.f.App.QueryRow(`SELECT bundle FROM authority.device_events WHERE account_id = $1 AND chain_seq = 1 AND op = $2`,
+		acct.ID, op).Scan(&devBundle); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal(err)
+	}
+	legacy := ac.LegacyBatch{Rows: []string{uuid.NewString() + "." + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 48))}}.Encode()
+	holdReq := ac.HoldReq{Bundles: [][]byte{bundle}}.Encode()
+	importBatch := ac.ImportBatch{Items: [][]byte{ac.ImportItem{Bundle: bundle, DeviceBundle: devBundle, CPEvidence: evidence}.Encode()}}.Encode()
+	if legacy == nil || holdReq == nil || importBatch == nil {
+		t.Fatal("a test operator body does not encode")
+	}
+	if _, err := ac.CheckHoldReq(holdReq); err != nil {
+		t.Fatalf("the test hold-req does not pass the prologue's decode: %v", err)
+	}
+	if _, err := ac.CheckImportBatch(importBatch); err != nil {
+		t.Fatalf("the test import-batch does not pass the prologue's decode: %v", err)
+	}
 	requests := []struct {
 		method, path string
 		body         []byte
+		control      int // the real code on a primary; 0 = only "not not_leader" is asserted
 	}{
-		{"POST", "/v1/transactions", s.rl.NewAccount(t).EnrollNew(t).Bytes},
-		{"GET", "/v1/accounts/" + uuid.NewString() + "/head", nil},
+		{"POST", "/v1/transactions", s.rl.NewAccount(t).EnrollNew(t).Bytes, 0},
+		{"GET", "/v1/accounts/" + uuid.NewString() + "/head", nil, 0},
+		{"POST", "/v1/legacy-population", legacy, http.StatusConflict},
+		{"POST", "/v1/reconcile/required", holdReq, http.StatusBadRequest},
+		{"POST", "/v1/reconcile/import", importBatch, http.StatusConflict},
+		{"POST", "/v1/reconcile/hold", holdReq, http.StatusConflict},
 	}
-	// Control: while the database is a primary, neither request is refused as
-	// not_leader, so the refusals below come from the demotion alone.
+	// Control: while the database is a primary, no request is refused as
+	// not_leader, so the refusals below come from the demotion alone. The four
+	// operator routes also answer their real code, so a body the prologue
+	// rejects before the leader check cannot pass for the demotion's refusal.
 	for _, req := range requests {
-		if _, body := call(t, c, s.r.addr, req.method, req.path, req.body); bytes.Equal(body, envelope(ac.ErrorNotLeader)) {
+		code, body := call(t, c, s.r.addr, req.method, req.path, req.body)
+		if bytes.Equal(body, envelope(ac.ErrorNotLeader)) {
 			t.Fatalf("%s %s on a primary: not_leader", req.method, req.path)
+		}
+		if req.control != 0 && code != req.control {
+			t.Fatalf("%s %s on a primary: %d %q, want %d", req.method, req.path, code, body, req.control)
 		}
 	}
 	recovering.Store(true)

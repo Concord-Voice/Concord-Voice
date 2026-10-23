@@ -5,8 +5,17 @@ import (
 	"errors"
 )
 
-// ErrNotImplemented is every B3 verb's answer in B1 (D-175, B1-D6).
-var ErrNotImplemented = errors.New("authority store: not_implemented")
+// The operator routes' own refusals (B3-D6). server.operatorErr answers
+// ErrSealed and ErrReconciled 409 with no body (B3-D2), and ErrBadAuthz 400
+// bad_authz.
+var (
+	// ErrSealed: the legacy population is sealed, so it takes no more rows.
+	ErrSealed = errors.New("authority store: the legacy population is sealed")
+	// ErrReconciled: the realm is reconciled, so it takes no import or hold.
+	ErrReconciled = errors.New("authority store: the realm is reconciled")
+	// ErrBadAuthz: a body that does not decode, or is not authorised.
+	ErrBadAuthz = errors.New("authority store: bad_authz")
+)
 
 // Authority is the store interface PR-B2's handlers call (§3.3).
 type Authority interface {
@@ -23,18 +32,12 @@ type Authority interface {
 	Operator
 }
 
-// Operator is the B3 surface (§3.4). PR-B3 implements it; in B1 every method
-// returns ErrNotImplemented.
+// Operator is the four operator routes serve answers (§3.3, B3-D3). The
+// seven owner verbs are not on it: they run in the owner CLI, as
+// authority_owner, on *Owner (owner.go), and are never served over HTTP.
 type Operator interface {
 	InsertLegacyPopulation(ctx context.Context, body []byte) error
 	ReconcileRequired(ctx context.Context, body []byte) error
 	ReconcileImport(ctx context.Context, body []byte) (Outcome, error)
 	ReconcileHold(ctx context.Context, body []byte) (Outcome, error)
-	RestoreBegin(ctx context.Context) error
-	ReconcileComplete(ctx context.Context) error
-	ClearHeld(ctx context.Context, accountID string) error
-	SealLegacy(ctx context.Context, snapshotDigest []byte) error
-	EndDrain(ctx context.Context, gen, serial uint64) error
-	RevokeKey(ctx context.Context, kind string, digest []byte) error
-	ReplicationGate(ctx context.Context, on bool) error
 }

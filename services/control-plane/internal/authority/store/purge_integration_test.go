@@ -185,8 +185,8 @@ func TestPurgeDeletesAnErasedAccountsEventsAndKeepsTheTombstone(t *testing.T) {
 	if events != 0 || devs != 0 || after != bindings || seq != 2 || len(root) != 97 {
 		t.Fatalf("after purge: events %d, device events %d, bindings %d→%d, seq %d, root %d bytes", events, devs, bindings, after, seq, len(root))
 	}
-	if rep, _ := e.s.Purge(context.Background()); rep.Purged != 0 {
-		t.Fatal("a purged tombstone was a candidate again (D-232)")
+	if rep, err := e.s.Purge(context.Background()); err != nil || rep.Purged != 0 {
+		t.Fatalf("a purged tombstone was a candidate again (D-232): purged %d, err %v", rep.Purged, err)
 	}
 	var lastMs int64
 	if err := e.f.App.QueryRow(`SELECT floor(extract(epoch FROM last_purge_at) * 1000)::bigint FROM authority.meta`).
@@ -200,11 +200,14 @@ func TestPurgeRefusals(t *testing.T) {
 	young := eraseAndAge(t, e, 29)
 	old := eraseAndAge(t, e, 31)
 	mustExec(t, e.f.Owner, `SELECT authority.enter_unreconciled()`)
-	if rep, _ := e.s.Purge(context.Background()); rep.Purged != 0 {
-		t.Fatal("purge ran while unreconciled")
+	if rep, err := e.s.Purge(context.Background()); err != nil || rep.Purged != 0 {
+		t.Fatalf("purge ran while unreconciled: purged %d, err %v", rep.Purged, err)
 	}
 	mustExec(t, e.f.Super, `UPDATE authority.meta SET reconciled = true`)
-	rep, _ := e.s.Purge(context.Background())
+	rep, err := e.s.Purge(context.Background())
+	if err != nil {
+		t.Fatalf("Purge = %v", err)
+	}
 	if rep.Purged != 1 {
 		t.Fatalf("purged %d, want only the account erased 31 d ago (%s), not %s", rep.Purged, old.ID, young.ID)
 	}
@@ -225,7 +228,10 @@ func TestPurgeActsOnEffectiveNotRawState(t *testing.T) {
 	// purge_erased reads clock_timestamp(); move every activation base 31 d + Δ + G into the past.
 	mustExec(t, e.f.Super, `UPDATE authority.account_heads SET activation_base_ms = activation_base_ms - 2592000000 - 86400000 - 900000
 		WHERE pending_erase`)
-	rep, _ := e.s.Purge(context.Background())
+	rep, err := e.s.Purge(context.Background())
+	if err != nil {
+		t.Fatalf("Purge = %v", err)
+	}
 	if rep.Purged != 1 {
 		t.Fatalf("purged %d, want exactly the unheld, uncancelled Pe", rep.Purged)
 	}

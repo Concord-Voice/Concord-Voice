@@ -144,7 +144,7 @@ func bindError(err error) error {
 
 // loadKeys reads the RSK and the TLS key (F2, B2-D11).
 func loadKeys(dir string) (signer.Signer, *ecdsa.PrivateKey, error) {
-	rsk, err := loadKey(dir, credRSK)
+	sig, err := loadSigner(dir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -152,11 +152,22 @@ func loadKeys(dir string) (signer.Signer, *ecdsa.PrivateKey, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	return sig, tlsKey, nil
+}
+
+// loadSigner reads the RSK alone (F2) as the signer. serve reads it through
+// loadKeys; clear-held, the one owner verb that signs, reads it here and
+// never reads the TLS key, which an owner verb has no use for (B3-D1).
+func loadSigner(dir string) (signer.Signer, error) {
+	rsk, err := loadKey(dir, credRSK)
+	if err != nil {
+		return nil, err
+	}
 	sig, err := signer.NewP384(rsk)
 	if err != nil {
-		return nil, nil, fmt.Errorf("credential %s: %w", credRSK, err)
+		return nil, fmt.Errorf("credential %s: %w", credRSK, err)
 	}
-	return sig, tlsKey, nil
+	return sig, nil
 }
 
 func loadKey(dir, name string) (*ecdsa.PrivateKey, error) {

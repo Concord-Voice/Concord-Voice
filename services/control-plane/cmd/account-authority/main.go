@@ -1,5 +1,5 @@
 // Command account-authority is the account-root authority (#3587): serve,
-// migrate and keygen. It only dispatches (D-119); the work is in
+// migrate, keygen and the seven owner verbs (owner.go). It only dispatches (D-119); the work is in
 // internal/authority/server and internal/authority/store.
 package main
 
@@ -33,7 +33,9 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
-const usage = "usage: account-authority serve | migrate --realm <uuid> | keygen --out <path>"
+const usage = "usage: account-authority serve | migrate --realm <uuid> | keygen --out <path> | restore-begin | " +
+	"reconcile-complete | clear-held [--dry-run] <account>... | seal-legacy --cp-digest <hex> | " +
+	"end-drain <gen>:<serial> | revoke-key <cak|operator|cp_tls> <hex> | replication-gate <on|off>"
 
 func main() {
 	ctx, stop := signalContext(context.Background(), signal.NotifyContext, syscall.SIGTERM, os.Interrupt)
@@ -84,7 +86,11 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		err = keygen(out, stdout)
 	default:
-		return usageExit(stderr)
+		call, ok := parseOwner(verb, rest)
+		if !ok {
+			return usageExit(stderr)
+		}
+		err = runOwner(ctx, call, stdout, log)
 	}
 	return exitCode(log, err)
 }

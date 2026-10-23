@@ -35,6 +35,12 @@ func (s *Store) dbNow(ctx context.Context, q queryer) (uint64, error) {
 	if s.hooks.DBNow != nil {
 		return s.hooks.DBNow(ctx)
 	}
+	return clockMs(ctx, q)
+}
+
+// clockMs is the database's clock_timestamp() in ms, read on q: dbNow's read,
+// and reconcile-complete's, which has no hook (owner_restore.go).
+func clockMs(ctx context.Context, q queryer) (uint64, error) {
 	var ms int64
 	if err := q.QueryRowContext(ctx, `SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint`).Scan(&ms); err != nil {
 		return 0, err

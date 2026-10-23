@@ -107,11 +107,24 @@ func appendSigned(ctx context.Context, q queryer, typ, query string, items [][]b
 // of its new generation could read the delegation without the succession and
 // refuse start.
 func (s *Store) LoadTrust(ctx context.Context, file []byte, install bool) (TrustView, error) {
+	return s.loadTrust(ctx, s.db, file, install)
+}
+
+// txBeginner is what *sql.DB and *sql.Conn share to open a transaction.
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+}
+
+// loadTrust is LoadTrust on b: serve passes its pool, and restore-begin the
+// owner verb's own leader-checked connection (DoR:1744 step 4), so both
+// install through one merge and one set of checks. It reads no field of s
+// but anchors and hooks.
+func (s *Store) loadTrust(ctx context.Context, b txBeginner, file []byte, install bool) (TrustView, error) {
 	env, err := ac.CheckTrustEnvelope(file)
 	if err != nil {
 		return TrustView{}, errors.Join(ErrTrustUnusable, err)
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: !install})
+	tx, err := b.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: !install})
 	if err != nil {
 		return TrustView{}, err
 	}

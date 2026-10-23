@@ -533,13 +533,28 @@ func TestExitError(t *testing.T) {
 	if got := (&ExitError{Reason: ReasonLock}).Error(); got != "lock" {
 		t.Errorf("an ExitError with no cause reads %q, want %q", got, "lock")
 	}
-	for _, r := range []string{ReasonConfig, ReasonTrust, ReasonLock} {
+	reasons := []string{ReasonConfig, ReasonTrust, ReasonLock, ReasonNotLeader, ReasonReplication, ReasonRefused}
+	for _, r := range reasons {
 		if r == "" {
 			t.Error("an empty exit reason")
 		}
 	}
-	if ReasonConfig == ReasonTrust || ReasonTrust == ReasonLock || ReasonConfig == ReasonLock {
-		t.Error("two exit reasons are equal")
+	distinct(t, "exit reason", reasons)
+	steps := []string{StepDeps, StepDumpable, StepCredentials, StepInputs, StepDatabase, StepListen, StepRole,
+		StepLock, StepSchema, StepStore, StepLeader, StepTrust, StepKeys, StepCert, StepPromotion, StepServe,
+		StepRealm, StepMigrate, StepMeta, StepOwner}
+	distinct(t, "exit step", steps)
+}
+
+// distinct fails for each value that appears twice in vs.
+func distinct(t *testing.T, what string, vs []string) {
+	t.Helper()
+	seen := map[string]bool{}
+	for _, v := range vs {
+		if seen[v] {
+			t.Errorf("two %ss are equal: %q", what, v)
+		}
+		seen[v] = true
 	}
 }
 

@@ -134,27 +134,31 @@ func (s *Store) commitDevice(ctx context.Context, conn *sql.Conn, rq *request) O
 // expiry for both cancel forms (B #7 too on the root form), a non-cancel's for
 // add_device and bind_recovery (#8), held, then malformed_for_op.
 func (s *Store) deviceWindowExpiryHeld(ctx context.Context, st *txState) (Outcome, bool) {
-	rq := st.rq
-	var out Outcome
-	var done bool
-	if rq.Intent.Op == ac.OpCancelRecoveryBind {
-		out, done = s.cancelWindowExpiry(ctx, st)
-	} else {
-		out, done = s.nonCancelWindowExpiry(ctx, st)
-	}
-	if done {
+	if out, done := s.deviceWindowExpiry(ctx, st); done {
 		return out, true
 	}
 	if st.h.Held {
 		return s.record(ctx, st, ac.RefusalHeld), true
 	}
-	if rq.DI != nil && ac.DeviceIntentForOp(*rq.DI, nil) != "" {
-		return s.record(ctx, st, ac.RefusalMalformedForOp), true
-	}
-	if rq.Bind != nil && ac.RecoveryBindForKind(*rq.Bind) != "" {
+	if deviceMalformedForOp(st.rq) {
 		return s.record(ctx, st, ac.RefusalMalformedForOp), true
 	}
 	return Outcome{}, false
+}
+
+// deviceWindowExpiry is steps 3 and 4 for a private op. Import's device replay
+// runs it at the entry's issued_at (importdevice.go).
+func (s *Store) deviceWindowExpiry(ctx context.Context, st *txState) (Outcome, bool) {
+	if st.rq.Intent.Op == ac.OpCancelRecoveryBind {
+		return s.cancelWindowExpiry(ctx, st)
+	}
+	return s.nonCancelWindowExpiry(ctx, st)
+}
+
+// deviceMalformedForOp is step 6 for a private op: the device-intent's or B's
+// positions for its op. Import's device replay shares it.
+func deviceMalformedForOp(rq *request) bool {
+	return (rq.DI != nil && ac.DeviceIntentForOp(*rq.DI, nil) != "") || (rq.Bind != nil && ac.RecoveryBindForKind(*rq.Bind) != "")
 }
 
 // cancelWindowExpiry is a cancel's window and expiry, for both cancel forms
@@ -162,6 +166,9 @@ func (s *Store) deviceWindowExpiryHeld(ctx context.Context, st *txState) (Outcom
 func (s *Store) cancelWindowExpiry(ctx context.Context, st *txState) (Outcome, bool) {
 	rq, now, a := st.rq, st.now, st.rq.AZ.AssertedAtMs
 	if a > now+ac.EpsilonMs {
+		if st.replay { // import: a refusal, never the tick's non-client leg (D-147; windowExpiry)
+			return s.record(ctx, st, ac.RefusalAuthzOutOfWindow), true
+		}
 		s.nonClient503.Store(true)
 		return errorOutcome(503, ac.ErrorClock), true
 	}
@@ -191,16 +198,14 @@ func (s *Store) nonCancelWindowExpiry(ctx context.Context, st *txState) (Outcome
 
 func (s *Store) decideDevice(ctx context.Context, st *txState) Outcome {
 	rq, h := st.rq, st.h
-	if rq.Class != classCancel && h.RecoverGuardUntilMs != nil && *h.RecoverGuardUntilMs > st.now { // D-271
+	if recoverGuardBusy(st) { // D-271
 		return errorOutcome(503, ac.ErrorBusy)
 	}
 	ds, cur, err := h.set()
 	if err != nil {
 		return s.storeError()
 	}
-	if r := policy.AdmitPrivate(policy.PrivateInput{Head: h.policyHead(st.inPop), Op: rq.Intent.Op, DeviceIntent: rq.DI,
-		Bind: rq.Bind, PriorSig: len(rq.Dev.SigRecoveryPrior) > 0, RootForm: rq.DI != nil && rq.Intent.Op == ac.OpCancelRecoveryBind,
-		SheetForm: rq.DI == nil, Evidence: ac.EvidenceOf(rq.Ev), Scope: st.sig.D.Scope}); r != "" {
+	if r := admitPrivate(st); r != "" {
 		return s.record(ctx, st, r)
 	}
 	if !verifyDeviceStateSigs(rq, h, ds) {
@@ -217,6 +222,16 @@ func (s *Store) decideDevice(ctx context.Context, st *txState) Outcome {
 		return out
 	}
 	return s.writeDevice(ctx, st, cur, next)
+}
+
+// admitPrivate is step 8's policy decision for a private op on st's
+// normalized head. The commit path and import's device replay (importdevice.go)
+// both decide through it, so the two cannot build a different policy input.
+func admitPrivate(st *txState) ac.Refusal {
+	rq, h := st.rq, st.h
+	return policy.AdmitPrivate(policy.PrivateInput{Head: h.policyHead(st.inPop), Op: rq.Intent.Op, DeviceIntent: rq.DI,
+		Bind: rq.Bind, PriorSig: len(rq.Dev.SigRecoveryPrior) > 0, RootForm: rq.DI != nil && rq.Intent.Op == ac.OpCancelRecoveryBind,
+		SheetForm: rq.DI == nil, Evidence: ac.EvidenceOf(rq.Ev), Scope: st.sig.D.Scope})
 }
 
 // verifyDeviceStateSigs: sig_root under the effective active root (over D on
@@ -294,19 +309,8 @@ func deviceBindings(rq *request) []keyBinding {
 }
 
 func (s *Store) writeDevice(ctx context.Context, st *txState, cur, next []byte) Outcome {
-	rq, h := st.rq, st.h
-	sd, err := ac.DeviceSetDigest(next)
-	if err != nil {
-		return s.storeError()
-	}
-	named := rq.D // device-result #6: D, or H(B) on the sheet form, which has no device-intent (DoR:445)
-	if rq.DI == nil {
-		named = rq.H
-	}
-	drb := ac.DeviceResult{RealmID: rq.Intent.RealmID, AccountID: rq.Intent.AccountID, RequestID: rq.Intent.RequestID,
-		DeviceIntentDigest: named, CPAuthzDigest: ac.Digest(rq.Dev.CPAuthz), Op: rq.Intent.Op, Dseq: h.Dseq + 1,
-		PrevDeviceEntryDigest: h.DeviceHead, ChainSeq: h.Seq, ChainEntryDigest: h.Entry, DeviceSetDigest: sd,
-		IssuedAtMs: st.now, DelegationGen: st.sig.Gen, DelegationSerial: st.sig.Serial}.Encode()
+	h := st.h
+	drb := deviceResultOf(st, next)
 	if drb == nil {
 		return s.storeError()
 	}
@@ -314,15 +318,8 @@ func (s *Store) writeDevice(ctx context.Context, st *txState, cur, next []byte) 
 	if err != nil {
 		return s.signerError()
 	}
-	d := rq.Dev
-	bundle := ac.DeviceBundle{DeviceIntent: d.DeviceIntent, SigRoot: d.SigRoot, SigActor: d.SigActor, SigNewDevice: d.SigNewDevice,
-		RecoveryBind: d.RecoveryBind, SigRecovery: d.SigRecovery, SigRecoveryPrior: d.SigRecoveryPrior, CPAuthz: d.CPAuthz,
-		CPAuthzSig: d.CPAuthzSig, DeviceResult: drb, DeviceResultSig: dsig}.Encode()
-	if _, err := st.tx.ExecContext(ctx, `INSERT INTO authority.device_events (account_id, dseq, request_id, device_intent_digest,
-		op, chain_seq, chain_entry_digest, bundle, cp_evidence, entry_digest, prev_entry_digest, issued_at_ms, delegation_gen,
-		delegation_serial, imported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, false)`,
-		h.AccountID, i64(h.Dseq+1), rq.Intent.RequestID, rq.LedgerDigest, rq.Intent.Op, i64(h.Seq), nilIfEmpty(h.Entry),
-		bundle, d.CPEvidence, ac.Digest(drb), nilIfEmpty(h.DeviceHead), i64(st.now), i64(st.sig.Gen), i64(st.sig.Serial)); err != nil {
+	bundle := deviceBundleOf(st.rq.Dev, drb, dsig)
+	if err := insertDeviceEvent(ctx, st, bundle, drb); err != nil {
 		return s.storeError()
 	}
 	if err := applyDevice(st, cur, next, drb); err != nil {
@@ -335,6 +332,48 @@ func (s *Store) writeDevice(ctx context.Context, st *txState, cur, next []byte) 
 		return s.storeError()
 	}
 	return Outcome{HTTP: 200, Kind: KindCommitted, Body: ac.DeviceCommitted{DeviceBundle: bundle}.Encode()}
+}
+
+// deviceResultOf is the device result the commit core signs for st's private
+// op on st's head (D-270): the next dseq and the private head it links to, the
+// published head it was built on, and the digest of next, the set after the
+// op. nil when next or the result does not encode. Import's device replay
+// requires the retained result to equal it byte for byte (importdevice.go).
+func deviceResultOf(st *txState, next []byte) []byte {
+	rq, h := st.rq, st.h
+	sd, err := ac.DeviceSetDigest(next)
+	if err != nil {
+		return nil
+	}
+	named := rq.D // device-result #6: D, or H(B) on the sheet form, which has no device-intent (DoR:445)
+	if rq.DI == nil {
+		named = rq.H
+	}
+	return ac.DeviceResult{RealmID: rq.Intent.RealmID, AccountID: rq.Intent.AccountID, RequestID: rq.Intent.RequestID,
+		DeviceIntentDigest: named, CPAuthzDigest: ac.Digest(rq.Dev.CPAuthz), Op: rq.Intent.Op, Dseq: h.Dseq + 1,
+		PrevDeviceEntryDigest: h.DeviceHead, ChainSeq: h.Seq, ChainEntryDigest: h.Entry, DeviceSetDigest: sd,
+		IssuedAtMs: st.now, DelegationGen: st.sig.Gen, DelegationSerial: st.sig.Serial}.Encode()
+}
+
+// deviceBundleOf is the device bundle the commit core stores for a private op:
+// the submit's parts, then the device result and its signature.
+func deviceBundleOf(d *ac.DeviceSubmit, drb, dsig []byte) []byte {
+	return ac.DeviceBundle{DeviceIntent: d.DeviceIntent, SigRoot: d.SigRoot, SigActor: d.SigActor, SigNewDevice: d.SigNewDevice,
+		RecoveryBind: d.RecoveryBind, SigRecovery: d.SigRecovery, SigRecoveryPrior: d.SigRecoveryPrior, CPAuthz: d.CPAuthz,
+		CPAuthzSig: d.CPAuthzSig, DeviceResult: drb, DeviceResultSig: dsig}.Encode()
+}
+
+// insertDeviceEvent writes a private op's device entry at the head's next
+// dseq. imported is st.replay: true only for import's device replay.
+func insertDeviceEvent(ctx context.Context, st *txState, bundle, drb []byte) error {
+	rq, h := st.rq, st.h
+	_, err := st.tx.ExecContext(ctx, `INSERT INTO authority.device_events (account_id, dseq, request_id, device_intent_digest,
+		op, chain_seq, chain_entry_digest, bundle, cp_evidence, entry_digest, prev_entry_digest, issued_at_ms, delegation_gen,
+		delegation_serial, imported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		h.AccountID, i64(h.Dseq+1), rq.Intent.RequestID, rq.LedgerDigest, rq.Intent.Op, i64(h.Seq), nilIfEmpty(h.Entry),
+		bundle, rq.Dev.CPEvidence, ac.Digest(drb), nilIfEmpty(h.DeviceHead), i64(st.now), i64(st.sig.Gen), i64(st.sig.Serial),
+		st.replay)
+	return err
 }
 
 // applyDevice writes the private head and the recovery columns (D-273, D-274).

@@ -218,7 +218,7 @@ func TestSelectionIgnoresARowInstalledAfterTheTrustBuild(t *testing.T) {
 	if d, err := e.s.signingDelegation(ctx, e.f.App, tr.CurrentGen(), e.now.Load(), accepted); err != nil || d.Serial != good.D.Serial {
 		t.Fatalf("signing delegation = %+v, %v; want serial %d, never the unseen serial %d", d, err, good.D.Serial, bad.D.Serial)
 	}
-	if at, err := e.s.supersedingInstalledAt(ctx, e.f.App, good.D.ProductRootGen, good.D.Serial, accepted); err != nil || at.Valid {
+	if at, err := supersedingInstalledAt(ctx, e.f.App, good.D.ProductRootGen, good.D.Serial, accepted); err != nil || at.Valid {
 		t.Fatalf("superseding installed_at = %+v, %v; want none, since serial %d was never accepted", at, err, bad.D.Serial)
 	}
 }

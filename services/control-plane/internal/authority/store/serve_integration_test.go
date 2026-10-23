@@ -62,6 +62,54 @@ func TestServeLockPingFailsWhenItsSessionDies(t *testing.T) {
 	}
 }
 
+// An owner verb holding the lock learns its session died through Watch: the
+// context stays live while pings answer, is cancelled with ErrServeLockLost
+// once the session is terminated, and the lock is by then free for another
+// holder, which is what the cancellation guards against. stop is no loss.
+func TestServeLockWatchCancelsWhenItsSessionDies(t *testing.T) {
+	f := authoritydb.Setup(t)
+	ctx := context.Background()
+	l, err := AcquireServeLock(ctx, f.Owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Release)
+	pid := backendPID(ctx, t, l.conn)
+	wctx, stop := l.Watch(ctx)
+	defer stop()
+	time.Sleep(ServeLockWatchInterval * 3 / 2) // at least one ping answered
+	if wctx.Err() != nil {
+		t.Fatalf("the watch cancelled a live session: %v", context.Cause(wctx))
+	}
+	var gone bool
+	if err := f.Super.QueryRowContext(ctx, `SELECT pg_terminate_backend($1, 5000)`, pid).Scan(&gone); err != nil || !gone {
+		t.Fatalf("terminate the lock's session: %v %v", gone, err)
+	}
+	select {
+	case <-wctx.Done():
+	case <-time.After(ServeLockWatchInterval + RolePollInterval + time.Second):
+		t.Fatal("the watch did not cancel its context after the lock's session died")
+	}
+	if !errors.Is(context.Cause(wctx), ErrServeLockLost) {
+		t.Fatalf("cause = %v, want ErrServeLockLost", context.Cause(wctx))
+	}
+	cut := errors.New("statement cut short")
+	if err := lockLost(wctx, cut); !errors.Is(err, ErrServeLockLost) || !errors.Is(err, cut) {
+		t.Fatalf("lockLost = %v, want the work's error joined with ErrServeLockLost", err)
+	}
+	l2, err := AcquireServeLock(ctx, f.App)
+	if err != nil {
+		t.Fatalf("acquire after the session died = %v, want the lock free", err)
+	}
+	defer l2.Release()
+
+	w2, stop2 := l2.Watch(ctx)
+	stop2()
+	if errors.Is(context.Cause(w2), ErrServeLockLost) || lockLost(w2, cut) != cut {
+		t.Fatalf("stop reads as a lost lock: cause %v", context.Cause(w2))
+	}
+}
+
 func backendPID(ctx context.Context, t *testing.T, conn *sql.Conn) int {
 	t.Helper()
 	var pid int

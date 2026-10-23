@@ -1116,6 +1116,59 @@ func VerifyDeviceLedger(t *Trust, hw HighWater, from DeviceHead, in DeviceLedger
 	return head, out, viewOf(shown, l.live[0].dseq, ds.AsOfMs, out.AdmittedBy), hw2, verdict
 }
 
+// AuthenticateDeviceBundle is AuthenticateBundle's counterpart for a lone
+// private-op device entry (§3.4 import; B3-D16, B3-D17, Go only, for the
+// issuing authority): a halted or nil Trust admits nothing; EN5 over every
+// part (parseDevice, malformed); every part naming t's realm and the device
+// result's account (realm_mismatch); §2.5's identity rules for the entry with
+// no step (consistent: the device result names its device-intent or B, its
+// request and op, its cp-authz, and the device-intent's expected_seq is the
+// result's chain_seq; device_rule); and T7's RSK signature, window and scope
+// under a delegation t retains at the device result's (gen, serial). Each
+// check is the one VerifyDeviceLedger runs on the entry (preEntry's identity
+// clauses, then admitEntry's checkT7), so an entry the ledger admits
+// authenticates here.
+//
+// An attached entry (an op whose device part rides a published result) is
+// device_rule here: its identity is the published result's (attachedTo), which
+// a lone entry does not carry, so it authenticates only beside that result.
+//
+// The invariant: an OK result is bytes an RSK of t's realm signed, within its
+// delegation's window and scope, over exactly the device-intent (or B) and
+// cp-authz beside it. It reads no device head, so it judges no dseq, no link,
+// no set and no private signature (DR3): it is evidence that the authority's
+// private head once reached res.Dseq, never that the entry extends a head the
+// caller holds. superseded is T7's clause, reported and never refused. A
+// refusal returns the zero DeviceResult.
+//
+// What breaks it: returning the decoded result before T7 or the identity check
+// has passed; accepting an attached entry alone; or a client calling it in
+// place of VerifyDeviceLedger, which needs the device-status and the chain
+// (TestAuthorityOnlyExportsStayInTheAuthority).
+func AuthenticateDeviceBundle(t *Trust, hw HighWater, bundle []byte) (DeviceResult, bool, Reason) {
+	if r := t.haltReason(); r != ReasonOK {
+		return DeviceResult{}, false, r
+	}
+	p, r := parseDevice(bundle)
+	if r != ReasonOK {
+		return DeviceResult{}, false, r
+	}
+	switch {
+	case !p.sameAccount(t.realm, p.dr.AccountID):
+		return DeviceResult{}, false, ReasonRealmMismatch
+	case attachedOp(p.dr.Op):
+		return DeviceResult{}, false, ReasonDeviceRule
+	}
+	if r := p.consistent(nil); r != ReasonOK {
+		return DeviceResult{}, false, r
+	}
+	sup, r := t.checkT7(hw, p.dr.DelegationGen, p.dr.DelegationSerial, p.dr.IssuedAtMs, p.dr.Op, p.drBytes, p.raw.DeviceResultSig)
+	if r != ReasonOK {
+		return DeviceResult{}, false, r
+	}
+	return p.dr, sup, ReasonOK
+}
+
 // deviceHead is the persisted device-head; device_set is "" until the first entry.
 func (w *ledgerWalk) deviceHead(from DeviceHead, head ChainHead) DeviceHead {
 	out := DeviceHead{RealmID: from.RealmID, AccountID: from.AccountID, SelfDeviceID: from.SelfDeviceID,

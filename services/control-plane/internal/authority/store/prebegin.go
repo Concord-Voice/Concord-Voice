@@ -156,10 +156,8 @@ func (s *Store) storeError() Outcome {
 // checkCAK is step 3 (T8 part of T9, the evidence binding, the actor, the
 // cross-field binding: B1-D16) and step 3a (T12 without revoked_keys).
 func (s *Store) checkCAK(ctx context.Context, conn *sql.Conn, rq *request) (Outcome, bool) {
-	az, in := rq.AZ, rq.Intent
-	if az.RealmID != in.RealmID || az.AccountID != in.AccountID || az.RequestID != in.RequestID ||
-		!bytes.Equal(az.IntentDigest, rq.IntentDigest) || !bytes.Equal(az.EvidenceDigest, ac.Digest(rq.Sub.CPEvidence)) ||
-		rq.Ev.RequestID != az.RequestID || (az.Actor != ac.ActorUser && az.Actor != ac.ActorOperator) {
+	az := rq.AZ
+	if !cakBound(rq) {
 		return errorOutcome(400, ac.ErrorBadAuthz), false
 	}
 	tr, accepted, err := s.trustFor(ctx, conn)
@@ -196,6 +194,18 @@ func (s *Store) checkCAK(ctx context.Context, conn *sql.Conn, rq *request) (Outc
 		return errorOutcome(400, ac.ErrorBadSignature), false
 	}
 	return Outcome{}, true
+}
+
+// cakBound is step 3's cross-field binding (B1-D16) on the decoded request
+// alone: the cp-authz names the intent's realm, account and request and binds
+// the intent and evidence digests, the evidence names the same request, and
+// the actor is user or operator. It reads no key: checkCAK verifies the CAK
+// signature after it, and import's replay relies on ac's T8 (import.go).
+func cakBound(rq *request) bool {
+	az, in := rq.AZ, rq.Intent
+	return az.RealmID == in.RealmID && az.AccountID == in.AccountID && az.RequestID == in.RequestID &&
+		bytes.Equal(az.IntentDigest, rq.IntentDigest) && bytes.Equal(az.EvidenceDigest, ac.Digest(rq.Sub.CPEvidence)) &&
+		rq.Ev.RequestID == az.RequestID && (az.Actor == ac.ActorUser || az.Actor == ac.ActorOperator)
 }
 
 func (s *Store) signerError() Outcome {

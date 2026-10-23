@@ -1,10 +1,19 @@
 package server
 
-// The exit reasons (B2-D8), exported for cmd/account-authority's verbs.
+// The exit reasons (B2-D8, B3-D12), exported for cmd/account-authority's
+// verbs.
 const (
 	ReasonConfig = "config"
 	ReasonTrust  = "trust"
 	ReasonLock   = "lock"
+	// ReasonNotLeader: an owner verb reached a standby (B3-D7).
+	ReasonNotLeader = "not_leader"
+	// ReasonReplication: an owner verb committed locally, not replicated
+	// (D-225); a re-run converges (B3-D8).
+	ReasonReplication = "replication"
+	// ReasonRefused: an owner verb's own refusal, such as a digest mismatch,
+	// an unknown key or a wrong state.
+	ReasonRefused = "refused"
 )
 
 // The steps an ExitError names: a closed set, logged as
@@ -30,6 +39,7 @@ const (
 	StepRealm       = "realm"
 	StepMigrate     = "migrate"
 	StepMeta        = "meta"
+	StepOwner       = "owner" // an owner verb's own step (B3-D12)
 )
 
 // ExitError is a refusal to start, or a fatal stop: exit 1, logged as

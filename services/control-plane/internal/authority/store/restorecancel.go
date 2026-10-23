@@ -91,8 +91,7 @@ func (s *Store) restoreCancelTx(ctx context.Context, st *txState) (Outcome, erro
 	azb := az.Encode()
 	st.rq = &request{Intent: in, IntentDigest: ac.Digest(ib), AZ: az, Sub: ac.Submit{Intent: ib, CPAuthz: azb}}
 	bundle := ac.Bundle{Intent: ib, CPAuthz: azb, HeldStatus: held}
-	d := policy.Admit(policy.Input{Head: h.policyHead(st.inPop), Bundle: bundle, Intent: in, Actor: ac.ActorRestore,
-		Scope: st.sig.D.Scope, DBNowMs: T})
+	d := restoreCancelDecision(st, bundle)
 	if d.Refusal != "" || d.Row.N != 22 {
 		return s.storeError(), errors.New("authority store: row 22 not admitted: " + string(d.Refusal))
 	}
@@ -106,27 +105,50 @@ func (s *Store) restoreCancelTx(ctx context.Context, st *txState) (Outcome, erro
 		return s.signerError(), err
 	}
 	bundle.Result, bundle.ResultSig = rb, rsig
-	entry := ac.EntryDigest(rb)
-	if _, err := st.tx.ExecContext(ctx, `INSERT INTO authority.account_events (account_id, seq, restore_epoch, request_id,
-		intent_digest, op, bundle, cp_evidence, entry_digest, prev_entry_digest, delegation_gen, delegation_serial,
-		issued_at_ms, asserted_at_ms, imported) VALUES ($1, $2, $3, $4, $5, 'cancel_pending', $6, NULL, $7, $8, $9, $10, $11, $11, false)`,
-		h.AccountID, i64(res.Seq), i64(st.restoreEpoch), in.RequestID, ac.Digest(ib), bundle.Encode(), entry,
-		nilIfEmpty(h.Entry), i64(st.sig.Gen), i64(st.sig.Serial), i64(T)); err != nil {
-		return s.storeError(), err
-	}
-	_, cur, err := h.set()
-	if err != nil {
-		return s.storeError(), err
-	}
-	next := ac.NormalizeDeviceSet(cur, false, false, false, true, true) // DR8: pending := "", slot emptied, bound key kept
-	if err := applyCommit(st, d, res, entry, next, nil); err != nil {
-		return s.storeError(), err
-	}
-	if err := saveHead(ctx, st.tx, h); err != nil {
+	if err := applyRestoreCancel(ctx, st, d, res, bundle.Encode()); err != nil {
 		return s.storeError(), err
 	}
 	if err := st.tx.Commit(); err != nil {
 		return s.storeError(), err
 	}
 	return Outcome{HTTP: 200, Kind: KindCommitted, Body: ac.Committed{Result: rb, ResultSig: rsig}.Encode()}, nil
+}
+
+// restoreCancelDecision is row 22's policy decision on st's head as it is,
+// never normalized: a held head never normalizes (step 7), and import's replay
+// of row 22 takes the raw from-head its own held_status names. policy.Admit
+// does not read held, so the decision is the same whether or not the head it
+// lands on is held (D-288). clear-held and import both decide through it.
+func restoreCancelDecision(st *txState, bundle ac.Bundle) policy.Decision {
+	return policy.Admit(policy.Input{Head: st.h.policyHead(st.inPop), Bundle: bundle, Intent: st.rq.Intent,
+		Actor: ac.ActorRestore, Scope: st.sig.D.Scope, DBNowMs: st.now})
+}
+
+// applyRestoreCancel writes row 22's event and moves the head to it: the event
+// carries no cp_evidence (NULL, E3-02) and asserted_at = issued_at = st.now;
+// the private set takes DR8 (pending := "", the slot emptied, the bound key
+// kept). imported is st.replay. clear-held (restoreCancelTx) and import
+// (importdevice.go) both write row 22 through it.
+func applyRestoreCancel(ctx context.Context, st *txState, d policy.Decision, res ac.Result, bundle []byte) error {
+	h, rb := st.h, res.Encode()
+	if rb == nil {
+		return errors.New("authority store: row 22's result does not encode")
+	}
+	entry := ac.EntryDigest(rb)
+	if _, err := st.tx.ExecContext(ctx, `INSERT INTO authority.account_events (account_id, seq, restore_epoch, request_id,
+		intent_digest, op, bundle, cp_evidence, entry_digest, prev_entry_digest, delegation_gen, delegation_serial,
+		issued_at_ms, asserted_at_ms, imported) VALUES ($1, $2, $3, $4, $5, 'cancel_pending', $6, NULL, $7, $8, $9, $10, $11, $11, $12)`,
+		h.AccountID, i64(res.Seq), i64(st.restoreEpoch), st.rq.Intent.RequestID, st.rq.IntentDigest, bundle, entry,
+		nilIfEmpty(h.Entry), i64(res.DelegationGen), i64(res.DelegationSerial), i64(st.now), st.replay); err != nil {
+		return err
+	}
+	_, cur, err := h.set()
+	if err != nil {
+		return err
+	}
+	next := ac.NormalizeDeviceSet(cur, false, false, false, true, true) // DR8: pending := "", slot emptied, bound key kept
+	if err := applyCommit(st, d, res, entry, next, nil); err != nil {
+		return err
+	}
+	return saveHead(ctx, st.tx, h)
 }

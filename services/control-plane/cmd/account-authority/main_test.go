@@ -1201,3 +1201,225 @@ func TestTheExitLineNamesTheStep(t *testing.T) {
 // refused is a stepless ExitError for reason, as the server package builds
 // one; the exitText tables use it.
 func refused(reason string, err error) error { return server.RefuseAt("", reason, err) }
+
+// ---- Task 11: the owner verbs (B3-D9, B3-D12) ----
+
+const ownerUsage = "usage: account-authority serve | migrate --realm <uuid> | keygen --out <path> | restore-begin | " +
+	"reconcile-complete | clear-held [--dry-run] <account>... | seal-legacy --cp-digest <hex> | " +
+	"end-drain <gen>:<serial> | revoke-key <cak|operator|cp_tls> <hex> | replication-gate <on|off>"
+
+// ownerEnv is a complete owner-verb environment: the owner URL (a checked
+// socket directory), absolute trust and anchors paths, no credentials
+// directory. It returns the directory holding the trust and anchors paths.
+func ownerEnv(t *testing.T) string {
+	t.Helper()
+	clearEnv(t)
+	dir := t.TempDir()
+	t.Setenv("AUTHORITY_MIGRATE_DATABASE_URL", socketURL("authority_owner", shortDir(t), ""))
+	t.Setenv("AUTHORITY_TRUST_PATH", filepath.Join(dir, "trust"))
+	t.Setenv("AUTHORITY_ANCHORS_PATH", filepath.Join(dir, "anchors"))
+	return dir
+}
+
+func ownerAccounts(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = uuid.NewString()
+	}
+	return out
+}
+
+// The contract's usage line is pinned literally, so the malformed-form cases
+// below cannot pass on the old usage text.
+func TestOwnerUsageText(t *testing.T) {
+	if usage != ownerUsage {
+		t.Fatalf("usage = %q, want %q", usage, ownerUsage)
+	}
+}
+
+func TestOwnerVerbUsage(t *testing.T) {
+	h96 := strings.Repeat("ab", 48)
+	u := uuid.NewString()
+	cases := map[string][]string{
+		"restore-begin extra":            {"restore-begin", "x"},
+		"reconcile-complete extra":       {"reconcile-complete", "x"},
+		"clear-held no account":          {"clear-held"},
+		"clear-held dry-run only":        {"clear-held", "--dry-run"},
+		"clear-held 65 accounts":         append([]string{"clear-held"}, ownerAccounts(65)...),
+		"clear-held duplicate":           {"clear-held", u, u},
+		"clear-held uppercase uuid":      {"clear-held", strings.ToUpper(u)},
+		"clear-held non-hyphenated uuid": {"clear-held", strings.ReplaceAll(u, "-", "")},
+		"clear-held not a uuid":          {"clear-held", "nope"},
+		"clear-held unknown flag":        {"clear-held", "--bogus", u},
+		"seal-legacy no flag":            {"seal-legacy"},
+		"seal-legacy empty digest":       {"seal-legacy", "--cp-digest", ""},
+		"seal-legacy 95 hex":             {"seal-legacy", "--cp-digest", h96[:95]},
+		"seal-legacy 97 hex":             {"seal-legacy", "--cp-digest", h96 + "a"},
+		"seal-legacy 96 non-hex":         {"seal-legacy", "--cp-digest", strings.Repeat("zz", 48)},
+		"seal-legacy extra positional":   {"seal-legacy", "--cp-digest", h96, "x"},
+		"seal-legacy repeated flag":      {"seal-legacy", "--cp-digest", h96, "--cp-digest", h96},
+		"end-drain none":                 {"end-drain"},
+		"end-drain one number":           {"end-drain", "1"},
+		"end-drain empty serial":         {"end-drain", "1:"},
+		"end-drain empty gen":            {"end-drain", ":2"},
+		"end-drain letters":              {"end-drain", "a:b"},
+		"end-drain three parts":          {"end-drain", "1:2:3"},
+		"end-drain negative":             {"end-drain", "-1:2"},
+		"end-drain fraction":             {"end-drain", "1.5:2"},
+		"end-drain uint64 overflow":      {"end-drain", "99999999999999999999:1"},
+		"end-drain extra":                {"end-drain", "1:2", "x"},
+		"revoke-key none":                {"revoke-key"},
+		"revoke-key no digest":           {"revoke-key", "cak"},
+		"revoke-key unknown kind":        {"revoke-key", "rsk", h96},
+		"revoke-key short digest":        {"revoke-key", "cak", h96[:94]},
+		"revoke-key non-hex digest":      {"revoke-key", "operator", strings.Repeat("zz", 48)},
+		"revoke-key extra":               {"revoke-key", "cp_tls", h96, "x"},
+		"replication-gate none":          {"replication-gate"},
+		"replication-gate ON":            {"replication-gate", "ON"},
+		"replication-gate true":          {"replication-gate", "true"},
+		"replication-gate two args":      {"replication-gate", "on", "off"},
+		"replication-gate empty":         {"replication-gate", ""},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t) // a form that reached Load would exit 1, not 2
+			if code, stdout, stderr := run(args...); code != 2 || stderr != ownerUsage+"\n" || stdout != "" {
+				t.Errorf("%q: code %d, stdout %q, stderr %q", args, code, stdout, stderr)
+			}
+		})
+	}
+}
+
+// The positive control for TestOwnerVerbUsage: every well-formed form gets
+// past parsing (and so is NOT usage), and with an empty environment dies at the
+// loader as config. Without it the malformed cases would pass today, when every
+// owner verb is an unknown verb and so exit 2.
+func TestOwnerVerbWellFormedIsNotUsage(t *testing.T) {
+	h96 := strings.Repeat("cd", 48)
+	forms := [][]string{
+		{"restore-begin"}, {"reconcile-complete"},
+		{"clear-held", uuid.NewString()}, {"clear-held", "--dry-run", uuid.NewString(), uuid.NewString()},
+		append([]string{"clear-held"}, ownerAccounts(64)...),
+		{"seal-legacy", "--cp-digest", h96},
+		{"end-drain", "0:1"}, {"end-drain", "18446744073709551615:7"},
+		{"revoke-key", "cak", h96}, {"revoke-key", "operator", h96}, {"revoke-key", "cp_tls", h96},
+		{"replication-gate", "on"}, {"replication-gate", "off"},
+	}
+	for _, args := range forms {
+		clearEnv(t)
+		code, stdout, stderr := run(args...)
+		if code == 2 || stderr != "" {
+			t.Errorf("%q: code %d, stderr %q: a well-formed form was refused as usage", args[:1], code, stderr)
+			continue
+		}
+		exitLine(t, code, stdout, "config")
+	}
+}
+
+// ownerExit is exitCode over err with a JSON log on a fresh buffer: the code
+// and the one exit line it wrote.
+func ownerExit(t *testing.T, err error) (int, map[string]any) {
+	t.Helper()
+	var out bytes.Buffer
+	code := exitCode(logger.NewJSON(&out).Logger, err)
+	if code == 0 {
+		if out.Len() != 0 {
+			t.Fatalf("exit 0 wrote %q", out.String())
+		}
+		return 0, nil
+	}
+	lines := logLines(t, out.String())
+	if len(lines) != 1 || lines[0]["msg"] != "authority.exit" {
+		t.Fatalf("exit %d wrote %q, want exactly one authority.exit line", code, out.String())
+	}
+	return code, lines[0]
+}
+
+// B3-D12's mapping, the hand-off's three trust-file sentinels included: every
+// owner-verb error exits 1 at step owner with its reason, and a replication
+// failure carries DoR:1743's text in place of its cause, wrapped or not.
+func TestOwnerErrMapping(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		reason string
+	}{
+		{"serve lock held", store.ErrServeLockHeld, server.ReasonLock},
+		{"lock wait ran out (55P03)", fmt.Errorf("authority store: reconcile-complete: %w", &pq.Error{Code: "55P03"}), server.ReasonLock},
+		{"another database error stays config", &pq.Error{Code: "57014"}, server.ReasonConfig},
+		{"serve lock lost mid-verb, ahead of replication", errors.Join(store.ErrServeLockLost,
+			fmt.Errorf("%w: %w", store.ErrNotReplicated, context.Canceled)), server.ReasonLock},
+		{"standby", store.ErrNotLeader, server.ReasonNotLeader},
+		{"not replicated", store.ErrNotReplicated, server.ReasonReplication},
+		{"not replicated, with a cause", fmt.Errorf("%w: %w", store.ErrNotReplicated, errors.New("probe: x")), server.ReasonReplication},
+		{"refused", fmt.Errorf("%w: revoke-key: unknown", store.ErrRefused), server.ReasonRefused},
+		{"trust unusable", errors.Join(store.ErrTrustUnusable, errors.New("x")), server.ReasonRefused},
+		{"rsk reused", store.ErrRSKReused, server.ReasonRefused},
+		{"no meta", store.ErrNoMeta, server.ReasonRefused},
+		{"realm mismatch, as migrate maps it", store.ErrRealmMismatch, server.ReasonTrust},
+		{"a halted installed trust (T4)", fmt.Errorf("authority store: trust halt: %w", errors.Join(errors.New("signer"), &ac.HaltError{Rule: "T4"})), server.ReasonTrust},
+		{"anything else", errors.New("db down"), server.ReasonConfig},
+		{"a deadline", fmt.Errorf("authority store: owner connection: %w", context.DeadlineExceeded), server.ReasonConfig},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, m := ownerExit(t, ownerErr(c.err))
+			if code != 1 || m["reason"] != c.reason || m["step"] != server.StepOwner {
+				t.Fatalf("exit %d, line %v; want 1, reason %s, step owner", code, m, c.reason)
+			}
+			if c.reason == server.ReasonReplication && errorOf(t, m) != "committed locally, not replicated, re-run" {
+				t.Fatalf("error %q, want DoR:1743's text", errorOf(t, m))
+			}
+		})
+	}
+	if ownerErr(nil) != nil {
+		t.Fatal("ownerErr(nil) is not nil")
+	}
+	exit := server.RefuseAt(server.StepInputs, server.ReasonTrust, errors.New("AUTHORITY_TRUST_PATH: x"))
+	if got := ownerErr(exit); got != exit {
+		t.Fatalf("an ExitError was remapped to %v", got)
+	}
+}
+
+// clear-held's exit decision, at the narrowest seam: finishClear, everything
+// the verb does after its store call. A per-account refusal through runMain
+// needs a held head the commit core refuses for row 22, which only the store
+// package's internal fixtures build, so this drives the seam directly.
+func TestClearHeldRefusedResultExitsOne(t *testing.T) {
+	a, b := uuid.NewString(), uuid.NewString()
+	refusedOut := store.ClearRefused + "clear-held: the commit core refused it"
+	results := []store.ClearResult{{Account: a, Outcome: store.ClearUnverified}, {Account: b, Outcome: refusedOut}}
+
+	var out bytes.Buffer
+	code := exitCode(logger.NewJSON(&out).Logger, ownerErr(finishClear(&out, results, nil)))
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if code != 1 || len(lines) != 3 {
+		t.Fatalf("exit %d with %d lines %q, want 1 and two results then one exit line", code, len(lines), out.String())
+	}
+	if want := []string{"account=" + a + " outcome=unverified", "account=" + b + " outcome=" + refusedOut}; !slices.Equal(lines[:2], want) {
+		t.Fatalf("results %q, want %q, in input order", lines[:2], want)
+	}
+	m := exitLine(t, 1, lines[2], server.ReasonRefused)
+	if m["step"] != server.StepOwner || strings.Contains(lines[2], a) || strings.Contains(lines[2], b) {
+		t.Fatalf("exit line %s: want step owner and no account id", lines[2])
+	}
+
+	// The control: the same results with no refusal exit 0 and log nothing.
+	out.Reset()
+	results[1].Outcome = store.ClearRestoreCancel
+	if code := exitCode(logger.NewJSON(&out).Logger, ownerErr(finishClear(&out, results, nil))); code != 0 ||
+		strings.Contains(out.String(), "authority.exit") {
+		t.Fatalf("no refusal: exit %d, stdout %q; want 0 and no exit line", code, out.String())
+	}
+
+	// The store call's own error wins, and the results still print.
+	out.Reset()
+	results[1].Outcome = refusedOut
+	if code, m := ownerExit(t, ownerErr(finishClear(&out, results, store.ErrNotReplicated))); code != 1 ||
+		m["reason"] != server.ReasonReplication {
+		t.Fatalf("exit %d, line %v; want replication", code, m)
+	}
+	if n := strings.Count(out.String(), "account="); n != 2 {
+		t.Fatalf("%d result lines printed beside a store error, want 2", n)
+	}
+}

@@ -40,4 +40,7 @@ var (
 	RolePollInterval    = 5 * time.Second
 	TickInterval        = 30 * time.Second
 	PurgeBudget         = 20 * time.Second
+	// ServeLockWatchInterval is how often an owner verb holding ServeLock
+	// pings the lock's session (ServeLock.Watch).
+	ServeLockWatchInterval = time.Second
 )

@@ -610,11 +610,22 @@ func (s *Server) operator(f func(context.Context, []byte) (store.Outcome, error)
 	}
 }
 
-// operatorErr is B2-D5: ErrNotImplemented is 501 with no body; any other
-// error is 503 store until PR-B3 maps its own codes.
+// operatorErr is B3-D6. A store.OutcomeError, wrapped or not, is the store's
+// own refusal from the operator prologue (503 busy, not_leader, disk, store or
+// replication): it goes on the wire as the store wrote it, and is not counted
+// here, since the store has already set its own tick leg where one is due. A
+// sealed population or a reconciled realm is 409 with no body (B3-D2: no ac
+// code names either); an unproven hold or a malformed batch is 400 bad_authz;
+// any other error is 503 store, counted.
 func (s *Server) operatorErr(err error) store.Outcome {
-	if errors.Is(err, store.ErrNotImplemented) {
-		return store.Outcome{HTTP: http.StatusNotImplemented, Kind: store.KindError, Code: "not_implemented"}
+	var oe store.OutcomeError
+	switch {
+	case errors.As(err, &oe) && oe.Outcome.Kind == store.KindError: // never a success reply
+		return oe.Outcome
+	case errors.Is(err, store.ErrSealed), errors.Is(err, store.ErrReconciled):
+		return store.Outcome{HTTP: http.StatusConflict, Kind: store.KindError, Code: "conflict"}
+	case errors.Is(err, store.ErrBadAuthz):
+		return errOut(http.StatusBadRequest, ac.ErrorBadAuthz)
 	}
 	s.b.NoteNonClient503()
 	return errOut(http.StatusServiceUnavailable, ac.ErrorStore)

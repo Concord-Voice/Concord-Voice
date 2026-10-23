@@ -148,10 +148,10 @@ func (pb *parsedBundle) parseRestore() Reason {
 	return ReasonOK
 }
 
-func (pb parsedBundle) sameAccount(h ChainHead) bool {
+func (pb parsedBundle) sameAccount(realm, account string) bool {
 	for _, x := range [][2]string{{pb.intent.RealmID, pb.intent.AccountID}, {pb.authz.RealmID, pb.authz.AccountID},
 		{pb.res.RealmID, pb.res.AccountID}} {
-		if x[0] != h.RealmID || x[1] != h.AccountID {
+		if x[0] != realm || x[1] != account {
 			return false
 		}
 	}
@@ -417,16 +417,29 @@ func verifyBundleStep(t *Trust, hw HighWater, prev ChainHead, prevIdx int, raw [
 	return st, sup, ReasonOK
 }
 
-// linkCheck is realm/account, request and digest identity, seq and link.
-// Every part names the head's realm and account, and that realm is the
-// Trust's (B-SF1, D-115): the RSK and CAK checks that follow say which keys
-// signed, not which realm the bundle speaks for.
-func linkCheck(pb parsedBundle, prev ChainHead, pp pub, realm string) Reason {
+// identityCheck is realm/account and request and digest identity, the part of
+// linkCheck that reads no head: every part names realm and account, that realm
+// is the Trust's (B-SF1, D-115), and the intent, cp-authz and result agree on
+// the request and bind each other's digests. The RSK and CAK checks that follow
+// say which keys signed, not which realm the bundle speaks for, nor that the
+// parts beside a signed result are the ones it was signed over.
+func identityCheck(pb parsedBundle, realm, account, trustRealm string) Reason {
 	switch {
-	case !pb.sameAccount(prev) || prev.RealmID != realm:
+	case !pb.sameAccount(realm, account) || realm != trustRealm:
 		return ReasonRealmMismatch
 	case !pb.consistent():
 		return ReasonTransitionInvalid
+	}
+	return ReasonOK
+}
+
+// linkCheck is identityCheck against the head's realm and account, then seq
+// and link.
+func linkCheck(pb parsedBundle, prev ChainHead, pp pub, realm string) Reason {
+	if r := identityCheck(pb, prev.RealmID, prev.AccountID, realm); r != ReasonOK {
+		return r
+	}
+	switch {
 	case pb.res.Seq != pp.Seq+1:
 		return ReasonChainGap
 	case !bytes.Equal(pb.res.PrevEntryDigest, pp.Entry):
@@ -578,6 +591,98 @@ func VerifyBundle(t *Trust, hw HighWater, prev ChainHead, bundle []byte, fix *Fi
 		return prev, ReasonSupersededUncovered
 	}
 	return st.after, ReasonOK
+}
+
+// AuthenticateBundle is VerifyBundle's prev-independent part (§2.12; B3-D15
+// R1, Go only, for the issuing authority): a halted or nil Trust admits
+// nothing; EN5 over every part and the restore positions (parseBundle); every
+// part naming t's realm and the result's account (realm_mismatch); the intent,
+// cp-authz and result agreeing on the request and binding each other's digests
+// (transition_invalid); and T7's RSK signature, window and scope under a
+// delegation t retains at the result's (gen, serial). Each check is the one
+// VerifyBundle runs, in its order, so a bundle VerifyBundle accepts
+// authenticates here, and one it refuses at those checks is refused with the
+// same Reason.
+//
+// The invariant: an OK result is bytes an RSK of t's realm signed, within its
+// delegation's window and scope, over exactly the intent and cp-authz beside
+// it. That is all it says. It reads no head, so it judges no seq, no link, no
+// row, no hypothesis, no pin and no CAK signature (T8): what the authority
+// signed is evidence that its head once reached res.Seq, never that the result
+// extends any head the caller holds. superseded is T7's clause (an entry under
+// a serial a renewal or hw has passed) and is reported, never refused; whether
+// to admit it is the caller's. A refusal returns the zero Result, so a caller
+// that ignores the Reason reads no unverified account or seq.
+//
+// What breaks it: returning the decoded result before T7 or the identity check
+// has passed, which hands a caller an account and seq nobody signed; dropping
+// the identity check, which lets a signed result vouch for an intent it was
+// not signed over; or treating it as VerifyBundle, which a client must call:
+// a client's superseded entry needs a covering status (VerifyChain), and a
+// client's head moves only through a link.
+func AuthenticateBundle(t *Trust, hw HighWater, bundle []byte) (Result, bool, Reason) {
+	if r := t.haltReason(); r != ReasonOK {
+		return Result{}, false, r
+	}
+	pb, r := parseBundle(bundle)
+	if r != ReasonOK {
+		return Result{}, false, r
+	}
+	if r := identityCheck(pb, t.realm, pb.res.AccountID, t.realm); r != ReasonOK {
+		return Result{}, false, r
+	}
+	sup, r := t.checkT7(hw, pb.res.DelegationGen, pb.res.DelegationSerial, pb.res.IssuedAtMs, pb.res.Op, pb.resBytes, pb.raw.ResultSig)
+	if r != ReasonOK {
+		return Result{}, false, r
+	}
+	return pb.res, sup, ReasonOK
+}
+
+// ReplayAuthorityBundle is VerifyBundle in the issuing authority's form (§3.4
+// import and its history fold; B3-D15 R3, Go only, for the issuing authority).
+// It differs from VerifyBundle in exactly two places:
+//
+//   - pin is the seq-0 pin, read only when prev is the genesis head: the
+//     authority's own head row is its AccountMemory (V3-05's pin analogue),
+//     so a legacy-population account's first result, a PoP enroll_existing,
+//     replays here where VerifyBundle refuses it as transition_invalid;
+//   - a superseded entry returns its after-head with superseded = true, in
+//     place of prev and superseded_uncovered (DoR:1727): the authority is
+//     re-verifying its own past signatures, every delegation it knows is
+//     installed, and there is no status to cover them.
+//
+// Everything else is VerifyBundle's, in its order: halt (a nil Trust
+// included), the canonical-head guard, EN5, realm and account, request and
+// digest identity, seq and link, T7 and the R1–R4 row checks. It takes no fix
+// (the authority keeps none). Supersession excuses T7's serial clause only,
+// never the link or the row.
+//
+// The invariant: an OK next is the head a client holding pin as its first-sight
+// memory reaches through this bundle, with the T7 superseded clause the only
+// check relaxed. What breaks it: reading the pin off genesis (a later result
+// could restart the pin the chain has fixed since seq 0; checkPost keeps it
+// immutable only from the head's own pin); returning prev with
+// superseded_uncovered, which stops a replay at the first renewal; or a client
+// calling this in place of VerifyBundle or VerifyChain, which would take a pin
+// it was never given and admit a superseded entry without the covering status
+// T7 requires of it (TestAuthorityOnlyExportsStayInTheAuthority).
+//
+// On every refusal it returns prev unchanged, as VerifyBundle does. The head it
+// returns does not alias pin (CWE-375).
+func ReplayAuthorityBundle(t *Trust, hw HighWater, prev ChainHead, bundle, pin []byte) (ChainHead, bool, Reason) {
+	if r := t.haltReason(); r != ReasonOK {
+		return prev, false, r
+	}
+	in := clipIndexes(prev)
+	idx, ok := indexLen(in)
+	if !ok {
+		return prev, false, ReasonMalformed
+	}
+	st, sup, r := verifyBundleStep(t, hw, in, idx, bundle, slices.Clone(pin))
+	if r != ReasonOK {
+		return prev, false, r
+	}
+	return st.after, sup, ReasonOK
 }
 
 // stateReasons are the verdicts of a status that verified: the chain they

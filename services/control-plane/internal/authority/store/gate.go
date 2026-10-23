@@ -32,26 +32,45 @@ func (s *Store) release(ctx context.Context, conn *sql.Conn, o Outcome) Outcome 
 	if o.Kind == KindError {
 		return o
 	}
-	var required bool
-	if err := conn.QueryRowContext(ctx, `SELECT replication_required FROM authority.meta WHERE id = 1`).Scan(&required); err != nil {
+	if ok, err := waitReplicated(ctx, conn, s.probe); err != nil || !ok {
 		return s.replicationError()
 	}
+	return o
+}
+
+// waitReplicated is step 12's wait, the one release and the owner verbs'
+// finish share so the two cannot diverge (B3 Task 3, D-225). It reads
+// meta.replication_required on conn; when that is false it reports true at
+// once and never calls probe. Otherwise it reads the session's WAL insert
+// LSN, which is at or past every commit conn has made, and polls probe at
+// ReleasePollInterval until probe confirms it or ctx ends.
+//
+// It reports true, with a nil error, on those two paths alone. Every other
+// path reports false with its cause and never (false, nil): a meta or LSN
+// read that fails, and ctx ending first. A probe error is not a confirmation
+// and not a refusal either: the wait keeps polling until ctx ends, as B1's
+// release did. Callers treat anything but (true, nil) as not replicated.
+func waitReplicated(ctx context.Context, conn *sql.Conn, probe ReplicationProbe) (bool, error) {
+	var required bool
+	if err := conn.QueryRowContext(ctx, `SELECT replication_required FROM authority.meta WHERE id = 1`).Scan(&required); err != nil {
+		return false, err
+	}
 	if !required {
-		return o
+		return true, nil
 	}
 	var lsn string
 	if err := conn.QueryRowContext(ctx, `SELECT pg_current_wal_insert_lsn()::text`).Scan(&lsn); err != nil {
-		return s.replicationError()
+		return false, err
 	}
 	tick := time.NewTicker(ReleasePollInterval)
 	defer tick.Stop()
 	for {
-		if ok, err := s.probe.Replicated(ctx, conn, lsn); err == nil && ok {
-			return o
+		if ok, err := probe.Replicated(ctx, conn, lsn); err == nil && ok {
+			return true, nil
 		}
 		select {
 		case <-ctx.Done():
-			return s.replicationError()
+			return false, ctx.Err()
 		case <-tick.C:
 		}
 	}
@@ -67,8 +86,15 @@ func (s *Store) replicationError() Outcome {
 // inRecovery is step 1a's read on conn: Hooks.InRecovery, or
 // pg_is_in_recovery() (B1-D10). serve's role poll shares it (B2-D6).
 func (s *Store) inRecovery(ctx context.Context, conn *sql.Conn) (bool, error) {
-	if s.hooks.InRecovery != nil {
-		return s.hooks.InRecovery(ctx, conn)
+	return readInRecovery(ctx, conn, s.hooks.InRecovery)
+}
+
+// readInRecovery is the role read itself: hook when it is set, otherwise
+// pg_is_in_recovery() on conn. The store's step 1a and the owner verbs'
+// leader check (B3-D7) both read it here.
+func readInRecovery(ctx context.Context, conn *sql.Conn, hook func(context.Context, *sql.Conn) (bool, error)) (bool, error) {
+	if hook != nil {
+		return hook(ctx, conn)
 	}
 	var r bool
 	err := conn.QueryRowContext(ctx, `SELECT pg_is_in_recovery()`).Scan(&r)

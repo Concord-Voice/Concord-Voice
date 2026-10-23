@@ -1,8 +1,6 @@
 package store
 
 import (
-	"context"
-	"errors"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/signer"
@@ -39,29 +37,5 @@ func TestOpenRefusesAMissingStatfsSignerOrDB(t *testing.T) {
 	s, _ := signer.GenerateP384()
 	if _, err := Open(Config{Signer: s}); err == nil {
 		t.Fatal("Open accepted a nil DB")
-	}
-}
-
-func TestEveryOperatorVerbIsNotImplemented(t *testing.T) {
-	var st Store
-	ctx := context.Background()
-	checks := map[string]error{
-		"InsertLegacyPopulation": st.InsertLegacyPopulation(ctx, nil),
-		"ReconcileRequired":      st.ReconcileRequired(ctx, nil),
-		"RestoreBegin":           st.RestoreBegin(ctx),
-		"ReconcileComplete":      st.ReconcileComplete(ctx),
-		"ClearHeld":              st.ClearHeld(ctx, ""),
-		"SealLegacy":             st.SealLegacy(ctx, nil),
-		"EndDrain":               st.EndDrain(ctx, 0, 0),
-		"RevokeKey":              st.RevokeKey(ctx, "", nil),
-		"ReplicationGate":        st.ReplicationGate(ctx, true),
-	}
-	_, ierr := st.ReconcileImport(ctx, nil)
-	_, herr := st.ReconcileHold(ctx, nil)
-	checks["ReconcileImport"], checks["ReconcileHold"] = ierr, herr
-	for name, err := range checks {
-		if !errors.Is(err, ErrNotImplemented) {
-			t.Fatalf("%s = %v, want ErrNotImplemented (D-175)", name, err)
-		}
 	}
 }

@@ -23,6 +23,10 @@ type txState struct {
 	reconciled                                                bool // read after L1 (B1-D33)
 	norm                                                      normOut
 	preNorm                                                   ac.PublishedHead
+	// replay marks import's replay of a retained result (import.go, B3-D4):
+	// record writes no ledger row and does not commit, and writeEvents marks
+	// the events imported. Every commit-path transaction leaves it false.
+	replay bool
 }
 
 func setLocalTimeouts(ctx context.Context, tx *sql.Tx) error {
@@ -152,7 +156,7 @@ func (s *Store) drainAndRevocation(ctx context.Context, st *txState) (bool, erro
 	if grace < 0 { // CHECK (drain_grace_ms IN (0, 660000)) rules it out; fail closed
 		return false, nil
 	}
-	supAt, err := s.supersedingInstalledAt(ctx, st.tx, c.Gen, c.Serial, st.accepted)
+	supAt, err := supersedingInstalledAt(ctx, st.tx, c.Gen, c.Serial, st.accepted)
 	if err != nil {
 		return false, err
 	}
@@ -184,7 +188,9 @@ func (s *Store) drainAndRevocation(ctx context.Context, st *txState) (bool, erro
 // installed_at among higher serials of gen in accepted, the set trustFor
 // returned with this transaction's trust (B1-D36, B1-D37). A row the trust
 // ignored, or never saw, never supersedes, as it is never the signer.
-func (s *Store) supersedingInstalledAt(ctx context.Context, q queryer, gen, serial uint64, accepted map[string]bool) (sql.NullTime, error) {
+// end-drain asks the same question through it (B3-D10), so the verb's
+// "superseded" and serve's cannot differ.
+func supersedingInstalledAt(ctx context.Context, q queryer, gen, serial uint64, accepted map[string]bool) (sql.NullTime, error) {
 	rows, err := q.QueryContext(ctx, `SELECT bytes, installed_at FROM authority.delegations
 		WHERE product_root_gen = $1 AND serial > $2 ORDER BY installed_at`, i64(gen), i64(serial))
 	if err != nil {
@@ -218,9 +224,34 @@ func isCancel(op string) bool { return op == ac.OpCancelPending }
 
 // stepsWindowToMalformed is steps 3–6.
 func (s *Store) stepsWindowToMalformed(ctx context.Context, st *txState) (Outcome, bool) {
+	rq := st.rq
+	if out, done := s.windowExpiry(ctx, st); done { // 3, 4
+		return out, true
+	}
+	if st.h.Held && policy.HeldRefuses(st.h.published().FromCode(), rq.Intent.Op, rq.AZ.Actor) { // 5
+		return s.record(ctx, st, ac.RefusalHeld), true
+	}
+	rootCancels := len(rq.Sub.SigCurrentRoot) > 0
+	if ac.IntentForOp(rq.Intent, rq.AZ.Actor, rq.PoP, rootCancels) != "" { // 6
+		return s.record(ctx, st, ac.RefusalMalformedForOp), true
+	}
+	if rq.DI != nil && ac.DeviceIntentForOp(*rq.DI, rq.Intent.CandidateRoot) != "" {
+		return s.record(ctx, st, ac.RefusalMalformedForOp), true
+	}
+	return Outcome{}, false
+}
+
+// windowExpiry is steps 3 and 4 for a published op: the cp-authz window, then
+// the intent's expiry. Import's replay runs it at the result's issued_at
+// (import.go), where a cp-authz asserted after that db_now is a refusal, never
+// the 503 that sets the tick's non-client leg (D-147): only a live clock lags.
+func (s *Store) windowExpiry(ctx context.Context, st *txState) (Outcome, bool) {
 	rq, now, a := st.rq, st.now, st.rq.AZ.AssertedAtMs
 	if isCancel(rq.Intent.Op) { // 3, cancel
 		if a > now+ac.EpsilonMs {
+			if st.replay {
+				return s.record(ctx, st, ac.RefusalAuthzOutOfWindow), true
+			}
 			s.nonClient503.Store(true) // D-228: the authority's clock lags
 			return errorOutcome(503, ac.ErrorClock), true
 		}
@@ -233,16 +264,6 @@ func (s *Store) stepsWindowToMalformed(ctx context.Context, st *txState) (Outcom
 	}
 	if code := expiry(rq, now, st.restoreStartedMs); code != "" { // 4
 		return s.record(ctx, st, code), true
-	}
-	if st.h.Held && policy.HeldRefuses(st.h.published().FromCode(), rq.Intent.Op, rq.AZ.Actor) { // 5
-		return s.record(ctx, st, ac.RefusalHeld), true
-	}
-	rootCancels := len(rq.Sub.SigCurrentRoot) > 0
-	if ac.IntentForOp(rq.Intent, rq.AZ.Actor, rq.PoP, rootCancels) != "" { // 6
-		return s.record(ctx, st, ac.RefusalMalformedForOp), true
-	}
-	if rq.DI != nil && ac.DeviceIntentForOp(*rq.DI, rq.Intent.CandidateRoot) != "" {
-		return s.record(ctx, st, ac.RefusalMalformedForOp), true
 	}
 	return Outcome{}, false
 }
@@ -276,38 +297,55 @@ func expiry(rq *request, now, restoreStarted uint64) ac.Refusal {
 	return ""
 }
 
-// stepNormalize is step 7. The pending result's assurance (which opens the
-// segment at activation) is read from the head event's stored result.
+// stepNormalize is step 7 (normalizeHead); a failure is 503 store.
 func (s *Store) stepNormalize(ctx context.Context, st *txState) (Outcome, bool) {
+	if err := normalizeHead(ctx, st); err != nil {
+		return s.storeError(), true
+	}
+	return Outcome{}, false
+}
+
+// normalizeHead is step 7 on st.h at st.now. The pending result's assurance
+// (which opens the segment at activation) is read from the head event's
+// stored result. Import's replay normalizes through it too, at each retained
+// result's own issued_at (import.go).
+func normalizeHead(ctx context.Context, st *txState) error {
 	st.preNorm = st.h.published()
 	pa := ""
 	if st.h.State == ac.StatePending && len(st.h.PendRoot) > 0 {
 		var bundle []byte
 		if err := st.tx.QueryRowContext(ctx, `SELECT bundle FROM authority.account_events WHERE account_id = $1 AND seq = $2`,
 			st.h.AccountID, i64(st.h.Seq)).Scan(&bundle); err != nil {
-			return s.storeError(), true
+			return err
 		}
 		b, err := ac.DecodeBundle(bundle)
 		if err != nil {
-			return s.storeError(), true
+			return err
 		}
 		res, err := ac.DecodeResult(b.Result)
 		if err != nil {
-			return s.storeError(), true
+			return err
 		}
 		pa = res.Assurance
 	}
 	n, err := normalize(st.h, st.now, st.acc, pa)
 	if err != nil {
-		return s.storeError(), true
+		return err
 	}
 	st.norm = n
-	return Outcome{}, false
+	return nil
 }
 
-// record writes a recorded refusal (D-90) and commits it.
+// record writes a recorded refusal (D-90) and commits it. Under import's
+// replay (st.replay) it writes and commits nothing: the replay rolls the item
+// back and holds the account (import.go), so no ledger row is ever written
+// for a request this process never received, and the account's transaction
+// is never committed from inside a step.
 func (s *Store) record(ctx context.Context, st *txState, code ac.Refusal) Outcome {
 	rq := st.rq
+	if st.replay {
+		return refusedOutcome(rq.Intent.RequestID, code)
+	}
 	if _, err := st.tx.ExecContext(ctx, `INSERT INTO authority.request_ledger (account_id, request_id, intent_digest, code, cp_evidence)
 		VALUES ($1, $2, $3, $4, $5)`, rq.Intent.AccountID, rq.Intent.RequestID, rq.ledgerKey(), string(code), rq.Sub.CPEvidence); err != nil {
 		return s.storeError()

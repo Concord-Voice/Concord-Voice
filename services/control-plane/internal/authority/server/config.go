@@ -28,10 +28,13 @@ import (
 // Verb is the subcommand an environment is loaded for. keygen reads none.
 type Verb int
 
-// The verbs that read the environment.
+// The verbs that read the environment. VerbOwner is every owner verb
+// (B3-D3): they share one column, since only clear-held's credential differs,
+// and OpenOwner, not Load, requires it (B3-D1).
 const (
 	VerbServe Verb = iota + 1
 	VerbMigrate
+	VerbOwner
 )
 
 type need int
@@ -40,16 +43,22 @@ const (
 	unused need = iota
 	required
 	refused
+	// optional is read, and judged by its rule, when set to a value, and is
+	// never required: the owner column's CREDENTIALS_DIRECTORY, which only
+	// clear-held reads a credential from (B3-D1).
+	optional
 )
 
-// Config is serve's or migrate's environment (DoR §3.3 Config table).
+// Config is serve's, migrate's or an owner verb's environment (DoR §3.3
+// Config table).
 type Config struct {
 	ListenAddr    netip.AddrPort
 	TrustPath     string
 	AnchorsPath   string
 	DiskWatchPath string
 	// DatabaseURL is AUTHORITY_DATABASE_URL for serve and
-	// AUTHORITY_MIGRATE_DATABASE_URL for migrate. It is never logged (§3.6).
+	// AUTHORITY_MIGRATE_DATABASE_URL for migrate and the owner verbs. It is
+	// never logged (§3.6).
 	DatabaseURL string
 	// DB is lib/pq's reading of DatabaseURL, as checkDBURL checked it. Dial
 	// it with sql.OpenDB(pq.NewConnectorConfig(DB)), never by passing
@@ -59,27 +68,29 @@ type Config struct {
 	// checked is set by setDB alone, after checkDBURL passed DB. OpenDB
 	// refuses a Config without it: no other package can set it, so a DB built
 	// by hand, or by pq.NewConfig from an unchecked URL, never dials (M3).
-	checked        bool
+	checked bool
+	// CredentialsDir is CREDENTIALS_DIRECTORY: serve's, and an owner verb's
+	// when set. Of the owner verbs, only clear-held reads from it.
 	CredentialsDir string
 }
 
 type envRule struct {
-	name           string
-	serve, migrate need
-	set            func(c *Config, v string) error
+	name                  string
+	serve, migrate, owner need
+	set                   func(c *Config, v string) error
 }
 
-// envRules is the Config table, one row per variable (DoR:1641–1649). The
-// variables lib/pq honours silently (B2-D14) are refused before the table, by
-// envMap. PR-B3 adds the owner-CLI column.
+// envRules is the Config table, one row per variable (DoR:1641–1649), with the
+// owner-CLI column of DoR:1658–1666 as B3-D1 amends it. The variables lib/pq
+// honours silently (B2-D14) are refused before the table, by envMap.
 var envRules = []envRule{
-	{"AUTHORITY_LISTEN_ADDR", required, unused, setListen},
-	{"AUTHORITY_TRUST_PATH", required, unused, func(c *Config, v string) error { return setAbs(&c.TrustPath, v) }},
-	{"AUTHORITY_ANCHORS_PATH", required, unused, func(c *Config, v string) error { return setAbs(&c.AnchorsPath, v) }},
-	{"AUTHORITY_DISK_WATCH_PATH", required, unused, setDiskWatch},
-	{"AUTHORITY_DATABASE_URL", required, refused, func(c *Config, v string) error { return setDB(c, v, "authority_app") }},
-	{"AUTHORITY_MIGRATE_DATABASE_URL", refused, required, func(c *Config, v string) error { return setDB(c, v, "authority_owner") }},
-	{"CREDENTIALS_DIRECTORY", required, unused, func(c *Config, v string) error { return setAbs(&c.CredentialsDir, v) }},
+	{"AUTHORITY_LISTEN_ADDR", required, unused, unused, setListen},
+	{"AUTHORITY_TRUST_PATH", required, unused, required, func(c *Config, v string) error { return setAbs(&c.TrustPath, v) }},
+	{"AUTHORITY_ANCHORS_PATH", required, unused, required, func(c *Config, v string) error { return setAbs(&c.AnchorsPath, v) }},
+	{"AUTHORITY_DISK_WATCH_PATH", required, unused, unused, setDiskWatch},
+	{"AUTHORITY_DATABASE_URL", required, refused, refused, func(c *Config, v string) error { return setDB(c, v, "authority_app") }},
+	{"AUTHORITY_MIGRATE_DATABASE_URL", refused, required, required, func(c *Config, v string) error { return setDB(c, v, "authority_owner") }},
+	{"CREDENTIALS_DIRECTORY", required, unused, optional, func(c *Config, v string) error { return setAbs(&c.CredentialsDir, v) }},
 }
 
 // Load reads verb's environment from environ, in os.Environ's form; the
@@ -89,7 +100,7 @@ var envRules = []envRule{
 // settings come from the URL and lib/pq's defaults alone (B2-D14, N1). A
 // refusal names the variable, never its value, which can be a URL (§3.6).
 func Load(verb Verb, environ []string) (Config, error) {
-	if verb != VerbServe && verb != VerbMigrate {
+	if verb != VerbServe && verb != VerbMigrate && verb != VerbOwner {
 		return Config{}, fmt.Errorf("unknown verb %d", verb)
 	}
 	env, err := envMap(environ)
@@ -106,11 +117,20 @@ func Load(verb Verb, environ []string) (Config, error) {
 }
 
 // apply is r's cell for verb. A refused variable is refused when set at all,
-// even to the empty string, as a lib/pq variable is.
+// even to the empty string, as a lib/pq variable is. An optional one set to
+// the empty string reads as unset. A verb with no column is refused, never
+// read as another verb's.
 func (r envRule) apply(c *Config, verb Verb, env map[string]string) error {
-	n := r.serve
-	if verb == VerbMigrate {
+	var n need
+	switch verb {
+	case VerbServe:
+		n = r.serve
+	case VerbMigrate:
 		n = r.migrate
+	case VerbOwner:
+		n = r.owner
+	default:
+		return fmt.Errorf("unknown verb %d", verb)
 	}
 	v, set := env[r.name]
 	switch {
@@ -118,7 +138,7 @@ func (r envRule) apply(c *Config, verb Verb, env map[string]string) error {
 		return fmt.Errorf("%s must not be set for this verb", r.name)
 	case n == required && v == "":
 		return fmt.Errorf("%s is required", r.name)
-	case n == required:
+	case n == required, n == optional && v != "":
 		if err := r.set(c, v); err != nil {
 			return fmt.Errorf("%s: %w", r.name, err)
 		}

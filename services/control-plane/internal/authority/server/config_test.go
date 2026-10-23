@@ -105,8 +105,20 @@ func TestLoadEveryCell(t *testing.T) {
 		{VerbMigrate, "AUTHORITY_DATABASE_URL", true, false}, // refuse
 		{VerbMigrate, "AUTHORITY_MIGRATE_DATABASE_URL", false, true},
 		{VerbMigrate, "CREDENTIALS_DIRECTORY", true, true},
+		// The owner-CLI column (DoR:1658-1666, #3587 PR-B3, B3-D1): the owner
+		// URL and the trust and anchors paths are required, the serve URL is
+		// refused, and the rest are never required: LISTEN and DISK_WATCH are
+		// ignored when set, and CREDENTIALS_DIRECTORY is read when set, for
+		// clear-held's RSK (TestOwnerLoadReadsTheCredentialsDirectoryWhenSet).
+		{VerbOwner, "AUTHORITY_LISTEN_ADDR", true, true},
+		{VerbOwner, "AUTHORITY_TRUST_PATH", false, true},
+		{VerbOwner, "AUTHORITY_ANCHORS_PATH", false, true},
+		{VerbOwner, "AUTHORITY_DISK_WATCH_PATH", true, true},
+		{VerbOwner, "AUTHORITY_DATABASE_URL", true, false}, // refuse if set
+		{VerbOwner, "AUTHORITY_MIGRATE_DATABASE_URL", false, true},
+		{VerbOwner, "CREDENTIALS_DIRECTORY", true, true},
 	}
-	// B2-D14 and N1: every variable lib/pq reads is refused for both verbs.
+	// B2-D14 and N1: every variable lib/pq reads is refused for every verb.
 	// TestLoadRefusesEveryVariableLibpqReads covers the rest of pq.Config.
 	libpq := []string{
 		"PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE",
@@ -116,10 +128,10 @@ func TestLoadEveryCell(t *testing.T) {
 		// the whole prefix is refused, so a lib/pq upgrade cannot widen it.
 		"PGSYSCONFDIR", "PGREQUIRESSL",
 	}
-	cells := make([]cell, 0, len(table)+2*len(libpq))
+	cells := make([]cell, 0, len(table)+3*len(libpq))
 	cells = append(cells, table...)
 	for _, pg := range libpq {
-		cells = append(cells, cell{VerbServe, pg, true, false}, cell{VerbMigrate, pg, true, false})
+		cells = append(cells, cell{VerbServe, pg, true, false}, cell{VerbMigrate, pg, true, false}, cell{VerbOwner, pg, true, false})
 	}
 	for _, c := range cells {
 		base := validEnv(t)
@@ -972,7 +984,7 @@ func TestLoadRefusesAnUnknownVerb(t *testing.T) {
 	clearLibpqEnv(t)
 	env := validEnv(t)
 	delete(env, "AUTHORITY_MIGRATE_DATABASE_URL")
-	for _, v := range []Verb{0, VerbMigrate + 1, -1} {
+	for _, v := range []Verb{0, VerbOwner + 1, -1} {
 		if _, err := Load(v, environOf(env)); err == nil {
 			t.Errorf("verb %d: loaded", v)
 		}
@@ -1168,7 +1180,7 @@ func ping(t *testing.T, db *sql.DB) {
 }
 
 // Every variable lib/pq's Config reads from the environment is refused by
-// Load, for both verbs. A lib/pq upgrade that adds one fails here.
+// Load, for every verb. A lib/pq upgrade that adds one fails here.
 func TestLoadRefusesEveryVariableLibpqReads(t *testing.T) {
 	clearLibpqEnv(t)
 	typ := reflect.TypeFor[pq.Config]()
@@ -1177,7 +1189,7 @@ func TestLoadRefusesEveryVariableLibpqReads(t *testing.T) {
 		if name == "" || name == "-" {
 			continue
 		}
-		for _, verb := range []Verb{VerbServe, VerbMigrate} {
+		for _, verb := range []Verb{VerbServe, VerbMigrate, VerbOwner} {
 			env := validEnv(t)
 			if verb == VerbServe {
 				delete(env, "AUTHORITY_MIGRATE_DATABASE_URL")
