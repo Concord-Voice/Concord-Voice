@@ -5152,6 +5152,7 @@ class VoiceService {
       return;
     }
 
+    const codecSettingsBeforeCapture = useVideoSettingsStore.getState();
     let acquiredStream: MediaStream | null = null;
     try {
       await this.ensureOsPermission('camera');
@@ -5205,20 +5206,28 @@ class VoiceService {
         });
         return { codec, producer, publishedBitrate };
       };
+      const currentCodecSettings = useVideoSettingsStore.getState();
+      // Explicit settings saved during capture supersede the old recovery plan.
+      const recovery =
+        currentCodecSettings.preferredVideoCodec ===
+          codecSettingsBeforeCapture.preferredVideoCodec &&
+        currentCodecSettings.hdrEncoding === codecSettingsBeforeCapture.hdrEncoding &&
+        currentCodecSettings.prioritizeHdrCodecs === codecSettingsBeforeCapture.prioritizeHdrCodecs
+          ? recoveryCodec
+          : undefined;
       const selectedCodec =
-        recoveryCodec?.requireRoomFloorMatch &&
-        !this.roomFloorIncludesCodec(recoveryCodec.selectedCodec)
-          ? recoveryCodec.activeCodec
-          : recoveryCodec?.selectedCodec;
+        recovery?.requireRoomFloorMatch && !this.roomFloorIncludesCodec(recovery.selectedCodec)
+          ? recovery.activeCodec
+          : recovery?.selectedCodec;
       let replacement = await publish(selectedCodec);
       if (
-        recoveryCodec?.requireRoomFloorMatch &&
+        recovery?.requireRoomFloorMatch &&
         this.isCurrentVideoReproduce(token, transport) &&
         this.localCameraStream === acquiredStream &&
         !this.producers.has('camera') &&
         !this.codecKeysEquivalent(
           this.codecKeyFromParameters(replacement.codec),
-          this.codecKeyFromParameters(recoveryCodec.activeCodec)
+          this.codecKeyFromParameters(recovery.activeCodec)
         ) &&
         !this.roomFloorIncludesCodec(replacement.codec)
       ) {
@@ -5233,7 +5242,36 @@ class VoiceService {
           if (this.localCameraStream === acquiredStream) this.localCameraStream = null;
           return;
         }
-        replacement = await publish(recoveryCodec.activeCodec);
+        replacement = await publish(recovery.activeCodec);
+      }
+      let publishedSettings = currentCodecSettings;
+      while (
+        this.isCurrentVideoReproduce(token, transport) &&
+        this.localCameraStream === acquiredStream &&
+        !this.producers.has('camera')
+      ) {
+        const latestSettings = useVideoSettingsStore.getState();
+        if (
+          latestSettings.preferredVideoCodec === publishedSettings.preferredVideoCodec &&
+          latestSettings.hdrEncoding === publishedSettings.hdrEncoding &&
+          latestSettings.prioritizeHdrCodecs === publishedSettings.prioritizeHdrCodecs
+        ) {
+          break;
+        }
+        // No mapped producer can receive settings saves while publication awaits.
+        this.discardProducedProducer(replacement.producer, socket);
+        await this.drainSendTransportQueue(transport);
+        if (
+          !this.isCurrentVideoReproduce(token, transport) ||
+          this.localCameraStream !== acquiredStream ||
+          this.producers.has('camera')
+        ) {
+          this.stopMediaStream(acquiredStream);
+          if (this.localCameraStream === acquiredStream) this.localCameraStream = null;
+          return;
+        }
+        publishedSettings = useVideoSettingsStore.getState();
+        replacement = await publish();
       }
       if (
         !this.commitCameraProducer(

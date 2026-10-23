@@ -187,17 +187,11 @@ type tokenTheftRetryTask struct {
 	releaseDeny  func()
 }
 
-// SetManagedRedisRecovery gives WATCH a fresh, non-streaming authenticated
+// SetManagedRedisRecovery gives sticky recovery operations a fresh authenticated
 // client per attempt; go-redis's pinned streaming sticky transaction path panics.
 // Call once during router setup, before requests start.
 func (h *Handler) SetManagedRedisRecovery(runtime *managedredis.Runtime, endpoint string, tlsConfig *tls.Config) {
-	h.recoveryWatchClient = func(ctx context.Context) (*redis.Client, error) {
-		snapshot, err := runtime.Snapshot(runtime.Now())
-		if err != nil {
-			return nil, fmt.Errorf("managed Redis recovery credential unavailable")
-		}
-		return database.NewRecoveryWatchClient(ctx, endpoint, tlsConfig, snapshot, runtime)
-	}
+	h.recoveryWatchClient = database.NewRecoveryWatchClientFactory(runtime, endpoint, tlsConfig)
 }
 
 // SetSecurityEvents injects bounded Nightwatch telemetry without widening this
@@ -1880,7 +1874,7 @@ func (h *Handler) handleTokenTheft(c *gin.Context, token models.RefreshToken) bo
 
 	revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), tokenTheftEnqueueTimeout)
 	defer cancel()
-	queuedInDB, queueErr := queueTokenTheftRevocation(revokeCtx, h.db, h.redis, token.UserID)
+	queuedInDB, queueErr := queueTokenTheftRevocation(revokeCtx, h.db, h.redis, token.UserID, h.recoveryWatchClient)
 	if queueErr != nil {
 		h.log.Error("Failed to persist pending token theft revocation", "error", queueErr, "user_id", token.UserID)
 	}
@@ -1891,7 +1885,7 @@ func (h *Handler) handleTokenTheft(c *gin.Context, token models.RefreshToken) bo
 	if queuedInDB {
 		processCtx, cancelProcess := context.WithTimeout(revokeCtx, 2*time.Second)
 		defer cancelProcess()
-		if err := ProcessTokenTheftRevocation(processCtx, h.db, h.redis, token.UserID); err != nil {
+		if err := ProcessTokenTheftRevocation(processCtx, h.db, h.redis, token.UserID, h.recoveryWatchClient); err != nil {
 			h.log.Error("Failed to revoke refresh tokens after token theft", "error", err, "user_id", token.UserID)
 			h.retryTokenTheftRecovery(token.UserID, false)
 		} else {
@@ -1973,12 +1967,12 @@ func (h *Handler) retryTokenTheftRecoveryOnce(ctx context.Context, userID string
 	var queueErr error
 	if needsEnqueue {
 		var queuedInDB bool
-		queuedInDB, queueErr = queueTokenTheftRevocation(ctx, h.db, h.redis, userID)
+		queuedInDB, queueErr = queueTokenTheftRevocation(ctx, h.db, h.redis, userID, h.recoveryWatchClient)
 		if !queuedInDB {
 			return queueErr == nil, queueErr
 		}
 	}
-	processErr := ProcessTokenTheftRevocation(ctx, h.db, h.redis, userID)
+	processErr := ProcessTokenTheftRevocation(ctx, h.db, h.redis, userID, h.recoveryWatchClient)
 	if queueErr == nil || processErr == nil {
 		return true, processErr
 	}

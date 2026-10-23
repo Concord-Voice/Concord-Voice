@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { z } from 'zod';
+import { useDMStore } from '../../stores/chat/dmStore';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2ee/e2eeService';
@@ -8,6 +9,7 @@ import type { MessageWithStatus } from '../../types/chat';
 import { DMExpirationEventSchema, ISOTimestamp, UUID } from '../../types/ws-events';
 import {
   indexMessages,
+  removeScope,
   subscribeSearchResultInvalidations,
 } from '../../services/messaging/searchService';
 import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
@@ -236,7 +238,9 @@ export function reconcileFetchedMessages(
     }
     const isOptimistic =
       Boolean(message.clientMessageId) &&
-      (message.status === 'pending' || message.status === 'sent');
+      (message.status === 'pending' ||
+        message.status === 'sent' ||
+        (message.status === 'failed' && message.id === message.clientMessageId));
     const arrivedDuringRequest = !idsAtRequestStart.has(message.id);
     return isOptimistic || arrivedDuringRequest;
   });
@@ -428,13 +432,34 @@ function buildEndpoint(type: 'channel' | 'dm', channelId: string, limit: number,
   return `${base}?${params}`;
 }
 
+class HistoryAccessDeniedError extends Error {}
+
+function clearDeniedHistory(err: unknown, scopeId: string): void {
+  if (!(err instanceof HistoryAccessDeniedError)) return;
+  recordScopePurge(scopeId);
+  e2eeService.revokeChannelAccess(scopeId);
+  removeScope(scopeId);
+  useChatStore.getState().clearMessages(scopeId);
+  useDMStore.getState().bumpConversation(scopeId, null);
+}
+
 async function readMessagePage(
   res: Response,
+  type: 'channel' | 'dm',
   channelId: string,
   fallbackError: string
 ): Promise<MessageWithStatus[]> {
   if (!res.ok) {
-    const data = await safeJson<{ error?: string }>(res);
+    const data = await safeJson<{ error?: string; code?: string }>(res);
+    // Only the history handler's refusal proves access loss; attestation also returns 403.
+    const denied =
+      type === 'dm'
+        ? data.error === 'Not a participant'
+        : data.error === "Not a member of this channel's server" ||
+          data.error === 'Insufficient permissions';
+    if (res.status === 403 && data.code === undefined && denied) {
+      throw new HistoryAccessDeniedError(data.error);
+    }
     throw new Error(data.error || fallbackError);
   }
 
@@ -498,7 +523,7 @@ async function loadOlderMessagesAttempt({
     // flight — discard results.
     if (!isCurrent()) return 'stale';
 
-    const rawMsgs = await readMessagePage(res, channelId, 'Failed to load more messages');
+    const rawMsgs = await readMessagePage(res, type, channelId, 'Failed to load more messages');
     const msgs = await decryptMessages(channelId, rawMsgs, operationGuard);
     operationGuard.assertCurrent();
 
@@ -759,6 +784,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
       );
       const invalidatedDuringRequest = new Set<string>();
       const purgeGenerationAtRequestStart = currentPurgeGeneration(channelId);
+      const lifecycle = captureAuthLifecycle();
       const unsubscribeInvalidations = subscribeSearchResultInvalidations((messageId) => {
         invalidatedDuringRequest.add(messageId);
       });
@@ -771,7 +797,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         const res = await apiFetch(buildEndpoint(type, channelId, limit));
         if (aborted) return;
 
-        const rawMsgs = await readMessagePage(res, channelId, 'Failed to load messages');
+        const rawMsgs = await readMessagePage(res, type, channelId, 'Failed to load messages');
         if (aborted) return;
 
         const msgs = await decryptMessages(channelId, rawMsgs, operationGuard);
@@ -810,7 +836,10 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
           retryFetch();
         }
       } catch (err) {
-        if (!aborted) {
+        if (!aborted && isSameAuthLifecycle(lifecycle)) {
+          if (currentPurgeGeneration(channelId) === purgeGenerationAtRequestStart) {
+            clearDeniedHistory(err, channelId);
+          }
           // A key rotation invalidated this batch after decryption. Start a
           // fresh request with the new generation; access revocations use a
           // terminal NOT_MEMBER fence and never enter this retry path.
@@ -881,6 +910,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         }
         return { status: 'done', requests };
       } catch (err) {
+        if (sameChannelAndAuth() && !purged()) clearDeniedHistory(err, channelKey);
         // Reconcile from a fresh initial snapshot after rotation. Retrying
         // the same `before` cursor could be stale after live edits/deletes.
         const status = thrownPageStatus(err, {

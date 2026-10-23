@@ -242,7 +242,11 @@ func runControlPlane() (runErr error) {
 
 	// Start background cleanup job (reaps expired tokens, stale sessions, orphaned presence)
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
-	if err := auth.StartTokenTheftRecoveryWorker(cleanupCtx, db, redisClient, log, auth.TokenTheftRecoveryInterval); err != nil {
+	var recoveryClient func(context.Context) (*redis.Client, error)
+	if redisRuntime != nil {
+		recoveryClient = database.NewRecoveryWatchClientFactory(redisRuntime, cfg.RedisEndpoint, redisTLSConfig)
+	}
+	if err := auth.StartTokenTheftRecoveryWorker(cleanupCtx, db, redisClient, log, auth.TokenTheftRecoveryInterval, recoveryClient); err != nil {
 		cleanupCancel()
 		return fmt.Errorf("start token theft recovery worker: %w", err)
 	}

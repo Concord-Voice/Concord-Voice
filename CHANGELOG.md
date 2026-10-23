@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Your failed channel messages stay available to retry after a brief disconnect.
+Camera recovery honors codec settings you save while capture restarts.
+
 If suspicious use of a sign-in session is detected, that account stays blocked
 until session revocation finishes, even after a temporary server error.
 
@@ -106,6 +109,10 @@ you verify your email.
 - **Up Arrow edits your last message** (internal development reference omitted) — in an empty message box, Up Arrow opens your most recent message for editing, in channels, direct messages and voice text chat. It keeps its usual cursor behaviour while the box holds text, a reply or an attached file, while an input method is composing, and with Shift, Ctrl, Alt or Cmd held. When your newest message is still sending, failed to send or cannot be read, Up Arrow does nothing rather than opening an older message. Any message edit now opens with the cursor at the end of the text, saving or cancelling it returns focus to the message box you were using, and the edit box has an accessible name. If an edit cannot be saved, the edit box opens again with your text. An edit you leave open closes when you switch channels, and a message that cannot be read offers Delete but not Edit.
 
 ### Fixed
+
+- **Failed channel messages survive reconnects** (internal development reference omitted) — your pending and failed sends keep their text and retry controls after a brief outage. Reply previews are cleared, and message purges, access loss and sign-out still clear the affected history.
+- **Camera recovery honors saved settings** (internal development reference omitted) — codec and HDR settings saved while camera capture restarts now replace the earlier recovery choice. Room compatibility checks still apply.
+- **Subscription updates arrive in order** (internal development reference omitted) — an older downgrade notification can no longer follow a newer upgrade for the same subscription and lower your active capabilities.
 
 - **Video stays on when someone joins a call with incompatible video support** (internal development reference omitted) — a participant's codec claim no longer stops an active camera or screen share. Codec and layering changes keep a working format for existing viewers.
 

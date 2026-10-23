@@ -22,7 +22,7 @@ import (
 // fetch taken while it held that exclusivity. So commits for one id happen in
 // fetch order, and a slower reconcile carrying an older fetch can never land
 // after a newer one. The exclusivity is a SESSION-level advisory lock held on
-// a dedicated connection from before the fetch until after the commit. It
+// a dedicated connection from before the fetch through post-commit notifications. It
 // breaks if the fetch moves before the lock, if the lock becomes
 // transaction-scoped (it would end at commit, and no transaction may be open
 // across the Stripe call), or if a connection that failed to unlock returns to
@@ -53,6 +53,9 @@ const (
 	// detached from the caller's cancellation, so a canceled request still
 	// releases its key instead of discarding a healthy connection.
 	unlockTimeout = 5 * time.Second
+
+	// A stalled live-notification queue must not retain the subscription lock.
+	tierNotificationTimeout = 10 * time.Second
 
 	// Log attribute keys. Stripe ids appear only as values under these
 	// constant keys (spec §14); objects are never dumped.
@@ -166,7 +169,13 @@ type reconcileOutcome struct {
 // and by the same rule for the row's owner when that is another user; a push
 // failure is logged, never returned, because the row is committed.
 func (s *Service) Reconcile(ctx context.Context, subID, eventID, eventType string) (changed bool, err error) {
-	out, err := s.reconcileLocked(ctx, subID, eventID, eventType)
+	conn, err := s.lockSubscription(ctx, subID)
+	if err != nil {
+		return false, err
+	}
+	defer s.unlockSubscription(ctx, conn, subID)
+
+	out, err := s.reconcileLocked(ctx, conn, subID, eventID, eventType)
 	if err != nil {
 		return false, err
 	}
@@ -189,21 +198,17 @@ func (s *Service) Reconcile(ctx context.Context, subID, eventID, eventType strin
 // pushTier tells the TierChanger that userID's tier moved. The row is already
 // committed, so a failure is logged and not returned.
 func (s *Service) pushTier(ctx context.Context, subID string, userID uuid.UUID, before, after string) {
-	if err := s.Changer.OnTierChange(ctx, userID, before, after); err != nil {
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tierNotificationTimeout)
+	defer cancel()
+	if err := s.Changer.OnTierChange(notifyCtx, userID, before, after); err != nil {
 		s.Log.Error("billing: tier change push failed after reconcile",
 			logKeySubID, subID, logKeyErrorClass, errorClass(err), logKeyStage, stageTierPush)
 	}
 }
 
-// reconcileLocked holds the advisory key across fetch, transaction and commit,
-// and releases it before Reconcile pushes the tier change.
-func (s *Service) reconcileLocked(ctx context.Context, subID, eventID, eventType string) (reconcileOutcome, error) {
-	conn, err := s.lockSubscription(ctx, subID)
-	if err != nil {
-		return reconcileOutcome{}, err
-	}
-	defer s.unlockSubscription(ctx, conn, subID)
-
+// reconcileLocked fetches and commits under the advisory key Reconcile holds
+// through the subsequent tier notifications.
+func (s *Service) reconcileLocked(ctx context.Context, conn *sql.Conn, subID, eventID, eventType string) (reconcileOutcome, error) {
 	fields, metadata, err := s.fetchSubscription(ctx, subID)
 	if err != nil {
 		return reconcileOutcome{}, err

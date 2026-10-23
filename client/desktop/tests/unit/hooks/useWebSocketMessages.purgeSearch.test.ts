@@ -479,3 +479,98 @@ describe('server_purged clears every known channel of the server', () => {
     expect(details).toEqual([{ scopeId: null, serverId: SERVER_ID }]);
   });
 });
+
+describe('disconnect preserves client-authored rows', () => {
+  it('keeps a failed optimistic send across a transient control socket outage', () => {
+    addChannel(CHANNEL_ID, SERVER_ID);
+    const localMessage = {
+      ...mockMessage,
+      id: 'msg_123456',
+      clientMessageId: 'msg_123456',
+      channel_id: CHANNEL_ID,
+      content: 'not stored on server',
+      status: 'failed' as const,
+    };
+    useChatStore.getState().setMessages(CHANNEL_ID, [localMessage]);
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    act(() => {
+      ws.emitConnectionChange(ConnectionState.CONNECTED);
+      ws.emitConnectionChange(ConnectionState.RECONNECTING);
+      ws.emitConnectionChange(ConnectionState.CONNECTED);
+    });
+    expect(useChatStore.getState().messagesByChannel.get(CHANNEL_ID)).toEqual([
+      expect.objectContaining(localMessage),
+    ]);
+  });
+});
+
+describe('outage-only preservation keeps authority boundaries', () => {
+  it('retains only own pending/failed temporary rows and full purge still clears them', () => {
+    addChannel(CHANNEL_ID, SERVER_ID);
+    const own = (id: string, status: 'pending' | 'failed') => ({
+      ...mockMessage,
+      id,
+      clientMessageId: id,
+      channel_id: CHANNEL_ID,
+      content: 'own unsent content',
+      status,
+    });
+    const pending = own('msg_pending', 'pending');
+    const failed = own('msg_failed', 'failed');
+    useChatStore.getState().setMessages(CHANNEL_ID, [
+      { ...mockMessage, id: MESSAGE_ID, channel_id: CHANNEL_ID, content: 'confirmed history' },
+      {
+        ...pending,
+        replied_to: { id: MESSAGE_ID, user_id: 'other-user', content: 'server reply text' },
+      },
+      failed,
+      { ...own('msg_foreign', 'pending'), user_id: 'other-user' },
+      { ...own('msg_sent', 'pending'), status: 'sent' },
+      { ...own('msg_acknowledged', 'failed'), id: MESSAGE_B_ID },
+    ]);
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    act(() => {
+      ws.emitConnectionChange(ConnectionState.CONNECTED);
+      ws.emitConnectionChange(ConnectionState.RECONNECTING);
+    });
+    expect(useChatStore.getState().messagesByChannel.get(CHANNEL_ID)).toEqual([
+      expect.objectContaining({ ...pending, replied_to: undefined }),
+      expect.objectContaining(failed),
+    ]);
+    act(() => requireHandler(ws, 'channel_purged')(channelPurgedEvent(CHANNEL_ID)));
+    expect(useChatStore.getState().messagesByChannel.get(CHANNEL_ID)).toBeUndefined();
+  });
+
+  it('authoritative access revocation still clears an unsent row after an outage', () => {
+    addChannel(CHANNEL_ID, SERVER_ID);
+    useChatStore.getState().setMessages(CHANNEL_ID, [
+      {
+        ...mockMessage,
+        id: 'msg_local',
+        clientMessageId: 'msg_local',
+        channel_id: CHANNEL_ID,
+        content: 'own unsent content',
+        status: 'failed',
+      },
+    ]);
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    act(() => {
+      ws.emitConnectionChange(ConnectionState.CONNECTED);
+      ws.emitConnectionChange(ConnectionState.RECONNECTING);
+    });
+    expect(useChatStore.getState().messagesByChannel.get(CHANNEL_ID)).toHaveLength(1);
+    act(() =>
+      requireHandler(
+        ws,
+        'channel_access_revoked'
+      )({ type: 'channel_access_revoked', data: { channel_id: CHANNEL_ID } })
+    );
+    expect(useChatStore.getState().messagesByChannel.get(CHANNEL_ID)).toBeUndefined();
+    expect(useChannelStore.getState().channels.some((channel) => channel.id === CHANNEL_ID)).toBe(
+      false
+    );
+  });
+});

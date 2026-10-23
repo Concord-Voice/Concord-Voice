@@ -2,7 +2,9 @@ package entitlements_test
 
 import (
 	"context"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -17,9 +19,19 @@ type fakeNotifier struct {
 	broadcasts   []entitlements.EntitlementDTO
 }
 
-func (f *fakeNotifier) DisconnectUser(id uuid.UUID) { f.disconnected = append(f.disconnected, id) }
-func (f *fakeNotifier) BroadcastEntitlements(_ uuid.UUID, dto entitlements.EntitlementDTO) {
+func (f *fakeNotifier) DisconnectUserContext(ctx context.Context, id uuid.UUID) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	f.disconnected = append(f.disconnected, id)
+	return true
+}
+func (f *fakeNotifier) BroadcastEntitlementsContext(ctx context.Context, _ uuid.UUID, dto entitlements.EntitlementDTO) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	f.broadcasts = append(f.broadcasts, dto)
+	return true
 }
 
 func TestIsDowngrade(t *testing.T) {
@@ -107,4 +119,41 @@ func TestOnTierChange_DowngradeDisconnectsEvenIfInvalidateFails(t *testing.T) {
 	// BroadcastEntitlements does not touch Redis, so the push still records.
 	require.Len(t, disc.broadcasts, 1)
 	assert.Equal(t, "free", disc.broadcasts[0].Tier)
+}
+
+func TestOnTierChange_CacheTimeoutLeavesDowngradeQueueBudget(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	release := make(chan struct{})
+	joined := make(chan struct{})
+	t.Cleanup(func() {
+		require.NoError(t, listener.Close())
+		close(release)
+		select {
+		case <-joined:
+		case <-time.After(time.Second):
+			t.Error("stalled Redis fixture did not exit")
+		}
+	})
+	go func() {
+		defer close(joined)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		<-release
+		if err := conn.Close(); err != nil {
+			t.Errorf("close stalled Redis connection: %v", err)
+		}
+	}()
+	client := redis.NewClient(&redis.Options{Addr: listener.Addr().String(), ContextTimeoutEnabled: true, ReadTimeout: -1, MaxRetries: -1, DialerRetries: 1})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	notifier := &fakeNotifier{}
+	err = entitlements.OnTierChange(ctx, entitlements.NewCache(client, nil), notifier, uuid.New(), "premium", "free")
+	require.Error(t, err, "stalled cache invalidation must be surfaced")
+	require.NoError(t, ctx.Err(), "invalidation must leave time for downgrade enforcement")
+	assert.Len(t, notifier.disconnected, 1, "cache timeout must not consume the downgrade's queue budget")
+	assert.Len(t, notifier.broadcasts, 1)
 }

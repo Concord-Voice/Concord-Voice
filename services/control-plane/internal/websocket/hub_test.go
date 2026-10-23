@@ -4324,3 +4324,55 @@ func TestParseDMMessageFields_RejectsEnvelopeMissingKeyVersion(t *testing.T) {
 	assert.Nil(t, input)
 	assert.False(t, valid)
 }
+
+type disconnectWaitContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *disconnectWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
+func TestDisconnectUserContext(t *testing.T) {
+	userID := uuid.New()
+	t.Run("enqueue", func(t *testing.T) {
+		hub := NewHub(nil, nil)
+		require.True(t, hub.DisconnectUserContext(context.Background(), userID))
+		assert.Equal(t, userID, <-hub.disconnectUser)
+	})
+	t.Run("canceled", func(t *testing.T) {
+		hub := NewHub(nil, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		require.False(t, hub.DisconnectUserContext(ctx, userID))
+		assert.Empty(t, hub.disconnectUser)
+	})
+	t.Run("blocked queue", func(t *testing.T) {
+		hub := NewHub(nil, nil)
+		for range cap(hub.disconnectUser) {
+			hub.disconnectUser <- userID
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan bool, 1)
+		waiting := &disconnectWaitContext{Context: ctx, entered: make(chan struct{})}
+		go func() { done <- hub.DisconnectUserContext(waiting, userID) }()
+		<-waiting.entered
+		cancel()
+		select {
+		case queued := <-done:
+			assert.False(t, queued)
+		case <-time.After(time.Second):
+			t.Fatal("disconnect enqueue ignored cancellation")
+		}
+		assert.Len(t, hub.disconnectUser, cap(hub.disconnectUser), "cancellation must not enqueue a late disconnect")
+	})
+	t.Run("stopped", func(t *testing.T) {
+		hub := NewHub(nil, nil)
+		close(hub.done)
+		require.False(t, hub.DisconnectUserContext(context.Background(), userID))
+		assert.Empty(t, hub.disconnectUser)
+	})
+}

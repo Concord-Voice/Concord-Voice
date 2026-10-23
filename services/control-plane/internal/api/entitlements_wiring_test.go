@@ -1,13 +1,17 @@
 package api
 
 import (
+	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -25,12 +29,20 @@ type recordingBroadcaster struct {
 	broadcasts   []recordedBroadcast
 }
 
-func (r *recordingBroadcaster) DisconnectUser(id uuid.UUID) {
+func (r *recordingBroadcaster) DisconnectUserContext(ctx context.Context, id uuid.UUID) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	r.disconnected = append(r.disconnected, id)
+	return true
 }
 
-func (r *recordingBroadcaster) BroadcastToUser(id uuid.UUID, msg websocket.OutgoingMessage) {
+func (r *recordingBroadcaster) BroadcastToUserContext(ctx context.Context, id uuid.UUID, msg websocket.OutgoingMessage) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	r.broadcasts = append(r.broadcasts, recordedBroadcast{userID: id, msg: msg})
+	return true
 }
 
 // TestEntitlementNotifier_BroadcastEntitlements locks the live-update wire
@@ -68,9 +80,70 @@ func TestEntitlementNotifier_DisconnectUser(t *testing.T) {
 	n := NewEntitlementNotifier(rb, logger.New("test"))
 	uid := uuid.New()
 
-	n.DisconnectUser(uid)
+	require.True(t, n.DisconnectUserContext(context.Background(), uid))
 
 	require.Len(t, rb.disconnected, 1)
 	assert.Equal(t, uid, rb.disconnected[0])
 	assert.Empty(t, rb.broadcasts, "a disconnect must not broadcast")
+}
+
+// blockingEntitlementHub models a Hub queue that cannot drain until cleanup.
+type blockingEntitlementHub struct {
+	blockBroadcast bool
+	disconnected   bool
+	entered        chan struct{}
+	release        chan struct{}
+}
+
+func (h *blockingEntitlementHub) wait(ctx context.Context) bool {
+	close(h.entered)
+	select {
+	case <-h.release:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+func (h *blockingEntitlementHub) BroadcastToUserContext(ctx context.Context, _ uuid.UUID, _ websocket.OutgoingMessage) bool {
+	if h.blockBroadcast {
+		return h.wait(ctx)
+	}
+	return ctx.Err() == nil
+}
+func (h *blockingEntitlementHub) DisconnectUserContext(ctx context.Context, _ uuid.UUID) bool {
+	if !h.blockBroadcast {
+		h.disconnected = h.wait(ctx)
+		return h.disconnected
+	}
+	h.disconnected = ctx.Err() == nil
+	return h.disconnected
+}
+
+func TestOnTierChange_BlockedHubHonorsCancellation(t *testing.T) {
+	for _, broadcast := range []bool{true, false} {
+		t.Run(map[bool]string{true: "broadcast", false: "disconnect"}[broadcast], func(t *testing.T) {
+			rdb := redistest.Client(t)
+			t.Cleanup(func() { require.NoError(t, rdb.Close()) })
+			hub := &blockingEntitlementHub{blockBroadcast: broadcast, entered: make(chan struct{}), release: make(chan struct{})}
+			var release sync.Once
+			t.Cleanup(func() { release.Do(func() { close(hub.release) }) })
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- entitlements.OnTierChange(ctx, entitlements.NewCache(rdb, nil), NewEntitlementNotifier(hub, logger.New("test")), uuid.New(), "premium", "free")
+			}()
+			<-hub.entered
+			cancel()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.Canceled)
+				if broadcast {
+					assert.True(t, hub.disconnected, "downgrade revocation must precede a stalled capability broadcast")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("tier change ignored cancellation while the Hub queue was blocked")
+			}
+		})
+	}
 }

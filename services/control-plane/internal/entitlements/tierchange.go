@@ -2,10 +2,15 @@ package entitlements
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+// Cache invalidation must leave the billing notification budget time to revoke sessions.
+const tierCacheInvalidationTimeout = 5 * time.Second
 
 // SessionNotifier is the subset of the WebSocket hub the tier-change path needs:
 // force-disconnect (downgrade revocation) and a soft entitlements_changed push.
@@ -14,8 +19,8 @@ import (
 // entitlements, so the reverse edge would be an import cycle. The concrete
 // adapter lives in internal/api (see entitlements_wiring.go).
 type SessionNotifier interface {
-	DisconnectUser(userID uuid.UUID)
-	BroadcastEntitlements(userID uuid.UUID, dto EntitlementDTO)
+	DisconnectUserContext(ctx context.Context, userID uuid.UUID) bool
+	BroadcastEntitlementsContext(ctx context.Context, userID uuid.UUID, dto EntitlementDTO) bool
 }
 
 // Rank orders tiers for downgrade detection. Unknown tiers rank 0 (fail-closed:
@@ -48,27 +53,34 @@ func OnTierChange(ctx context.Context, cache *Cache, notifier SessionNotifier, u
 	// and MUST run even when Redis is unavailable. Returning early on an invalidate
 	// error would skip the disconnect, leaving a downgraded user on a stale premium
 	// session during a Redis hiccup (fail-open). The error is still surfaced below.
-	invalidateErr := cache.Invalidate(ctx, userID.String())
+	invalidateCtx, cancel := context.WithTimeout(ctx, tierCacheInvalidationTimeout)
+	invalidateErr := cache.Invalidate(invalidateCtx, userID.String())
+	cancel()
+	var notifyErr error
 
 	if notifier != nil {
-		// Push the NEW capability set to all of the user's connected clients so the
-		// UI live-updates without a re-fetch round-trip (works for upgrade, lateral,
-		// and downgrade alike).
-		notifier.BroadcastEntitlements(userID, ToDTO(For(newTier)))
-
-		// notifier.DisconnectUser severs the user's CONTROL-PLANE WebSocket only,
+		// notifier.DisconnectUserContext severs the user's CONTROL-PLANE WebSocket only,
 		// forcing re-auth -> a fresh free claim for all subsequent API/WS/join
 		// decisions. It does NOT tear down an in-progress media-plane SFU voice
 		// session (a separate transport); eager media-session teardown on downgrade
 		// (via the voice.enforce.disconnect NATS path) is media-plane tier
 		// enforcement, deferred to #1300/#1542.
 		if IsDowngrade(oldTier, newTier) {
-			notifier.DisconnectUser(userID)
+			if !notifier.DisconnectUserContext(ctx, userID) {
+				notifyErr = errors.Join(notifyErr, errors.New("enqueue tier downgrade disconnect"), ctx.Err())
+			}
+		}
+
+		// Push the NEW capability set to all of the user's connected clients so the
+		// UI live-updates without a re-fetch round-trip (works for upgrade, lateral,
+		// and downgrade alike).
+		if !notifier.BroadcastEntitlementsContext(ctx, userID, ToDTO(For(newTier))) {
+			notifyErr = errors.Join(notifyErr, errors.New("enqueue entitlement change"), ctx.Err())
 		}
 	}
 
 	if invalidateErr != nil {
-		return fmt.Errorf("invalidate tier cache: %w", invalidateErr)
+		return errors.Join(fmt.Errorf("invalidate tier cache: %w", invalidateErr), notifyErr)
 	}
-	return nil
+	return notifyErr
 }

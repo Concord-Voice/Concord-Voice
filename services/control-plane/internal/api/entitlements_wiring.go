@@ -2,6 +2,8 @@
 package api
 
 import (
+	"context"
+
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -17,8 +19,8 @@ import (
 // contract the client keys on. *websocket.Hub satisfies it (compile-time
 // asserted below).
 type entitlementBroadcaster interface {
-	DisconnectUser(userID uuid.UUID)
-	BroadcastToUser(userID uuid.UUID, msg websocket.OutgoingMessage)
+	DisconnectUserContext(ctx context.Context, userID uuid.UUID) bool
+	BroadcastToUserContext(ctx context.Context, userID uuid.UUID, msg websocket.OutgoingMessage) bool
 }
 
 var _ entitlementBroadcaster = (*websocket.Hub)(nil)
@@ -48,18 +50,27 @@ func NewEntitlementNotifier(hub entitlementBroadcaster, log *logger.Logger) *Ent
 	return &EntitlementNotifier{hub: hub, log: log}
 }
 
-// DisconnectUser severs the user's control-plane WebSocket (forced re-auth).
-func (n *EntitlementNotifier) DisconnectUser(userID uuid.UUID) { n.hub.DisconnectUser(userID) }
+// DisconnectUserContext bounds the downgrade enqueue by the notification budget.
+func (n *EntitlementNotifier) DisconnectUserContext(ctx context.Context, userID uuid.UUID) bool {
+	return n.hub.DisconnectUserContext(ctx, userID)
+}
 
 // BroadcastEntitlements pushes the new capability set to all of the user's
 // connected clients as an entitlements_changed event.
 func (n *EntitlementNotifier) BroadcastEntitlements(userID uuid.UUID, dto entitlements.EntitlementDTO) {
+	if !n.BroadcastEntitlementsContext(context.Background(), userID, dto) {
+		n.log.Error("entitlements: enqueue capability push failed")
+	}
+}
+
+// BroadcastEntitlementsContext bounds the capability enqueue by the notification budget.
+func (n *EntitlementNotifier) BroadcastEntitlementsContext(ctx context.Context, userID uuid.UUID, dto entitlements.EntitlementDTO) bool {
 	data, err := entitlements.DTOToMap(dto)
 	if err != nil {
 		n.log.Error("entitlements: marshal DTO for push failed", "error", err)
-		return
+		return false
 	}
-	n.hub.BroadcastToUser(userID, websocket.OutgoingMessage{Type: "entitlements_changed", Data: data})
+	return n.hub.BroadcastToUserContext(ctx, userID, websocket.OutgoingMessage{Type: "entitlements_changed", Data: data})
 }
 
 // newViolationRecorder builds #1308's misbehaviour recorder. Its threshold

@@ -101,7 +101,10 @@ vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/system/postLoginHydrationLifecycle', () => ({
+vi.mock('@/renderer/services/system/postLoginHydrationLifecycle', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('@/renderer/services/system/postLoginHydrationLifecycle')
+  >()),
   beginPostLoginHydrationGuard: vi.fn(() => ({
     signal: new AbortController().signal,
     isCurrent: () => true,

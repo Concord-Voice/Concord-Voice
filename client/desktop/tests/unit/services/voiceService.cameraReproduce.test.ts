@@ -26,6 +26,8 @@
  * regardless of track.readyState. This suite uses mediasoup-FAITHFUL mocks.
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { waitFor } from '@testing-library/react';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -753,6 +755,185 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
           ? useVoiceStore.getState().activeCameraCodec
           : useVoiceStore.getState().activeScreenCodec
       ).toBeNull();
+    }
+  );
+
+  it.each([
+    { change: 'saved preference', expected: ['video/VP8'] },
+    { change: 'null floor during capture', expected: ['video/VP8'] },
+    { change: 'disjoint floor during capture', expected: ['video/VP8'] },
+    { change: 'null floor during publication', expected: ['video/AV1', 'video/VP8'] },
+  ])('dead-track camera recovery obeys $change', async ({ change, expected }) => {
+    const svc = voiceService as any;
+    resetService(svc);
+    const av1 = { ...requestedVp8Codec, mimeType: 'video/AV1' };
+    svc.device.rtpCapabilities = {
+      codecs: [...mockDeviceRtpCapabilities.codecs, av1],
+    };
+    // Exercise the real current-settings selection, including recovery overrides.
+    svc.pickCameraCodec = Object.getPrototypeOf(svc).pickCameraCodec;
+    useVoiceStore.getState().setCodecFloor(['video/av1', 'video/vp8']);
+    useVideoSettingsStore.setState({
+      preferredVideoCodec: 'video/AV1',
+      hardwareAcceleration: false,
+      hdrEncoding: false,
+      prioritizeHdrCodecs: false,
+    });
+    const deadTrack = makeVideoTrack('dead-camera');
+    deadTrack.stop();
+    svc.localCameraStream = new MockMediaStream([deadTrack]);
+    svc.producers.set(
+      'camera',
+      makeMockProducer({
+        track: deadTrack,
+        stopTracks: false,
+        source: 'camera',
+      })
+    );
+    let releaseCapture!: (stream: MockMediaStream) => void;
+    svc.acquireCameraWithFallback = vi.fn(
+      () =>
+        new Promise<MockMediaStream>((resolve) => {
+          releaseCapture = resolve;
+        })
+    );
+    const produce = svc.sendTransport.produce;
+    svc.sendTransport.produce = vi.fn(async (options: any) => {
+      if (change === 'null floor during publication') {
+        useVoiceStore.getState().setCodecFloor(null);
+      }
+      return produce(options);
+    });
+    const recovery = svc.handleCodecFloorChange(['video/vp8'], ['video/av1', 'video/vp8']);
+    await waitFor(() => expect(svc.acquireCameraWithFallback).toHaveBeenCalledTimes(1));
+    expect(svc.producers.has('camera')).toBe(false);
+    if (change === 'saved preference') {
+      const previous = useVideoSettingsStore.getState();
+      useVideoSettingsStore.setState({ preferredVideoCodec: 'video/VP8' });
+      svc.handleVideoSettingsChange(useVideoSettingsStore.getState(), previous);
+    } else if (change === 'null floor during capture') {
+      useVoiceStore.getState().setCodecFloor(null);
+    } else if (change === 'disjoint floor during capture') {
+      useVoiceStore.getState().setCodecFloor(['video/h264']);
+    }
+    releaseCapture(new MockMediaStream([makeVideoTrack('recovered-camera')]));
+    await recovery;
+
+    expect(svc.producers.has('camera')).toBe(true);
+    expect(useVoiceStore.getState().isVideoOn).toBe(true);
+    expect(
+      svc.sendTransport.produce.mock.calls.map(([options]: any[]) => options.codec.mimeType)
+    ).toEqual(expected);
+    if (change === 'saved preference') {
+      expect(useVideoSettingsStore.getState().preferredVideoCodec).toBe('video/VP8');
+    }
+  });
+
+  it.each([
+    { setting: 'preferredVideoCodec', saved: 'video/VP8', outcome: 'published' },
+    { setting: 'hdrEncoding', saved: false, outcome: 'published' },
+    { setting: 'prioritizeHdrCodecs', saved: false, outcome: 'published' },
+    { setting: 'preferredVideoCodec', saved: 'video/VP8', outcome: 'cancelled' },
+    { setting: 'preferredVideoCodec', saved: 'video/VP8', outcome: 'rejected' },
+  ] as const)(
+    'handles $outcome $setting save while camera recovery is publishing',
+    async ({ setting, saved, outcome }) => {
+      const svc = voiceService as any;
+      resetService(svc);
+      const hdrCodec = {
+        ...requestedVp8Codec,
+        mimeType: 'video/VP9',
+        parameters: { 'profile-id': 2 },
+      };
+      svc.device.rtpCapabilities = { codecs: [...mockDeviceRtpCapabilities.codecs, hdrCodec] };
+      svc.pickCameraCodec = Object.getPrototypeOf(svc).pickCameraCodec;
+      useVoiceStore.getState().setCodecFloor(['video/vp9:2', 'video/vp8']);
+      useVideoSettingsStore.setState({
+        preferredVideoCodec: null,
+        hardwareAcceleration: true,
+        hdrEncoding: true,
+        prioritizeHdrCodecs: true,
+        codecCapabilities: [
+          {
+            mimeType: 'video/VP9',
+            profileId: '2',
+            profileLabel: 'HDR',
+            hwAvailable: false,
+            swAvailable: true,
+            supported: true,
+            isHdr: true,
+          },
+          {
+            mimeType: 'video/VP8',
+            profileId: '',
+            profileLabel: 'SDR',
+            hwAvailable: true,
+            swAvailable: true,
+            supported: true,
+            isHdr: false,
+          },
+        ],
+      });
+      const deadTrack = makeVideoTrack('dead-camera');
+      deadTrack.stop();
+      svc.localCameraStream = new MockMediaStream([deadTrack]);
+      svc.producers.set(
+        'camera',
+        makeMockProducer({ track: deadTrack, stopTracks: false, source: 'camera' })
+      );
+      const recoveredTrack = makeVideoTrack('recovered-camera');
+      svc.acquireCameraWithFallback = vi
+        .fn()
+        .mockResolvedValue(new MockMediaStream([recoveredTrack]));
+      let releasePublication!: () => void;
+      const publicationGate = new Promise<void>((resolve) => {
+        releasePublication = resolve;
+      });
+      const produce = svc.sendTransport.produce;
+      const staleProducer = makeMockProducer({
+        track: recoveredTrack,
+        stopTracks: false,
+        source: 'camera',
+      });
+      svc.sendTransport.produce = vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          await publicationGate;
+          return staleProducer;
+        })
+        .mockImplementation(produce);
+
+      const recovery = svc.handleCodecFloorChange(['video/vp8'], ['video/vp9:2', 'video/vp8']);
+      await waitFor(() => expect(svc.sendTransport.produce).toHaveBeenCalledTimes(1));
+      expect(svc.producers.has('camera')).toBe(false);
+      const previous = useVideoSettingsStore.getState();
+      useVideoSettingsStore.setState({ [setting]: saved });
+      svc.handleVideoSettingsChange(useVideoSettingsStore.getState(), previous);
+      if (outcome === 'cancelled') {
+        svc.drainSendTransportQueue.mockImplementationOnce(async () => {
+          svc.cancelVideoReproduce('camera');
+        });
+      } else if (outcome === 'rejected') {
+        svc.sendTransport.produce.mockRejectedValueOnce(new Error('replacement publish failed'));
+      }
+      releasePublication();
+      await recovery;
+
+      expect(
+        svc.sendTransport.produce.mock.calls.map(([options]: any[]) => options.codec.mimeType)
+      ).toEqual(outcome === 'cancelled' ? ['video/VP9'] : ['video/VP9', 'video/VP8']);
+      expect(staleProducer.closed).toBe(true);
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-producer', {
+        producerId: staleProducer.id,
+      });
+      expect(svc.producers.get('camera')).not.toBe(staleProducer);
+      expect(recoveredTrack.readyState).toBe(outcome === 'published' ? 'live' : 'ended');
+      expect(svc.acquireCameraWithFallback).toHaveBeenCalledTimes(1);
+      expect(svc.producers.has('camera')).toBe(outcome === 'published');
+      expect(useVoiceStore.getState().isVideoOn).toBe(outcome === 'published');
+      if (outcome === 'rejected') {
+        expect(useVoiceStore.getState().videoSlotError).toMatch(/sharing it with the call failed/);
+      }
     }
   );
 

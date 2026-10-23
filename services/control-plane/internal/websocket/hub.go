@@ -6685,7 +6685,27 @@ func (h *Hub) handleDisconnectSession(sessionID string) {
 // a token is blacklisted or session is revoked. The server does not trust the
 // client to disconnect itself — this is the authoritative enforcement.
 func (h *Hub) DisconnectUser(userID uuid.UUID) {
-	h.disconnectUser <- userID
+	h.DisconnectUserContext(context.Background(), userID)
+}
+
+// DisconnectUserContext bounds the authoritative disconnect enqueue for lifecycle callbacks.
+func (h *Hub) DisconnectUserContext(ctx context.Context, userID uuid.UUID) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	select {
+	case h.disconnectUser <- userID:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-h.done:
+		return false
+	}
 }
 
 // evictServerSubscriber removes every client of userID from serverID's server-level

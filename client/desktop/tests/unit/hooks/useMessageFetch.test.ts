@@ -1,10 +1,17 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { mockMessage, mockMessage2, mockPendingMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
-import { removeMessage } from '@/renderer/services/messaging/searchService';
+import {
+  clearIndex,
+  indexMessage,
+  removeMessage,
+  searchMessages,
+} from '@/renderer/services/messaging/searchService';
 
 const callEventPayload = {
   status: 'completed' as const,
@@ -27,6 +34,7 @@ const mockDecryptWithKey = vi.fn();
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
 const mockInvalidateChannelKey = vi.fn();
+const mockRevokeChannelAccess = vi.fn();
 const mockOperationGuard = { assertCurrent: vi.fn() };
 const mockCreateChannelOperationGuard = vi.fn(() => mockOperationGuard);
 
@@ -42,6 +50,7 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
     decryptForChannel: (...args: unknown[]) => mockDecryptForChannel(...args),
     decryptForChannelWithVersion: (...args: unknown[]) => mockDecryptForChannelWithVersion(...args),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    revokeChannelAccess: (...args: unknown[]) => mockRevokeChannelAccess(...args),
   },
 }));
 
@@ -86,10 +95,200 @@ describe('useMessageFetch', () => {
     mockApiFetch.mockReset();
     mockSafeJson.mockReset();
     resetAllStores();
+    mockRevokeChannelAccess.mockClear();
+    clearIndex();
     useChatStore.setState({
       messagesByChannel: new Map(),
     });
     mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
+  });
+
+  it('preserves a failed never-posted row through grace reconnect history backfill', async () => {
+    mockFetchResponse([]);
+    const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    const failed = {
+      ...mockMessage,
+      id: 'msg_failed',
+      clientMessageId: 'msg_failed',
+      content: 'never stored on the server',
+      status: 'failed' as const,
+    };
+    act(() => useChatStore.getState().setMessages('channel-1', [failed]));
+    mockFetchResponse([]);
+
+    await act(async () => {
+      globalThis.dispatchEvent(new CustomEvent('connection-recovered'));
+    });
+
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(useChatStore.getState().messagesByChannel.get('channel-1')).toEqual([
+      expect.objectContaining(failed),
+    ]);
+  });
+
+  it.each([
+    ['channel', "Not a member of this channel's server"],
+    ['channel', 'Insufficient permissions'],
+    ['dm', 'Not a participant'],
+  ] as const)(
+    'clears retained intent after reconnect history denial (%s: %s)',
+    async (type, error) => {
+      mockFetchResponse([]);
+      const { result } = renderHook(() => useMessageFetch('channel-1', { type }));
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      if (type === 'dm') {
+        useDMStore.setState({
+          conversations: [
+            {
+              id: 'channel-1',
+              isGroup: false,
+              isPersonal: false,
+              name: null,
+              participants: [],
+              lastMessage: {
+                content: 'cached preview',
+                userId: 'user-1',
+                username: 'sender',
+                createdAt: mockMessage.created_at,
+              },
+              unreadCount: 0,
+              createdAt: mockMessage.created_at,
+            },
+          ],
+        });
+      }
+      const pending = { ...mockPendingMessage, clientMessageId: mockPendingMessage.id };
+      const failed = {
+        ...pending,
+        id: 'failed-local',
+        clientMessageId: 'failed-local',
+        status: 'failed' as const,
+      };
+      act(() => {
+        useChatStore.getState().setMessages('channel-1', [pending, failed]);
+        useChatStore.getState().setMessages('other-scope', [mockMessage]);
+      });
+      indexMessage('cached-message', 'denied history', 'channel-1');
+      expect(searchMessages('denied', 'channel-1')).toEqual(['cached-message']);
+      mockApiFetch.mockResolvedValueOnce({ ok: false, status: 403 });
+      mockSafeJson.mockResolvedValueOnce({ error });
+      act(() => globalThis.dispatchEvent(new CustomEvent('connection-recovered')));
+      await waitFor(() => expect(result.current.error).toBe(error));
+      expect(useChatStore.getState().messagesByChannel.get('channel-1') ?? []).toEqual([]);
+      expect(useChatStore.getState().messagesByChannel.get('other-scope')).toEqual([
+        expect.objectContaining(mockMessage),
+      ]);
+      expect(searchMessages('denied', 'channel-1')).toEqual([]);
+      if (type === 'dm') expect(useDMStore.getState().conversations[0]?.lastMessage).toBeNull();
+      expect(mockRevokeChannelAccess).toHaveBeenCalledWith('channel-1');
+    }
+  );
+
+  it.each([
+    [500, { error: 'Server error' }],
+    [403, { error: 'Attestation required', code: 'ATTESTATION_MISSING' }],
+    [403, { error: 'Forbidden' }],
+  ])(
+    'preserves retained intent for non-authoritative history refusal (%s: %j)',
+    async (status, body) => {
+      mockFetchResponse([]);
+      const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      act(() => useChatStore.getState().setMessages('channel-1', [mockPendingMessage]));
+      mockApiFetch.mockResolvedValueOnce({ ok: false, status });
+      mockSafeJson.mockResolvedValueOnce(body);
+      act(() => globalThis.dispatchEvent(new CustomEvent('connection-recovered')));
+      await waitFor(() => expect(result.current.error).toBe(body.error));
+      expect(useChatStore.getState().messagesByChannel.get('channel-1')).toEqual([
+        expect.objectContaining(mockPendingMessage),
+      ]);
+      expect(mockRevokeChannelAccess).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['account', 'scope'] as const)(
+    'ignores a history denial body after the %s changes',
+    async (change) => {
+      const body = deferred<{ error: string }>();
+      mockApiFetch.mockResolvedValueOnce({ ok: false, status: 403 });
+      mockSafeJson.mockReturnValueOnce(body.promise);
+      const { rerender } = renderHook(({ id }) => useMessageFetch(id, { type: 'channel' }), {
+        initialProps: { id: 'channel-1' },
+      });
+      await waitFor(() => expect(mockSafeJson).toHaveBeenCalledTimes(1));
+      if (change === 'scope') {
+        mockFetchResponse([]);
+        rerender({ id: 'other-scope' });
+        await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+      }
+      act(() => {
+        if (change === 'account') useAuthStore.getState().setAccessToken('next-account-token');
+        useChatStore.getState().setMessages('channel-1', [mockPendingMessage]);
+      });
+      await act(async () => body.resolve({ error: 'Insufficient permissions' }));
+      expect(useChatStore.getState().messagesByChannel.get('channel-1')).toEqual([
+        expect.objectContaining(mockPendingMessage),
+      ]);
+      expect(mockRevokeChannelAccess).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['scroll', 'jump'] as const)(
+    'clears denied history during %s pagination',
+    async (mode) => {
+      mockFetchResponse([
+        {
+          ...mockMessage,
+          content: '',
+          type: 'call_event',
+          call_event_payload: callEventPayload,
+        } as MessageWithStatus,
+      ]);
+      const { result } = renderHook(() =>
+        useMessageFetch('channel-1', { type: 'channel', limit: 1 })
+      );
+      await waitFor(() => expect(result.current.hasMore).toBe(true));
+      act(() => useChatStore.getState().addMessage('channel-1', mockPendingMessage));
+      mockApiFetch.mockResolvedValueOnce({ ok: false, status: 403 });
+      mockSafeJson.mockResolvedValueOnce({ error: 'Insufficient permissions' });
+      await act(async () => {
+        if (mode === 'scroll') await result.current.handleLoadMore();
+        else
+          expect(await result.current.loadUntil('missing-message', 2)).toMatchObject({
+            status: 'failed',
+          });
+      });
+      expect(useChatStore.getState().messagesByChannel.get('channel-1') ?? []).toEqual([]);
+      expect(mockRevokeChannelAccess).toHaveBeenCalledWith('channel-1');
+    }
+  );
+
+  it('fences an overlapping history response when another view receives access denial', async () => {
+    const body = deferred<{ messages: MessageWithStatus[] }>();
+    mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+    mockSafeJson.mockReturnValueOnce(body.promise);
+    const first = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+    await waitFor(() => expect(mockSafeJson).toHaveBeenCalledTimes(1));
+    mockApiFetch.mockResolvedValueOnce({ ok: false, status: 403 });
+    mockSafeJson.mockResolvedValueOnce({ error: 'Insufficient permissions' });
+    const second = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+    await waitFor(() => expect(second.result.current.error).toBe('Insufficient permissions'));
+    await act(async () =>
+      body.resolve({
+        messages: [
+          {
+            ...mockMessage,
+            content: '',
+            type: 'call_event',
+            call_event_payload: callEventPayload,
+          } as MessageWithStatus,
+        ],
+      })
+    );
+    await waitFor(() => expect(first.result.current.isLoading).toBe(false));
+    expect(useChatStore.getState().messagesByChannel.get('channel-1') ?? []).toEqual([]);
   });
 
   // --- Basic fetch ---

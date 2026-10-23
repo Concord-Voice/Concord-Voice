@@ -193,16 +193,18 @@ type fakeSessionNotifier struct {
 	broadcasts   int
 }
 
-func (f *fakeSessionNotifier) DisconnectUser(id uuid.UUID) {
+func (f *fakeSessionNotifier) DisconnectUserContext(_ context.Context, id uuid.UUID) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.disconnected = append(f.disconnected, id)
+	return true
 }
 
-func (f *fakeSessionNotifier) BroadcastEntitlements(_ uuid.UUID, _ entitlements.EntitlementDTO) {
+func (f *fakeSessionNotifier) BroadcastEntitlementsContext(_ context.Context, _ uuid.UUID, _ entitlements.EntitlementDTO) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.broadcasts++
+	return true
 }
 
 // TestSweep_ProductionPath_RealCacheAndNotifier drives the production

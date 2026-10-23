@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/uuid"
@@ -20,9 +21,13 @@ type fakeSessionNotifier struct {
 	disconnects int
 }
 
-func (f *fakeSessionNotifier) DisconnectUser(uuid.UUID) { f.disconnects++ }
-func (f *fakeSessionNotifier) BroadcastEntitlements(uuid.UUID, entitlements.EntitlementDTO) {
+func (f *fakeSessionNotifier) DisconnectUserContext(context.Context, uuid.UUID) bool {
+	f.disconnects++
+	return true
+}
+func (f *fakeSessionNotifier) BroadcastEntitlementsContext(context.Context, uuid.UUID, entitlements.EntitlementDTO) bool {
 	f.broadcasts++
+	return true
 }
 
 // TestBuildRedemptionHandler_Constructs verifies the wiring builds a non-nil

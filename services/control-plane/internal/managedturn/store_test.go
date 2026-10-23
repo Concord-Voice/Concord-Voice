@@ -3,6 +3,7 @@ package managedturn_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -282,13 +283,13 @@ func TestStore_InsertRejectsZeroKey(t *testing.T) {
 	assert.Empty(t, ids, "an empty key must never become a turn_secret row")
 }
 
-func inodeOf(t testing.TB, path string) (dev, ino uint64) {
+func inodeOf(t testing.TB, path string) (dev string, ino uint64) {
 	t.Helper()
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	st, ok := info.Sys().(*syscall.Stat_t)
 	require.True(t, ok, "expected a unix stat")
-	return uint64(st.Dev), uint64(st.Ino) //nolint:unconvert,gosec // widths and signedness differ per platform (darwin Dev is int32); compared only for identity
+	return fmt.Sprint(st.Dev), uint64(st.Ino) //nolint:unconvert // inode field widths differ per platform
 }
 
 func TestStore_NeverRenameReplacesDatabase(t *testing.T) {

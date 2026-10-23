@@ -170,8 +170,22 @@ func OpenManagedRedis(endpoint string, tlsConfig *tls.Config, reader managedredi
 	return client, runtime, nil
 }
 
+// NewRecoveryWatchClientFactory resolves a fresh credential for each sticky recovery scope.
+func NewRecoveryWatchClientFactory(runtime *managedredis.Runtime, endpoint string, tlsConfig *tls.Config) func(context.Context) (*redis.Client, error) {
+	return func(ctx context.Context) (*redis.Client, error) {
+		if runtime == nil {
+			return nil, fmt.Errorf("managed Redis recovery credential unavailable")
+		}
+		snapshot, err := runtime.Snapshot(runtime.Now())
+		if err != nil {
+			return nil, fmt.Errorf("managed Redis recovery credential unavailable")
+		}
+		return NewRecoveryWatchClient(ctx, endpoint, tlsConfig, snapshot, runtime)
+	}
+}
+
 // NewRecoveryWatchClient uses an immutable non-streaming credential because
-// go-redis 9.23.0's sticky WATCH path does not support the streaming manager.
+// go-redis 9.23.0's sticky connection path does not support the streaming manager.
 func NewRecoveryWatchClient(ctx context.Context, endpoint string, tlsConfig *tls.Config, snapshot managedredis.Credential, runtime *managedredis.Runtime) (*redis.Client, error) {
 	if runtime == nil || snapshot.Generation == 0 || snapshot.Username == "" || snapshot.Password == "" {
 		return nil, fmt.Errorf("managed Redis recovery credential unavailable")

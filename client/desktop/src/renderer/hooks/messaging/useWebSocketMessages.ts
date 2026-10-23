@@ -1159,11 +1159,24 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // decrypted rows the local index holds, fences running backfills so one
     // cannot RE-index purged plaintext after the purge lands, and dismisses
     // copies already emitted into an open search pane.
-    const clearScopeState = (scopeId: string) => {
+    const clearScopeState = (scopeId: string, preserveLocalIntent = false) => {
+      const currentUserId = useUserStore.getState().user?.id;
+      const localIntent =
+        preserveLocalIntent && currentUserId
+          ? (useChatStore.getState().messagesByChannel.get(scopeId) ?? [])
+              .filter(
+                (message) =>
+                  message.user_id === currentUserId &&
+                  message.id === message.clientMessageId &&
+                  (message.status === 'pending' || message.status === 'failed')
+              )
+              .map((message) => ({ ...message, replied_to: undefined }))
+          : [];
       invalidateMessageContentOperationsForScope(messageContentOperationOwner, scopeId);
       settleMessagePlaceholdersForScope(scopeId);
       removeScope(scopeId);
       useChatStore.getState().clearMessages(scopeId);
+      if (localIntent.length > 0) useChatStore.getState().setMessages(scopeId, localIntent);
     };
 
     // Every channel of one server the client knows about. `channels` holds the
@@ -1171,13 +1184,13 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // other servers. Unioning both mirrors `removeServerChannels`, and the bound
     // is the correct one: the deletion is already authoritative server-side, and
     // a channel the client has never loaded holds no local plaintext to clear.
-    const clearServerScopes = (serverId: string) => {
+    const clearServerScopes = (serverId: string, preserveLocalIntent = false) => {
       const channelState = useChannelStore.getState();
       const scopeIds = new Set(channelState.channelIdsByServer[serverId] ?? []);
       for (const channel of channelState.channels) {
         if (channel.server_id === serverId) scopeIds.add(channel.id);
       }
-      for (const scopeId of scopeIds) clearScopeState(scopeId);
+      for (const scopeId of scopeIds) clearScopeState(scopeId, preserveLocalIntent);
     };
 
     // ONE clearing lane, two producers. The WebSocket echo is not sufficient on
@@ -1850,7 +1863,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           const channelState = useChannelStore.getState();
           const serverIds = new Set(Object.keys(channelState.channelIdsByServer));
           for (const channel of channelState.channels) serverIds.add(channel.server_id);
-          for (const serverId of serverIds) clearServerScopes(serverId);
+          for (const serverId of serverIds) clearServerScopes(serverId, true);
           serverScopesClearedForOutage = true;
         }
       } else if (state === ConnectionState.CONNECTED) {
