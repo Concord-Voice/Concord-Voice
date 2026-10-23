@@ -39,14 +39,25 @@ import (
 //
 // restore-begin's invariant (B3-D8, Review Focus 5): restore_epoch rises once
 // per restore. A restore is in progress while meta is unreconciled, has a
-// restore_started_at, and has completed no reconcile since that start; a run
-// in that state returns the recorded point and writes nothing, so a re-run
-// neither bumps the epoch nor moves the backup point. The third clause is
-// what keeps a finished restore from passing for an open one: reconcile-
-// complete keeps restore_started_at, so a reconcile/required after it
-// (DoR:1803, a snapshot rollback) leaves meta unreconciled with the old start
-// still set, and without the clause restore-begin would hand back the old
-// restore's epoch and backup point instead of recording this one.
+// restore_started_at, and has no reconcile_completed_at; a run in that state
+// returns the recorded point and writes nothing, so a re-run neither bumps the
+// epoch nor moves the backup point. restore-begin clears
+// reconcile_completed_at in the statement that sets restore_started_at, and
+// only reconcile-complete sets it, so a stamp is there exactly when a
+// reconcile completed after the latest start. The third clause is what keeps
+// a finished restore from passing for an open one: reconcile-complete keeps
+// restore_started_at, so a reconcile/required after it (DoR:1803, a snapshot
+// rollback) leaves meta unreconciled with the old start still set, and
+// without the clause restore-begin would hand back the old restore's epoch
+// and backup point instead of recording this one. The clause compares no
+// clocks (Codex round 2, G3): restore_started_at is clock_timestamp() and
+// reconcile_completed_at is db_now, read by different verbs of a clock that
+// can step back between them. Ordering the two let a backward step between
+// reconcile-complete and the next restore-begin make that restore's re-run
+// bump the epoch and move the backup point again, and one between
+// restore-begin and reconcile-complete make the restore after a snapshot
+// rollback reuse the finished one's point. What breaks it: another writer of
+// reconcile_completed_at, or a restore_started_at set without clearing it.
 
 // RestorePoint is what restore-begin recorded (DoR:1726): the restore epoch,
 // the highest account_events.commit_id and the highest issued_at_ms over both
@@ -91,7 +102,7 @@ func (o *Owner) stopped(ctx context.Context, verb string, prepare func(ctx conte
 // verify, or that the installed trust refuses, is an error and nothing is
 // written. Then, unless a restore is in progress, it sets reconciled = false,
 // restore_epoch + 1, restore_started_at = clock_timestamp() and the backup
-// point, and returns what it recorded; while one is in progress it returns
+// point, clears reconcile_completed_at, and returns what it recorded; while one is in progress it returns
 // the recorded point unchanged (B3-D8). Either way it ends on finish.
 func (o *Owner) RestoreBegin(ctx context.Context, trustFile []byte) (RestorePoint, error) {
 	install := func(ctx context.Context, conn *sql.Conn) error {
@@ -133,7 +144,7 @@ func beginRestore(ctx context.Context, tx *sql.Tx) (RestorePoint, error) {
 		return pointOf(epoch, started, commitID, issued), nil
 	}
 	if err := tx.QueryRowContext(ctx, `UPDATE authority.meta SET reconciled = false,
-		restore_epoch = restore_epoch + 1, restore_started_at = clock_timestamp(),
+		restore_epoch = restore_epoch + 1, restore_started_at = clock_timestamp(), reconcile_completed_at = NULL,
 		backup_max_commit_id = (SELECT COALESCE(max(commit_id), 0) FROM authority.account_events),
 		backup_max_issued_at_ms = GREATEST((SELECT COALESCE(max(issued_at_ms), 0) FROM authority.account_events),
 			(SELECT COALESCE(max(issued_at_ms), 0) FROM authority.device_events))
@@ -145,9 +156,10 @@ func beginRestore(ctx context.Context, tx *sql.Tx) (RestorePoint, error) {
 }
 
 // restoreInProgress is B3-D8's skip: unreconciled, begun, and no reconcile
-// completed since the start (see the invariant above).
+// completed since the start, which a NULL reconcile_completed_at is (see the
+// invariant above).
 func restoreInProgress(reconciled bool, started, completed sql.NullTime) bool {
-	return !reconciled && started.Valid && (!completed.Valid || completed.Time.Before(started.Time))
+	return !reconciled && started.Valid && !completed.Valid
 }
 
 func pointOf(epoch int64, started sql.NullTime, commitID, issued sql.NullInt64) RestorePoint {

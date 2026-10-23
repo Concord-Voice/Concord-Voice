@@ -56,14 +56,26 @@ func (s *Store) ReconcileRequired(ctx context.Context, body []byte) error {
 // ReconcileHold is POST /v1/reconcile/hold (DoR:1611): while unreconciled, it
 // sets held on the head of every account the hold-req proves ahead, all in one
 // transaction, and answers 200 with no body (B3-D14). Reconciled is
-// ErrReconciled (409, B3-D2), before any bundle is judged. Its prologue is
-// operatorRun's.
+// ErrReconciled (409, B3-D2). Its prologue is operatorRun's.
 //
-// reconciled is read without a lock: a reconcile-complete that commits while
-// the bundles are judged lets this hold commit after it. That race only ends
-// an account held on verified evidence, the state clear-held exists for; a
-// meta lock here would order meta before the heads, against the one lock order
-// (the heads, then meta: operatorRun).
+// reconciled is read twice. The first read, without a lock, refuses a realm
+// already reconciled before any bundle is judged. The second runs once
+// aheadBundles holds every head, under meta FOR SHARE: the heads, then meta,
+// the one lock order (operatorRun). It is what makes the 409 exact.
+// reconcile-complete takes every head it can see and then meta FOR UPDATE, and
+// sets reconciled and counts the held heads in that transaction, so either it
+// holds meta first, this read waits for its commit and reads reconciled = true
+// (READ COMMITTED re-reads the row a waited-for lock protected), and nothing is
+// held; or this transaction holds meta first, and reconcile-complete waits for
+// this commit and then floors and counts with these heads held. Neither
+// transaction waits for a head while it holds meta, so the two cannot deadlock
+// (Codex round 2, G2). What breaks it: reading reconciled only before the
+// heads, since a reconcile-complete holding them commits while aheadBundles
+// waits for them, and the hold then lands after reconciliation and outside the
+// held count; or the second read without a lock, since a head lockHead creates
+// here, for an account the restored backup lacks, is not in
+// reconcile-complete's scan, so the heads alone do not order the two; or meta
+// locked before the heads.
 func (s *Store) ReconcileHold(ctx context.Context, body []byte) (Outcome, error) {
 	err := operatorRun(ctx, s, "reconcile-hold", body, decodeHoldReq,
 		func(ctx context.Context, conn *sql.Conn, req ac.HoldReq) error {
@@ -76,16 +88,15 @@ func (s *Store) ReconcileHold(ctx context.Context, body []byte) (Outcome, error)
 }
 
 func (s *Store) hold(ctx context.Context, tx *sql.Tx, req ac.HoldReq) error {
-	var reconciled bool
-	if err := tx.QueryRowContext(ctx, `SELECT reconciled FROM authority.meta WHERE id = 1`).Scan(&reconciled); err != nil {
-		return fmt.Errorf("authority store: reconcile-hold: meta: %w", err)
-	}
-	if reconciled {
-		return ErrReconciled
+	if err := holdUnreconciled(ctx, tx, `SELECT reconciled FROM authority.meta WHERE id = 1`); err != nil {
+		return err // the fast path: no bundle is judged on a reconciled realm
 	}
 	ids, err := s.aheadBundles(ctx, tx, req)
 	if err != nil {
 		return err
+	}
+	if err := holdUnreconciled(ctx, tx, `SELECT reconciled FROM authority.meta WHERE id = 1 FOR SHARE`); err != nil {
+		return err // after every head: the one lock order
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE authority.account_heads SET held = true WHERE account_id = ANY($1::uuid[])`,
 		pq.Array(ids))
@@ -98,6 +109,19 @@ func (s *Store) hold(ctx context.Context, tx *sql.Tx, req ac.HoldReq) error {
 	}
 	if n != int64(len(ids)) { // aheadBundles locked a row for every id; anything else is not a hold
 		return fmt.Errorf("authority store: reconcile-hold: held %d of %d heads", n, len(ids))
+	}
+	return nil
+}
+
+// holdUnreconciled runs q, a read of meta's reconciled, and refuses a
+// reconciled realm with ErrReconciled.
+func holdUnreconciled(ctx context.Context, tx *sql.Tx, q string) error {
+	var reconciled bool
+	if err := tx.QueryRowContext(ctx, q).Scan(&reconciled); err != nil {
+		return fmt.Errorf("authority store: reconcile-hold: meta: %w", err)
+	}
+	if reconciled {
+		return ErrReconciled
 	}
 	return nil
 }

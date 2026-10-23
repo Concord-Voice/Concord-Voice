@@ -44,9 +44,10 @@ import (
 //   - Purge: L1 (purgeAccount), then purge_erased's meta FOR SHARE and its
 //     re-take of the L1 already held. purge_erased alone takes meta first, and
 //     000001 is not edited, so the caller's L1 is what puts it in this order;
+//   - reconcile/hold: every head (aheadBundles), then meta FOR SHARE, as
+//     reconcile/import takes its one head and then meta FOR SHARE;
 //   - heads and no meta lock: the account and device commits and
-//     restore-cancel (one head; meta read without a lock), and reconcile/hold
-//     (likewise);
+//     restore-cancel (one head; meta read without a lock);
 //   - meta and no head: tick, seal-legacy, restore-begin, and the population
 //     insert (the guard's meta FOR SHARE).
 //

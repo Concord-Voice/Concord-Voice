@@ -1,14 +1,20 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/lib/pq"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/authoritytest"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/signer"
 	ac "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authoritycontract"
 )
 
@@ -681,7 +687,7 @@ func TestClearHeldRefusalDoesNotAbortTheRest(t *testing.T) {
 	e.pinHeld(p.ID)
 	e.pinHeld(act.ID)
 	o := signedOwner(t, e)
-	o.afterRestoreCancel = func() error { return errors.New("injected refusal") }
+	o.afterRestoreCancel = func() error { return fmt.Errorf("%w: injected refusal", ErrRefused) }
 
 	got, err := o.ClearHeld(liveCtx(t), []string{p.ID, act.ID})
 	if err != nil {
@@ -696,4 +702,156 @@ func TestClearHeldRefusalDoesNotAbortTheRest(t *testing.T) {
 	if !heldOf(t, e.f.Super, p.ID) || heldOf(t, e.f.Super, act.ID) {
 		t.Fatal("want the refused account held and the next one cleared")
 	}
+}
+
+// failoverAfterConn is an InRecovery hook that answers primary for the owner
+// connection's role read (the first call) and standby for every later one: the
+// leader check of the next row 22, after a failover mid-run.
+func failoverAfterConn() func(context.Context, *sql.Conn) (bool, error) {
+	var calls atomic.Int64
+	return func(context.Context, *sql.Conn) (bool, error) { return calls.Add(1) > 1, nil }
+}
+
+// Codex round 2, G5: only an account's own refusal is its outcome. A database
+// failure on one account (here a head another transaction holds beyond the 2 s
+// lock_timeout, 55P03) stops the run there: the accounts before it keep their
+// results, the ones after it are not touched, and the error is the database's,
+// never a refused outcome.
+func TestClearHeldStopsOnADatabaseFailure(t *testing.T) {
+	e := newEnv(t)
+	a1, _ := e.enrolledWith()
+	a2, _ := e.enrolledWith()
+	a3, _ := e.enrolledWith()
+	for _, a := range []*authoritytest.Account{a1, a2, a3} {
+		e.pinHeld(a.ID)
+	}
+	beginHolding(t, e.f.Super, `SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, a2.ID)
+	o := signedOwner(t, e)
+
+	got, err := o.ClearHeld(liveCtx(t), []string{a1.ID, a2.ID, a3.ID})
+	var pe *pq.Error
+	if !errors.As(err, &pe) || pe.Code != "55P03" {
+		t.Fatalf("ClearHeld = %v, want an error carrying SQLSTATE 55P03", err)
+	}
+	if errors.Is(err, ErrRefused) {
+		t.Fatalf("ClearHeld = %v: a lock wait read as a refusal", err)
+	}
+	wantResults(t, got, ClearResult{a1.ID, "unverified"})
+	if heldOf(t, e.f.Super, a1.ID) || !heldOf(t, e.f.Super, a2.ID) || !heldOf(t, e.f.Super, a3.ID) {
+		t.Fatal("want a1 cleared, and a2 and a3 still held: the run stopped at a2")
+	}
+}
+
+// The other half of G5: a policy refusal of row 22 is still the account's
+// outcome and the run goes on. The installed delegation here lacks
+// cancel_pending in its scope (policy step 2, policy_disabled), a refusal the
+// commit core makes on every held P, D and Pr alike (a held D head with anb 0,
+// the runbook's V3-12 example, is cleared by this build and cannot be used).
+// The outcome is the policy's text, with no store error prefix, and the next
+// account is cleared.
+func TestClearHeldPolicyRefusalContinues(t *testing.T) {
+	e := newEnv(t)
+	d, _ := e.enrolledWith()
+	e.commitOK(d, d.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+	e.commitOK(d, d.CancelByRoot(t).Bytes)
+	e.commitOK(d, d.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+	if d.Head.State != ac.StateDisputed {
+		t.Fatalf("fixture: head %s, want disputed", d.Head.State)
+	}
+	next, _ := e.enrolledWith()
+	e.pinHeld(d.ID)
+	e.pinHeld(next.ID)
+	rsk, err := signer.GenerateP384() // D-223: an RSK is listed in one delegation only
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.r.Install(t, e.f.App, e.r.NextDelegation(t, authoritytest.WithRSKs(rsk.PublicKey()), func(del *ac.Delegation) {
+		del.Scope = slices.DeleteFunc(slices.Clone(del.Scope), func(s string) bool { return s == ac.OpCancelPending })
+	}))
+	o := ownerOver(t, e.f, e.r, OwnerConfig{Signer: rsk})
+
+	got, err := o.ClearHeld(liveCtx(t), []string{d.ID, next.ID})
+	if err != nil {
+		t.Fatalf("ClearHeld = %v, want nil: a policy refusal is an outcome", err)
+	}
+	if len(got) != 2 || got[0].Account != d.ID || got[0].Outcome != "refused:row 22 not admitted: policy_disabled" {
+		t.Fatalf("results = %+v, want %s refused with the policy's text and no store prefix", got, d.ID)
+	}
+	if got[1] != (ClearResult{next.ID, "unverified"}) {
+		t.Fatalf("results = %+v, want %s unverified after the refusal", got, next.ID)
+	}
+	if !heldOf(t, e.f.Super, d.ID) || heldOf(t, e.f.Super, next.ID) {
+		t.Fatal("want the refused account held and the next one cleared")
+	}
+}
+
+// A plain error from the seam after row 22 is no refusal: the run stops, the
+// error is returned as it is with no results, and row 22 stays committed (the
+// resumable state) while the second account is untouched.
+func TestClearHeldStopsOnAPlainErrorAfterRow22(t *testing.T) {
+	e := newEnv(t)
+	p, _ := e.enrolledWith()
+	e.commitOK(p, p.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+	act, _ := e.enrolledWith()
+	e.pinHeld(p.ID)
+	e.pinHeld(act.ID)
+	o := signedOwner(t, e)
+	cause := errors.New("injected database failure")
+	o.afterRestoreCancel = func() error { return cause }
+	events := countRows(t, e, "account_events")
+
+	got, err := o.ClearHeld(liveCtx(t), []string{p.ID, act.ID})
+	if !errors.Is(err, cause) {
+		t.Fatalf("ClearHeld = %v, want the injected error", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("results = %+v, want none: the stopped account gets no result", got)
+	}
+	if n := countRows(t, e, "account_events"); n != events+1 {
+		t.Fatalf("account_events = %d, want %d: row 22 committed before the stop", n, events+1)
+	}
+	if !heldOf(t, e.f.Super, act.ID) {
+		t.Fatal("the second account was cleared after the run stopped")
+	}
+}
+
+// A failover between two accounts is ErrNotLeader (N1), so the CLI exits
+// not_leader and not config: the first account is cleared and reported, the
+// second is not touched. The probe says nothing replicated, and finish still
+// runs on the stop (G5): the error carries both the cause and ErrNotReplicated.
+func TestClearHeldStopsOnAFailoverAndStillFinishes(t *testing.T) {
+	setup := func(t *testing.T, cfg OwnerConfig) (*env, *Owner, *authoritytest.Account, *authoritytest.Account) {
+		e := newEnv(t)
+		act, _ := e.enrolledWith()
+		p, _ := e.enrolledWith()
+		e.commitOK(p, p.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+		e.pinHeld(act.ID)
+		e.pinHeld(p.ID)
+		cfg.Signer, cfg.InRecovery = e.r.RSK, failoverAfterConn()
+		return e, ownerOver(t, e.f, e.r, cfg), act, p
+	}
+
+	t.Run("not_leader", func(t *testing.T) {
+		e, o, act, p := setup(t, OwnerConfig{})
+		got, err := o.ClearHeld(liveCtx(t), []string{act.ID, p.ID})
+		if !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("ClearHeld after a failover = %v, want ErrNotLeader", err)
+		}
+		wantResults(t, got, ClearResult{act.ID, "unverified"})
+		if heldOf(t, e.f.Super, act.ID) || !heldOf(t, e.f.Super, p.ID) {
+			t.Fatal("want the first account cleared and the second still held")
+		}
+	})
+
+	t.Run("finish runs on a stop", func(t *testing.T) {
+		e, o, act, p := setup(t, OwnerConfig{Probe: &fakeProbe{}}) // answers not replicated
+		requireGate(t, e.f, true)
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		got, err := o.ClearHeld(ctx, []string{act.ID, p.ID})
+		if !errors.Is(err, ErrNotLeader) || !errors.Is(err, ErrNotReplicated) {
+			t.Fatalf("ClearHeld = %v, want both ErrNotLeader and ErrNotReplicated: the first account committed", err)
+		}
+		wantResults(t, got, ClearResult{act.ID, "unverified"})
+	})
 }

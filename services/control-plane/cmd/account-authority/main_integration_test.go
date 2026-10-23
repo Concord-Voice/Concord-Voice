@@ -384,6 +384,26 @@ func exitFields(t *testing.T, stdout, wantReason string) map[string]any {
 	return m
 }
 
+// replicaExec runs q in a transaction under the replica role, which skips the
+// schema's row guards, as the store package's own fixtures rely on.
+func replicaExec(t *testing.T, db *sql.DB, q string, args ...any) {
+	t.Helper()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`SET LOCAL session_replication_role = replica`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(q, args...); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOwnerVerbExitLines(t *testing.T) {
 	long := func(t *testing.T) context.Context {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -423,6 +443,15 @@ func TestOwnerVerbExitLines(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(r.dir, "trust"), []byte("not a trust file"), 0o600); err != nil { // ownerEnv's AUTHORITY_TRUST_PATH
 					t.Fatal(err)
 				}
+			}},
+		// Codex round 2, G4: the owner connection checks the realm for every verb.
+		{name: "ErrRealmMismatch", cfg: store.OwnerConfig{Probe: okProbe{true}}, args: []string{"replication-gate", "on"}, reason: "trust",
+			setup: func(t *testing.T, r *ownerRig) {
+				replicaExec(t, r.f.Super, `UPDATE authority.meta SET realm_id = $1`, uuid.NewString())
+			}},
+		{name: "ErrNoMeta", cfg: store.OwnerConfig{Probe: okProbe{true}}, args: []string{"reconcile-complete"}, reason: "config",
+			setup: func(t *testing.T, r *ownerRig) {
+				replicaExec(t, r.f.Super, `DELETE FROM authority.meta`) // meta_never_deleted is a row trigger: replica skips it
 			}},
 		{name: "anything else", args: []string{"replication-gate", "on"}, reason: "config",
 			cfg: store.OwnerConfig{InRecovery: func(context.Context, *sql.Conn) (bool, error) { return false, errors.New("boom") }}},

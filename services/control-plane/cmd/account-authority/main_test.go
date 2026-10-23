@@ -1335,7 +1335,7 @@ func ownerExit(t *testing.T, err error) (int, map[string]any) {
 	return code, lines[0]
 }
 
-// B3-D12's mapping, the hand-off's three trust-file sentinels included: every
+// B3-D12's mapping, the hand-off's trust-file sentinels included: every
 // owner-verb error exits 1 at step owner with its reason, and a replication
 // failure carries DoR:1743's text in place of its cause, wrapped or not.
 func TestOwnerErrMapping(t *testing.T) {
@@ -1350,12 +1350,13 @@ func TestOwnerErrMapping(t *testing.T) {
 		{"serve lock lost mid-verb, ahead of replication", errors.Join(store.ErrServeLockLost,
 			fmt.Errorf("%w: %w", store.ErrNotReplicated, context.Canceled)), server.ReasonLock},
 		{"standby", store.ErrNotLeader, server.ReasonNotLeader},
+		{"a failover during clear-held's row 22 (N1)", fmt.Errorf("authority store: row 22 refused before BEGIN: %w", store.ErrNotLeader), server.ReasonNotLeader},
 		{"not replicated", store.ErrNotReplicated, server.ReasonReplication},
 		{"not replicated, with a cause", fmt.Errorf("%w: %w", store.ErrNotReplicated, errors.New("probe: x")), server.ReasonReplication},
 		{"refused", fmt.Errorf("%w: revoke-key: unknown", store.ErrRefused), server.ReasonRefused},
 		{"trust unusable", errors.Join(store.ErrTrustUnusable, errors.New("x")), server.ReasonRefused},
 		{"rsk reused", store.ErrRSKReused, server.ReasonRefused},
-		{"no meta", store.ErrNoMeta, server.ReasonRefused},
+		{"no meta, as serve maps it (B2-D10)", store.ErrNoMeta, server.ReasonConfig},
 		{"realm mismatch, as migrate maps it", store.ErrRealmMismatch, server.ReasonTrust},
 		{"a halted installed trust (T4)", fmt.Errorf("authority store: trust halt: %w", errors.Join(errors.New("signer"), &ac.HaltError{Rule: "T4"})), server.ReasonTrust},
 		{"anything else", errors.New("db down"), server.ReasonConfig},
@@ -1421,5 +1422,34 @@ func TestClearHeldRefusedResultExitsOne(t *testing.T) {
 	}
 	if n := strings.Count(out.String(), "account="); n != 2 {
 		t.Fatalf("%d result lines printed beside a store error, want 2", n)
+	}
+}
+
+// Codex round 2, G5 at the CLI: a clear-held run the store stopped on a database
+// failure prints the lines of the accounts before it and nothing for the one it
+// stopped at, and exits by the failure's own reason, never refused.
+func TestClearHeldStoppedRunExitsByItsReason(t *testing.T) {
+	a := uuid.NewString()
+	results := []store.ClearResult{{Account: a, Outcome: store.ClearUnverified}}
+	for _, c := range []struct {
+		name   string
+		err    error
+		reason string
+	}{
+		{"a lock wait that ran out", fmt.Errorf("authority store: clear-held: head: %w", &pq.Error{Code: "55P03"}), server.ReasonLock},
+		{"a failover", fmt.Errorf("row 22: %w", store.ErrNotLeader), server.ReasonNotLeader},
+		{"a database failure beside an unreplicated commit", errors.Join(errors.New("db down"), store.ErrNotReplicated), server.ReasonReplication},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var out bytes.Buffer
+			code := exitCode(logger.NewJSON(&out).Logger, ownerErr(finishClear(&out, results, c.err)))
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if code != 1 || len(lines) != 2 || lines[0] != "account="+a+" outcome=unverified" {
+				t.Fatalf("exit %d, output %q; want 1, the one result line, then one exit line", code, out.String())
+			}
+			if m := exitLine(t, 1, lines[1], c.reason); m["step"] != server.StepOwner {
+				t.Fatalf("exit line %s: want step owner", lines[1])
+			}
+		})
 	}
 }

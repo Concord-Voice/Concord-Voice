@@ -71,15 +71,19 @@ type ClearResult struct{ Account, Outcome string }
 // with an empty, oversized or duplicated account list, with ServeLock held
 // (ErrServeLockHeld), on a standby (ErrNotLeader) and when this RSK is not in
 // the installed high-water delegation. Otherwise it clears each account in
-// input order; one account's refusal is recorded as its outcome and the rest
-// continue. finish runs once, after the last account, and its error is
-// returned with the results.
+// input order. An account's own refusal (clearRefusal) is recorded as its
+// outcome and the rest continue; finish runs once, after the last account,
+// and its error is returned with the results. Any other error, the
+// database's, the clock's, the signer's or the lock's, is no refusal (Codex
+// round 2, G5): the run stops at that account, which gets no result, and the
+// results so far return with the error, joined with finish's, since the
+// accounts before it committed.
 //
 // Everything after ServeLock, finish included, runs under the lock's watch
-// (ServeLock.Watch): a lock session that dies mid-run cancels the rest, each
-// account it cuts short is refused, and the error carries ErrServeLockLost.
-// A run cancelled between an account's row 22 and its L1 transaction is the
-// resumable state described above.
+// (ServeLock.Watch): a lock session that dies mid-run cancels the rest, the
+// run stops at the account it cuts short, and the error carries
+// ErrServeLockLost. A run stopped between an account's row 22 and its L1
+// transaction is the resumable state described above.
 func (o *Owner) ClearHeld(ctx context.Context, accounts []string) ([]ClearResult, error) {
 	if o.sig == nil {
 		return nil, fmt.Errorf("%w: clear-held needs the RSK", ErrRefused)
@@ -120,15 +124,33 @@ func (o *Owner) clearLocked(ctx context.Context, accounts []string) ([]ClearResu
 	results := make([]ClearResult, 0, len(accounts))
 	for _, a := range accounts {
 		out, err := o.clearOne(ctx, conn, s, a)
-		if err != nil && errors.Is(context.Cause(ctx), ErrServeLockLost) {
-			err = ErrServeLockLost // one line: a joined error's text spans two
+		if err != nil && (ctx.Err() != nil || !clearRefusal(err)) {
+			if ferr := o.finish(ctx, conn); ferr != nil { // the accounts before this one committed
+				return results, errors.Join(err, ferr)
+			}
+			return results, err
 		}
 		if err != nil {
-			out = ClearRefused + strings.TrimPrefix(err.Error(), "authority store: ")
+			why := strings.TrimPrefix(strings.TrimPrefix(err.Error(), "authority store: "), "refused: ")
+			out = ClearRefused + why
 		}
 		results = append(results, ClearResult{Account: a, Outcome: out})
 	}
 	return results, o.finish(ctx, conn)
+}
+
+// clearRefusal is whether err, from clearOne, is the account's own refusal:
+// ErrRefused (row 22 not admitted by the policy or failing the client check,
+// or a head row 22 left in a state it never leaves) or
+// ErrNotHeldPendingOrDisputed (the head stopped being a held P, D or Pr
+// between the classifier and row 22). Each leaves the account as it was and
+// says nothing about the next one. Everything else, a 55P03 lock wait, a
+// statement or connection failure, db_now behind the account's last as_of_ms
+// or issued_at, a signer or delegation fault, a lost leader, is not: it is
+// returned as the verb's error and exits by its own reason, never as
+// refused.
+func clearRefusal(err error) bool {
+	return errors.Is(err, ErrRefused) || errors.Is(err, ErrNotHeldPendingOrDisputed)
 }
 
 // ClearHeldPlan is clear-held --dry-run: each account's would-be outcome, by
@@ -221,7 +243,7 @@ func (o *Owner) clearOne(ctx context.Context, conn *sql.Conn, s *Store, account 
 		return "", err
 	}
 	if next != ClearUnverified {
-		return "", fmt.Errorf("authority store: clear-held: after row 22 the head reads as %s", next)
+		return "", fmt.Errorf("%w: clear-held: after row 22 the head reads as %s", ErrRefused, next)
 	}
 	return ClearRestoreCancel, nil
 }

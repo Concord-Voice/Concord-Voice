@@ -288,7 +288,7 @@ func inodeOf(t testing.TB, path string) (dev, ino uint64) {
 	require.NoError(t, err)
 	st, ok := info.Sys().(*syscall.Stat_t)
 	require.True(t, ok, "expected a unix stat")
-	return uint64(st.Dev), uint64(st.Ino) //nolint:unconvert // field widths differ per platform
+	return uint64(st.Dev), uint64(st.Ino) //nolint:unconvert,gosec // widths and signedness differ per platform (darwin Dev is int32); compared only for identity
 }
 
 func TestStore_NeverRenameReplacesDatabase(t *testing.T) {

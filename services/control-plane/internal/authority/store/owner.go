@@ -63,8 +63,10 @@ type Owner struct {
 	// trustFile is cfg.TrustFile as given, nil for none: revoke-key's alone.
 	trustFile []byte
 	// afterRestoreCancel is a test seam: nil outside tests. clear-held calls it
-	// after a row 22 committed and before that account's L1 transaction, and a
-	// non-nil return refuses the account there (Review Focus 2).
+	// after a row 22 committed and before that account's L1 transaction. A
+	// non-nil return ends the account there and is classified as any other
+	// error (clearRefusal): an ErrRefused refuses the account, anything else
+	// stops the run (Review Focus 2).
 	afterRestoreCancel func() error
 }
 
@@ -91,12 +93,17 @@ func OpenOwner(cfg OwnerConfig) (*Owner, error) {
 }
 
 // conn is where every owner verb gets its connection, and so the one place
-// its leader check lives (B3-D7, step 1a's rule). It hands back conn only
-// when the role read on that same connection succeeded and said primary. A
-// standby closes it and refuses with ErrNotLeader; a role read that fails
+// its leader and realm checks live (B3-D7, step 1a's rule; B2-D10). It hands
+// back conn only when the role read on that same connection succeeded and said
+// primary, and then meta, read on it too, exists and names the anchors' realm.
+// A standby closes it and refuses with ErrNotLeader; a role read that fails
 // closes it and returns that failure, never ErrNotLeader, so the operator is
-// not sent looking for a primary that may be this one. The caller closes the
-// returned connection.
+// not sent looking for a primary that may be this one. A primary with no meta
+// row is ErrNoMeta and one of another realm ErrRealmMismatch, each closing the
+// connection with nothing read or written past meta, so an
+// AUTHORITY_MIGRATE_DATABASE_URL aimed at another realm's primary mutates
+// nothing (Codex round 2, G4); a realm read that fails is that failure. The
+// caller closes the returned connection.
 func (o *Owner) conn(ctx context.Context) (*sql.Conn, error) {
 	c, err := o.db.Conn(ctx)
 	if err != nil {
@@ -110,6 +117,15 @@ func (o *Owner) conn(ctx context.Context) (*sql.Conn, error) {
 	if inRecovery {
 		_ = c.Close()
 		return nil, ErrNotLeader
+	}
+	// checkRealm reads only the anchors of its Store, as RestoreBegin's
+	// loadTrust does.
+	if err := (&Store{anchors: o.anchors}).checkRealm(ctx, c); err != nil {
+		_ = c.Close()
+		if errors.Is(err, ErrNoMeta) || errors.Is(err, ErrRealmMismatch) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("authority store: realm read: %w", err)
 	}
 	return c, nil
 }

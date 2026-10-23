@@ -312,3 +312,149 @@ func TestOwnerVerbOnStandbyIsNotLeader(t *testing.T) {
 		})
 	}
 }
+
+// ownerVerbCase is one owner verb, called as an operator would.
+type ownerVerbCase struct {
+	name string
+	// arrange puts the database where, on the right realm's primary, the verb
+	// would write; nil needs nothing.
+	arrange func()
+	run     func(ctx context.Context, o *Owner) error
+}
+
+// ownerVerbCases is every owner verb, clear-held and its plan included. The
+// database a case is aimed at is f's, and trust is a trust file for the
+// anchors the Owner under test holds, so only the realm check can refuse it.
+func ownerVerbCases(t *testing.T, f *authoritydb.Fixture, pin []byte, trust []byte) []ownerVerbCase {
+	t.Helper()
+	pop := legacyPop(1)
+	popDigest := populationDigest(t, pop)
+	heldAcct := "00000000-0000-4000-8000-0000000000c1"
+	return []ownerVerbCase{
+		{name: "replication-gate on", run: func(ctx context.Context, o *Owner) error { return o.ReplicationGate(ctx, true) }},
+		{name: "replication-gate off", arrange: func() { requireGate(t, f, true) },
+			run: func(ctx context.Context, o *Owner) error { return o.ReplicationGate(ctx, false) }},
+		{name: "reconcile-complete", arrange: func() { mustExec(t, f.Owner, `SELECT authority.enter_unreconciled()`) },
+			run: func(ctx context.Context, o *Owner) error { _, err := o.ReconcileComplete(ctx); return err }},
+		{name: "seal-legacy", arrange: func() {
+			mustExec(t, f.Owner, `INSERT INTO authority.legacy_population (account_id, legacy_ek_digest) VALUES ($1, $2)`,
+				pop[0].AccountID, pop[0].LegacyEKDigest)
+		}, run: func(ctx context.Context, o *Owner) error { return o.SealLegacy(ctx, popDigest) }},
+		{name: "end-drain", run: func(ctx context.Context, o *Owner) error { return o.EndDrain(ctx, 0, 1) }},
+		{name: "revoke-key", run: func(ctx context.Context, o *Owner) error { return o.RevokeKey(ctx, "cp_tls", pin) }},
+		{name: "restore-begin", run: func(ctx context.Context, o *Owner) error { _, err := o.RestoreBegin(ctx, trust); return err }},
+		{name: "clear-held", arrange: func() { insertHeldA0(t, f.Owner, heldAcct) },
+			run: func(ctx context.Context, o *Owner) error { _, err := o.ClearHeld(ctx, []string{heldAcct}); return err }},
+		{name: "clear-held --dry-run", arrange: func() { insertHeldA0(t, f.Owner, heldAcct) },
+			run: func(ctx context.Context, o *Owner) error {
+				_, err := o.ClearHeldPlan(ctx, []string{heldAcct})
+				return err
+			}},
+	}
+}
+
+// arrangeOnce runs each case's arrange once: a clear-held pair shares a row.
+func arrangeOnce(cases []ownerVerbCase) {
+	heldRow := false
+	for _, c := range cases {
+		if c.arrange == nil || (strings.HasPrefix(c.name, "clear-held") && heldRow) {
+			continue
+		}
+		heldRow = heldRow || strings.HasPrefix(c.name, "clear-held")
+		c.arrange()
+	}
+}
+
+// B2-D10 on every owner verb (Codex round 2, G4): an Owner whose anchors name
+// another realm than the database's meta is refused with ErrRealmMismatch by
+// all of them, and the database is as it was. The cases are arranged so that,
+// on the right realm's primary, each verb WOULD write. conn is where the check
+// lives; before it, only restore-begin and clear-held checked at all.
+func TestOwnerVerbOnAnotherRealmIsRefused(t *testing.T) {
+	f := authoritydb.Setup(t)
+	r := authoritytest.NewRealm(t)
+	other := authoritytest.NewRealm(t) // a second realm: its own ID and anchors
+	newTestStore(t, f, r, &fakeProbe{}, Hooks{})
+	cases := ownerVerbCases(t, f, r.Current.D.CPTLSPins[0], trustFile(t, other.Current))
+	arrangeOnce(cases)
+	o, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: other.AnchorBytes, Signer: other.RSK})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			before := authoritySnapshot(t, f.App)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := c.run(ctx, o); !errors.Is(err, ErrRealmMismatch) {
+				t.Fatalf("%s over another realm's primary = %v, want ErrRealmMismatch", c.name, err)
+			}
+			if after := authoritySnapshot(t, f.App); after != before {
+				t.Fatalf("%s wrote on another realm's primary:\nbefore %s\nafter  %s", c.name, before, after)
+			}
+		})
+	}
+
+	// The control: the same cases over the right realm pass the realm check,
+	// so the refusals above are the realm's and not an arrangement fault.
+	right, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: r.AnchorBytes, Signer: r.RSK, Probe: &fakeProbe{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := right.conn(context.Background())
+	if err != nil {
+		t.Fatalf("conn over the right realm = %v, want nil (the control)", err)
+	}
+	_ = conn.Close()
+}
+
+// A migrated database with no meta row is ErrNoMeta on every owner verb (B2-D10),
+// the CLI's config exit, and not a verb run against an empty authority.
+func TestOwnerVerbWithNoMetaRowIsRefused(t *testing.T) {
+	f := authoritydb.Setup(t)
+	r := authoritytest.NewRealm(t) // meta is never seeded: the bareStore shape
+	cases := ownerVerbCases(t, f, r.Current.D.CPTLSPins[0], trustFile(t, r.Current))
+	o, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: r.AnchorBytes, Signer: r.RSK})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := c.run(ctx, o); !errors.Is(err, ErrNoMeta) {
+				t.Fatalf("%s with no meta row = %v, want ErrNoMeta", c.name, err)
+			}
+		})
+	}
+	var n int
+	if err := f.Super.QueryRow(`SELECT count(*) FROM authority.meta`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("meta has %d rows (%v) after refused verbs, want none", n, err)
+	}
+}
+
+// The leader check is first (B3-D7): a standby over another realm's database is
+// ErrNotLeader, not ErrRealmMismatch, so the operator is sent to the primary
+// before being told anything about its realm.
+func TestOwnerVerbOnAStandbyOfAnotherRealmIsNotLeader(t *testing.T) {
+	f := authoritydb.Setup(t)
+	r := authoritytest.NewRealm(t)
+	other := authoritytest.NewRealm(t)
+	newTestStore(t, f, r, &fakeProbe{}, Hooks{})
+	cases := ownerVerbCases(t, f, r.Current.D.CPTLSPins[0], trustFile(t, other.Current))
+	o, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: other.AnchorBytes, Signer: other.RSK,
+		InRecovery: func(context.Context, *sql.Conn) (bool, error) { return true, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := c.run(ctx, o)
+			if !errors.Is(err, ErrNotLeader) || errors.Is(err, ErrRealmMismatch) {
+				t.Fatalf("%s on a standby of another realm = %v, want ErrNotLeader alone", c.name, err)
+			}
+		})
+	}
+}

@@ -164,16 +164,23 @@ func TestRestoreCancelLeaderRefusalIsAnError(t *testing.T) {
 	e.pinHeld(a.ID)
 	before := countRows(t, e, "account_events")
 	for _, tc := range []struct {
-		name string
-		hook func(context.Context, *sql.Conn) (bool, error)
-		code ac.ErrorCode
+		name      string
+		hook      func(context.Context, *sql.Conn) (bool, error)
+		code      ac.ErrorCode
+		notLeader bool
 	}{
-		{"standby", func(context.Context, *sql.Conn) (bool, error) { return true, nil }, ac.ErrorNotLeader},
-		{"recovery probe fails", func(context.Context, *sql.Conn) (bool, error) { return false, errors.New("boom") }, ac.ErrorStore},
+		{"standby", func(context.Context, *sql.Conn) (bool, error) { return true, nil }, ac.ErrorNotLeader, true},
+		{"recovery probe fails", func(context.Context, *sql.Conn) (bool, error) { return false, errors.New("boom") }, ac.ErrorStore, false},
 	} {
 		e.s.hooks.InRecovery = tc.hook
-		if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err == nil || out.Code != string(tc.code) {
+		out, err := e.s.commitRestoreCancel(context.Background(), a.ID)
+		if err == nil || out.Code != string(tc.code) {
 			t.Fatalf("%s: row 22 = %+v, %v; want 503 %s and a non-nil error", tc.name, out, err, tc.code)
+		}
+		// N1: only a standby is ErrNotLeader, so clear-held exits not_leader for
+		// a failover and config for a role read that failed.
+		if errors.Is(err, ErrNotLeader) != tc.notLeader {
+			t.Fatalf("%s: row 22 error %v, errors.Is ErrNotLeader = %v, want %v", tc.name, err, !tc.notLeader, tc.notLeader)
 		}
 	}
 	e.s.hooks.InRecovery = nil

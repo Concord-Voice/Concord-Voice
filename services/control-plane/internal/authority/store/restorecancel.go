@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/google/uuid"
@@ -16,6 +17,12 @@ import (
 // ErrNotHeldPendingOrDisputed refuses row 22 on a head that is not a held P, D or Pr.
 var ErrNotHeldPendingOrDisputed = errors.New("authority store: row 22 needs a held P, D or Pr head")
 
+// commitRestoreCancel is clear-held's row 22. A non-nil error means nothing
+// committed. Its refusals of this account are ErrNotHeldPendingOrDisputed and
+// ErrRefused (the policy does not admit row 22, or the result fails the client
+// check), which clear-held records as the account's outcome; every other error
+// is the database's, the clock's, the signer's or the leader check's, and
+// stops clear-held's run (clearRefusal; Codex round 2, G5).
 func (s *Store) commitRestoreCancel(ctx context.Context, accountID string) (Outcome, error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -23,6 +30,9 @@ func (s *Store) commitRestoreCancel(ctx context.Context, accountID string) (Outc
 	}
 	defer func() { _ = conn.Close() }()
 	if out, ok := s.leaderCheck(ctx, conn); !ok { // an error, like every refusal: row 22 did not commit
+		if out.Code == string(ac.ErrorNotLeader) { // a failover mid-run exits not_leader, not config
+			return out, fmt.Errorf("authority store: row 22 refused before BEGIN: %w", ErrNotLeader)
+		}
 		return out, errors.New("authority store: row 22 refused before BEGIN: " + out.Code)
 	}
 	tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -93,11 +103,11 @@ func (s *Store) restoreCancelTx(ctx context.Context, st *txState) (Outcome, erro
 	bundle := ac.Bundle{Intent: ib, CPAuthz: azb, HeldStatus: held}
 	d := restoreCancelDecision(st, bundle)
 	if d.Refusal != "" || d.Row.N != 22 {
-		return s.storeError(), errors.New("authority store: row 22 not admitted: " + string(d.Refusal))
+		return s.storeError(), fmt.Errorf("%w: row 22 not admitted: %s", ErrRefused, d.Refusal)
 	}
 	res, ok := s.buildResult(st, d)
 	if !ok || ac.CheckPost(d.Row, h.published(), in, res, false, ac.Assurance(h.Segment), ac.Assurance(h.RecoveryBindAssurance)) != ac.ReasonOK {
-		return s.storeError(), errors.New("authority store: row-22 result fails the client check")
+		return s.storeError(), fmt.Errorf("%w: row-22 result fails the client check", ErrRefused)
 	}
 	rb := res.Encode()
 	rsig, err := signer.SignAndVerify(s.sig, rb)

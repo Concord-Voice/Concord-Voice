@@ -105,7 +105,9 @@ func parseClearHeld(args []string) (ownerCall, bool) {
 
 // finishClear prints one account=<uuid> outcome=<outcome> line per result,
 // in input order, and then decides the exit: the store call's own error
-// first (a replication failure is re-run whatever the accounts read), then
+// first (a replication failure is re-run whatever the accounts read, and a
+// failure that stopped the run, after the lines of the accounts before it,
+// exits by its own reason: Codex round 2, G5), then
 // any refused:<why> result, which exits 1 with reason=refused (B3-D11). The
 // why is the store's error text, printed for the operator on stdout and never
 // logged: the exit line counts the refusals and names no account.
@@ -275,11 +277,13 @@ func runOwner(ctx context.Context, c ownerCall, out io.Writer, log *slog.Logger)
 // reports; a standby is not_leader; a commit not confirmed replicated is
 // replication, with DoR:1743's text in place of the cause; the verb's own
 // refusal, and a trust file restore-begin cannot use (ErrTrustUnusable,
-// ErrRSKReused, ErrNoMeta, the Task 8 hand-off), is refused; a realm
-// mismatch, and a halted installed trust (T4), is trust; a lock wait that
-// ran out (55P03, the 2 s lock_timeout every owner transaction sets) is lock,
-// since a re-run converges once the other transaction ends; anything else is
-// config. An error that is already an exit (finishClear's, ReadTrust's)
+// ErrRSKReused, the Task 8 hand-off), is refused; a realm mismatch, and a
+// halted installed trust (T4), is trust; a database with no meta row
+// (ErrNoMeta) is config, as serve maps both (B2-D10), since the owner
+// connection checks the realm for every verb (Codex round 2, G4); a lock
+// wait that ran out (55P03, the 2 s lock_timeout every owner transaction
+// sets) is lock, since a re-run converges once the other transaction ends;
+// anything else is config. An error that is already an exit (finishClear's, ReadTrust's)
 // passes through.
 func ownerErr(err error) error {
 	var ee *server.ExitError
@@ -297,8 +301,9 @@ func ownerErr(err error) error {
 		return server.RefuseAt(server.StepOwner, server.ReasonNotLeader, err)
 	case errors.Is(err, store.ErrNotReplicated):
 		return server.RefuseAt(server.StepOwner, server.ReasonReplication, errNotReplicated)
-	case errors.Is(err, store.ErrRefused), errors.Is(err, store.ErrTrustUnusable), errors.Is(err, store.ErrRSKReused),
-		errors.Is(err, store.ErrNoMeta):
+	case errors.Is(err, store.ErrNoMeta): // as serve maps it: "run migrate --realm"
+		return server.RefuseAt(server.StepOwner, server.ReasonConfig, err)
+	case errors.Is(err, store.ErrRefused), errors.Is(err, store.ErrTrustUnusable), errors.Is(err, store.ErrRSKReused):
 		return server.RefuseAt(server.StepOwner, server.ReasonRefused, err)
 	}
 	if qe, ok := as[*pq.Error](err); ok && qe.Code == "55P03" { // lock_not_available

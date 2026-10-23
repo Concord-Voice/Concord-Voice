@@ -404,6 +404,76 @@ func TestRestoreBeginRecordsARestoreOnlyWhenOneIsNotInProgress(t *testing.T) {
 	})
 }
 
+// Codex round 2, G3: whether a restore is in progress compares no clocks.
+// restore-begin clears reconcile_completed_at when it records a restore, and
+// only reconcile-complete sets it, so a database clock that stepped between
+// the two verbs cannot make a finished restore look open or an open one finished.
+func TestRestoreBeginIgnoresAClockStep(t *testing.T) {
+	// The clock stepped back after reconcile-complete: the completion stamp is
+	// ahead of the next restore's start. The next restore-begin records a restore
+	// (reconciled is true) and clears the stamp, so its re-run is the same restore.
+	t.Run("a completion stamp ahead of the next start", func(t *testing.T) {
+		e := newEnv(t)
+		e.enrolledWith()
+		o := ownerOver(t, e.f, e.r, OwnerConfig{})
+		trust := trustFile(t, e.r.Current)
+		if _, err := o.RestoreBegin(liveCtx(t), trust); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.ReconcileComplete(liveCtx(t)); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, e.f.Super, `UPDATE authority.meta SET reconcile_completed_at = now() + interval '1 hour'`)
+
+		first, err := o.RestoreBegin(liveCtx(t), trust)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m := readMetaRestore(t, e.f.Super); m.completed.Valid || m.epoch != 2 || m.reconciled {
+			t.Fatalf("meta = %+v after the second restore began, want epoch 2, unreconciled, reconcile_completed_at NULL", m)
+		}
+		time.Sleep(20 * time.Millisecond) // a re-stamped restore_started_at would differ
+		second, err := o.RestoreBegin(liveCtx(t), trust)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second.Epoch != first.Epoch || !second.StartedAt.Equal(first.StartedAt) ||
+			second.BackupMaxCommitID != first.BackupMaxCommitID || second.BackupMaxIssuedMs != first.BackupMaxIssuedMs {
+			t.Fatalf("re-run = %+v after %+v, want the same epoch, start and backup point (B3-D8)", second, first)
+		}
+	})
+
+	// The clock stepped back between restore-begin and reconcile-complete: the
+	// completion stamp is BEFORE the restore's start. After a snapshot rollback
+	// (reconcile/required), the next restore-begin must record a new restore, not
+	// hand back the finished one's point.
+	t.Run("a completion stamp behind its own start", func(t *testing.T) {
+		e := newEnv(t)
+		e.enrolledWith()
+		o := ownerOver(t, e.f, e.r, OwnerConfig{})
+		trust := trustFile(t, e.r.Current)
+		first, err := o.RestoreBegin(liveCtx(t), trust)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.ReconcileComplete(liveCtx(t)); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, e.f.Super, `UPDATE authority.meta SET reconcile_completed_at = restore_started_at - interval '1 hour'`)
+		mustExec(t, e.f.Owner, `SELECT authority.enter_unreconciled()`)
+		time.Sleep(20 * time.Millisecond)
+
+		second, err := o.RestoreBegin(liveCtx(t), trust)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second.Epoch != first.Epoch+1 || !second.StartedAt.After(first.StartedAt) {
+			t.Fatalf("restore-begin after a finished restore with a stepped clock = %+v after %+v, "+
+				"want the next epoch and a later start, not the finished restore's point", second, first)
+		}
+	})
+}
+
 // ---- the serve lock ----
 
 // DoR:1764: the lock is taken first. While another session holds it the verb

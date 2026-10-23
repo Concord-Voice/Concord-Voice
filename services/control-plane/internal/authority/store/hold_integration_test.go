@@ -887,3 +887,216 @@ func TestPurgeAndRequiredDoNotDeadlock(t *testing.T) {
 		}
 	}
 }
+
+// ---- reconcile/hold against reconcile-complete (Codex round 2, G2) ----
+
+// holdResult is what a ReconcileHold running in a goroutine returned.
+type holdResult struct {
+	out Outcome
+	err error
+}
+
+func startHold(rs *restored, body []byte) <-chan holdResult {
+	ch := make(chan holdResult, 1)
+	go func() {
+		out, err := rs.e.s.ReconcileHold(context.Background(), body)
+		ch <- holdResult{out, err}
+	}()
+	return ch
+}
+
+// awaitWaiters blocks until n backends wait on a lock. A hold that returns
+// first never reached the interleaving, so the test fails saying so: the lock
+// it should have waited on was not taken.
+func awaitWaiters(t *testing.T, super *sql.DB, n int, side string, done <-chan holdResult) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case r := <-done:
+			t.Fatalf("%s returned (%v) before it waited on the lock held elsewhere: the interleaving was never reached", side, r.err)
+		default:
+		}
+		var waiting int
+		if err := super.QueryRow(`SELECT count(DISTINCT l.pid) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted AND a.datname = current_database()`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("fewer than %d lock waiters after 5 s (%s)", n, side)
+}
+
+func waitHold(t *testing.T, done <-chan holdResult) holdResult {
+	t.Helper()
+	select {
+	case r := <-done:
+		return r
+	case <-time.After(10 * time.Second):
+		t.Fatal("ReconcileHold did not finish after the lock it waited on was released")
+		return holdResult{}
+	}
+}
+
+func headHeld(t *testing.T, rs *restored, account string) (held bool, rows int) {
+	t.Helper()
+	if err := rs.e.f.Super.QueryRow(`SELECT count(*), COALESCE(bool_or(held), false) FROM authority.account_heads
+		WHERE account_id = $1`, account).Scan(&rows, &held); err != nil {
+		t.Fatal(err)
+	}
+	return held, rows
+}
+
+// reconcileBlocker is a transaction standing in for a reconcile-complete that
+// holds the given locks and has set reconciled, uncommitted.
+func reconcileBlocker(t *testing.T, rs *restored, headOf string) *sql.Tx {
+	t.Helper()
+	tx, err := rs.e.f.Super.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback() })
+	if headOf != "" { // the heads, then meta: the one lock order
+		if _, err := tx.Exec(`SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, headOf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`SELECT 1 FROM authority.meta WHERE id = 1 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE authority.meta SET reconciled = true`); err != nil {
+		t.Fatal(err)
+	}
+	return tx
+}
+
+// removeHead takes an account's head row away, as a backup that predates the
+// account would not have it. The replica role skips the append-only guards.
+func removeHead(t *testing.T, rs *restored, account string) {
+	t.Helper()
+	tx, err := rs.e.f.Super.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`SET LOCAL session_replication_role = replica`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`DELETE FROM authority.account_heads WHERE account_id = $1`, account); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A reconcile-complete that commits while a hold judges its bundles must win
+// (B3-D2): the hold is ErrReconciled and holds nothing, whether the account has
+// a head the complete locked or only the one the hold itself creates, which
+// the complete's scan of the heads cannot see.
+func TestHoldAfterAConcurrentCompleteIsReconciled(t *testing.T) {
+	t.Run("an account with no head row yet", func(t *testing.T) {
+		rs := newRestored(t, 1, restoredOpts{})
+		removeHead(t, rs, rs.accts[0].ID)
+		rs.enterUnreconciled(t)
+		blocker := reconcileBlocker(t, rs, "")
+
+		done := startHold(rs, holdReqBytes(t, rs.ahead[0]))
+		awaitWaiters(t, rs.e.f.Super, 1, "ReconcileHold", done)
+		if err := blocker.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if r := waitHold(t, done); !errors.Is(r.err, ErrReconciled) {
+			t.Fatalf("ReconcileHold after a reconcile-complete committed = %v, want ErrReconciled", r.err)
+		}
+		if held, rows := headHeld(t, rs, rs.accts[0].ID); held || rows != 0 {
+			t.Fatalf("head rows = %d, held = %v: the refused hold left a head behind", rows, held)
+		}
+	})
+
+	t.Run("an account with a head the complete locked", func(t *testing.T) {
+		rs := newRestored(t, 1, restoredOpts{})
+		rs.enterUnreconciled(t)
+		blocker := reconcileBlocker(t, rs, rs.accts[0].ID)
+
+		done := startHold(rs, holdReqBytes(t, rs.ahead[0]))
+		awaitWaiters(t, rs.e.f.Super, 1, "ReconcileHold", done)
+		if err := blocker.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if r := waitHold(t, done); !errors.Is(r.err, ErrReconciled) {
+			t.Fatalf("ReconcileHold after a reconcile-complete committed = %v, want ErrReconciled", r.err)
+		}
+		if held, _ := headHeld(t, rs, rs.accts[0].ID); held {
+			t.Fatal("the refused hold set held on the head")
+		}
+	})
+
+	// The control: the same hold, with no concurrent complete, lands.
+	t.Run("control: no concurrent complete", func(t *testing.T) {
+		rs := newRestored(t, 1, restoredOpts{})
+		removeHead(t, rs, rs.accts[0].ID)
+		rs.enterUnreconciled(t)
+		if _, err := rs.e.s.ReconcileHold(liveCtx(t), holdReqBytes(t, rs.ahead[0])); err != nil {
+			t.Fatalf("ReconcileHold = %v, want nil (the control)", err)
+		}
+		if held, rows := headHeld(t, rs, rs.accts[0].ID); !held || rows != 1 {
+			t.Fatalf("head rows = %d, held = %v, want one held head", rows, held)
+		}
+	})
+}
+
+// The other order: a hold that has its head first, and waits for meta while a
+// transaction holds it, makes a reconcile-complete wait for the head and then
+// count the account held. Neither takes meta before a head, so the pair cannot
+// deadlock (40P01) and the account is in the held count.
+func TestHoldBeforeAConcurrentCompleteIsCounted(t *testing.T) {
+	rs := newRestored(t, 1, restoredOpts{})
+	rs.enterUnreconciled(t)
+	o := ownerOver(t, rs.e.f, rs.e.r, OwnerConfig{})
+	tx, err := rs.e.f.Super.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback() })
+	if _, err := tx.Exec(`SELECT 1 FROM authority.meta WHERE id = 1 FOR UPDATE`); err != nil { // reconciled stays false
+		t.Fatal(err)
+	}
+
+	done := startHold(rs, holdReqBytes(t, rs.ahead[0]))
+	awaitWaiters(t, rs.e.f.Super, 1, "ReconcileHold", done) // the hold has its head and waits for meta
+	type completeResult struct {
+		counts ReconcileCounts
+		err    error
+	}
+	completed := make(chan completeResult, 1)
+	go func() {
+		c, err := o.ReconcileComplete(context.Background())
+		completed <- completeResult{c, err}
+	}()
+	awaitWaiters(t, rs.e.f.Super, 2, "ReconcileComplete", done) // and the complete waits for that head
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := waitHold(t, done); r.err != nil {
+		t.Fatalf("ReconcileHold = %v, want nil", r.err)
+	}
+	select {
+	case c := <-completed:
+		if c.err != nil {
+			t.Fatalf("ReconcileComplete = %v, want nil with no deadlock (40P01)", c.err)
+		}
+		if c.counts.Held != 1 {
+			t.Fatalf("ReconcileComplete counted %d held heads, want 1: the hold committed first", c.counts.Held)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ReconcileComplete did not finish")
+	}
+	if held, _ := headHeld(t, rs, rs.accts[0].ID); !held {
+		t.Fatal("the hold that committed first was lost")
+	}
+}
