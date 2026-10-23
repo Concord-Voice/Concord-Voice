@@ -1826,6 +1826,14 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       useSubscriptionStore.getState().setEntitlement(msg.data);
     });
 
+    // A purge event can be lost if the server exits before its in-memory
+    // delivery retry completes. On an interruption, discard every locally
+    // known server channel's plaintext, including channels that are no longer
+    // mounted. The mounted channel refetches on connection-recovered; other
+    // channels refetch when opened. Fence in-flight decrypts and search
+    // backfills through the same scope-loss path used by a live purge.
+    let serverScopesClearedForOutage = false;
+
     // Re-hydrate the entitlement set on every WS (re)connect so the capability
     // set converges after a reconnect — independent of whether a live
     // entitlements_changed push was delivered before the socket dropped (e.g. a
@@ -1833,6 +1841,21 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // to the free floor, so a failed/raced re-hydrate never escalates. (#1297 /
     // Gitar review: hydratePostLogin only covers fresh login/SSO/restore.)
     const unsubEntitlementsResync = wsService.onConnectionChange((state) => {
+      if (
+        state === ConnectionState.DISCONNECTED ||
+        state === ConnectionState.RECONNECTING ||
+        state === ConnectionState.ERROR
+      ) {
+        if (!serverScopesClearedForOutage) {
+          const channelState = useChannelStore.getState();
+          const serverIds = new Set(Object.keys(channelState.channelIdsByServer));
+          for (const channel of channelState.channels) serverIds.add(channel.server_id);
+          for (const serverId of serverIds) clearServerScopes(serverId);
+          serverScopesClearedForOutage = true;
+        }
+      } else if (state === ConnectionState.CONNECTED) {
+        serverScopesClearedForOutage = false;
+      }
       if (
         state === ConnectionState.DISCONNECTED ||
         state === ConnectionState.RECONNECTING ||

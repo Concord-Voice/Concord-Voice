@@ -781,34 +781,31 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       return;
     }
     if (
-      outcome.kind === 'success' ||
+      (outcome.kind === 'success' && (outcome.deletedCount > 0 || outcome.hiddenCount > 0)) ||
       outcome.kind === 'partial' ||
       outcome.kind === 'networkError'
     ) {
-      // The actor cleans up from their own request, not from the echo. A
-      // channel_purged/dm_purged broadcast is subscription-scoped, so the very
-      // person who pressed the button may never receive one — waiting on it
-      // leaves them reading purged content. The two uncertain outcomes dispatch
-      // for a different reason: a 500 can arrive after batches committed and a
-      // transport rejection cannot prove the request never landed, while no
-      // event is emitted on any DM error path — so the refetch is the only way
-      // back to the truth, and it matters most exactly when the outcome is
-      // unknown.
-      //
-      // The server context's scopeId is a SERVER id, which no mounted channel
-      // can match, so it stays null: `useMessageFetch` reads a null scope as
-      // "refetch whatever is mounted". It travels alongside an explicit
-      // `serverId` because the two carry different instructions — null says
-      // which scope to REFETCH, serverId says which scopes to CLEAR. Relying on
-      // the `server_purged` echo for the clear would fail in exactly the case
-      // that needs it most: a transport rejection means the WebSocket is
-      // plausibly down too, so the echo may never arrive and the actor's other
-      // known channels of that server would keep serving purged plaintext.
-      globalThis.dispatchEvent(
-        new CustomEvent('messages-purged', {
-          detail: context === 'server' ? { scopeId: null, serverId: scopeId } : { scopeId },
-        })
-      );
+      // The actor may not be subscribed to a changed channel. The server's
+      // successful response names exactly the channels with committed deletes,
+      // so clearing locally must use that list as well. Uncertain outcomes and
+      // older servers lack it and retain the conservative server refresh.
+      if (
+        context === 'server' &&
+        outcome.kind === 'success' &&
+        outcome.affectedChannelIds?.length
+      ) {
+        for (const channelId of outcome.affectedChannelIds) {
+          globalThis.dispatchEvent(
+            new CustomEvent('messages-purged', { detail: { scopeId: channelId } })
+          );
+        }
+      } else {
+        globalThis.dispatchEvent(
+          new CustomEvent('messages-purged', {
+            detail: context === 'server' ? { scopeId: null, serverId: scopeId } : { scopeId },
+          })
+        );
+      }
     }
     // Nothing beyond this point needs the credentials; drop them before the
     // result stage renders.

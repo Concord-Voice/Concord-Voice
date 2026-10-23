@@ -670,10 +670,11 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     return () => globalThis.removeEventListener('e2ee-key-delivered', handler);
   }, [channelId, retryFetch]);
 
-  // #2329: after a Recovery-A reconnect the WebSocket replays only subscriptions
+  // #2329: after any reconnect the WebSocket replays only subscriptions
   // + a presence snapshot, so messages sent during the outage are never
-  // redelivered. useConnectionRecovery dispatches `connection-recovered` once the
-  // session-guarded hydration completes; re-fetch the mounted channel so the gap
+  // redelivered. useConnectionRecovery dispatches `connection-recovered` after
+  // a grace reconnect or once longer recovery's session-guarded hydration completes;
+  // re-fetch the mounted channel so the gap
   // is backfilled. The fetch effect's own aborted/channel/E2EE-operation guards
   // keep this session-safe.
   useEffect(() => {

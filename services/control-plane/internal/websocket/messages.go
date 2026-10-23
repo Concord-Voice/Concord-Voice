@@ -98,8 +98,10 @@ type ServerBroadcastMessage struct {
 	// ChannelID and RequireVoiceViewAuth request per-recipient voice-channel-view
 	// filtering for server subscribers. handleServerBroadcast resolves the channel
 	// before delivery; callers cannot supply the permission bit.
-	ChannelID                                   uuid.UUID
-	RequireVoiceViewAuth                        bool
+	ChannelID            uuid.UUID
+	RequireVoiceViewAuth bool
+	// RequireChannelViewAuth resolves the channel's text or voice view bit.
+	RequireChannelViewAuth                      bool
 	serverVoiceParticipantID                    uuid.UUID
 	serverVoiceRetryOnAuthorizationInvalidation bool
 	serverVoiceTerminalReceipt                  chan ServerVoiceTerminalDeliveryOutcome

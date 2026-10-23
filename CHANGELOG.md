@@ -99,6 +99,8 @@ you verify your email.
 
 ### Fixed
 
+- **Server message purges refresh only affected channels** (internal development reference omitted) — a server purge no longer clears cached messages in private or skipped channels. A purge that removes no messages leaves channel caches alone.
+
 - **Invite links keep previews in the signed-in app** (internal development reference omitted) — shared links show a generic friend or server greeting, then offer to open Concord Voice. After sign-in and key unlock, the app opens the selected invite. Profile pictures, banners, and server icons now load through the signed-in account instead of anonymous image requests. The feedback screenshot picker warns that attached images are publicly readable and should be redacted before upload.
 - **Attachment deletion now requires current access to its channel or DM** —
   an uploader who has left or been removed can no longer delete that chat's

@@ -134,6 +134,13 @@ type ExpiryPlan struct {
 type Result struct {
 	PurgeID      string
 	DeletedCount int
+	// DeletedByScope records committed rows per DeleteSpec scope for Run. A
+	// partial commit whose count is later reconciled may exceed this map.
+	DeletedByScope map[string]int
+	// A failed batch can have committed without its acknowledgement. Until the
+	// durable audit count advances past the locally observed count, it cannot
+	// rule out a late commit in an otherwise unaccounted scope.
+	AffectedScopesUncertain bool
 	// HiddenCount is left 0 by the engine; PurgeConversation assigns it after the
 	// receiver-hide and sources both the JSON body and FinalizeHidden from it.
 	HiddenCount int
@@ -339,15 +346,22 @@ func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
 	}
 
 	total := 0
+	byScope := make(map[string]int)
 	for _, ds := range p.Deletes {
 		n, err := e.deleteBatched(ctx, purgeID, p, ds)
 		// Count BEFORE checking err: deleteBatched returns the rows it already
 		// committed even when a later batch fails. Those messages are irreversibly
 		// gone, so the audit must say so.
 		total += n
+		if n > 0 {
+			byScope[ds.ScopeID] += n
+		}
 		if err != nil {
-			total = e.recoverPartialCount(ctx, purgeID, total)
-			return Result{PurgeID: purgeID, DeletedCount: total}, fmt.Errorf("purge batched delete: %w", err)
+			var commitErr *batchCommitError
+			commitOutcomeUnknown := errors.As(err, &commitErr)
+			var reconciled bool
+			total, reconciled = e.recoverPartialCount(ctx, purgeID, total)
+			return Result{PurgeID: purgeID, DeletedCount: total, DeletedByScope: byScope, AffectedScopesUncertain: commitOutcomeUnknown && !reconciled}, fmt.Errorf("purge batched delete: %w", err)
 		}
 	}
 
@@ -357,11 +371,11 @@ func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
 			// failed, so record what was deleted rather than leaving the audit row reading
 			// in_progress/0 — the same false-compliance record recordPartialCount exists to
 			// prevent, and the reason the caller still gets its PurgeID/DeletedCount back.
-			total = e.recoverPartialCount(ctx, purgeID, total)
-			return Result{PurgeID: purgeID, DeletedCount: total}, err
+			total, _ = e.recoverPartialCount(ctx, purgeID, total)
+			return Result{PurgeID: purgeID, DeletedCount: total, DeletedByScope: byScope}, err
 		}
 	}
-	return Result{PurgeID: purgeID, DeletedCount: total}, nil
+	return Result{PurgeID: purgeID, DeletedCount: total, DeletedByScope: byScope}, nil
 }
 
 // RunExpiryBatch rechecks the discovered candidates under row locks, writes one
@@ -396,7 +410,7 @@ func (e *Engine) RunExpiryBatch(ctx context.Context, p ExpiryPlan) (Result, erro
 
 	e.EnqueueBlobDeletes(refs)
 	if err := e.finalizeCompleted(ctx, purgeID, affected); err != nil {
-		total := e.recoverPartialCount(ctx, purgeID, affected)
+		total, _ := e.recoverPartialCount(ctx, purgeID, affected)
 		return Result{PurgeID: purgeID, DeletedCount: total}, err
 	}
 	return Result{PurgeID: purgeID, DeletedCount: affected}, nil
@@ -658,13 +672,14 @@ func expiryDeleteSpec(p ExpiryPlan) (DeleteSpec, error) {
 // durable audit read and corrective update. A client disconnect must not erase
 // the audit evidence, but serial recovery operations must not extend the HTTP
 // response beyond that one bounded grace period.
-func (e *Engine) recoverPartialCount(ctx context.Context, purgeID string, total int) int {
+func (e *Engine) recoverPartialCount(ctx context.Context, purgeID string, total int) (int, bool) {
 	salvageCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialCountSalvageTimeout)
 	defer cancel()
 
-	total = e.durableDeletedCount(salvageCtx, purgeID, total)
+	var reconciled bool
+	total, reconciled = e.durableDeletedCount(salvageCtx, purgeID, total)
 	e.recordPartialCount(salvageCtx, purgeID, total)
-	return total
+	return total, reconciled
 }
 
 // recordPartialCount uses the bounded, detached context supplied by
@@ -681,21 +696,20 @@ func (e *Engine) recordPartialCount(ctx context.Context, purgeID string, total i
 	}
 }
 
-// durableDeletedCount reconciles an uncertain batch commit with the count that
-// committed atomically alongside the delete. PostgreSQL can commit while the
-// client loses the acknowledgement; returning the locally accumulated count in
-// that case would understate irreversible deletion to the moderation response.
-func (e *Engine) durableDeletedCount(ctx context.Context, purgeID string, fallback int) int {
+// durableDeletedCount reconciles an uncertain batch commit only when the audit
+// count has advanced past the locally observed committed count. A successful
+// read of the old count can race an in-flight COMMIT and cannot rule it out.
+func (e *Engine) durableDeletedCount(ctx context.Context, purgeID string, fallback int) (int, bool) {
 	var deleted int
 	if err := e.db.QueryRowContext(ctx,
 		`SELECT deleted_count FROM message_purges WHERE id = $1`, purgeID).Scan(&deleted); err != nil {
 		e.log.Warn("purge: failed to read durable count after batch error", "error", err, "purge_id", purgeID)
-		return fallback
+		return fallback, false
 	}
 	if deleted > fallback {
-		return deleted
+		return deleted, true
 	}
-	return fallback
+	return fallback, false
 }
 
 // deleteBatched runs the batched delete for one DeleteSpec until fewer than

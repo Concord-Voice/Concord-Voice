@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -214,7 +215,11 @@ func assertD1GateOutcome(t *testing.T, ts *testhelpers.TestServer, f d1Fixture, 
 	switch {
 	case !tc.enforcing:
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.JSONEq(t, `{"deleted_count":2,"hidden_count":0}`, w.Body.String())
+		if tc.route.name == "server purge" {
+			assert.JSONEq(t, fmt.Sprintf(`{"deleted_count":2,"hidden_count":0,"affected_channel_ids":[%q]}`, f.channel), w.Body.String())
+		} else {
+			assert.JSONEq(t, `{"deleted_count":2,"hidden_count":0}`, w.Body.String())
+		}
 		assert.True(t, d1TokenLive(t, ts.DB, f.mod.ID, tc.route.purpose), "nothing is verified off the toggle")
 	case !tc.enrolled:
 		require.Equal(t, http.StatusForbidden, w.Code)
@@ -424,7 +429,7 @@ func TestPurgeD1Gate_ToggleOffByteIdentical(t *testing.T) {
 
 	server := s.d1Purge(t, w.moderator.ID, "/servers/"+w.serverID+"/messages", map[string]any{"range": "all"})
 	require.Equal(t, http.StatusOK, server.Code)
-	assert.Equal(t, `{"deleted_count":2,"hidden_count":0}`, server.Body.String())
+	assert.Equal(t, fmt.Sprintf(`{"affected_channel_ids":[%q],"deleted_count":2,"hidden_count":0}`, w.channelID), server.Body.String())
 
 	denied := s.d1Purge(t, w.author.ID, "/channels/"+w.channelID+"/messages",
 		map[string]any{"range": "all", "target_user_id": w.moderator.ID})

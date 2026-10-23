@@ -20,6 +20,27 @@ import type { StepUpFactorRefusal } from '../../hooks/auth/useStepUpFactor';
 import type { PurgeRange } from '../../constants/purgeRanges';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import { clientConfigService } from '../system/clientConfigService';
+import { useChannelStore } from '../../stores/chat/channelStore';
+import { isValidUUID } from '../../utils/runtime/uuid';
+
+// Keep the success response from turning malformed scope data into an omitted
+// invalidation. An unknown channel makes the caller use its server-wide fallback.
+function affectedServerChannels(value: unknown, serverId: string): string[] | undefined {
+  if (!Array.isArray(value) || value.length > 500) return undefined;
+  const state = useChannelStore.getState();
+  const known = new Set(state.channelIdsByServer[serverId] ?? []);
+  for (const channel of state.channels) {
+    if (channel.server_id === serverId) known.add(channel.id);
+  }
+  const seen = new Set<string>();
+  for (const id of value) {
+    if (typeof id !== 'string' || !isValidUUID(id) || !known.has(id) || seen.has(id)) {
+      return undefined;
+    }
+    seen.add(id);
+  }
+  return value;
+}
 
 export type PurgeContext = 'channel' | 'server' | 'dm' | 'group';
 
@@ -182,7 +203,7 @@ export type DangerousChallengeRefusal = Extract<
 >;
 
 export type PurgeResult =
-  | { kind: 'success'; deletedCount: number; hiddenCount: number }
+  | { kind: 'success'; deletedCount: number; hiddenCount: number; affectedChannelIds?: string[] }
   | { kind: 'rateLimited'; retryAfterSeconds?: number }
   /** The shared step-up attempt budget, not the purge limiter (#3455, X17). */
   | { kind: 'verificationLimited'; retryAfterSeconds?: number }
@@ -513,18 +534,39 @@ export async function purgeMessages(
   if (res === null) return { kind: 'unavailable' };
 
   if (res.ok) {
-    // The server always emits a body, but a non-JSON 200 injected by an intermediary would
-    // reject out of a function whose callers have no catch, and a body missing
-    // the counts would render "Purged undefined messages."
-    const data = (await res.json().catch(() => ({}))) as Partial<{
+    // A malformed success body leaves the deletion outcome unknown. Treat it
+    // as partial so the caller invalidates the scope conservatively.
+    const body: unknown = await res.json().catch(() => null);
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      return { kind: 'partial' };
+    }
+    const data = body as Partial<{
       deleted_count: number;
       hidden_count: number;
+      affected_channel_ids: string[];
     }>;
+    const deletedCount = data.deleted_count;
+    const hiddenCount = data.hidden_count;
+    if (
+      typeof deletedCount !== 'number' ||
+      !Number.isSafeInteger(deletedCount) ||
+      deletedCount < 0 ||
+      typeof hiddenCount !== 'number' ||
+      !Number.isSafeInteger(hiddenCount) ||
+      hiddenCount < 0
+    ) {
+      return { kind: 'partial' };
+    }
+    const affectedChannelIds =
+      args.context === 'server'
+        ? affectedServerChannels(data.affected_channel_ids, args.scopeId)
+        : undefined;
     // deleted_count 0 is a legal success — an authorized purge of an empty scope.
     return {
       kind: 'success',
-      deletedCount: Number(data.deleted_count) || 0,
-      hiddenCount: Number(data.hidden_count) || 0,
+      deletedCount,
+      hiddenCount,
+      ...(affectedChannelIds !== undefined ? { affectedChannelIds } : {}),
     };
   }
 

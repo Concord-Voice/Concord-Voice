@@ -6,6 +6,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 import { formatRetryAfter } from '@/renderer/components/Purge/PurgeResult';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 
 const noop = () => {};
 
@@ -518,13 +519,19 @@ describe('PurgeMessagesModal — result stage', () => {
     expect(details).toEqual([{ scopeId: 'c1' }]);
   });
 
-  it('asks a successful server purge to refetch whatever is mounted', async () => {
+  it('invalidates only changed channels after a successful server purge', async () => {
+    const changedChannel = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    useChannelStore.setState({ channelIdsByServer: { s1: [changedChannel] } });
     const details: unknown[] = [];
     const listener = (e: Event) => details.push((e as CustomEvent).detail);
     globalThis.addEventListener('messages-purged', listener);
     server.use(
       http.delete('*/api/v1/servers/:id/messages', () =>
-        HttpResponse.json({ deleted_count: 7, hidden_count: 0 })
+        HttpResponse.json({
+          deleted_count: 7,
+          hidden_count: 0,
+          affected_channel_ids: [changedChannel],
+        })
       )
     );
     const user = userEvent.setup();
@@ -543,9 +550,113 @@ describe('PurgeMessagesModal — result stage', () => {
     await screen.findByText(/messages purged/i);
     globalThis.removeEventListener('messages-purged', listener);
 
-    // Same shape the partial path uses: a SERVER id matches no mounted channel,
-    // so `scopeId` stays null and `serverId` carries the clear.
+    expect(details).toEqual([{ scopeId: changedChannel }]);
+  });
+
+  it.each([
+    ['malformed', ['']],
+    ['absent on an older server', undefined],
+  ])('falls back to server invalidation when the successful scope list is %s', async (_, ids) => {
+    const details: unknown[] = [];
+    const listener = (e: Event) => details.push((e as CustomEvent).detail);
+    globalThis.addEventListener('messages-purged', listener);
+    server.use(
+      http.delete('*/api/v1/servers/:id/messages', () =>
+        HttpResponse.json({ deleted_count: 1, hidden_count: 0, affected_channel_ids: ids })
+      )
+    );
+    const user = userEvent.setup();
+    render(
+      <PurgeMessagesModal
+        context="server"
+        isOpen
+        scopeId="s1"
+        scopeName="Test Server"
+        onClose={noop}
+      />
+    );
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
+    await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
+    await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
+    await screen.findByText(/messages purged/i);
+    globalThis.removeEventListener('messages-purged', listener);
     expect(details).toEqual([{ scopeId: null, serverId: 's1' }]);
+  });
+
+  it('invalidates the server after a 200 with malformed counts', async () => {
+    const details: unknown[] = [];
+    const listener = (e: Event) => details.push((e as CustomEvent).detail);
+    globalThis.addEventListener('messages-purged', listener);
+    server.use(
+      http.delete('*/api/v1/servers/:id/messages', () =>
+        HttpResponse.json({ affected_channel_ids: [] })
+      )
+    );
+    const user = userEvent.setup();
+    render(
+      <PurgeMessagesModal
+        context="server"
+        isOpen
+        scopeId="s1"
+        scopeName="Test Server"
+        onClose={noop}
+      />
+    );
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
+    await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
+    await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
+    await screen.findByRole('button', { name: 'Done' });
+    globalThis.removeEventListener('messages-purged', listener);
+    expect(details).toEqual([{ scopeId: null, serverId: 's1' }]);
+  });
+
+  it('invalidates hidden-only DM purges even when no messages were deleted', async () => {
+    usePrivacyStore.setState({
+      settings: { ...usePrivacyStore.getState().settings, requireAuthBeforePurge: false },
+    });
+    const details: unknown[] = [];
+    const listener = (e: Event) => details.push((e as CustomEvent).detail);
+    globalThis.addEventListener('messages-purged', listener);
+    server.use(
+      http.delete('*/api/v1/dm/conversations/:id/messages', () =>
+        HttpResponse.json({ deleted_count: 0, hidden_count: 1 })
+      )
+    );
+    const user = userEvent.setup();
+    render(<PurgeMessagesModal context="dm" isOpen scopeId="d1" scopeName="Alex" onClose={noop} />);
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last 7 days');
+    await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
+    await screen.findByRole('button', { name: 'Done' });
+    globalThis.removeEventListener('messages-purged', listener);
+    expect(details).toEqual([{ scopeId: 'd1' }]);
+  });
+
+  it('does not clear a server after a confirmed zero-row purge', async () => {
+    const details: unknown[] = [];
+    const listener = (e: Event) => details.push((e as CustomEvent).detail);
+    globalThis.addEventListener('messages-purged', listener);
+    server.use(
+      http.delete('*/api/v1/servers/:id/messages', () =>
+        HttpResponse.json({ deleted_count: 0, hidden_count: 0 })
+      )
+    );
+    const user = userEvent.setup();
+    render(
+      <PurgeMessagesModal
+        context="server"
+        isOpen
+        scopeId="s1"
+        scopeName="Test Server"
+        onClose={noop}
+      />
+    );
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Range' }), 'Last hour');
+    await user.type(screen.getByLabelText(/type purge to confirm/i), 'PURGE');
+    await user.click(screen.getByRole('button', { name: 'Purge Messages' }));
+    await screen.findByText(/messages purged\. channels you cannot moderate were skipped/i);
+    globalThis.removeEventListener('messages-purged', listener);
+
+    expect(details).toEqual([]);
   });
 
   it('names the conversation, not a channel, when a DM scope is gone', async () => {

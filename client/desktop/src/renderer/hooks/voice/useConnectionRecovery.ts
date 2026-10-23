@@ -248,6 +248,9 @@ function handleReconnected(
 
   if (phase === 'grace_period') {
     useConnectionStore.getState().reset();
+    // The socket does not replay missed messages. The purge disconnect fence
+    // may also have cleared the mounted chat, so request its guarded backfill.
+    globalThis.dispatchEvent(new CustomEvent('connection-recovered'));
     if (e2eeService.isInitialized) {
       e2eeService.processPendingKeyRequests().catch(() => {});
       validateEpochsOnReconnect().catch((err) => {

@@ -135,14 +135,27 @@ describe('purgeMessages error matrix', () => {
     expect(r).toEqual({ kind: 'sessionExpired' });
   });
 
-  it('tolerates a 200 whose body is not the expected JSON', async () => {
+  it('treats a 200 with a non-JSON body as an uncertain partial outcome', async () => {
     server.use(
       http.delete('*/api/v1/channels/:id/messages', () => HttpResponse.text('<html>proxy</html>'))
     );
     const r = await purgeMessages({ context: 'channel', scopeId: CHANNEL, range: '7d' });
-    // Rejecting here would escape a caller that has no catch; "Purged undefined
-    // messages." is the other failure mode this coercion closes.
-    expect(r).toEqual({ kind: 'success', deletedCount: 0, hiddenCount: 0 });
+    expect(r).toEqual({ kind: 'partial' });
+  });
+
+  it.each([
+    { deleted_count: undefined, hidden_count: 0 },
+    { deleted_count: '0', hidden_count: 0 },
+    { deleted_count: -1, hidden_count: 0 },
+    { deleted_count: 0.5, hidden_count: 0 },
+    { deleted_count: 0, hidden_count: undefined },
+    { deleted_count: 0, hidden_count: -1 },
+    null,
+  ])('treats malformed 200 counts as an uncertain partial outcome: %j', async (body) => {
+    server.use(http.delete('*/api/v1/channels/:id/messages', () => HttpResponse.json(body)));
+    expect(await purgeMessages({ context: 'channel', scopeId: CHANNEL, range: '7d' })).toEqual({
+      kind: 'partial',
+    });
   });
 
   it('maps 500 to partial — messages may already be gone', async () => {

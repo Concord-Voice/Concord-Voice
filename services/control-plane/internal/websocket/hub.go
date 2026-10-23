@@ -234,7 +234,10 @@ type Hub struct {
 		func(presence.ActivitySnapshot) error,
 	) error
 	// A Hub-wide semaphore and deadline bound reconnect amplification.
-	clientBootstrapSlots   chan struct{}
+	clientBootstrapSlots chan struct{}
+	// A large server purge can touch 500 channels. Limit its concurrent
+	// uncached permission walks so they cannot starve the database pool.
+	purgeDeliverySlots     chan struct{}
 	clientBootstrapTimeout time.Duration
 	// richPresenceHiddenSuppressor clears a sender's active Rich Presence when
 	// their base presence transitions to invisible or offline (#2444). Injected
@@ -562,6 +565,7 @@ type channelDeliveryRequest struct {
 	data                             []byte
 	recipients                       []channelDeliveryRecipient
 	requireVoiceChannelAuth          bool
+	requireChannelViewAuth           bool
 	serverVoiceParticipantID         uuid.UUID
 	retryOnAuthorizationInvalidation bool
 	serverVoiceTerminalReceipt       chan ServerVoiceTerminalDeliveryOutcome
@@ -578,6 +582,7 @@ type channelDeliveryResult struct {
 	kind                             channelDeliveryKind
 	serverID                         uuid.UUID
 	channelID                        uuid.UUID
+	requireChannelViewAuth           bool
 	authzEpoch                       uint64
 	data                             []byte
 	decisions                        []channelDeliveryDecision
@@ -781,6 +786,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		stopped:                      make(chan struct{}),
 		onlineCountPending:           make(map[uuid.UUID]bool),
 		clientBootstrapSlots:         make(chan struct{}, clientBootstrapConcurrency),
+		purgeDeliverySlots:           make(chan struct{}, 8),
 		presenceGeneration:           make(map[uuid.UUID]uint64),
 		presenceDispatchPending:      make(map[uuid.UUID]pendingPresence),
 		presenceInFlight:             make(map[uuid.UUID]struct{}),
@@ -2110,6 +2116,13 @@ type ChannelPermissionChecker interface {
 	HasChannelPermissionsUncached(ctx context.Context, serverID, userID, channelID string, permBits ...int64) (bool, error)
 }
 
+// ChannelAudiencePermissionChecker can authorize all recipients of a purge in
+// one fresh query. Production supplies it through the RBAC resolver; legacy
+// test checkers still use the individual permission method.
+type ChannelAudiencePermissionChecker interface {
+	FilterVisibleUserIDsForChannelFresh(ctx context.Context, serverID, channelID string, candidateUserIDs []string) ([]string, error)
+}
+
 const (
 	permViewVoiceChannels   int64 = 1 << 9
 	permViewTextChannels    int64 = 1 << 10
@@ -2259,7 +2272,7 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) bool {
 		h.completeServerVoiceTerminalReceipt(req, ServerVoiceTerminalDeliveryApplied)
 		return true
 	}
-	if req.viewPerm == 0 || req.serverID == uuid.Nil {
+	if (req.viewPerm == 0 && !req.requireChannelViewAuth) || req.serverID == uuid.Nil {
 		h.handleChannelDeliveryResult(allowAllChannelDelivery(req))
 		return true
 	}
@@ -2394,6 +2407,16 @@ func (h *Hub) runServerVoiceDeliveryJob(
 	results chan channelDeliveryResult,
 	done <-chan struct{},
 ) bool {
+	if job.req.requireChannelViewAuth {
+		select {
+		case h.purgeDeliverySlots <- struct{}{}:
+			defer func() { <-h.purgeDeliverySlots }()
+		case <-ctx.Done():
+			return false
+		case <-done:
+			return false
+		}
+	}
 	participantFence := h.retainServerVoiceParticipantFence(job.req.serverVoiceParticipantID)
 	defer h.releaseServerVoiceParticipantFence(job.req.serverVoiceParticipantID, participantFence)
 
@@ -2657,6 +2680,7 @@ func allowAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 		kind:                             req.kind,
 		serverID:                         req.serverID,
 		channelID:                        req.channelID,
+		requireChannelViewAuth:           req.requireChannelViewAuth,
 		data:                             req.data,
 		decisions:                        make([]channelDeliveryDecision, 0, len(req.recipients)),
 		retryOnAuthorizationInvalidation: req.retryOnAuthorizationInvalidation,
@@ -2677,6 +2701,7 @@ func denyAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 		kind:                             req.kind,
 		serverID:                         req.serverID,
 		channelID:                        req.channelID,
+		requireChannelViewAuth:           req.requireChannelViewAuth,
 		data:                             req.data,
 		decisions:                        make([]channelDeliveryDecision, 0, len(req.recipients)),
 		retryOnAuthorizationInvalidation: req.retryOnAuthorizationInvalidation,
@@ -2707,6 +2732,7 @@ func (h *Hub) checkChannelDeliveryPermissionsContext(
 		kind:                             req.kind,
 		serverID:                         req.serverID,
 		channelID:                        req.channelID,
+		requireChannelViewAuth:           req.requireChannelViewAuth,
 		data:                             req.data,
 		decisions:                        make([]channelDeliveryDecision, 0, len(req.recipients)),
 		retryOnAuthorizationInvalidation: req.retryOnAuthorizationInvalidation,
@@ -2716,13 +2742,17 @@ func (h *Hub) checkChannelDeliveryPermissionsContext(
 		// its query and no revocation begins before delivery on Run.
 		authzState = h.presenceAuthzState.Load()
 	}
-	if allowed, failed := h.authorizeVoiceChannelDelivery(ctx, req); !allowed {
+	viewPerm, allowed, failed := h.authorizeServerChannelDelivery(ctx, req)
+	if !allowed {
 		result = denyAllChannelDelivery(req)
 		if failed {
 			result.retryableDependency = true
 			h.completeSecurityEventProbeFailure(permissionProbe)
 		}
 		return result
+	}
+	if req.requireChannelViewAuth {
+		req.viewPerm = viewPerm
 	}
 
 	result.authzState = authzState
@@ -2735,23 +2765,35 @@ func (h *Hub) checkChannelDeliveryPermissionsContext(
 	return result
 }
 
-func (h *Hub) authorizeVoiceChannelDelivery(ctx context.Context, req channelDeliveryRequest) (allowed, failed bool) {
-	if !req.requireVoiceChannelAuth {
-		return true, false
+func (h *Hub) authorizeServerChannelDelivery(ctx context.Context, req channelDeliveryRequest) (viewPerm int64, allowed, failed bool) {
+	if !req.requireVoiceChannelAuth && !req.requireChannelViewAuth {
+		return req.viewPerm, true, false
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, channelAuthCtxTimeout)
 	channel, err := h.fetchChannelContextForAuthContext(queryCtx, req.channelID)
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
-			return false, false
+			return 0, false, false
 		}
-		return false, !errors.Is(err, sql.ErrNoRows)
+		return 0, false, !errors.Is(err, sql.ErrNoRows)
 	}
-	return channel.serverUUID == req.serverID && channel.channelType == "voice", false
+	if channel.serverUUID != req.serverID {
+		return 0, false, false
+	}
+	if req.requireVoiceChannelAuth {
+		return permViewVoiceChannels, channel.channelType == "voice", false
+	}
+	viewPerm, ok := channel.viewPermission()
+	return viewPerm, ok, false
 }
 
 func (h *Hub) checkChannelDeliveryRecipients(ctx context.Context, req channelDeliveryRequest, checker ChannelPermissionChecker) ([]channelDeliveryDecision, bool) {
+	if req.requireChannelViewAuth {
+		if audience, ok := checker.(ChannelAudiencePermissionChecker); ok {
+			return h.checkPurgeDeliveryRecipients(ctx, req, audience)
+		}
+	}
 	decisions := make([]channelDeliveryDecision, 0, len(req.recipients))
 	hadFailure := false
 	for _, recipient := range req.recipients {
@@ -2793,6 +2835,43 @@ func (h *Hub) checkChannelDeliveryRecipients(ctx context.Context, req channelDel
 		})
 	}
 	return decisions, hadFailure
+}
+
+func (h *Hub) checkPurgeDeliveryRecipients(
+	ctx context.Context, req channelDeliveryRequest, checker ChannelAudiencePermissionChecker,
+) ([]channelDeliveryDecision, bool) {
+	userIDs := make([]string, 0, len(req.recipients))
+	seen := make(map[uuid.UUID]struct{}, len(req.recipients))
+	for _, recipient := range req.recipients {
+		if _, exists := seen[recipient.userID]; !exists {
+			seen[recipient.userID] = struct{}{}
+			userIDs = append(userIDs, recipient.userID.String())
+		}
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, channelAuthCtxTimeout)
+	viewerIDs, err := checker.FilterVisibleUserIDsForChannelFresh(
+		queryCtx, req.serverID.String(), req.channelID.String(), userIDs,
+	)
+	cancel()
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("Failed to check purge delivery audience: %v", err)
+		}
+		return nil, ctx.Err() == nil
+	}
+	allowed := make(map[string]struct{}, len(viewerIDs))
+	for _, viewerID := range viewerIDs {
+		allowed[viewerID] = struct{}{}
+	}
+	decisions := make([]channelDeliveryDecision, 0, len(req.recipients))
+	for _, recipient := range req.recipients {
+		_, hasView := allowed[recipient.userID.String()]
+		decisions = append(decisions, channelDeliveryDecision{
+			clientID: recipient.clientID, userID: recipient.userID,
+			allowed: hasView, definitive: true,
+		})
+	}
+	return decisions, false
 }
 
 func (h *Hub) handleChannelDeliveryResult(result channelDeliveryResult) {
@@ -2928,10 +3007,18 @@ func serverVoiceDeliveryRetryOrSuppress(
 
 func (h *Hub) enqueueServerBroadcastDeliveryLocked(result channelDeliveryResult) []*Client {
 	serverClients := h.serverSubscriptions[result.serverID]
+	channelClients := h.channelSubscriptions[result.channelID]
 	var failedClients []*Client
 	for _, decision := range result.decisions {
 		client, ok := h.clients[decision.clientID]
-		if !ok || serverClients == nil || !serverClients[decision.clientID] || !decision.allowed {
+		if !ok || !decision.allowed {
+			continue
+		}
+		subscribed := serverClients[decision.clientID]
+		if result.requireChannelViewAuth {
+			subscribed = subscribed || channelClients[decision.clientID]
+		}
+		if !subscribed {
 			continue
 		}
 		if !client.enqueueOutbound(result.data) {
@@ -4862,7 +4949,7 @@ func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) (admitted bool) 
 		}
 		return admitted
 	}
-	if msg.RequireVoiceViewAuth {
+	if msg.RequireVoiceViewAuth || msg.RequireChannelViewAuth {
 		return h.handleAuthorizedServerVoiceBroadcast(msg, data)
 	}
 
@@ -4891,6 +4978,21 @@ func (h *Hub) handleAuthorizedServerVoiceBroadcast(msg ServerBroadcastMessage, d
 		}
 		recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
 	}
+	if msg.RequireChannelViewAuth {
+		// Channel-only subscribers still expect channel_purged. A client in
+		// both sets receives one event, and every recipient takes the same
+		// uncached permission check below.
+		for clientID := range h.channelSubscriptions[msg.ChannelID] {
+			if subscribers[clientID] {
+				continue
+			}
+			client, ok := h.clients[clientID]
+			if !ok {
+				continue
+			}
+			recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
+		}
+	}
 	return h.dispatchChannelDelivery(channelDeliveryRequest{
 		kind:                             channelDeliveryServerBroadcast,
 		serverID:                         msg.ServerID,
@@ -4898,7 +5000,8 @@ func (h *Hub) handleAuthorizedServerVoiceBroadcast(msg ServerBroadcastMessage, d
 		viewPerm:                         permViewVoiceChannels,
 		data:                             data,
 		recipients:                       recipients,
-		requireVoiceChannelAuth:          true,
+		requireVoiceChannelAuth:          msg.RequireVoiceViewAuth,
+		requireChannelViewAuth:           msg.RequireChannelViewAuth,
 		serverVoiceParticipantID:         msg.serverVoiceParticipantID,
 		retryOnAuthorizationInvalidation: msg.serverVoiceRetryOnAuthorizationInvalidation,
 		serverVoiceTerminalReceipt:       msg.serverVoiceTerminalReceipt,
@@ -4960,6 +5063,121 @@ func (h *Hub) BroadcastToServerChannelAuthorizedContext(
 	msg OutgoingMessage,
 ) bool {
 	return h.broadcastToServerChannelAuthorizedContext(ctx, serverID, channelID, uuid.Nil, true, nil, msg)
+}
+
+// BroadcastToServerChannelViewAuthorizedContext reaches current server or
+// channel subscribers who can view the named channel, including
+// unmounted channels reached through their server subscription.
+// Channel type and recipient permissions are resolved by the delivery worker.
+func (h *Hub) BroadcastToServerChannelViewAuthorizedContext(
+	ctx context.Context, serverID, channelID uuid.UUID, msg OutgoingMessage,
+) bool {
+	return h.broadcastToServerChannelViewAuthorizedContext(ctx, serverID, channelID, nil, msg)
+}
+
+// ServerPurgeChannelEvent is one channel-scoped invalidation within a purge.
+type ServerPurgeChannelEvent struct {
+	ChannelID uuid.UUID
+	Message   OutgoingMessage
+}
+
+// BroadcastToServerChannelViewAuthorizedRecovering is the single-event form.
+func (h *Hub) BroadcastToServerChannelViewAuthorizedRecovering(
+	serverID, channelID uuid.UUID, msg OutgoingMessage,
+) {
+	h.BroadcastServerPurgeViewAuthorizedRecovering(serverID, []ServerPurgeChannelEvent{{ChannelID: channelID, Message: msg}})
+}
+
+// BroadcastServerPurgeViewAuthorizedRecovering keeps one committed purge's
+// invalidations pending while channel or permission authority is unavailable.
+// One coordinator and at most eight workers handle the whole purge, including
+// retries. A failed round revisits only failed channels; duplicate
+// invalidations are safe.
+func (h *Hub) BroadcastServerPurgeViewAuthorizedRecovering(
+	serverID uuid.UUID, events []ServerPurgeChannelEvent,
+) {
+	if len(events) == 0 {
+		return
+	}
+	go func() {
+		backoff := time.Second
+		pending := events
+		for len(pending) > 0 {
+			jobs := make(chan ServerPurgeChannelEvent, len(pending))
+			for _, event := range pending {
+				jobs <- event
+			}
+			close(jobs)
+			failed := make([]ServerPurgeChannelEvent, 0, len(pending))
+			var mu sync.Mutex
+			var workers sync.WaitGroup
+			for range min(len(pending), cap(h.purgeDeliverySlots)) {
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					for event := range jobs {
+						receipt := make(chan ServerVoiceTerminalDeliveryOutcome, 1)
+						if !h.broadcastToServerChannelViewAuthorizedContext(context.Background(), serverID, event.ChannelID, receipt, event.Message) {
+							return // the hub has stopped; its clients are disconnected
+						}
+						select {
+						case outcome := <-receipt:
+							if outcome == ServerVoiceTerminalDeliveryApplied {
+								continue
+							}
+						case <-h.done:
+							return
+						}
+						mu.Lock()
+						failed = append(failed, event)
+						mu.Unlock()
+					}
+				}()
+			}
+			workers.Wait()
+			if len(failed) == 0 {
+				return
+			}
+			pending = failed
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-h.done:
+				timer.Stop()
+				return
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		}
+	}()
+}
+
+func (h *Hub) broadcastToServerChannelViewAuthorizedContext(
+	ctx context.Context, serverID, channelID uuid.UUID,
+	receipt chan ServerVoiceTerminalDeliveryOutcome, msg OutgoingMessage,
+) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	serverMessage := ServerBroadcastMessage{
+		ServerID: serverID, ChannelID: channelID, RequireChannelViewAuth: true,
+		serverVoiceRetryOnAuthorizationInvalidation: true,
+		serverVoiceTerminalReceipt:                  receipt, Data: msg,
+	}
+	select {
+	case h.serverVoiceBroadcast <- serverMessage:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-h.done:
+		return false
+	}
 }
 
 // BroadcastToServerVoiceParticipant sends an ordinary participant lifecycle

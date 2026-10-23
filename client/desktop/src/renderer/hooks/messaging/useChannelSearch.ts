@@ -445,8 +445,8 @@ export function useChannelSearch(
 
   // A reconnect may have missed edits and deletes: forget the session's copies
   // and show only what the chat path still owns. No automatic refetch. A
-  // reconnect inside the grace period sends no 'connection-recovered', so the
-  // return to 'stable' counts too; running both is harmless.
+  // grace-period reconnect also returns to 'stable' before dispatching the
+  // event; running both is harmless.
   useEffect(() => {
     const onRecovered = () => {
       stopRun();

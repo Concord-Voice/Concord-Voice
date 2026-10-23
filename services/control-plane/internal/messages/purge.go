@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -494,7 +495,7 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 
 	deletes, status, err := h.authorizeServerPurge(purgeCtx, serverID, userID, req.TargetUserID)
 	if status != PurgeCompleted {
-		h.respondServerPurge(c, serverID, userID, 0, status, err, req.IncludePinned)
+		h.respondServerPurge(c, serverID, userID, purge.Result{}, status, err, req.IncludePinned)
 		return
 	}
 	epoch := middleware.TokenCredentialEpoch(c)
@@ -518,18 +519,18 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 	}
 	deletes = softLock.fence(deletes, userID)
 	sreq.admission = softLock.admission
-	deleted, status, err := h.runServerPurge(purgeCtx, sreq, deletes)
+	result, status, err := h.runServerPurge(purgeCtx, sreq, deletes)
 	if h.refuseSelfPurge(c, softLock) {
 		return
 	}
 	h.settleSelfPurge(purgeCtx, softLock, err)
-	h.respondServerPurge(c, serverID, userID, deleted, status, err, req.IncludePinned)
+	h.respondServerPurge(c, serverID, userID, result, status, err, req.IncludePinned)
 }
 
 // respondServerPurge writes PurgeServer's outcome. A skip carries RS5's
 // refusal as its error when the MFA mask caused it (serverPurgeDeletes).
 func (h *Handler) respondServerPurge(
-	c *gin.Context, serverID, userID string, deleted int, status PurgeStatus, err error, includePinned bool,
+	c *gin.Context, serverID, userID string, result purge.Result, status PurgeStatus, err error, includePinned bool,
 ) {
 	switch status {
 	case PurgeSkippedUnauthorized:
@@ -539,16 +540,23 @@ func (h *Handler) respondServerPurge(
 		}
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgServerPurgeForbidden})
 	case PurgeFailed:
-		if deleted == 0 && h.writePurgeGuardRefusal(c, err) {
+		if result.DeletedCount == 0 && h.writePurgeGuardRefusal(c, err) {
 			return
 		}
 		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
 	default:
-		h.log.Info("Server purged", "server_id", serverID, "actor", userID, "deleted", deleted, "include_pinned", includePinned)
+		h.log.Info("Server purged", "server_id", serverID, "actor", userID, "deleted", result.DeletedCount, "include_pinned", includePinned)
 		// hidden_count is structurally 0 for server contexts — returned so the response
 		// shape matches spec §4 { deleted_count, hidden_count } across ALL contexts.
-		c.JSON(http.StatusOK, gin.H{"deleted_count": deleted, "hidden_count": 0})
+		channels := make([]string, 0, len(result.DeletedByScope))
+		for channelID, count := range result.DeletedByScope {
+			if count > 0 {
+				channels = append(channels, channelID)
+			}
+		}
+		sort.Strings(channels)
+		c.JSON(http.StatusOK, gin.H{"deleted_count": result.DeletedCount, "hidden_count": 0, "affected_channel_ids": channels})
 	}
 }
 
@@ -569,7 +577,8 @@ func (h *Handler) purgeServerCore(ctx context.Context, req serverPurgeRequest) (
 	if status != PurgeCompleted {
 		return 0, status, err
 	}
-	return h.runServerPurge(ctx, req, deletes)
+	result, status, err := h.runServerPurge(ctx, req, deletes)
+	return result.DeletedCount, status, err
 }
 
 // authorizeServerPurge enumerates a server's channels and authorizes the actor in each,
@@ -615,7 +624,7 @@ func (h *Handler) authorizeServerPurge(
 // batch guard re-authorizes every channel under lock (#3142), and fences the
 // credential epoch when the request carries one (the HTTP route does; the
 // ban/kick path has no bearer token).
-func (h *Handler) runServerPurge(ctx context.Context, req serverPurgeRequest, deletes []purge.DeleteSpec) (int, PurgeStatus, error) {
+func (h *Handler) runServerPurge(ctx context.Context, req serverPurgeRequest, deletes []purge.DeleteSpec) (purge.Result, PurgeStatus, error) {
 	plan := purge.Plan{
 		ContextType: purge.ContextServer,
 		ContextID:   req.serverID,
@@ -639,13 +648,15 @@ func (h *Handler) runServerPurge(ctx context.Context, req serverPurgeRequest, de
 		if req.admission == nil || !errors.Is(err, purge.ErrNotAdmitted) {
 			h.log.Error("Server purge failed", "error", err, "server_id", req.serverID)
 		}
-		if res.DeletedCount > 0 {
-			h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes)
+		if res.DeletedCount > 0 || res.AffectedScopesUncertain {
+			h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes, res)
 		}
-		return res.DeletedCount, PurgeFailed, fmt.Errorf("run server purge: %w", err)
+		return res, PurgeFailed, fmt.Errorf("run server purge: %w", err)
 	}
-	h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes)
-	return res.DeletedCount, PurgeCompleted, nil
+	if res.DeletedCount > 0 {
+		h.emitServerPurgeEvents(req.serverID, req.actorID, req.rangeLabel, deletes, res)
+	}
+	return res, PurgeCompleted, nil
 }
 
 // guardServerPurgeBatch is a server purge's per-batch Guard. Under the
@@ -695,18 +706,47 @@ func (h *Handler) authorizeServerPurgeBatchTx(ctx context.Context, tx *sql.Tx, r
 // deleted rows. Emission runs only after the engine has committed its work, and no
 // broadcast can fail the request: the hub calls return no error.
 //
-// One channel_purged per affected channel (spec §11), unchanged — it is what drops
-// the mounted channel live. The engine returns only an aggregate count, so the
-// per-channel event carries 0; clients treat the event as an invalidation signal
-// and refetch (next-fetch is the correctness backstop). The single server_purged
-// then covers every OTHER affected scope: a client subscribes to channels it has
-// mounted, so the per-channel events alone leave locally cached plaintext (search
-// index included) in every channel the recipient does not currently have open.
-func (h *Handler) emitServerPurgeEvents(serverID, actorID, rangeLabel string, deletes []purge.DeleteSpec) {
-	for _, ds := range deletes {
-		h.emitChannelPurged(ds.ScopeID, actorID, 0, rangeLabel)
+// The server subscription carries one channel-scoped event to every recipient
+// who can currently view that channel, including those who have it cached but
+// unmounted. A reconciled partial count can exceed the per-scope observations;
+// then conservatively invalidate every authorized DeleteSpec.
+func (h *Handler) emitServerPurgeEvents(serverID, actorID, rangeLabel string, deletes []purge.DeleteSpec, res purge.Result) {
+	if h.hub == nil {
+		return
 	}
-	h.emitServerPurged(serverID, actorID, rangeLabel)
+	serverUUID, err := uuid.Parse(serverID)
+	if err != nil {
+		return
+	}
+	events := make([]websocket.ServerPurgeChannelEvent, 0, len(deletes))
+	for _, scopeID := range serverPurgeEventScopes(deletes, res) {
+		channelUUID, parseErr := uuid.Parse(scopeID)
+		if parseErr != nil {
+			continue
+		}
+		events = append(events, websocket.ServerPurgeChannelEvent{
+			ChannelID: channelUUID,
+			Message: websocket.OutgoingMessage{Type: "channel_purged", Data: map[string]interface{}{
+				"channel_id": scopeID, "purged_by": actorID,
+				"deleted_count": 0, "range": rangeLabel,
+			}},
+		})
+	}
+	h.hub.BroadcastServerPurgeViewAuthorizedRecovering(serverUUID, events)
+}
+
+func serverPurgeEventScopes(deletes []purge.DeleteSpec, res purge.Result) []string {
+	observed := 0
+	for _, n := range res.DeletedByScope {
+		observed += n
+	}
+	scopes := make([]string, 0, len(deletes))
+	for _, ds := range deletes {
+		if res.AffectedScopesUncertain || observed < res.DeletedCount || res.DeletedByScope[ds.ScopeID] > 0 {
+			scopes = append(scopes, ds.ScopeID)
+		}
+	}
+	return scopes
 }
 
 // serverPurgeDeletes authorizes every channel before constructing the purge plan.
@@ -902,34 +942,6 @@ func (h *Handler) emitChannelPurged(channelID, actorID string, count int, rng st
 			"purged_by":     actorID,
 			"deleted_count": count,
 			"range":         rng,
-		},
-	})
-}
-
-// emitServerPurged broadcasts the server-scoped bulk-purge event to every client
-// subscribed to the server (#1354). The subscription set is membership-verified at
-// subscribe_server and evicted on removal/ban, and the desktop client subscribes to
-// EVERY server it belongs to (not just the one on screen) — so this reaches each
-// affected member once, the acting client included.
-//
-// Payload carries context only: no channel identifiers (so it discloses nothing to a
-// member who cannot see a purged channel) and deliberately NO count. The per-channel
-// deleted_count is structurally 0 for a server purge, and a server-level total would
-// turn an invalidation signal into a report of what was destroyed (spec §11).
-func (h *Handler) emitServerPurged(serverID, actorID, rng string) {
-	if h.hub == nil {
-		return
-	}
-	serverUUID, err := uuid.Parse(serverID)
-	if err != nil {
-		return
-	}
-	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
-		Type: "server_purged",
-		Data: map[string]interface{}{
-			"server_id": serverID,
-			"purged_by": actorID,
-			"range":     rng,
 		},
 	})
 }

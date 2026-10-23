@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/stmthook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -923,6 +924,7 @@ func TestEngineRun_PartialDeleteIsAudited(t *testing.T) {
 
 	require.Error(t, err, "the failing spec must surface an error")
 	assert.Equal(t, 3, res.DeletedCount, "the caller is told what was actually deleted")
+	assert.False(t, res.AffectedScopesUncertain, "a pre-COMMIT failure cannot add an unknown scope")
 	assert.Equal(t, 0, f.countMessages(t), "spec 1's deletes are committed and irreversible")
 
 	status, deleted, _ := f.auditRow(t)
@@ -938,8 +940,50 @@ func TestEngineDurableDeletedCount_ReadsAuditOrFallsBack(t *testing.T) {
 	_, err = f.db.Exec(`UPDATE message_purges SET deleted_count = 4 WHERE id = $1`, purgeID)
 	require.NoError(t, err)
 
-	assert.Equal(t, 4, e.durableDeletedCount(context.Background(), purgeID, 3))
-	assert.Equal(t, 3, e.durableDeletedCount(context.Background(), f.serverID, 3))
+	count, reconciled := e.durableDeletedCount(context.Background(), purgeID, 3)
+	assert.Equal(t, 4, count)
+	assert.True(t, reconciled)
+	count, reconciled = e.durableDeletedCount(context.Background(), purgeID, 4)
+	assert.Equal(t, 4, count)
+	assert.False(t, reconciled, "the old audit count can be read before an ambiguous commit finishes")
+	count, reconciled = e.durableDeletedCount(context.Background(), f.serverID, 3)
+	assert.Equal(t, 3, count)
+	assert.False(t, reconciled)
+}
+
+func TestEngineRun_AmbiguousBatchCommitNeedsAuditAdvanceToKnowScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "stale audit count", committed: false},
+		{name: "advanced audit count", committed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := seedEngineFixture(t)
+			f.seedMessages(t, f.authorID, 2, 0)
+			hook, db := stmthook.Open(t)
+			log := logger.NewWithWriter(io.Discard)
+			e := NewEngine(db, log, NewReaper(db, log, nil), 5000)
+			plan := f.channelPlan()
+			plan.Guard = func(context.Context, *sql.Tx, DeleteSpec) error {
+				hook.ArmCommit(tc.committed, errors.New("batch acknowledgement lost"))
+				return nil
+			}
+
+			res, err := e.Run(context.Background(), plan)
+			require.Error(t, err)
+			assert.Equal(t, !tc.committed, res.AffectedScopesUncertain)
+			wantDeleted := 0
+			if tc.committed {
+				wantDeleted = 2
+			}
+			assert.Equal(t, wantDeleted, res.DeletedCount)
+			assert.Equal(t, 2-wantDeleted, f.countMessages(t))
+			_, auditCount, _ := f.auditRow(t)
+			assert.Equal(t, res.DeletedCount, auditCount)
+		})
+	}
 }
 
 // A batch's audit increment must commit with its delete. Otherwise an audit-update

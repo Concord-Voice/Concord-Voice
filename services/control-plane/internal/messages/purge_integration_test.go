@@ -428,6 +428,11 @@ func TestPurgeServer_ChannelDenyHonored(t *testing.T) {
 	assert.Equal(t, 0, countChannelMessages(t, ts, chOpen), "permitted channel is purged")
 	assert.Equal(t, 1, countChannelMessages(t, ts, chProtected),
 		"channel with a scoped ManageAll deny must be SKIPPED by the server purge (M1)")
+	var response struct {
+		AffectedChannelIDs []string `json:"affected_channel_ids"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, []string{chOpen}, response.AffectedChannelIDs)
 }
 
 func TestPurgeServer_NonMemberDeniedNoAudit(t *testing.T) {
@@ -685,11 +690,9 @@ func collectPurgeEvents(t *testing.T, conn *gorillaWS.Conn, window time.Duration
 	}
 }
 
-// TestPurgeServer_EmitsOneServerScopedEvent locks the #1354 fan-out: a server purge
-// emits exactly ONE server_purged to every subscribed member (the actor included),
-// while the per-channel channel_purged emissions stay exactly as they were — one per
-// affected channel, delivered only to the channel each client actually has mounted.
-func TestPurgeServer_EmitsOneServerScopedEvent(t *testing.T) {
+// A changed channel reaches viewers through their server subscription even if
+// they have a different channel mounted.
+func TestPurgeServer_EmitsScopedEventsToServerSubscribers(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	owner := ts.CreateTestUser(t, "bc_owner")
 	member := ts.CreateTestUser(t, "bc_member")
@@ -697,11 +700,11 @@ func TestPurgeServer_EmitsOneServerScopedEvent(t *testing.T) {
 	ts.AddMemberToServer(t, serverID, member.ID, "member")
 	ownerChannel := ts.CreateTestChannel(t, serverID, "owner-mounted")
 	memberChannel := ts.CreateTestChannel(t, serverID, "member-mounted")
+	emptyChannel := ts.CreateTestChannel(t, serverID, "unchanged")
 	ts.CreateTestMessage(t, ownerChannel, owner, "owner-msg")
 	ts.CreateTestMessage(t, memberChannel, member, "member-msg")
 
-	// Each observer has a DIFFERENT channel mounted, so neither can learn about the
-	// other's purged channel from channel_purged alone.
+	// Each observer has a different channel mounted.
 	ownerConn := dialPurgeObserver(t, ts, owner, serverID, ownerChannel)
 	memberConn := dialPurgeObserver(t, ts, member, serverID, memberChannel)
 
@@ -710,31 +713,88 @@ func TestPurgeServer_EmitsOneServerScopedEvent(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.Equal(t, 0, countChannelMessages(t, ts, ownerChannel))
 	require.Equal(t, 0, countChannelMessages(t, ts, memberChannel))
+	var response struct {
+		AffectedChannelIDs []string `json:"affected_channel_ids"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.ElementsMatch(t, []string{ownerChannel, memberChannel}, response.AffectedChannelIDs)
+	assert.NotContains(t, response.AffectedChannelIDs, emptyChannel)
 
 	for _, observer := range []struct {
-		name    string
-		conn    *gorillaWS.Conn
-		mounted string
+		name string
+		conn *gorillaWS.Conn
 	}{
-		{"actor", ownerConn, ownerChannel},
-		{"other member", memberConn, memberChannel},
+		{"actor", ownerConn},
+		{"other member", memberConn},
 	} {
 		t.Run(observer.name, func(t *testing.T) {
 			channelEvents, serverEvents := collectPurgeEvents(t, observer.conn, time.Second)
 
-			require.Len(t, serverEvents, 1, "a server purge emits server_purged exactly once")
-			assert.Equal(t, map[string]interface{}{
-				"server_id": serverID,
-				"purged_by": owner.ID,
-				"range":     "1d",
-			}, serverEvents[0], "invalidation signal only — no count field")
-
-			require.Len(t, channelEvents, 1, "channel_purged still reaches only the mounted channel")
-			assert.Equal(t, observer.mounted, channelEvents[0]["channel_id"])
-			assert.Equal(t, owner.ID, channelEvents[0]["purged_by"])
-			assert.Equal(t, float64(0), channelEvents[0]["deleted_count"])
-			assert.Equal(t, "1d", channelEvents[0]["range"])
+			assert.Empty(t, serverEvents)
+			require.Len(t, channelEvents, 2)
+			assert.ElementsMatch(t, []interface{}{ownerChannel, memberChannel}, []interface{}{
+				channelEvents[0]["channel_id"], channelEvents[1]["channel_id"],
+			})
+			for _, event := range channelEvents {
+				assert.Equal(t, owner.ID, event["purged_by"])
+				assert.Equal(t, float64(0), event["deleted_count"])
+				assert.Equal(t, "1d", event["range"])
+			}
 		})
+	}
+}
+
+func TestPurgeServer_ZeroRowsEmitNoInvalidation(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "empty_broadcast_owner")
+	member := ts.CreateTestUser(t, "empty_broadcast_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "empty-broadcast-server")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	conn := dialPurgeObserver(t, ts, member, serverID, channelID)
+
+	w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+		map[string]any{"range": "1h"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var response struct {
+		AffectedChannelIDs []string `json:"affected_channel_ids"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Empty(t, response.AffectedChannelIDs)
+	channelEvents, serverEvents := collectPurgeEvents(t, conn, 300*time.Millisecond)
+	assert.Empty(t, channelEvents)
+	assert.Empty(t, serverEvents)
+}
+
+func TestPurgeServer_HiddenChannelNeverInvalidated(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "private_broadcast_owner")
+	actor := ts.CreateTestUser(t, "private_broadcast_actor")
+	serverID := ts.CreateTestServer(t, owner.ID, "private-broadcast-server")
+	ts.AddMemberToServer(t, serverID, actor.ID, "member")
+	visible := ts.CreateTestChannel(t, serverID, "visible")
+	private := ts.CreateTestChannel(t, serverID, "private")
+	ts.CreateChannelOverride(t, private, "user", actor.ID, 0, int64(rbac.PermViewTextChannels))
+	ts.CreateTestMessage(t, visible, actor, "visible-message")
+	ts.CreateTestMessage(t, private, owner, "private-message")
+	actorConn := dialPurgeObserver(t, ts, actor, serverID, visible)
+	victimConn := dialPurgeObserver(t, ts, owner, serverID, private)
+
+	w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+		map[string]any{"range": "all"}, testhelpers.AuthHeaders(actor.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Zero(t, countChannelMessages(t, ts, visible))
+	assert.Equal(t, 1, countChannelMessages(t, ts, private))
+	var response struct {
+		AffectedChannelIDs []string `json:"affected_channel_ids"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, []string{visible}, response.AffectedChannelIDs)
+	for _, conn := range []*gorillaWS.Conn{actorConn, victimConn} {
+		channelEvents, serverEvents := collectPurgeEvents(t, conn, 300*time.Millisecond)
+		assert.Empty(t, serverEvents)
+		require.Len(t, channelEvents, 1)
+		assert.Equal(t, visible, channelEvents[0]["channel_id"])
 	}
 }
 

@@ -16,6 +16,7 @@ import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import {
   beginSearchBackfill,
   canIndexBackfillMessage,
@@ -25,7 +26,7 @@ import {
   subscribeSearchScopeInvalidations,
 } from '@/renderer/services/messaging/searchService';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { mockChannel } from '../../mocks/fixtures';
+import { mockChannel, mockMessage } from '../../mocks/fixtures';
 
 vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
@@ -69,13 +70,22 @@ type AnyHandler = (...args: any[]) => void;
 
 function createMockWsService() {
   const handlers = new Map<string, AnyHandler>();
+  let connectionHandler: ((state: ConnectionState) => void) | undefined;
   return {
     handlers,
     on: vi.fn((type: string, handler: AnyHandler) => {
       handlers.set(type, handler);
       return () => handlers.delete(type);
     }),
-    onConnectionChange: vi.fn(() => () => {}),
+    onConnectionChange: vi.fn((handler: (state: ConnectionState) => void) => {
+      connectionHandler = handler;
+      return () => {
+        connectionHandler = undefined;
+      };
+    }),
+    emitConnectionChange(state: ConnectionState) {
+      connectionHandler?.(state);
+    },
     disconnect: vi.fn(),
   };
 }
@@ -139,6 +149,32 @@ afterEach(() => {
 });
 
 describe('purge removes decrypted plaintext from the local search index', () => {
+  it('discards unmounted server channel plaintext when the socket is interrupted', () => {
+    addChannel(CHANNEL_ID, SERVER_ID);
+    useChannelStore.setState((state) => ({
+      channelIdsByServer: { ...state.channelIdsByServer, [SERVER_ID]: [CHANNEL_ID, CHANNEL_B_ID] },
+    }));
+    useChatStore
+      .getState()
+      .setMessages(CHANNEL_B_ID, [
+        { ...mockMessage, id: MESSAGE_B_ID, channel_id: CHANNEL_B_ID, content: 'sensitive' },
+      ]);
+    indexMessage(MESSAGE_B_ID, 'sensitive cached text', CHANNEL_B_ID);
+    const backfill = beginSearchBackfill([CHANNEL_B_ID]);
+
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    act(() => {
+      ws.emitConnectionChange(ConnectionState.CONNECTED);
+      ws.emitConnectionChange(ConnectionState.RECONNECTING);
+    });
+
+    expect(useChatStore.getState().messagesByChannel.get(CHANNEL_B_ID)).toBeUndefined();
+    expect(searchMessages('sensitive', CHANNEL_B_ID)).toEqual([]);
+    expect(canIndexBackfillMessage(backfill, MESSAGE_B_ID, CHANNEL_B_ID)).toBe(false);
+    backfill.close();
+  });
+
   it('channel_purged makes purged plaintext unsearchable', () => {
     indexMessage(MESSAGE_ID, 'confidential quarterly numbers', CHANNEL_ID);
     expect(searchMessages('confidential', CHANNEL_ID)).toContain(MESSAGE_ID);
@@ -243,6 +279,25 @@ describe('purge removes decrypted plaintext from the local search index', () => 
 // `messages-purged` locally on every terminal outcome; the handler lane listens
 // to that event so the clear runs either way (#1741).
 describe('the actor’s own purge clears their index without any echo', () => {
+  it('keeps a denied channel cached when only another channel was purged', () => {
+    addChannel(CHANNEL_ID, SERVER_ID);
+    addChannel(CHANNEL_B_ID, SERVER_ID);
+    indexMessage(MESSAGE_ID, 'purged text', CHANNEL_ID);
+    indexMessage(MESSAGE_B_ID, 'protected text', CHANNEL_B_ID);
+
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+
+    act(() => {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: CHANNEL_ID } })
+      );
+    });
+
+    expect(searchMessages('purged', CHANNEL_ID)).toEqual([]);
+    expect(searchMessages('protected', CHANNEL_B_ID)).toEqual([MESSAGE_B_ID]);
+  });
+
   it('clears the dispatched scope with no WebSocket event', () => {
     indexMessage(MESSAGE_ID, 'confidential quarterly numbers', CHANNEL_B_ID);
     expect(searchMessages('confidential', CHANNEL_B_ID)).toContain(MESSAGE_ID);

@@ -23,6 +23,207 @@ type serverVoiceRevocationChecker struct {
 	release chan struct{}
 }
 
+type scopedPurgeChecker struct {
+	allowedUser uuid.UUID
+	batchCalls  *int
+}
+
+func (c scopedPurgeChecker) FilterVisibleUserIDsForChannelFresh(_ context.Context, _, _ string, candidates []string) ([]string, error) {
+	if c.batchCalls != nil {
+		*c.batchCalls++
+	}
+	for _, candidate := range candidates {
+		if candidate == c.allowedUser.String() {
+			return []string{candidate}, nil
+		}
+	}
+	return []string{}, nil
+}
+
+type retryingPurgeChecker struct {
+	mu    sync.Mutex
+	calls int
+}
+
+type boundedPurgeChecker struct {
+	mu      sync.Mutex
+	active  int
+	peak    int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *boundedPurgeChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	return false, errors.New("uncached permission path required")
+}
+
+func (c *boundedPurgeChecker) HasChannelPermissionsUncached(ctx context.Context, _, _, _ string, _ ...int64) (bool, error) {
+	c.mu.Lock()
+	c.active++
+	if c.active > c.peak {
+		c.peak = c.active
+	}
+	c.mu.Unlock()
+	c.started <- struct{}{}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+	}
+	c.mu.Lock()
+	c.active--
+	c.mu.Unlock()
+	return ctx.Err() == nil, ctx.Err()
+}
+
+func TestServerChannelPurgeBoundsConcurrentPermissionWalks(t *testing.T) {
+	serverID := uuid.New()
+	hub := NewHub(openScriptedRowsDB(t,
+		[]string{"allow_embedded_content", "server_id", "type"},
+		[][]driver.Value{{false, serverID.String(), "text"}}, nil,
+	), nil)
+	viewer := newTestClient(hub, uuid.New())
+	hub.clients[viewer.ID] = viewer
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{viewer.ID: true}
+	checker := &boundedPurgeChecker{started: make(chan struct{}, 9), release: make(chan struct{})}
+	hub.SetChannelPermissionChecker(checker)
+	go hub.Run()
+	t.Cleanup(hub.Shutdown)
+	events := make([]ServerPurgeChannelEvent, 9)
+	for i := range events {
+		events[i] = ServerPurgeChannelEvent{ChannelID: uuid.New(), Message: OutgoingMessage{Type: "channel_purged"}}
+	}
+	hub.BroadcastServerPurgeViewAuthorizedRecovering(serverID, events)
+	for range cap(hub.purgeDeliverySlots) {
+		select {
+		case <-checker.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("purge authorization did not fill bounded workers")
+		}
+	}
+	select {
+	case <-checker.started:
+		t.Fatal("purge authorization exceeded the shared concurrency bound")
+	case <-time.After(100 * time.Millisecond):
+	}
+	checker.mu.Lock()
+	require.Equal(t, cap(hub.purgeDeliverySlots), checker.peak)
+	checker.mu.Unlock()
+	close(checker.release)
+	for range events {
+		select {
+		case <-viewer.Send:
+		case <-time.After(2 * time.Second):
+			t.Fatal("bounded purge workers did not finish every channel")
+		}
+	}
+}
+
+func (c *retryingPurgeChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	return false, errors.New("uncached permission path required")
+}
+
+func (c *retryingPurgeChecker) HasChannelPermissionsUncached(context.Context, string, string, string, ...int64) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls <= serverVoiceAuthorizationRetryMaxAttempts {
+		return false, errors.New("permission database unavailable")
+	}
+	return true, nil
+}
+
+func TestServerChannelPurgeRecoversAfterAuthorizationDependencyFailure(t *testing.T) {
+	serverID, channelID := uuid.New(), uuid.New()
+	hub := NewHub(openScriptedRowsDB(t,
+		[]string{"allow_embedded_content", "server_id", "type"},
+		[][]driver.Value{{false, serverID.String(), "text"}}, nil,
+	), nil)
+	viewer := newTestClient(hub, uuid.New())
+	hub.clients[viewer.ID] = viewer
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{viewer.ID: true}
+	checker := &retryingPurgeChecker{}
+	hub.SetChannelPermissionChecker(checker)
+	go hub.Run()
+	t.Cleanup(hub.Shutdown)
+
+	hub.BroadcastToServerChannelViewAuthorizedRecovering(serverID, channelID,
+		OutgoingMessage{Type: "channel_purged"})
+	select {
+	case <-viewer.Send:
+	case <-time.After(8 * time.Second):
+		t.Fatal("committed purge was not retried after authorization recovered")
+	}
+	checker.mu.Lock()
+	defer checker.mu.Unlock()
+	require.GreaterOrEqual(t, checker.calls, serverVoiceAuthorizationRetryMaxAttempts+1)
+}
+
+func (c scopedPurgeChecker) HasChannelPermission(_ context.Context, _, userID, _ string, bit int64) (bool, error) {
+	return userID == c.allowedUser.String() && bit == permViewTextChannels, nil
+}
+
+func (c scopedPurgeChecker) HasChannelPermissionsUncached(ctx context.Context, serverID, userID, channelID string, bits ...int64) (bool, error) {
+	if len(bits) != 1 {
+		return false, nil
+	}
+	return c.HasChannelPermission(ctx, serverID, userID, channelID, bits[0])
+}
+
+func TestServerChannelViewAuthorizedDeliversTextPurgeOnlyToViewers(t *testing.T) {
+	serverID, channelID := uuid.New(), uuid.New()
+	hub := NewHub(openScriptedRowsDB(t,
+		[]string{"allow_embedded_content", "server_id", "type"},
+		[][]driver.Value{{false, serverID.String(), "text"}}, nil,
+	), nil)
+	viewer := newTestClient(hub, uuid.New())
+	channelOnly := newTestClient(hub, viewer.UserID)
+	hidden := newTestClient(hub, uuid.New())
+	for _, client := range []*Client{viewer, channelOnly, hidden} {
+		hub.clients[client.ID] = client
+	}
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{viewer.ID: true, hidden.ID: true}
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{viewer.ID: true, channelOnly.ID: true, hidden.ID: true}
+	batchCalls := 0
+	hub.SetChannelPermissionChecker(scopedPurgeChecker{allowedUser: viewer.UserID, batchCalls: &batchCalls})
+	t.Cleanup(func() { close(hub.done) })
+	require.True(t, hub.BroadcastToServerChannelViewAuthorizedContext(context.Background(), serverID, channelID,
+		OutgoingMessage{Type: "channel_purged"}))
+
+	select {
+	case msg := <-hub.serverVoiceBroadcast:
+		require.True(t, hub.handleServerBroadcast(msg))
+	case <-time.After(time.Second):
+		t.Fatal("scoped purge event was not queued")
+	}
+	select {
+	case result := <-hub.channelDeliveryResults:
+		hub.handleChannelDeliveryResult(result)
+	case <-time.After(time.Second):
+		t.Fatal("scoped purge authorization did not complete")
+	}
+	select {
+	case <-viewer.Send:
+	case <-time.After(time.Second):
+		t.Fatal("server subscriber missed the purge")
+	}
+	select {
+	case <-channelOnly.Send:
+	case <-time.After(time.Second):
+		t.Fatal("channel-only subscriber missed the purge")
+	}
+	select {
+	case <-viewer.Send:
+		t.Fatal("recipient subscribed to both audiences received a duplicate purge")
+	default:
+	}
+	select {
+	case frame := <-hidden.Send:
+		t.Fatalf("hidden channel event leaked to denied recipient: %s", frame)
+	default:
+	}
+	require.Equal(t, 1, batchCalls, "all recipients must share one fresh audience query")
+}
+
 type blockingServerVoiceStateDriver struct {
 	entered  chan struct{}
 	canceled chan struct{}

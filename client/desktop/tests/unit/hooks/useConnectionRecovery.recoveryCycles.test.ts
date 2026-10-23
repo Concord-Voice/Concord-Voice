@@ -215,6 +215,36 @@ describe('repeated Recovery-A cycles (#2199 AC #7)', () => {
 });
 
 describe('Recovery-A authoritative refresh (#2329)', () => {
+  it('refetches a cleared mounted chat after a grace-period reconnect', async () => {
+    const before = { ...mockMessage, id: 'before-grace', channel_id: 'channel-1' };
+    const after = { ...mockMessage2, id: 'after-grace', channel_id: 'channel-1' };
+    useChannelStore.setState({ activeChannelId: 'channel-1', currentServerId: 'server-1' });
+    messagePages = [{ messages: [before] }, { messages: [after] }];
+
+    const { result } = renderHook(() => {
+      useMessageFetch('channel-1', { type: 'channel' });
+      return useConnectionRecovery(mockWsService as never, validateEpochs);
+    });
+    await vi.waitFor(() => expect(messageFetchCount()).toBe(1));
+    useChatStore.getState().clearMessages('channel-1');
+    expect(useChatStore.getState().messagesByChannel.get('channel-1')).toBeUndefined();
+
+    act(() => {
+      useConnectionStore.getState().startGracePeriod();
+      result.current('CONNECTED' as never);
+    });
+
+    await vi.waitFor(() => {
+      expect(messageFetchCount()).toBe(2);
+      expect(
+        useChatStore
+          .getState()
+          .messagesByChannel.get('channel-1')
+          ?.map((m) => m.id)
+      ).toEqual(['after-grace']);
+    });
+  });
+
   it('backfills messages missed during Recovery-A without duplicating the mount fetch', async () => {
     const existing = {
       ...mockMessage,
