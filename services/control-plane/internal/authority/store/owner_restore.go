@@ -10,10 +10,11 @@ import (
 
 // restore-begin and reconcile-complete (§3.4, DoR:1726, :1729, :1739–1759;
 // D-171, D-286, B3-D8): the two owner verbs that bracket a restore, and the
-// only two that need serve stopped without signing. Each takes ServeLock
-// first and holds it for the whole verb, so no serve on this node commits,
-// signs or ticks between its reads and its commit; ErrServeLockHeld passes
-// through and nothing is written. Then the leader check on the verb's own
+// only two that need serve stopped without signing. Each checks the leader
+// and the realm on a connection it closes, then takes ServeLock and holds it
+// for the whole verb, so no serve on this node commits, signs or ticks
+// between its reads and its commit; ErrServeLockHeld passes through and
+// nothing is written. Then the leader check again on the verb's own
 // connection (B3-D7), one transaction, and finish (D-225).
 //
 // reconcile-complete's invariant (D-286, D-146, DoR:1773): once it commits,
@@ -75,7 +76,9 @@ type RestorePoint struct {
 type ReconcileCounts struct{ Imported, Held uint64 }
 
 // stopped is the shape of an owner verb that needs serve stopped (D-171,
-// DoR:1764): ServeLock first, on its own connection, released on every path
+// DoR:1764): the leader and realm checks first (checkBeforeLock), so a
+// standby or another realm's primary refuses as such and not as a lock its
+// serve holds; then ServeLock, on its own connection, released on every path
 // once the verb, finish included, is done; then writeAfter, prepare and body
 // included, under the lock's watch (ServeLock.Watch). A lock session that
 // dies mid-verb cancels the verb, so it does not go on beside a serve that
@@ -83,6 +86,9 @@ type ReconcileCounts struct{ Imported, Held uint64 }
 // ErrServeLockHeld is returned as it is.
 func (o *Owner) stopped(ctx context.Context, verb string, prepare func(ctx context.Context, conn *sql.Conn) error,
 	body func(ctx context.Context, tx *sql.Tx) error) error {
+	if err := o.checkBeforeLock(ctx); err != nil {
+		return err
+	}
 	lock, err := AcquireServeLock(ctx, o.db)
 	if errors.Is(err, ErrServeLockHeld) {
 		return err

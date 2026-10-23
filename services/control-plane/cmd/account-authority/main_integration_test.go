@@ -543,3 +543,62 @@ func TestOwnerRestoreBeginWithAValidTrustFile(t *testing.T) {
 		t.Fatalf("a re-run printed %q, the first run %q", second, first)
 	}
 }
+
+// S1 at the CLI, end to end: a clear-held run a database fault stopped (here a
+// head another transaction holds past lock_timeout, 55P03) while replication is
+// required and no standby confirms exits by that fault, lock, and not by the
+// replication wait that followed it. It prints the line of the account before
+// the stop and names no account in the exit line. The same three accounts with
+// nothing held and replication confirmed exit 0 (the control).
+func TestClearHeldStoppedByALockWaitExitsLockNotReplication(t *testing.T) {
+	insertHeld := func(t *testing.T, db *sql.DB) []string {
+		t.Helper()
+		ids := []string{uuid.NewString(), uuid.NewString(), uuid.NewString()}
+		for _, id := range ids {
+			if _, err := db.Exec(`INSERT INTO authority.account_heads (account_id, state, seq, recovery_gen, susp_operator,
+				susp_user, root_revoked, legacy_pin_revoked, held) VALUES ($1, 'absent', 0, 0, false, false, false, false, true)`, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return ids
+	}
+
+	t.Run("control: nothing held, replication confirmed", func(t *testing.T) {
+		r := newOwnerRig(t, store.OwnerConfig{Probe: okProbe{true}})
+		if _, err := r.f.Owner.Exec(`UPDATE authority.meta SET replication_required = true`); err != nil {
+			t.Fatal(err)
+		}
+		ids := insertHeld(t, r.f.Owner)
+		if lines := okRun(t, "clear-held", ids[0], ids[1], ids[2]); len(lines) != 3 {
+			t.Fatalf("clear-held stdout %q, want one line per account", lines)
+		}
+	})
+
+	t.Run("a lock wait on account 2", func(t *testing.T) {
+		r := newOwnerRig(t, store.OwnerConfig{Probe: okProbe{false}}) // nothing ever replicates
+		if _, err := r.f.Owner.Exec(`UPDATE authority.meta SET replication_required = true`); err != nil {
+			t.Fatal(err)
+		}
+		ids := insertHeld(t, r.f.Owner)
+		old := ownerDeadline
+		ownerDeadline = 4 * time.Second // lock_timeout is 2 s; finish gets the rest
+		t.Cleanup(func() { ownerDeadline = old })
+		holder, err := r.f.Super.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = holder.Rollback() })
+		if _, err := holder.Exec(`SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, ids[1]); err != nil {
+			t.Fatal(err)
+		}
+
+		code, stdout, _ := run("clear-held", ids[0], ids[1], ids[2])
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if code != 1 || len(lines) != 2 || lines[0] != "account="+ids[0]+" outcome=absent" {
+			t.Fatalf("exit %d, stdout %q; want 1, the first account's line, then one exit line", code, stdout)
+		}
+		if m := exitFields(t, lines[1], "lock"); m["step"] != server.StepOwner || strings.Contains(lines[1], ids[1]) {
+			t.Fatalf("exit line %s: want reason lock at step owner, naming no account", lines[1])
+		}
+	})
+}

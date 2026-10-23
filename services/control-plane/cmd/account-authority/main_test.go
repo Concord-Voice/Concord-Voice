@@ -1350,7 +1350,7 @@ func TestOwnerErrMapping(t *testing.T) {
 		{"serve lock lost mid-verb, ahead of replication", errors.Join(store.ErrServeLockLost,
 			fmt.Errorf("%w: %w", store.ErrNotReplicated, context.Canceled)), server.ReasonLock},
 		{"standby", store.ErrNotLeader, server.ReasonNotLeader},
-		{"a failover during clear-held's row 22 (N1)", fmt.Errorf("authority store: row 22 refused before BEGIN: %w", store.ErrNotLeader), server.ReasonNotLeader},
+		{"a failover during clear-held's row 22 (N1)", fmt.Errorf("authority store: row 22 stopped before BEGIN: %w", store.ErrNotLeader), server.ReasonNotLeader},
 		{"not replicated", store.ErrNotReplicated, server.ReasonReplication},
 		{"not replicated, with a cause", fmt.Errorf("%w: %w", store.ErrNotReplicated, errors.New("probe: x")), server.ReasonReplication},
 		{"refused", fmt.Errorf("%w: revoke-key: unknown", store.ErrRefused), server.ReasonRefused},

@@ -6,9 +6,12 @@ import (
 	"database/sql"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/authoritytest"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/policy"
 	ac "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authoritycontract"
 )
 
@@ -62,13 +65,19 @@ func TestRestoreCancelRunsStep9(t *testing.T) {
 	e.pinHeld(a.ID)
 	before := countRows(t, e, "account_events")
 	e.now.Store(e.now.Load() - 60_000) // the new leader's clock is behind the head's issued_at
-	if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err == nil || out.Code != string(ac.ErrorClock) {
-		t.Fatalf("row 22 with the clock behind the head = %+v, %v; want 503 clock", out, err)
+	// S4: the error names the step and its code, so clear-held's operator reads
+	// why row 22 stopped and not only that it did.
+	if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err == nil || out.Code != string(ac.ErrorClock) ||
+		!strings.Contains(err.Error(), "row 22 stopped at step 9: "+string(ac.ErrorClock)) {
+		t.Fatalf("row 22 with the clock behind the head = %+v, %v; want 503 clock and an error reading %q",
+			out, err, "row 22 stopped at step 9: clock")
 	}
 	e.now.Store(e.now.Load() + 60_000)
 	e.r.Install(t, e.f.App, e.r.NextDelegation(t, authoritytest.WithRSKs(authoritytest.Point(authoritytest.NewRealm(t).CAK))))
-	if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err == nil || out.Code != string(ac.ErrorSigner) {
-		t.Fatalf("row 22 under a delegation without this node's RSK = %+v, %v; want 503 signer", out, err)
+	if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err == nil || out.Code != string(ac.ErrorSigner) ||
+		!strings.Contains(err.Error(), "row 22 stopped at step 9: "+string(ac.ErrorSigner)) {
+		t.Fatalf("row 22 under a delegation without this node's RSK = %+v, %v; want 503 signer and an error reading %q",
+			out, err, "row 22 stopped at step 9: signer")
 	}
 	if countRows(t, e, "account_events") != before {
 		t.Fatal("a row 22 refused at step 9 wrote an event")
@@ -186,5 +195,95 @@ func TestRestoreCancelLeaderRefusalIsAnError(t *testing.T) {
 	e.s.hooks.InRecovery = nil
 	if countRows(t, e, "account_events") != before {
 		t.Fatal("a row 22 refused by the leader check wrote an event")
+	}
+}
+
+// S2: a role read that fails keeps its cause in row 22's error, wrapped, so a
+// clear-held stop exits by the database's own fault and not by a bare code. A
+// standby is ErrNotLeader and nothing else; the hook that reports primary is
+// the control, and row 22 commits.
+func TestRestoreCancelKeepsTheRoleReadCause(t *testing.T) {
+	e := newEnv(t)
+	a, _ := e.enrolledWith()
+	e.commitOK(a, a.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+	e.pinHeld(a.ID)
+	before := authoritySnapshot(t, e.f.App)
+	events := countRows(t, e, "account_events")
+
+	sentinel := errors.New("role read: connection reset by peer")
+	e.s.hooks.InRecovery = func(context.Context, *sql.Conn) (bool, error) { return false, sentinel }
+	out, err := e.s.commitRestoreCancel(context.Background(), a.ID)
+	if !errors.Is(err, sentinel) || errors.Is(err, ErrNotLeader) || out.Code != string(ac.ErrorStore) {
+		t.Fatalf("row 22 with a failing role read = %+v, %v; want 503 store and an error wrapping the read's own cause", out, err)
+	}
+
+	e.s.hooks.InRecovery = func(context.Context, *sql.Conn) (bool, error) { return true, nil }
+	out, err = e.s.commitRestoreCancel(context.Background(), a.ID)
+	if !errors.Is(err, ErrNotLeader) || errors.Is(err, sentinel) || out.Code != string(ac.ErrorNotLeader) {
+		t.Fatalf("row 22 on a standby = %+v, %v; want 503 not_leader wrapping ErrNotLeader", out, err)
+	}
+	if after := authoritySnapshot(t, e.f.App); after != before || countRows(t, e, "account_events") != events {
+		t.Fatalf("a row 22 stopped by the role read wrote:\nbefore %s\nafter  %s", before, after)
+	}
+
+	e.s.hooks.InRecovery = func(context.Context, *sql.Conn) (bool, error) { return false, nil }
+	if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err != nil || out.Kind != KindCommitted {
+		t.Fatalf("row 22 on a primary = %+v, %v; want committed (the control)", out, err)
+	}
+}
+
+// E1: row 22 signs with the realm its own transaction read from meta, so a Store
+// whose anchors name another realm must refuse inside that transaction, before
+// anything is signed, and the refusal is ErrRealmMismatch, which stops a
+// clear-held run (the CLI exits trust). The right realm's Store commits the
+// same head afterwards (the control).
+func TestRestoreCancelRefusesAHeadOfAnotherRealm(t *testing.T) {
+	e := newEnv(t)
+	a, _ := e.enrolledWith()
+	e.commitOK(a, a.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+	e.pinHeld(a.ID)
+	other := authoritytest.NewRealm(t)
+	wrong, err := Open(Config{DB: e.f.App, Signer: e.r.RSK, Anchors: other.AnchorBytes, Probe: e.probe, Hooks: e.s.hooks,
+		TxDeadline: 2 * time.Second, ReadDeadline: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := authoritySnapshot(t, e.f.App)
+	events := countRows(t, e, "account_events")
+
+	out, err := wrong.commitRestoreCancel(context.Background(), a.ID)
+	if !errors.Is(err, ErrRealmMismatch) || errors.Is(err, ErrRefused) || out.Kind == KindCommitted {
+		t.Fatalf("row 22 under another realm's anchors = %+v, %v; want ErrRealmMismatch and nothing committed", out, err)
+	}
+	if n := countRows(t, e, "account_events"); n != events {
+		t.Fatalf("account_events = %d, want %d: the refused row 22 signed an event", n, events)
+	}
+	if after := authoritySnapshot(t, e.f.App); after != before {
+		t.Fatalf("the refused row 22 changed the head:\nbefore %s\nafter  %s", before, after)
+	}
+
+	if out, err := e.s.commitRestoreCancel(context.Background(), a.ID); err != nil || out.Kind != KindCommitted {
+		t.Fatalf("row 22 under the right realm's anchors = %+v, %v; want committed (the control)", out, err)
+	}
+	if n := countRows(t, e, "account_events"); n != events+1 {
+		t.Fatalf("account_events = %d after the control, want %d", n, events+1)
+	}
+}
+
+// S5: a policy decision that is not row 22 and names no refusal still ends the
+// account's outcome on a reason: the row the policy selected. Unreachable
+// through commitRestoreCancel (Admit selects row 22 for every held P, D and Pr
+// and refuses the rest with a code), so this pins notAdmitted itself.
+func TestNotAdmittedNamesTheSelectedRowWhenThereIsNoRefusal(t *testing.T) {
+	if err := notAdmitted(policy.Decision{Refusal: ac.RefusalWrongState}); !errors.Is(err, ErrRefused) ||
+		!strings.HasSuffix(err.Error(), "row 22 not admitted: "+string(ac.RefusalWrongState)) {
+		t.Fatalf("notAdmitted with a refusal = %v, want ErrRefused ending on the refusal's code", err)
+	}
+	var row ac.Row
+	row.N = 5
+	err := notAdmitted(policy.Decision{Row: row})
+	if !errors.Is(err, ErrRefused) || !strings.HasSuffix(err.Error(), "row 22 not admitted: the policy selected row 5") {
+		t.Fatalf("notAdmitted with no refusal = %v, want ErrRefused ending on %q, not on an empty reason",
+			err, "the policy selected row 5")
 	}
 }

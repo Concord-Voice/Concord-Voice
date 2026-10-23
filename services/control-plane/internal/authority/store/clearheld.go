@@ -43,7 +43,7 @@ import (
 // is raised with GREATEST, as reconcile-complete's are); or a write while serve
 // runs, which holds no D-241 memory of this verb's held_status and could
 // commit on the head between its reads and its write. ServeLock, taken before
-// anything else is read, rules that out on this node.
+// any head is read, rules that out on this node.
 //
 // Signing is fenced before any account is read: the verb refuses unless this
 // RSK is listed in the installed high-water delegation, the check serve makes
@@ -68,16 +68,19 @@ const (
 type ClearResult struct{ Account, Outcome string }
 
 // ClearHeld is clear-held (§3.4). It refuses, writing nothing, with no signer,
-// with an empty, oversized or duplicated account list, with ServeLock held
-// (ErrServeLockHeld), on a standby (ErrNotLeader) and when this RSK is not in
-// the installed high-water delegation. Otherwise it clears each account in
+// with an empty, oversized or duplicated account list, on a standby
+// (ErrNotLeader) or another realm's database (ErrRealmMismatch), both checked
+// before the lock as well as after it (checkBeforeLock), with ServeLock held
+// (ErrServeLockHeld), and when this RSK is not in the installed high-water
+// delegation. Otherwise it clears each account in
 // input order. An account's own refusal (clearRefusal) is recorded as its
 // outcome and the rest continue; finish runs once, after the last account,
 // and its error is returned with the results. Any other error, the
 // database's, the clock's, the signer's or the lock's, is no refusal (Codex
-// round 2, G5): the run stops at that account, which gets no result, and the
-// results so far return with the error, joined with finish's, since the
-// accounts before it committed.
+// round 2, G5): the run stops at that account, which gets no result, finish
+// still runs, since the accounts before it committed, and the results so far
+// return with the stop's error, which names the account's position and
+// carries a failed finish as text only (stopAt).
 //
 // Everything after ServeLock, finish included, runs under the lock's watch
 // (ServeLock.Watch): a lock session that dies mid-run cancels the rest, the
@@ -89,6 +92,9 @@ func (o *Owner) ClearHeld(ctx context.Context, accounts []string) ([]ClearResult
 		return nil, fmt.Errorf("%w: clear-held needs the RSK", ErrRefused)
 	}
 	if err := checkClearAccounts(accounts); err != nil {
+		return nil, err
+	}
+	if err := o.checkBeforeLock(ctx); err != nil {
 		return nil, err
 	}
 	lock, err := AcquireServeLock(ctx, o.db)
@@ -122,13 +128,10 @@ func (o *Owner) clearLocked(ctx context.Context, accounts []string) ([]ClearResu
 		return nil, fmt.Errorf("authority store: clear-held: commit core: %w", err)
 	}
 	results := make([]ClearResult, 0, len(accounts))
-	for _, a := range accounts {
+	for i, a := range accounts {
 		out, err := o.clearOne(ctx, conn, s, a)
 		if err != nil && (ctx.Err() != nil || !clearRefusal(err)) {
-			if ferr := o.finish(ctx, conn); ferr != nil { // the accounts before this one committed
-				return results, errors.Join(err, ferr)
-			}
-			return results, err
+			return results, o.stopAt(ctx, conn, i, len(accounts), err)
 		}
 		if err != nil {
 			why := strings.TrimPrefix(strings.TrimPrefix(err.Error(), "authority store: "), "refused: ")
@@ -139,16 +142,39 @@ func (o *Owner) clearLocked(ctx context.Context, accounts []string) ([]ClearResu
 	return results, o.finish(ctx, conn)
 }
 
-// clearRefusal is whether err, from clearOne, is the account's own refusal:
-// ErrRefused (row 22 not admitted by the policy or failing the client check,
-// or a head row 22 left in a state it never leaves) or
-// ErrNotHeldPendingOrDisputed (the head stopped being a held P, D or Pr
-// between the classifier and row 22). Each leaves the account as it was and
-// says nothing about the next one. Everything else, a 55P03 lock wait, a
-// statement or connection failure, db_now behind the account's last as_of_ms
-// or issued_at, a signer or delegation fault, a lost leader, is not: it is
-// returned as the verb's error and exits by its own reason, never as
-// refused.
+// stopAt is the run's stop at accounts[i], of n: err, the error that stopped
+// it, with the account's 1-based position and never its id (the exit line
+// names no account), and then finish, since what committed before the stop
+// still waits on replication. The stop's own error decides the exit: a
+// finish that fails too is attached as text, never wrapped, so a lock wait,
+// a clock, signer or realm fault, a lost leader or a vanished head exits by
+// its own reason and not as replication. A refusal that arrives once ctx has
+// ended did not stop the run; ctx's end did, so that is the error wrapped,
+// and the run never exits refused for an account it did not finish.
+func (o *Owner) stopAt(ctx context.Context, conn *sql.Conn, i, n int, err error) error {
+	if clearRefusal(err) {
+		err = fmt.Errorf("%w (and the account's own refusal: %v)", context.Cause(ctx), err)
+	}
+	err = fmt.Errorf("authority store: clear-held: stopped at account %d of %d: %w", i+1, n, err)
+	if ferr := o.finish(ctx, conn); ferr != nil {
+		return fmt.Errorf("%w (and what committed before it: %v)", err, ferr)
+	}
+	return err
+}
+
+// clearRefusal is whether err, from clearOne, is the account's own refusal.
+// Exactly two errors are: ErrRefused, which row 22 returns when the policy
+// does not admit it, and ErrNotHeldPendingOrDisputed, when the locked head is
+// not a held P, D or Pr (it changed between the classifier and row 22). Each
+// is decided before row 22 signs or writes anything, so each leaves the
+// account as it was and says nothing about the next one. Everything else is
+// not: a 55P03 lock wait, a statement or connection failure, db_now behind
+// the account's last as_of_ms or issued_at, a signer or delegation fault, a
+// realm mismatch, a lost leader, a row-22 result that fails the client check,
+// and anything after row 22 committed (the head then reads as another state
+// than the L1 exit), each of which is the store's or the database's and not
+// the account's. Those are returned as the verb's error and exit by their own
+// reason, never as refused.
 func clearRefusal(err error) bool {
 	return errors.Is(err, ErrRefused) || errors.Is(err, ErrNotHeldPendingOrDisputed)
 }
@@ -242,8 +268,8 @@ func (o *Owner) clearOne(ctx context.Context, conn *sql.Conn, s *Store, account 
 	if err != nil {
 		return "", err
 	}
-	if next != ClearUnverified {
-		return "", fmt.Errorf("%w: clear-held: after row 22 the head reads as %s", ErrRefused, next)
+	if next != ClearUnverified { // row 22 committed: a defect, never a refusal
+		return "", fmt.Errorf("authority store: clear-held: after row 22 the head reads as %s", next)
 	}
 	return ClearRestoreCancel, nil
 }

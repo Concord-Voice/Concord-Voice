@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/policy"
 	ac "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authoritycontract"
@@ -330,18 +331,27 @@ func issuedNotBefore(ctx context.Context, st *txState) (bool, error) {
 // step9: db_now ≥ max(issued_at) over the account's published and private
 // entries (D-36), and this node's RSK is listed in the signing delegation (T10).
 func (s *Store) step9(ctx context.Context, st *txState) (Outcome, bool) {
+	out, err := s.step9Cause(ctx, st)
+	return out, err != nil
+}
+
+// step9Cause is step 9 with the reason it stopped: nil when it passes;
+// otherwise its 503's code, wrapping the database's error when the read
+// failed. serve answers with the outcome alone; row 22 (restoreCancelTx)
+// returns the cause to clear-held's operator.
+func (s *Store) step9Cause(ctx context.Context, st *txState) (Outcome, error) {
 	ok, err := issuedNotBefore(ctx, st)
 	if err != nil {
-		return s.storeError(), true
+		return s.storeError(), fmt.Errorf("%s: %w", ac.ErrorStore, err)
 	}
 	if !ok {
 		s.nonClient503.Store(true)
-		return errorOutcome(503, ac.ErrorClock), true
+		return errorOutcome(503, ac.ErrorClock), errors.New(string(ac.ErrorClock))
 	}
 	if !s.rskListed(st.sig) {
-		return s.signerError(), true
+		return s.signerError(), errors.New(string(ac.ErrorSigner))
 	}
-	return Outcome{}, false
+	return Outcome{}, nil
 }
 
 // rskListed is T10's last clause: this node's own RSK is listed in the

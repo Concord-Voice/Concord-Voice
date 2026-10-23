@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -678,7 +678,11 @@ func TestClearHeldRefusesUndelegatedSigner(t *testing.T) {
 }
 
 // One account's refusal is its outcome, and the accounts after it are still
-// cleared (Task 9 step 3): the refused account stays held, the next one does not.
+// cleared (Task 9 step 3). The refusal here is one only row 22 can make before
+// it signs: the head stopped being a held P, D or Pr between the classifier and
+// row 22 (ErrNotHeldPendingOrDisputed), which nothing has written. The policy
+// refusal is TestClearHeldPolicyRefusalContinues. The refused account is not
+// touched by this run, and the next one is cleared.
 func TestClearHeldRefusalDoesNotAbortTheRest(t *testing.T) {
 	e := newEnv(t)
 	p, _ := e.enrolledWith()
@@ -686,30 +690,63 @@ func TestClearHeldRefusalDoesNotAbortTheRest(t *testing.T) {
 	act, _ := e.enrolledWith()
 	e.pinHeld(p.ID)
 	e.pinHeld(act.ID)
-	o := signedOwner(t, e)
-	o.afterRestoreCancel = func() error { return fmt.Errorf("%w: injected refusal", ErrRefused) }
+	events := countRows(t, e, "account_events")
+	// Another actor ends p's hold after the classifier read it, before row 22.
+	o := ownerOver(t, e.f, e.r, OwnerConfig{Signer: e.r.RSK, InRecovery: onRowTwentyTwo(func() {
+		mustExec(t, e.f.Owner, `UPDATE authority.account_heads SET held = false WHERE account_id = $1`, p.ID)
+	})})
 
 	got, err := o.ClearHeld(liveCtx(t), []string{p.ID, act.ID})
 	if err != nil {
 		t.Fatalf("ClearHeld = %v, want nil: a per-account refusal is an outcome, not the verb's error", err)
 	}
-	if len(got) != 2 || got[0].Account != p.ID || !strings.HasPrefix(got[0].Outcome, "refused:") {
-		t.Fatalf("results = %+v, want %s refused first", got, p.ID)
+	wantResults(t, got, ClearResult{p.ID, ClearRefused + "row 22 needs a held P, D or Pr head"}, ClearResult{act.ID, "unverified"})
+	if heldOf(t, e.f.Super, act.ID) {
+		t.Fatal("the account after the refusal is still held")
 	}
-	if got[1] != (ClearResult{act.ID, "unverified"}) {
-		t.Fatalf("results = %+v, want %s unverified after the refusal", got, act.ID)
+	if n := countRows(t, e, "account_events"); n != events {
+		t.Fatalf("account_events = %d, want %d: a refused row 22 signs nothing", n, events)
 	}
-	if !heldOf(t, e.f.Super, p.ID) || heldOf(t, e.f.Super, act.ID) {
-		t.Fatal("want the refused account held and the next one cleared")
+	if c := readCleared(t, e.f.Super, p.ID); c.forceUnv {
+		t.Fatalf("the refused account was cleared by this run: %+v", c)
 	}
 }
 
-// failoverAfterConn is an InRecovery hook that answers primary for the owner
-// connection's role read (the first call) and standby for every later one: the
-// leader check of the next row 22, after a failover mid-run.
-func failoverAfterConn() func(context.Context, *sql.Conn) (bool, error) {
-	var calls atomic.Int64
-	return func(context.Context, *sql.Conn) (bool, error) { return calls.Add(1) > 1, nil }
+// inRowTwentyTwo is whether the caller runs under commitRestoreCancel, clear-held's
+// row 22. The InRecovery hook is shared by the owner connection's checks and by
+// row 22, and it is keyed here on that call site, never on how many role reads
+// came before it, so adding or removing a pre-lock check cannot move a fixture.
+func inRowTwentyTwo() bool {
+	pcs := make([]uintptr, 48)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		f, more := frames.Next()
+		if strings.HasSuffix(f.Function, ").commitRestoreCancel") {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// failoverAtRowTwentyTwo is an InRecovery hook that answers primary for the
+// owner connection's checks and standby for row 22's own role read: the leader
+// check of a row 22 after a failover mid-run.
+func failoverAtRowTwentyTwo() func(context.Context, *sql.Conn) (bool, error) {
+	return func(context.Context, *sql.Conn) (bool, error) { return inRowTwentyTwo(), nil }
+}
+
+// onRowTwentyTwo is an InRecovery hook that reports primary and runs fn at row
+// 22's role read, which is after the classifier chose row 22 for the account
+// and before row 22 takes its lock.
+func onRowTwentyTwo(fn func()) func(context.Context, *sql.Conn) (bool, error) {
+	return func(context.Context, *sql.Conn) (bool, error) {
+		if inRowTwentyTwo() {
+			fn()
+		}
+		return false, nil
+	}
 }
 
 // Codex round 2, G5: only an account's own refusal is its outcome. A database
@@ -818,7 +855,8 @@ func TestClearHeldStopsOnAPlainErrorAfterRow22(t *testing.T) {
 // A failover between two accounts is ErrNotLeader (N1), so the CLI exits
 // not_leader and not config: the first account is cleared and reported, the
 // second is not touched. The probe says nothing replicated, and finish still
-// runs on the stop (G5): the error carries both the cause and ErrNotReplicated.
+// runs on the stop (G5): the error carries the cause, and finish's failure
+// only as text, so the stop and not replication decides the exit.
 func TestClearHeldStopsOnAFailoverAndStillFinishes(t *testing.T) {
 	setup := func(t *testing.T, cfg OwnerConfig) (*env, *Owner, *authoritytest.Account, *authoritytest.Account) {
 		e := newEnv(t)
@@ -827,7 +865,7 @@ func TestClearHeldStopsOnAFailoverAndStillFinishes(t *testing.T) {
 		e.commitOK(p, p.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
 		e.pinHeld(act.ID)
 		e.pinHeld(p.ID)
-		cfg.Signer, cfg.InRecovery = e.r.RSK, failoverAfterConn()
+		cfg.Signer, cfg.InRecovery = e.r.RSK, failoverAtRowTwentyTwo()
 		return e, ownerOver(t, e.f, e.r, cfg), act, p
 	}
 
@@ -849,9 +887,202 @@ func TestClearHeldStopsOnAFailoverAndStillFinishes(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 		defer cancel()
 		got, err := o.ClearHeld(ctx, []string{act.ID, p.ID})
-		if !errors.Is(err, ErrNotLeader) || !errors.Is(err, ErrNotReplicated) {
-			t.Fatalf("ClearHeld = %v, want both ErrNotLeader and ErrNotReplicated: the first account committed", err)
+		if !errors.Is(err, ErrNotLeader) || errors.Is(err, ErrNotReplicated) || !strings.Contains(err.Error(), ErrNotReplicated.Error()) {
+			t.Fatalf("ClearHeld = %v, want ErrNotLeader with finish's ErrNotReplicated as text only: the first account committed", err)
 		}
 		wantResults(t, got, ClearResult{act.ID, "unverified"})
 	})
+}
+
+// S1 and S6: a run stopped by a database fault exits by that fault, at the
+// position it stopped, and the replication wait that follows it is only text.
+// Account 2 of 3 is held beyond lock_timeout (55P03) with replication required
+// and a probe that never confirms: the error reaches the pq code, says "stopped
+// at account 2 of 3", names no account, carries finish's ErrNotReplicated as
+// text and not as a wrapped error (the CLI would exit replication), and the
+// first account's line is returned. The control runs the same three accounts
+// with nothing held and a confirming probe.
+func TestClearHeldStopKeepsItsReasonAndPosition(t *testing.T) {
+	heldThree := func(t *testing.T, cfg OwnerConfig) (*env, *Owner, []*authoritytest.Account) {
+		e := newEnv(t)
+		as := make([]*authoritytest.Account, 0, 3)
+		for range 3 {
+			a, _ := e.enrolledWith()
+			e.pinHeld(a.ID)
+			as = append(as, a)
+		}
+		cfg.Signer = e.r.RSK
+		requireGate(t, e.f, true)
+		return e, ownerOver(t, e.f, e.r, cfg), as
+	}
+	ids := func(as []*authoritytest.Account) []string { return []string{as[0].ID, as[1].ID, as[2].ID} }
+
+	t.Run("control: nothing held, replication confirmed", func(t *testing.T) {
+		probe := &fakeProbe{}
+		probe.ok.Store(true)
+		e, o, as := heldThree(t, OwnerConfig{Probe: probe})
+		got, err := o.ClearHeld(liveCtx(t), ids(as))
+		if err != nil {
+			t.Fatalf("ClearHeld = %v, want nil", err)
+		}
+		wantResults(t, got, ClearResult{as[0].ID, "unverified"}, ClearResult{as[1].ID, "unverified"}, ClearResult{as[2].ID, "unverified"})
+		if heldOf(t, e.f.Super, as[2].ID) {
+			t.Fatal("the third account is still held")
+		}
+	})
+
+	t.Run("a lock wait on account 2", func(t *testing.T) {
+		e, o, as := heldThree(t, OwnerConfig{Probe: &fakeProbe{}}) // answers not replicated
+		beginHolding(t, e.f.Super, `SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, as[1].ID)
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		got, err := o.ClearHeld(ctx, ids(as))
+		var pe *pq.Error
+		if !errors.As(err, &pe) || pe.Code != "55P03" {
+			t.Fatalf("ClearHeld = %v, want an error carrying SQLSTATE 55P03", err)
+		}
+		if errors.Is(err, ErrNotReplicated) || errors.Is(err, ErrRefused) {
+			t.Fatalf("ClearHeld = %v: the stop is wrapped with finish's ErrNotReplicated or read as a refusal, so the CLI exits by it", err)
+		}
+		if !strings.Contains(err.Error(), ErrNotReplicated.Error()) {
+			t.Fatalf("ClearHeld = %v, want finish's failure attached as text", err)
+		}
+		if !strings.Contains(err.Error(), "stopped at account 2 of 3") {
+			t.Fatalf("ClearHeld = %v, want it to say \"stopped at account 2 of 3\"", err)
+		}
+		for _, a := range as {
+			if strings.Contains(err.Error(), a.ID) {
+				t.Fatalf("ClearHeld = %v: the error names account %s, and the exit line names none", err, a.ID)
+			}
+		}
+		wantResults(t, got, ClearResult{as[0].ID, "unverified"})
+		if heldOf(t, e.f.Super, as[0].ID) || !heldOf(t, e.f.Super, as[1].ID) || !heldOf(t, e.f.Super, as[2].ID) {
+			t.Fatal("want account 1 cleared and accounts 2 and 3 still held")
+		}
+	})
+}
+
+// R3: nothing after row 22 committed is a refusal. A head that reads as another
+// state than the L1 exit once row 22 is done (here ended by another actor in the
+// seam) is a defect and stops the run, with no result for the account, row 22
+// left committed (the resumable state) and the next account untouched. An
+// ErrRefused returned after ctx ended is ctx's end that stopped the run, so the
+// error wraps ctx's cause and is not ErrRefused.
+func TestClearHeldStopsAfterRow22InsteadOfRefusing(t *testing.T) {
+	setup := func(t *testing.T) (*env, *Owner, *authoritytest.Account, *authoritytest.Account) {
+		e := newEnv(t)
+		p, _ := e.enrolledWith()
+		e.commitOK(p, p.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+		act, _ := e.enrolledWith()
+		e.pinHeld(p.ID)
+		e.pinHeld(act.ID)
+		return e, signedOwner(t, e), p, act
+	}
+
+	t.Run("the head reads as not_held after row 22", func(t *testing.T) {
+		e, o, p, act := setup(t)
+		events := countRows(t, e, "account_events")
+		o.afterRestoreCancel = func() error {
+			mustExec(t, e.f.Owner, `UPDATE authority.account_heads SET held = false WHERE account_id = $1`, p.ID)
+			return nil
+		}
+		got, err := o.ClearHeld(liveCtx(t), []string{p.ID, act.ID})
+		if err == nil || errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "after row 22 the head reads as not_held") ||
+			!strings.Contains(err.Error(), "stopped at account 1 of 2") {
+			t.Fatalf("ClearHeld = %v, want a stop (not ErrRefused) at account 1 of 2 saying the head reads as not_held", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("results = %+v, want none: the stopped account gets no result, and refused: is not one", got)
+		}
+		if n := countRows(t, e, "account_events"); n != events+1 {
+			t.Fatalf("account_events = %d, want %d: row 22 committed before the stop", n, events+1)
+		}
+		if !heldOf(t, e.f.Super, act.ID) {
+			t.Fatal("the second account was cleared after the run stopped")
+		}
+	})
+
+	t.Run("a refusal after ctx ended is the context's stop", func(t *testing.T) {
+		e, o, p, act := setup(t)
+		ctx, cancel := context.WithCancel(liveCtx(t))
+		defer cancel()
+		o.afterRestoreCancel = func() error {
+			cancel()
+			return fmt.Errorf("%w: injected refusal", ErrRefused)
+		}
+		got, err := o.ClearHeld(ctx, []string{p.ID, act.ID})
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrRefused) {
+			t.Fatalf("ClearHeld = %v, want the context's cause wrapped and no ErrRefused", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("results = %+v, want none: no account was finished", got)
+		}
+		if !heldOf(t, e.f.Super, act.ID) {
+			t.Fatal("the second account was cleared after the run stopped")
+		}
+	})
+
+	t.Run("control: the seam does nothing", func(t *testing.T) {
+		_, o, p, act := setup(t)
+		o.afterRestoreCancel = func() error { return nil }
+		got, err := o.ClearHeld(liveCtx(t), []string{p.ID, act.ID})
+		if err != nil {
+			t.Fatalf("ClearHeld = %v, want nil", err)
+		}
+		wantResults(t, got, ClearResult{p.ID, "restore_cancel"}, ClearResult{act.ID, "unverified"})
+	})
+}
+
+// T4: a clear-held whose ServeLock session dies mid-run stops with
+// ErrServeLockLost at the account it cuts short, still runs finish (whose failure
+// on the cancelled context is attached as text), and returns the results before
+// the stop. The seam, after the second account's row 22, terminates the lock's
+// backend. A re-run, with the lock free, converges.
+func TestClearHeldStopsWhenTheServeLockSessionDies(t *testing.T) {
+	e := newEnv(t)
+	act, _ := e.enrolledWith()
+	p, _ := e.enrolledWith()
+	e.commitOK(p, p.ReplaceRoot(t, ac.FactorEmail, ac.FactorPassword).Bytes)
+	last, _ := e.enrolledWith()
+	for _, a := range []*authoritytest.Account{act, p, last} {
+		e.pinHeld(a.ID)
+	}
+	o := signedOwner(t, e)
+	events := countRows(t, e, "account_events")
+	o.afterRestoreCancel = func() error {
+		var gone bool
+		if err := e.f.Super.QueryRow(`SELECT pg_terminate_backend(pid, 5000) FROM pg_locks
+			WHERE locktype = 'advisory' AND granted AND classid = $1::bigint::oid AND objid = $2::bigint::oid
+			AND objsubid = 1`, ServeLockKey>>32, ServeLockKey&0xffffffff).Scan(&gone); err != nil || !gone {
+			return fmt.Errorf("terminate the lock's session: %v: %w", gone, err)
+		}
+		time.Sleep(3 * ServeLockWatchInterval) // the watch pings every interval and cancels the run's context
+		return nil
+	}
+
+	got, err := o.ClearHeld(liveCtx(t), []string{act.ID, p.ID, last.ID})
+	if !errors.Is(err, ErrServeLockLost) {
+		t.Fatalf("ClearHeld after its lock's session died = %v, want ErrServeLockLost", err)
+	}
+	if !strings.Contains(err.Error(), "stopped at account 2 of 3") ||
+		!strings.Contains(err.Error(), ErrNotReplicated.Error()) || errors.Is(err, ErrNotReplicated) {
+		t.Fatalf("ClearHeld = %v, want the stop at account 2 of 3 with finish's failure attached as text only (finish ran)", err)
+	}
+	wantResults(t, got, ClearResult{act.ID, "unverified"})
+	if n := countRows(t, e, "account_events"); n != events+1 {
+		t.Fatalf("account_events = %d, want %d: the second account's row 22 committed", n, events+1)
+	}
+	if !heldOf(t, e.f.Super, p.ID) || !heldOf(t, e.f.Super, last.ID) {
+		t.Fatal("want the second and third accounts still held")
+	}
+	if holdsServeLock(t, e.f.Owner) {
+		t.Fatal("the serve lock is still held after the verb returned")
+	}
+
+	o.afterRestoreCancel = nil
+	got, err = o.ClearHeld(liveCtx(t), []string{act.ID, p.ID, last.ID})
+	if err != nil {
+		t.Fatalf("re-run = %v, want nil", err)
+	}
+	wantResults(t, got, ClearResult{act.ID, "not_held"}, ClearResult{p.ID, "unverified"}, ClearResult{last.ID, "unverified"})
 }

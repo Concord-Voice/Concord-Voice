@@ -18,22 +18,30 @@ import (
 var ErrNotHeldPendingOrDisputed = errors.New("authority store: row 22 needs a held P, D or Pr head")
 
 // commitRestoreCancel is clear-held's row 22. A non-nil error means nothing
-// committed. Its refusals of this account are ErrNotHeldPendingOrDisputed and
-// ErrRefused (the policy does not admit row 22, or the result fails the client
-// check), which clear-held records as the account's outcome; every other error
-// is the database's, the clock's, the signer's or the leader check's, and
-// stops clear-held's run (clearRefusal; Codex round 2, G5).
+// committed. Exactly two of its errors are this account's refusal, which
+// clear-held records as the account's outcome before it goes on to the next:
+// ErrNotHeldPendingOrDisputed (the locked head is not a held P, D or Pr) and
+// ErrRefused (the policy does not admit row 22 on it). Each is decided before
+// anything is signed or written, so each leaves the account as it was. Every
+// other error stops clear-held's run (clearRefusal; Codex round 2, G5): the
+// role read's, a standby (ErrNotLeader), a realm mismatch (ErrRealmMismatch),
+// the database's, the clock's, the signer's, and a result that does not build
+// or fails the client check, which is the store's defect and never the
+// account's (AC9, as step 11 treats it).
 func (s *Store) commitRestoreCancel(ctx context.Context, accountID string) (Outcome, error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return s.storeError(), err
 	}
 	defer func() { _ = conn.Close() }()
-	if out, ok := s.leaderCheck(ctx, conn); !ok { // an error, like every refusal: row 22 did not commit
-		if out.Code == string(ac.ErrorNotLeader) { // a failover mid-run exits not_leader, not config
-			return out, fmt.Errorf("authority store: row 22 refused before BEGIN: %w", ErrNotLeader)
-		}
-		return out, errors.New("authority store: row 22 refused before BEGIN: " + out.Code)
+	// Step 1a on row 22's own connection, read here rather than through
+	// leaderCheck so the run's error keeps the role read's cause.
+	inRecovery, err := s.inRecovery(ctx, conn)
+	if err != nil {
+		return s.storeError(), fmt.Errorf("authority store: row 22 stopped before BEGIN: role read: %w", err)
+	}
+	if inRecovery { // a failover mid-run exits not_leader, not config
+		return errorOutcome(503, ac.ErrorNotLeader), fmt.Errorf("authority store: row 22 stopped before BEGIN: %w", ErrNotLeader)
 	}
 	tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -46,6 +54,14 @@ func (s *Store) commitRestoreCancel(ctx context.Context, accountID string) (Outc
 	st := &txState{tx: tx, rq: &request{}}
 	if st.h, st.inPop, err = lockHead(ctx, tx, accountID); err != nil {
 		return s.storeError(), err
+	}
+	// Row 22 signs its status, intent, CPAuthz and result with the realm this
+	// transaction read from meta (lockHead). The owner connection's realm check
+	// ran on another session, so this one is checked as well, before the head
+	// is classified or anything signed (B2-D10). A mismatch is no refusal: it
+	// stops the run, and the CLI exits trust.
+	if st.h.RealmID != s.anchors.RealmID {
+		return s.storeError(), fmt.Errorf("%w: row 22's transaction: the anchors name another", ErrRealmMismatch)
 	}
 	code := st.h.published().FromCode()
 	if !st.h.Held || (code != ac.FromP && code != ac.FromD && code != ac.FromPr) {
@@ -79,8 +95,8 @@ func (s *Store) commitRestoreCancel(ctx context.Context, accountID string) (Outc
 func (s *Store) restoreCancelTx(ctx context.Context, st *txState) (Outcome, error) {
 	// Step 9 binds row 22 as it binds every signed result: db_now ≥ max(issued_at)
 	// (D-36) and this node's RSK listed in the signing delegation (T10).
-	if out, done := s.step9(ctx, st); done {
-		return out, errors.New("authority store: row 22 refused at step 9: " + out.Code)
+	if out, err := s.step9Cause(ctx, st); err != nil {
+		return out, fmt.Errorf("authority store: row 22 stopped at step 9: %w", err)
 	}
 	// T6 (DoR:347, :720): held_status is a status, so `status` must be in the
 	// signing delegation's scope, or every client rejects the bundle (review round 3).
@@ -103,11 +119,13 @@ func (s *Store) restoreCancelTx(ctx context.Context, st *txState) (Outcome, erro
 	bundle := ac.Bundle{Intent: ib, CPAuthz: azb, HeldStatus: held}
 	d := restoreCancelDecision(st, bundle)
 	if d.Refusal != "" || d.Row.N != 22 {
-		return s.storeError(), fmt.Errorf("%w: row 22 not admitted: %s", ErrRefused, d.Refusal)
+		return s.storeError(), notAdmitted(d)
 	}
 	res, ok := s.buildResult(st, d)
 	if !ok || ac.CheckPost(d.Row, h.published(), in, res, false, ac.Assurance(h.Segment), ac.Assurance(h.RecoveryBindAssurance)) != ac.ReasonOK {
-		return s.storeError(), fmt.Errorf("%w: row-22 result fails the client check", ErrRefused)
+		// AC9, as step 11: never sign what a client would refuse. A result the
+		// commit core built wrong is its defect, not this account's refusal.
+		return s.storeError(), errors.New("authority store: row 22's result does not build or fails the client check")
 	}
 	rb := res.Encode()
 	rsig, err := signer.SignAndVerify(s.sig, rb)
@@ -122,6 +140,16 @@ func (s *Store) restoreCancelTx(ctx context.Context, st *txState) (Outcome, erro
 		return s.storeError(), err
 	}
 	return Outcome{HTTP: 200, Kind: KindCommitted, Body: ac.Committed{Result: rb, ResultSig: rsig}.Encode()}, nil
+}
+
+// notAdmitted is the refusal of a policy decision that is not row 22: its
+// refusal's code, or, for one that selected another row and named no refusal,
+// that row, so the account's outcome never ends on an empty reason.
+func notAdmitted(d policy.Decision) error {
+	if d.Refusal != "" {
+		return fmt.Errorf("%w: row 22 not admitted: %s", ErrRefused, d.Refusal)
+	}
+	return fmt.Errorf("%w: row 22 not admitted: the policy selected row %d", ErrRefused, d.Row.N)
 }
 
 // restoreCancelDecision is row 22's policy decision on st's head as it is,

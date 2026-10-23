@@ -66,7 +66,8 @@ type Owner struct {
 	// after a row 22 committed and before that account's L1 transaction. A
 	// non-nil return ends the account there and is classified as any other
 	// error (clearRefusal): an ErrRefused refuses the account, anything else
-	// stops the run (Review Focus 2).
+	// stops the run (Review Focus 2). Only the seam can refuse an account
+	// after its row 22 committed; no production error there is a refusal.
 	afterRestoreCancel func() error
 }
 
@@ -92,10 +93,14 @@ func OpenOwner(cfg OwnerConfig) (*Owner, error) {
 	return o, nil
 }
 
-// conn is where every owner verb gets its connection, and so the one place
-// its leader and realm checks live (B3-D7, step 1a's rule; B2-D10). It hands
-// back conn only when the role read on that same connection succeeded and said
-// primary, and then meta, read on it too, exists and names the anchors' realm.
+// conn is where every owner verb gets its connection, with its leader and
+// realm checks (B3-D7, step 1a's rule; B2-D10). Two other places make the
+// same checks: checkBeforeLock runs conn once before a verb takes ServeLock,
+// and clear-held's row 22, on the commit core's own connection, reads the
+// role before BEGIN and checks the realm inside its transaction
+// (commitRestoreCancel). conn hands back a connection only when the role read
+// on that same connection succeeded and said primary, and then meta, read on
+// it too, exists and names the anchors' realm.
 // A standby closes it and refuses with ErrNotLeader; a role read that fails
 // closes it and returns that failure, never ErrNotLeader, so the operator is
 // not sent looking for a primary that may be this one. A primary with no meta
@@ -128,6 +133,23 @@ func (o *Owner) conn(ctx context.Context) (*sql.Conn, error) {
 		return nil, fmt.Errorf("authority store: realm read: %w", err)
 	}
 	return c, nil
+}
+
+// checkBeforeLock is conn's leader and realm checks, on a connection it
+// closes, for a verb that takes ServeLock next (stopped, ClearHeld). Without
+// it a misaimed AUTHORITY_MIGRATE_DATABASE_URL, a standby or another realm's
+// primary, whose serve holds the lock, would exit lock, whose remedy (a re-run
+// converges) does not apply there, and a run against another realm's idle
+// primary would hold that realm's ServeLock until conn refused it. The checks
+// that bind are conn's, made again once the lock is held, so a failover
+// between the two is still refused.
+func (o *Owner) checkBeforeLock(ctx context.Context) error {
+	c, err := o.conn(ctx)
+	if err != nil {
+		return err
+	}
+	_ = c.Close()
+	return nil
 }
 
 // finish is every owner verb's last step, after its commit on conn (D-225):

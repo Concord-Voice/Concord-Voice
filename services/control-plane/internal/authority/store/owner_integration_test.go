@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/authoritytest"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/authority/signer"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/authoritydb"
 )
 
@@ -41,7 +42,9 @@ func (p *stepProbe) Replicated(context.Context, *sql.Conn, string) (bool, error)
 }
 
 // B3-D7: every owner verb calls the leader check on its own connection, and a
-// standby refuses with ErrNotLeader. conn is the one place that check lives.
+// standby refuses with ErrNotLeader. conn is where the verbs' check lives;
+// checkBeforeLock runs it ahead of ServeLock, and row 22 repeats it on the
+// commit core's own connection and, for the realm, inside its transaction.
 func TestOwnerConnRefusesOnStandby(t *testing.T) {
 	f := authoritydb.Setup(t)
 	r := authoritytest.NewRealm(t)
@@ -375,6 +378,11 @@ func TestOwnerVerbOnAnotherRealmIsRefused(t *testing.T) {
 	r := authoritytest.NewRealm(t)
 	other := authoritytest.NewRealm(t) // a second realm: its own ID and anchors
 	newTestStore(t, f, r, &fakeProbe{}, Hooks{})
+	rsk, err := signer.GenerateP384() // D-223: an RSK is listed in one delegation only
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Install(t, f.App, r.NextDelegation(t, authoritytest.WithRSKs(rsk.PublicKey()))) // serial 1 is superseded: end-drain has something to drain
 	cases := ownerVerbCases(t, f, r.Current.D.CPTLSPins[0], trustFile(t, other.Current))
 	arrangeOnce(cases)
 	o, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: other.AnchorBytes, Signer: other.RSK})
@@ -395,17 +403,79 @@ func TestOwnerVerbOnAnotherRealmIsRefused(t *testing.T) {
 		})
 	}
 
-	// The control: the same cases over the right realm pass the realm check,
-	// so the refusals above are the realm's and not an arrangement fault.
-	right, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: r.AnchorBytes, Signer: r.RSK, Probe: &fakeProbe{}})
+	// The control (T2): every verb, over the right realm and the same arranged
+	// database, passes the realm check and runs, so each refusal above is the
+	// realm's and not an arrangement fault of that verb. A fresh run of each case
+	// with a trust file for the right realm.
+	probe := &fakeProbe{}
+	probe.ok.Store(true)
+	right, err := OpenOwner(OwnerConfig{DB: f.Owner, Anchors: r.AnchorBytes, Signer: rsk, Probe: probe})
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := right.conn(context.Background())
-	if err != nil {
-		t.Fatalf("conn over the right realm = %v, want nil (the control)", err)
+	for _, c := range ownerVerbCases(t, f, r.Current.D.CPTLSPins[0], trustFile(t, r.Current)) {
+		t.Run("control: "+c.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := c.run(ctx, right); err != nil {
+				t.Fatalf("%s over the right realm = %v, want nil (the control)", c.name, err)
+			}
+		})
 	}
-	_ = conn.Close()
+}
+
+// R1: the leader and realm checks run before the verb takes ServeLock. With
+// another session holding the lock (serve, on a primary of the right realm), a
+// standby or another realm's primary must still be refused as that and not as
+// ErrServeLockHeld, whose remedy does not apply there. Each verb that takes the
+// lock is checked: restore-begin and reconcile-complete (stopped), and
+// clear-held. The control is the right realm's primary, which meets the lock.
+func TestOwnerVerbChecksPrecedeServeLock(t *testing.T) {
+	f := authoritydb.Setup(t)
+	r := authoritytest.NewRealm(t)
+	other := authoritytest.NewRealm(t)
+	newTestStore(t, f, r, &fakeProbe{}, Hooks{})
+	locking := map[string]bool{"restore-begin": true, "reconcile-complete": true, "clear-held": true}
+	cases := ownerVerbCases(t, f, r.Current.D.CPTLSPins[0], trustFile(t, r.Current))
+	arrangeOnce(cases)
+	held, err := AcquireServeLock(context.Background(), f.App)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	for _, tc := range []struct {
+		name string
+		cfg  OwnerConfig
+		want error
+	}{
+		{"a standby", OwnerConfig{Anchors: r.AnchorBytes, Signer: r.RSK,
+			InRecovery: func(context.Context, *sql.Conn) (bool, error) { return true, nil }}, ErrNotLeader},
+		{"another realm's primary", OwnerConfig{Anchors: other.AnchorBytes, Signer: other.RSK}, ErrRealmMismatch},
+		{"control: the right realm's primary", OwnerConfig{Anchors: r.AnchorBytes, Signer: r.RSK}, ErrServeLockHeld},
+	} {
+		tc.cfg.DB = f.Owner
+		o, err := OpenOwner(tc.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cases {
+			if !locking[c.name] {
+				continue
+			}
+			t.Run(tc.name+"/"+c.name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err := c.run(ctx, o)
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("%s with ServeLock held elsewhere, %s = %v, want %v", c.name, tc.name, err, tc.want)
+				}
+				if tc.want != ErrServeLockHeld && errors.Is(err, ErrServeLockHeld) {
+					t.Fatalf("%s, %s = %v: refused as the lock, not as what it is", c.name, tc.name, err)
+				}
+			})
+		}
+	}
 }
 
 // A migrated database with no meta row is ErrNoMeta on every owner verb (B2-D10),

@@ -105,9 +105,11 @@ func parseClearHeld(args []string) (ownerCall, bool) {
 
 // finishClear prints one account=<uuid> outcome=<outcome> line per result,
 // in input order, and then decides the exit: the store call's own error
-// first (a replication failure is re-run whatever the accounts read, and a
-// failure that stopped the run, after the lines of the accounts before it,
-// exits by its own reason: Codex round 2, G5), then
+// first (a replication failure of a run that went through every account is
+// re-run whatever the accounts read, and a failure that stopped the run,
+// after the lines of the accounts before it, exits by its own reason even
+// when the finish after it failed too, which the store carries as text and
+// not as ErrNotReplicated: Codex round 2, G5), then
 // any refused:<why> result, which exits 1 with reason=refused (B3-D11). The
 // why is the store's error text, printed for the operator on stdout and never
 // logged: the exit line counts the refusals and names no account.
@@ -275,7 +277,9 @@ func runOwner(ctx context.Context, c ownerCall, out io.Writer, log *slog.Logger)
 // StepOwner: ServeLock held, or its session lost mid-verb (ErrServeLockLost),
 // is lock, ahead of the replication a verb cut short by that loss also
 // reports; a standby is not_leader; a commit not confirmed replicated is
-// replication, with DoR:1743's text in place of the cause; the verb's own
+// replication, with DoR:1743's text in place of the cause (clear-held's stop
+// names a failed finish only as text, so the stop exits by its own reason
+// and its cause is never replaced); the verb's own
 // refusal, and a trust file restore-begin cannot use (ErrTrustUnusable,
 // ErrRSKReused, the Task 8 hand-off), is refused; a realm mismatch, and a
 // halted installed trust (T4), is trust; a database with no meta row

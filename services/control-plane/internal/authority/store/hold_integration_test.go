@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -807,39 +808,41 @@ func TestPurgeAndRequiredDoNotDeadlock(t *testing.T) {
 		return err != nil && ((errors.As(err, &st) && st.SQLState() == "40P01") ||
 			strings.Contains(err.Error(), "40P01") || strings.Contains(err.Error(), "deadlock detected"))
 	}
-	waiters := func() int {
-		var n int
-		if err := e.f.Super.QueryRow(`SELECT count(DISTINCT l.pid) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
-			WHERE NOT l.granted AND a.datname = current_database()`).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-	// awaitWaiters blocks until n backends wait on a lock. A side that returns
-	// first has not reached the interleaving: the fixture is wrong, and the
-	// test says so instead of timing out.
-	awaitWaiters := func(n int, side string, done <-chan error) {
+	// awaitWaiters blocks until n backends wait on a row lock of rel
+	// (rowLockWaiters). A side that returns first has not reached the
+	// interleaving: the fixture is wrong, and the test says so instead of
+	// timing out.
+	awaitWaiters := func(n int, rel, side string, done <-chan error) {
 		t.Helper()
 		deadline := time.Now().Add(8 * time.Second)
-		for waiters() < n {
+		seen := ""
+		for rowLockWaiters(t, e.f.Super, rel) < n {
+			if d := lockDump(e.f.Super); d != "" {
+				seen = d
+			}
 			select {
 			case err := <-done:
-				t.Fatalf("%s returned %v before waiting on the held row: the interleaving was never reached", side, err)
+				t.Fatalf("%s returned %v before waiting on the held row: the interleaving was never reached; last locks: %s", side, err, seen)
 			default:
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("fewer than %d lock waiters after 8 s (%s)", n, side)
+				t.Fatalf("fewer than %d waiters on %s row locks after 8 s (%s)", n, rel, side)
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 
+	// requiredRel is where ReconcileRequired waits on what is held. Purge waits
+	// on the head row in both cases (behind required's own wait for it, or behind
+	// the head required already locked while it waits for meta); purgeWaiters is
+	// how many backends are then waiting on the head row.
 	holds := []struct {
-		name, q string
-		args    []any
+		name, requiredRel, q string
+		purgeWaiters         int
+		args                 []any
 	}{
-		{"the head row held", `SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, []any{a.ID}},
-		{"meta held", `SELECT 1 FROM authority.meta WHERE id = 1 FOR UPDATE`, nil},
+		{"the head row held", "authority.account_heads", `SELECT 1 FROM authority.account_heads WHERE account_id = $1 FOR UPDATE`, 2, []any{a.ID}},
+		{"meta held", "authority.meta", `SELECT 1 FROM authority.meta WHERE id = 1 FOR UPDATE`, 1, nil},
 	}
 	for _, held := range holds {
 		for i := range 10 {
@@ -860,12 +863,12 @@ func TestPurgeAndRequiredDoNotDeadlock(t *testing.T) {
 			t.Cleanup(cancel)
 			required, purged := make(chan error, 1), make(chan error, 1)
 			go func() { required <- e.s.ReconcileRequired(ctx, body) }()
-			awaitWaiters(1, "ReconcileRequired", required)
+			awaitWaiters(1, held.requiredRel, "ReconcileRequired", required)
 			go func() {
 				_, err := e.s.Purge(ctx)
 				purged <- err
 			}()
-			awaitWaiters(2, "Purge", purged)
+			awaitWaiters(held.purgeWaiters, "authority.account_heads", "Purge", purged)
 			if err := holder.Rollback(); err != nil { // release the held row: the pair now races for it
 				t.Fatal(err)
 			}
@@ -905,10 +908,52 @@ func startHold(rs *restored, body []byte) <-chan holdResult {
 	return ch
 }
 
-// awaitWaiters blocks until n backends wait on a lock. A hold that returns
-// first never reached the interleaving, so the test fails saying so: the lock
-// it should have waited on was not taken.
-func awaitWaiters(t *testing.T, super *sql.DB, n int, side string, done <-chan holdResult) {
+// rowLockWaiters is the number of backends waiting on a row lock of rel, an
+// authority table: a backend with an ungranted tuple or transactionid lock that
+// also holds or queues for a tuple lock on rel. A row lock that must wait takes
+// rel's tuple lock first (granted to the first waiter, queued for every later
+// one) and then waits on the holder's transaction, so matching the relation and
+// the lock type counts this fixture's waiters and not any backend of the shared
+// test database that happens to be blocked on something else.
+func rowLockWaiters(t *testing.T, super *sql.DB, rel string) int {
+	t.Helper()
+	var n int
+	if err := super.QueryRow(`SELECT count(DISTINCT w.pid) FROM pg_locks w
+		WHERE NOT w.granted AND w.locktype IN ('tuple', 'transactionid')
+		AND w.pid IN (SELECT r.pid FROM pg_locks r JOIN pg_database d ON d.oid = r.database
+			WHERE r.locktype = 'tuple' AND d.datname = current_database() AND r.relation = $1::regclass)`, rel).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// lockDump is every ungranted lock and every tuple lock, as text, for a failure
+// message that has to say what the backends were actually waiting on.
+func lockDump(super *sql.DB) string {
+	rows, err := super.Query(`SELECT pid, locktype, COALESCE(relation::regclass::text, ''), mode, granted FROM pg_locks
+		WHERE NOT granted OR locktype = 'tuple' ORDER BY pid`)
+	if err != nil {
+		return err.Error()
+	}
+	defer func() { _ = rows.Close() }()
+	var b strings.Builder
+	for rows.Next() {
+		var pid int
+		var lt, rel, mode string
+		var granted bool
+		if err := rows.Scan(&pid, &lt, &rel, &mode, &granted); err != nil {
+			return err.Error()
+		}
+		fmt.Fprintf(&b, "[pid %d %s %s %s granted=%v] ", pid, lt, rel, mode, granted)
+	}
+	return b.String()
+}
+
+// awaitWaiters blocks until n backends wait on a row lock of rel (rowLockWaiters),
+// polling every 2 ms so the step that follows starts well inside the waiters'
+// 2 s lock_timeout. A hold that returns first never reached the interleaving, so
+// the test fails saying so: the lock it should have waited on was not taken.
+func awaitWaiters(t *testing.T, super *sql.DB, n int, rel, side string, done <-chan holdResult) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -917,17 +962,12 @@ func awaitWaiters(t *testing.T, super *sql.DB, n int, side string, done <-chan h
 			t.Fatalf("%s returned (%v) before it waited on the lock held elsewhere: the interleaving was never reached", side, r.err)
 		default:
 		}
-		var waiting int
-		if err := super.QueryRow(`SELECT count(DISTINCT l.pid) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
-			WHERE NOT l.granted AND a.datname = current_database()`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting >= n {
+		if rowLockWaiters(t, super, rel) >= n {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("fewer than %d lock waiters after 5 s (%s)", n, side)
+	t.Fatalf("fewer than %d waiters on %s row locks after 5 s (%s): %s", n, rel, side, lockDump(super))
 }
 
 func waitHold(t *testing.T, done <-chan holdResult) holdResult {
@@ -1005,7 +1045,7 @@ func TestHoldAfterAConcurrentCompleteIsReconciled(t *testing.T) {
 		blocker := reconcileBlocker(t, rs, "")
 
 		done := startHold(rs, holdReqBytes(t, rs.ahead[0]))
-		awaitWaiters(t, rs.e.f.Super, 1, "ReconcileHold", done)
+		awaitWaiters(t, rs.e.f.Super, 1, "authority.meta", "ReconcileHold", done)
 		if err := blocker.Commit(); err != nil {
 			t.Fatal(err)
 		}
@@ -1023,7 +1063,7 @@ func TestHoldAfterAConcurrentCompleteIsReconciled(t *testing.T) {
 		blocker := reconcileBlocker(t, rs, rs.accts[0].ID)
 
 		done := startHold(rs, holdReqBytes(t, rs.ahead[0]))
-		awaitWaiters(t, rs.e.f.Super, 1, "ReconcileHold", done)
+		awaitWaiters(t, rs.e.f.Super, 1, "authority.account_heads", "ReconcileHold", done) // the head the complete locked
 		if err := blocker.Commit(); err != nil {
 			t.Fatal(err)
 		}
@@ -1067,7 +1107,7 @@ func TestHoldBeforeAConcurrentCompleteIsCounted(t *testing.T) {
 	}
 
 	done := startHold(rs, holdReqBytes(t, rs.ahead[0]))
-	awaitWaiters(t, rs.e.f.Super, 1, "ReconcileHold", done) // the hold has its head and waits for meta
+	awaitWaiters(t, rs.e.f.Super, 1, "authority.meta", "ReconcileHold", done) // the hold has its head and waits for meta
 	type completeResult struct {
 		counts ReconcileCounts
 		err    error
@@ -1077,7 +1117,7 @@ func TestHoldBeforeAConcurrentCompleteIsCounted(t *testing.T) {
 		c, err := o.ReconcileComplete(context.Background())
 		completed <- completeResult{c, err}
 	}()
-	awaitWaiters(t, rs.e.f.Super, 2, "ReconcileComplete", done) // and the complete waits for that head
+	awaitWaiters(t, rs.e.f.Super, 1, "authority.account_heads", "ReconcileComplete", done) // and the complete waits for that head
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
