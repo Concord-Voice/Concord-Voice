@@ -3,6 +3,7 @@ package mfa
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -25,11 +26,19 @@ type RekeyResult struct {
 
 // Rekey re-encrypts every user_mfa_totp row not sealed under ring's active
 // version (#2307). Operational properties the rotation runbook depends on:
-//   - per-row autocommit UPDATE: a crash mid-run leaves a decryptable mixed
+//   - one transaction per row: a crash mid-run leaves a decryptable mixed
 //     state (the retired key is still in the ring) and a re-run converges;
-//   - CAS tail (key_version + prior ciphertext) makes a concurrent
-//     re-enrollment a harmless skip — server writes are always active-version;
-//   - keyset pagination on user_id::text advances past failed rows, so an
+//   - each row's transaction sets concord.credential_rewrap='mfa-rekey'
+//     (transaction-local), so migration 000189's material trigger treats the
+//     rewrap as no change of material (#3680 H1); no other code may set it.
+//     A rewrap the trigger nonetheless treats as material is rolled back and
+//     aborts the run, so the fallback is never silent;
+//   - CAS tail (key_version + prior ciphertext + material_version) makes a
+//     concurrent re-enrollment or confirmation a harmless skip — server writes
+//     are always active-version;
+//   - an aborted run still returns the partial result, the failed rows
+//     included;
+//   - keyset pagination on user_id advances past failed rows, so an
 //     undecryptable row cannot loop the scan;
 //   - dryRun reports the pending count and mutates nothing.
 func Rekey(ctx context.Context, db *sql.DB, ring *Keyring, batchSize int, dryRun bool) (RekeyResult, error) {
@@ -68,11 +77,13 @@ func Rekey(ctx context.Context, db *sql.DB, ring *Keyring, batchSize int, dryRun
 	}
 }
 
-// rekeyOutcome classifies what happened to a single row.
+// rekeyOutcome classifies what happened to a single row. The zero value is
+// rekeyAborted, so an outcome left unset never counts as a re-sealed row.
 type rekeyOutcome int
 
 const (
-	rekeyDone      rekeyOutcome = iota // re-sealed to the active version
+	rekeyAborted   rekeyOutcome = iota // infrastructure failure; only ever paired with a non-nil error
+	rekeyDone                          // re-sealed to the active version
 	rekeySkipped                       // CAS guard matched 0 rows (concurrent rewrite)
 	rekeyFailedRow                     // could not decrypt/re-seal; left untouched
 )
@@ -91,12 +102,12 @@ func applyBatch(ctx context.Context, db *sql.DB, ring *Keyring, batch []pendingR
 			return cursor, err
 		}
 		switch outcome {
+		case rekeyDone:
+			res.Rekeyed++
 		case rekeySkipped:
 			res.Skipped++
 		case rekeyFailedRow:
 			res.Failed = append(res.Failed, *failure)
-		default:
-			res.Rekeyed++
 		}
 	}
 	return cursor, nil
@@ -105,7 +116,7 @@ func applyBatch(ctx context.Context, db *sql.DB, ring *Keyring, batch []pendingR
 // rekeyRow re-seals one pending row to ring's active version. A decrypt/re-seal
 // failure returns rekeyFailedRow + a *RekeyFailure and leaves the row untouched
 // (nil error — the run continues). A non-nil error is an infrastructure failure
-// that aborts the run.
+// that aborts the run; it names the row and comes with rekeyAborted.
 func rekeyRow(ctx context.Context, db *sql.DB, ring *Keyring, r pendingRow) (rekeyOutcome, *RekeyFailure, error) {
 	plain, err := ring.Open(r.enc, r.nonce, r.version)
 	if err != nil {
@@ -120,22 +131,73 @@ func rekeyRow(ctx context.Context, db *sql.DB, ring *Keyring, r pendingRow) (rek
 		return rekeyFailedRow, &RekeyFailure{UserID: r.userID, SealedVersion: r.version, Err: err}, nil
 	}
 
-	tag, err := db.ExecContext(ctx, `
-		UPDATE user_mfa_totp
-		   SET totp_secret_enc = $1, totp_secret_nonce = $2, key_version = $3, updated_at = NOW()
-		 WHERE user_id = $4 AND key_version = $5 AND totp_secret_enc = $6`,
-		newEnc, newNonce, newVer, r.userID, r.version, r.enc)
+	n, err := resealRowTx(ctx, db, r, newEnc, newNonce, newVer)
 	if err != nil {
-		return rekeyDone, nil, fmt.Errorf("update row: %w", err)
-	}
-	n, err := tag.RowsAffected()
-	if err != nil {
-		return rekeyDone, nil, fmt.Errorf("rows affected: %w", err)
+		return rekeyAborted, nil, fmt.Errorf("reseal user %s (key_version %d): %w", r.userID, r.version, err)
 	}
 	if n == 0 {
 		return rekeySkipped, nil, nil // concurrent rewrite (server writes are active-version)
 	}
 	return rekeyDone, nil, nil
+}
+
+// rewrapFlag and rewrapValue name the transaction-local setting migration
+// 000189's material trigger reads to exempt a rewrap of the same secret.
+const (
+	rewrapFlag  = "concord.credential_rewrap"
+	rewrapValue = "mfa-rekey"
+)
+
+// resealRowTx writes one re-sealed row in its own transaction under the rewrap
+// flag and returns the rows written (0 = the CAS lost to a concurrent write).
+// The flag is set with is_local = true, so it ends with the transaction and
+// cannot exempt a later statement on the same pooled connection.
+//
+// The CAS pins the material_version read with the batch, so when it matches,
+// the trigger's OLD.material_version is that value, and a different value from
+// RETURNING means the trigger did not apply the rewrap exemption and drew a new
+// version (its fail-closed fallback). That is an error, returned before Commit,
+// so the row is rolled back and the run aborts rather than silently re-stamping
+// a credential as newly enrolled.
+//
+// The deferred rollback discards any transaction that did not commit (a failed
+// statement, a later error, a cancelled context) and joins its own failure into
+// the returned error. A Commit error is returned, but it does not prove the row
+// was not written; a re-run converges either way, because a row already
+// re-sealed is no longer pending.
+func resealRowTx(ctx context.Context, db *sql.DB, r pendingRow, enc, nonce []byte, ver int) (_ int64, err error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return 0, fmt.Errorf("begin row transaction: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			err = errors.Join(err, fmt.Errorf("rollback row transaction: %w", rbErr))
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, `SELECT set_config($1, $2, true)`, rewrapFlag, rewrapValue); err != nil {
+		return 0, fmt.Errorf("set rewrap flag: %w", err)
+	}
+	var written int64
+	err = tx.QueryRowContext(ctx, `
+		UPDATE user_mfa_totp
+		   SET totp_secret_enc = $1, totp_secret_nonce = $2, key_version = $3, updated_at = NOW()
+		 WHERE user_id = $4 AND key_version = $5 AND totp_secret_enc = $6 AND material_version = $7
+		RETURNING material_version`,
+		enc, nonce, ver, r.userID, r.version, r.enc, r.materialVersion).Scan(&written)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil // the CAS lost: a concurrent write changed the row
+	}
+	if err != nil {
+		return 0, fmt.Errorf("update row: %w", err)
+	}
+	if written != r.materialVersion {
+		return 0, fmt.Errorf("rewrap exemption not applied for user %s: material_version changed", r.userID)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit row transaction: %w", err)
+	}
+	return 1, nil
 }
 
 // zeroUUID is the keyset-pagination first-page sentinel (see Rekey). No real
@@ -144,18 +206,20 @@ const zeroUUID = "00000000-0000-0000-0000-000000000000"
 
 // pendingRow is one user_mfa_totp row awaiting re-encryption.
 type pendingRow struct {
-	userID  string
-	enc     []byte
-	nonce   []byte
-	version int
+	userID          string
+	enc             []byte
+	nonce           []byte
+	version         int   // key_version: the sealing key
+	materialVersion int64 // migration 000189's material_version, pinned by the CAS
 }
 
 // fetchPendingBatch pages through rows not sealed under the active version,
-// keyset-ordered by user_id::text so the caller's cursor advances past rows it
-// could not process.
-func fetchPendingBatch(ctx context.Context, db *sql.DB, active int, cursor string, batchSize int) ([]pendingRow, error) {
+// keyset-ordered by user_id so the caller's cursor advances past rows it
+// could not process. A failure to close the result set is returned like any
+// other read error, with no batch.
+func fetchPendingBatch(ctx context.Context, db *sql.DB, active int, cursor string, batchSize int) (batch []pendingRow, err error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT user_id, totp_secret_enc, totp_secret_nonce, key_version
+		SELECT user_id, totp_secret_enc, totp_secret_nonce, key_version, material_version
 		  FROM user_mfa_totp
 		 WHERE key_version <> $1 AND user_id > $2::uuid
 		 ORDER BY user_id
@@ -163,17 +227,22 @@ func fetchPendingBatch(ctx context.Context, db *sql.DB, active int, cursor strin
 	if err != nil {
 		return nil, fmt.Errorf("select pending rows: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if cerr := rows.Close(); cerr != nil {
+			batch = nil
+			err = errors.Join(err, fmt.Errorf("close pending rows: %w", cerr))
+		}
+	}()
 
-	batch := make([]pendingRow, 0, batchSize)
+	batch = make([]pendingRow, 0, batchSize)
 	for rows.Next() {
 		var r pendingRow
-		if err := rows.Scan(&r.userID, &r.enc, &r.nonce, &r.version); err != nil {
+		if err = rows.Scan(&r.userID, &r.enc, &r.nonce, &r.version, &r.materialVersion); err != nil {
 			return nil, fmt.Errorf("scan pending row: %w", err)
 		}
 		batch = append(batch, r)
 	}
-	if err := rows.Err(); err != nil {
+	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate pending rows: %w", err)
 	}
 	return batch, nil

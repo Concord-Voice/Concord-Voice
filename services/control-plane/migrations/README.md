@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000188)
+## Existing Migrations (000001–000189)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -298,6 +298,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000186 | billing_credit_outbox | Pending D1 code credits, committed with the code claim and applied to Stripe afterwards; down refuses while any credit is pending |
 | 000187 | subscription_plan_changes | Stores each subscriber's discounted Stripe unit amount and the app-owned pending plan change; rollback refuses while Stripe subscriptions exist (#2033; 000186 belongs to #4085) |
 | 000188 | subscription_seats | Wing +1 seats: one open seat per Wing subscription and one active seat per holder, 7-day invites, cascading with the parent and both users; down refuses while any seat is pending or active (#2470). |
+| 000189 | accountguard_maturity | Credential maturity, material versions, provenance and contest columns on `users` and the four factor tables, material triggers (all `ENABLE ALWAYS`) with the `mfa-rekey` rewrap exemption, the global `accountguard_material_version_seq` (START 2) that numbers every insert and material change of `users.password_version`, `users.email_version` and the four factor tables' `material_version` so a re-enrolled credential never reuses a version, and the dormant `accountguard_state` marker; down runs under `lock_timeout = '3s'`, refuses while activated or while any credential is contested, and drops the sequence (#3680) |
 
 ### Message key-version constraints (migrations 000171–000176, #2844)
 

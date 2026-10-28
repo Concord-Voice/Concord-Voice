@@ -2,9 +2,11 @@ package migrationrunner_test
 
 import (
 	"database/sql"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -193,4 +195,83 @@ func TestRun_UpFailureIsReported(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&versionAfter, &dirty))
 	require.Equal(t, versionBefore, versionAfter, "a refused Up must not move the recorded version")
 	require.False(t, dirty, "a refused Up must not mark the database dirty")
+}
+
+// E1 pins (#3680). Both pass by design: they pin existing golang-migrate and
+// Run behaviour, and mutation M7 (runner.go ignoring every Up error) is their
+// control. An image older than the database's recorded version must refuse to
+// start, not downgrade quietly: golang-migrate's readUp fails versionExists for
+// a recorded version the source lacks, and Run treats that as fatal.
+
+// writeMigrationPair writes <version>_<name>.up.sql / .down.sql creating and
+// dropping a table of that name.
+func writeMigrationPair(t *testing.T, dir string, version int, name string) {
+	t.Helper()
+	base := filepath.Join(dir, fmt.Sprintf("%d_%s", version, name))
+	require.NoError(t, os.WriteFile(base+".up.sql", []byte("CREATE TABLE "+name+" (id integer);\n"), 0o600))
+	require.NoError(t, os.WriteFile(base+".down.sql", []byte("DROP TABLE "+name+";\n"), 0o600))
+}
+
+func TestRun_OlderSourceRefusesNewerSchema(t *testing.T) {
+	db := freshSchemaDB(t)
+
+	newer := t.TempDir()
+	writeMigrationPair(t, newer, 1, "a")
+	writeMigrationPair(t, newer, 2, "b")
+	require.NoError(t, migrationrunner.Run(db, "file://"+newer))
+
+	older := t.TempDir()
+	writeMigrationPair(t, older, 1, "a")
+	err := migrationrunner.Run(db, "file://"+older)
+	require.ErrorContains(t, err, "could not run migrations")
+	require.ErrorContains(t, err, "no migration found for version 2")
+
+	var version int
+	var dirty bool
+	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+	require.Equal(t, 2, version, "a refused Up must not downgrade the recorded version")
+	require.False(t, dirty)
+
+	var bExists bool
+	require.NoError(t, db.QueryRow(`SELECT to_regclass(quote_ident(current_schema()) || '.b') IS NOT NULL`).Scan(&bExists))
+	require.True(t, bExists, "the newer migration's table must still exist")
+}
+
+func TestRun_ControlPlaneTreeWithoutNewestRefuses(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+
+	var head int
+	require.NoError(t, db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&head))
+
+	src := filepath.Join("..", "..", "migrations")
+	entries, err := os.ReadDir(src)
+	require.NoError(t, err)
+	older := t.TempDir()
+	copied := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".sql") || len(name) < 6 {
+			continue
+		}
+		prefix, convErr := strconv.Atoi(name[:6])
+		if convErr != nil || prefix >= head {
+			continue
+		}
+		// #nosec G304 -- name comes from os.ReadDir of the repository's own migrations directory.
+		body, readErr := os.ReadFile(filepath.Join(src, name))
+		require.NoError(t, readErr)
+		// #nosec G703 -- name is a bare file name from os.ReadDir of the repository's migrations directory.
+		require.NoError(t, os.WriteFile(filepath.Join(older, name), body, 0o600)) //nolint:gosec // see above
+		copied++
+	}
+	require.Positive(t, copied, "the older tree must not be empty")
+
+	err = migrationrunner.Run(db, "file://"+older)
+	require.ErrorContains(t, err, fmt.Sprintf("no migration found for version %d", head))
+
+	var after int
+	var dirty bool
+	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&after, &dirty))
+	require.Equal(t, head, after)
+	require.False(t, dirty)
 }

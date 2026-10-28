@@ -13,7 +13,8 @@
 //	mfa-rekey               # re-seal them under the active version
 //
 // Exit status: 0 on convergence; 1 if any row could not be decrypted (those
-// rows are reported on stderr and left untouched); 2 on usage errors.
+// rows are reported on stderr and left untouched) or the run aborted (its
+// partial result, failed rows included, is still printed); 2 on usage errors.
 package main
 
 import (
@@ -45,9 +46,9 @@ func main() {
 
 // runMain is the testable orchestration behind main: parse flags, build the
 // keyring, connect, run the backfill, report. It returns the process exit code
-// (0 converged, 1 some rows failed, 2 setup/usage error) instead of calling
-// os.Exit, so an integration test can drive it against a real DB. Setup errors
-// go to stderr — never key material.
+// (0 converged, 1 some rows failed or the run aborted, 2 setup/usage error)
+// instead of calling os.Exit, so an integration test can drive it against a
+// real DB. Setup errors go to stderr — never key material.
 func runMain(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("mfa-rekey", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -92,6 +93,13 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	res, err := mfa.Rekey(runCtx, db, ring, opts.BatchSize, opts.DryRun)
 	if err != nil {
+		// An aborted live run still reports what it did before the abort. The
+		// undecryptable rows matter most: they are the operator's remediation
+		// list, and nothing else records them. A dry run has no partial result.
+		if !opts.DryRun {
+			_, _ = fmt.Fprintln(stdout, "rekey aborted; partial result:")
+			_ = report(res, false, ring.ActiveVersion(), stdout, stderr)
+		}
 		_, _ = fmt.Fprintf(stderr, "rekey: %v\n", err)
 		return 1
 	}
