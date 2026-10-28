@@ -2,9 +2,9 @@
  * SPA LKG cache protocol handler — memo HIT reuse + invalidation (Finding E1).
  *
  * The serve handler memoizes the signature-verified manifest keyed by
- * sha256(on-disk manifest bytes): a memo HIT reuses the parsed fileMap WITHOUT
- * re-running the (RSA) verifyManifest, while a change in the on-disk manifest
- * bytes invalidates the memo and forces a re-verify. The sibling
+ * hashes of manifest bytes and normalized signature: a memo HIT reuses the fileMap WITHOUT
+ * re-running the (RSA) verifyManifest, while a change in either verification
+ * input invalidates the memo and forces a re-verify. The sibling
  * `cacheProtocol.test.ts` resets the memo every case, so neither the HIT nor the
  * invalidation branch is exercised across two requests. This file deliberately
  * does NOT reset the memo between the two requests within each test so those
@@ -167,5 +167,50 @@ describe('handleCacheProtocolRequest memo (#1870 Finding E1)', () => {
     );
     expect(second.status).toBe(404);
     expect(verifyManifestSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a changed detached signature for an unchanged manifest after a valid cached request (#1934)', async () => {
+    installLiveCache();
+    const manifestPath = path.join(getLiveDir(), SPA_MANIFEST_FILENAME);
+    const signaturePath = path.join(getLiveDir(), SPA_MANIFEST_SIG_FILENAME);
+    const originalManifest = fs.readFileSync(manifestPath);
+    const originalSignature = fs.readFileSync(signaturePath, 'utf8');
+
+    const first = await handleCacheProtocolRequest(
+      new Request('spa-cache://concord/index.html'),
+      getLiveRoot
+    );
+    expect(first.status).toBe(200);
+    expect(await first.text()).toBe(ENTRY_HTML.toString());
+    expect(verifyManifestSpy).toHaveBeenCalledTimes(1);
+
+    // Keep the encoding and length valid so only RSA verification can reject it.
+    // Neither the signed manifest nor any served asset changes.
+    const changedSignature = Buffer.from(originalSignature, 'base64');
+    changedSignature[0] ^= 1;
+    fs.writeFileSync(signaturePath, changedSignature.toString('base64'));
+    expect(fs.readFileSync(manifestPath)).toEqual(originalManifest);
+    expect(fs.readFileSync(signaturePath, 'utf8')).not.toBe(originalSignature);
+
+    const rejected = await handleCacheProtocolRequest(
+      new Request('spa-cache://concord/index.html'),
+      getLiveRoot
+    );
+    expect(rejected.status, 'a changed detached signature must invalidate a verified memo').toBe(
+      404
+    );
+    expect(await rejected.text()).toBe('');
+    expect(verifyManifestSpy).toHaveBeenCalledTimes(2);
+
+    // Restoring a valid signature must recover through verification, not the
+    // memo that belonged to the signature rejected by the previous request.
+    fs.writeFileSync(signaturePath, originalSignature);
+    const restored = await handleCacheProtocolRequest(
+      new Request('spa-cache://concord/index.html'),
+      getLiveRoot
+    );
+    expect(restored.status).toBe(200);
+    expect(await restored.text()).toBe(ENTRY_HTML.toString());
+    expect(verifyManifestSpy).toHaveBeenCalledTimes(3);
   });
 });

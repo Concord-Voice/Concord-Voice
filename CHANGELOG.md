@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+The desktop app now re-checks its saved copy of the web app whenever that copy's
+signature changes, and refuses to load it if the new signature is not valid.
+
 Switching from a monthly to a yearly plan now works again. It credits the unused
 part of the month and keeps your billing date. Subscribing twice at the same time,
 for example from two windows, no longer creates a second subscription; the second

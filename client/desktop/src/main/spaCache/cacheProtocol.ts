@@ -92,13 +92,14 @@ export function resolveCachePath(requestUrl: string, liveRoot: string): CachePat
 // ── Memoized signature-verified manifest ───────────────────────────────────
 // An RSA-PSS verify per subresource request would be wasteful (a page pulls many
 // JS/CSS/font assets). Memoize the parsed manifest + path map keyed by the
-// sha256 of the on-disk manifest bytes: each call reads the (small) manifest
-// bytes and hashes them (both cheap); only a key change re-runs verifyManifest
+// sha256 of the manifest bytes and normalized signature value: each call reads
+// and hashes both verification inputs; only a key change re-runs verifyManifest
 // (RSA). The memo holds nothing trustworthy on its own — it is recomputed
-// whenever the on-disk manifest bytes change, and invalidated (returns null)
+// whenever either verification input changes, and invalidated (returns null)
 // whenever the manifest is absent or fails verification.
 interface MemoEntry {
   manifestHash: string;
+  signatureHash: string;
   fileMap: Map<string, SpaManifestFile>;
 }
 let memo: MemoEntry | null = null;
@@ -114,8 +115,8 @@ function buildFileMap(manifest: SpaManifest): Map<string, SpaManifestFile> {
 
 /**
  * Return the file map of the signature-verified live manifest, or null when no
- * trustworthy manifest exists. Cheap fast-path: if the on-disk manifest bytes
- * hash to the memoized key, reuse the parsed map; otherwise run the full
+ * trustworthy manifest exists. Cheap fast-path: if the manifest bytes and
+ * normalized signature hash to the memoized keys, reuse the parsed map; otherwise run the full
  * verification once and re-cache.
  */
 function getVerifiedManifestFileMap(): Map<string, SpaManifestFile> | null {
@@ -125,7 +126,8 @@ function getVerifiedManifestFileMap(): Map<string, SpaManifestFile> | null {
     return null;
   }
   const manifestHash = createHash('sha256').update(live.manifestBytes).digest('hex');
-  if (memo && memo.manifestHash === manifestHash) {
+  const signatureHash = createHash('sha256').update(live.signatureBase64).digest('hex');
+  if (memo && memo.manifestHash === manifestHash && memo.signatureHash === signatureHash) {
     return memo.fileMap;
   }
   const verified = verifyManifest({
@@ -140,7 +142,7 @@ function getVerifiedManifestFileMap(): Map<string, SpaManifestFile> | null {
     return null;
   }
   const fileMap = buildFileMap(verified.manifest);
-  memo = { manifestHash, fileMap };
+  memo = { manifestHash, signatureHash, fileMap };
   return fileMap;
 }
 
