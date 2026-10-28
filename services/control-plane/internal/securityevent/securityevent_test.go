@@ -126,6 +126,8 @@ func TestWriterCoalescesDuplicatesWithBoundedCount(t *testing.T) {
 	clock := newFakeClock(time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC))
 	path := filepath.Join(t.TempDir(), "events.jsonl")
 	w := newWriter(path, ServiceControlPlane, nil, clock.Now, newUUIDv4)
+	timers := &manualTimerFactory{}
+	w.afterFunc = timers.AfterFunc
 	ctx := withCorrelation(context.Background(), "corr_0123456789abcdef")
 	for range maxEventCount + 10 {
 		w.Emit(ctx, testEvent(""))

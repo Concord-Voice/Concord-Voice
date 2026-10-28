@@ -80,6 +80,11 @@ var errNoLiveSubscription = errors.New("billing: portal: no live stripe subscrip
 // marker: the operator has not bootstrapped this Stripe account.
 var errNoPortalConfiguration = errors.New("billing: portal: no active concord configuration")
 
+// errPortalPlanSwitching means Concord's configuration still allows plan
+// switching. Plan changes go through the app (it previews and books them), so a
+// configuration bootstrapped before that change is refused, not used.
+var errPortalPlanSwitching = errors.New("billing: portal: concord configuration allows plan switching")
+
 // portalRequest is the request body. Flow is optional; empty means no deep link.
 type portalRequest struct {
 	Flow string `json:"flow"`
@@ -268,6 +273,9 @@ func (s *Service) portalConfigID(ctx context.Context) (string, error) {
 			return "", withStage("list_portal_configurations", fmt.Errorf("billing: portal: list configurations: %w", err))
 		}
 		if pc.Metadata[PortalMetadataKey] == PortalMetadataVersion {
+			if pc.Features != nil && pc.Features.SubscriptionUpdate != nil && pc.Features.SubscriptionUpdate.Enabled {
+				return "", errPortalPlanSwitching
+			}
 			s.portalConfig.set(pc.ID, s.now().Add(portalConfigTTL))
 			return pc.ID, nil
 		}
@@ -280,6 +288,11 @@ func (s *Service) portalConfigID(ctx context.Context) (string, error) {
 func (s *Service) logPortalConfigFailure(err error) {
 	if errors.Is(err, errNoPortalConfiguration) {
 		s.Log.Error("billing: no active Customer Portal configuration is marked for Concord; run the Stripe bootstrap",
+			"marker_key", PortalMetadataKey, "marker_value", PortalMetadataVersion)
+		return
+	}
+	if errors.Is(err, errPortalPlanSwitching) {
+		s.Log.Error("billing: the Customer Portal configuration allows plan switching; run the Stripe bootstrap",
 			"marker_key", PortalMetadataKey, "marker_value", PortalMetadataVersion)
 		return
 	}

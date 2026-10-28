@@ -862,6 +862,11 @@ func TestStoppedVerbAbortsWhenTheServeLockSessionDies(t *testing.T) {
 		select {
 		case <-ctx.Done():
 		case <-time.After(ServeLockWatchInterval + RolePollInterval + time.Second):
+			t.Error("fixture timed out waiting for serve-lock cancellation")
+			return errors.New("fixture timed out waiting for serve-lock cancellation")
+		}
+		if !errors.Is(context.Cause(ctx), ErrServeLockLost) {
+			t.Fatalf("callback returned before serve-lock cancellation: cause = %v", context.Cause(ctx))
 		}
 		return nil
 	})

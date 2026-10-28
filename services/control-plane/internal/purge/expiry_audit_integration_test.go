@@ -324,12 +324,12 @@ func TestReconcileExpiryCommit(t *testing.T) {
 		assert.Equal(t, 3, res.DeletedCount)
 	})
 
-	t.Run("an absent row means nothing committed: no PurgeID is claimed", func(t *testing.T) {
+	t.Run("an absent row after a transport failure preserves the error and claims nothing", func(t *testing.T) {
 		s := channelExpiryAuditScope(t)
 		res, err := s.engine().reconcileExpiryCommit(context.Background(), uuid.NewString(), commitErr)
 		require.ErrorIs(t, err, commitErr)
 		assert.Equal(t, Result{}, res)
-		assert.NotContains(t, err.Error(), "outcome unknown")
+		// A terminal read can time out after earlier absent reads, leaving the outcome unknown.
 	})
 
 	t.Run("a COMMIT still landing after the first read is found, not reported absent", func(t *testing.T) {
@@ -361,9 +361,30 @@ func TestReconcileExpiryCommit(t *testing.T) {
 		started := time.Now()
 		res, err := s.engine().reconcileExpiryCommit(context.Background(), uuid.NewString(), refused)
 		require.ErrorIs(t, err, refused)
+		assert.NotContains(t, err.Error(), "outcome unknown", "a server refusal proves rollback")
 		assert.Equal(t, Result{}, res)
 		assert.Less(t, time.Since(started), expiryReconcileRetryInterval,
 			"a refusal the server answered is settled by the first read")
+	})
+
+	t.Run("a blocked audit read leaves the outcome unknown and claims nothing", func(t *testing.T) {
+		s := channelExpiryAuditScope(t)
+		purgeID := uuid.NewString()
+		ctx := t.Context()
+		blocker, err := s.db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, blocker.Rollback()) }()
+		_, err = blocker.ExecContext(ctx, `LOCK TABLE message_purges IN ACCESS EXCLUSIVE MODE`)
+		require.NoError(t, err)
+		var rows int
+		require.NoError(t, blocker.QueryRowContext(ctx,
+			`SELECT count(*) FROM message_purges WHERE id = $1`, purgeID).Scan(&rows))
+		require.Zero(t, rows, "the row is absent, but the reconciliation read cannot prove it")
+
+		res, err := s.engine().reconcileExpiryCommit(context.Background(), purgeID, commitErr)
+		require.ErrorIs(t, err, commitErr)
+		assert.Contains(t, err.Error(), "outcome unknown")
+		assert.Equal(t, Result{}, res)
 	})
 
 	t.Run("an unreadable row leaves the outcome unknown and claims nothing", func(t *testing.T) {

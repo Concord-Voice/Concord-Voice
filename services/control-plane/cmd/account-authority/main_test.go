@@ -768,11 +768,17 @@ func TestMigrateDialErrorNeverNamesItsSocket(t *testing.T) {
 // and its refusal quotes neither host nor port. (A real TCP dial error is
 // covered by TestExitTextOfTheErrorsLibpqReallyReturns.)
 func TestMigrateRefusesATCPURLWithoutQuotingIt(t *testing.T) {
-	port := closedPort(t)
+	port := sentinelPort
 	migrateEnv(t, "postgres://authority_owner@127.0.0.1:"+port+"/db?sslmode=disable")
 	code, stdout, _ := run("migrate", "--realm", uuid.NewString())
 	m := exitLine(t, code, stdout, "config")
-	if got := errorOf(t, m); !strings.Contains(got, "TCP is refused") || strings.Contains(stdout, "127.0.0.1") || strings.Contains(stdout, port) {
+	// A port substring in the log timestamp is not an endpoint disclosure.
+	delete(m, "time")
+	fields, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := errorOf(t, m); !strings.Contains(got, "TCP is refused") || strings.Contains(string(fields), "127.0.0.1") || strings.Contains(string(fields), port) {
 		t.Fatalf("TCP URL: %q", stdout)
 	}
 }

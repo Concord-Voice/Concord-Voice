@@ -98,7 +98,7 @@ func TestPlanChange_UpgradeInvoicesProratedDifferenceAndKeepsRenewal(t *testing.
 	previews := env.Fake.requestsTo(http.MethodPost, "/v1/invoices/create_preview")
 	require.Len(t, previews, 2)
 	assert.Equal(t, previews[1].Form.Get("subscription_details[proration_date]"), updates[0].Form.Get("proration_date"))
-	assert.Equal(t, "unchanged", updates[0].Form.Get("billing_cycle_anchor"))
+	assert.Equal(t, "unchanged", updates[0].Form.Get("billing_cycle_anchor[type]"))
 	assert.Equal(t, "price_WM", updates[0].Form.Get("items[0][price]"))
 	assert.NotContains(t, updates[0].Form, "discounts", "existing founders discount stays on the subscription")
 	var plan string
@@ -114,7 +114,12 @@ func TestPlanChange_MonthToYearCreditsUnusedMonth(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	updates := env.Fake.requestsTo(http.MethodPost, "/v1/subscriptions/sub_change")
 	require.Len(t, updates, 1)
-	assert.Equal(t, "now", updates[0].Form.Get("billing_cycle_anchor"))
+	assert.Equal(t, "unchanged", updates[0].Form.Get("billing_cycle_anchor[type]"), "anchor kept: Stripe refuses proration_date with anchor now")
+	assert.NotContains(t, updates[0].Form, "billing_cycle_anchor", "the string form is rejected on 2026-09-30.endive")
+	previews := env.Fake.requestsTo(http.MethodPost, "/v1/invoices/create_preview")
+	require.NotEmpty(t, previews)
+	assert.Equal(t, "unchanged", previews[0].Form.Get("subscription_details[billing_cycle_anchor][type]"))
+	assert.Equal(t, previews[len(previews)-1].Form.Get("subscription_details[proration_date]"), updates[0].Form.Get("proration_date"))
 	assert.Equal(t, "always_invoice", updates[0].Form.Get("proration_behavior"))
 	assert.Equal(t, "price_SY", updates[0].Form.Get("items[0][price]"))
 }
@@ -276,7 +281,7 @@ func TestPlanChange_MixedUpgradeNowAndIntervalAtPeriodEnd(t *testing.T) {
 	updates := env.Fake.requestsTo(http.MethodPost, "/v1/subscriptions/sub_change")
 	require.Len(t, updates, 2)
 	assert.Equal(t, "price_WY", updates[0].Form.Get("items[0][price]"))
-	assert.Equal(t, "unchanged", updates[0].Form.Get("billing_cycle_anchor"))
+	assert.Equal(t, "unchanged", updates[0].Form.Get("billing_cycle_anchor[type]"))
 	assert.Equal(t, "", updates[1].Form.Get("metadata[concord_mixed_month_at]"))
 	schedule := env.Fake.subscriptions[0].Schedule
 	phase := env.Fake.requestsTo(http.MethodPost, "/v1/subscription_schedules/"+schedule)

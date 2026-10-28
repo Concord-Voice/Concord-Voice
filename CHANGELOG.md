@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Switching from a monthly to a yearly plan now works again. It credits the unused
+part of the month and keeps your billing date. Subscribing twice at the same time,
+for example from two windows, no longer creates a second subscription; the second
+attempt is sent to manage billing instead.
+
 Billing recovery now checks environment ownership before changing a subscription,
 and canceled seat requests still notify members using their current tier. The
 mobile pod's public homepage also lets the public source mirror publish again.

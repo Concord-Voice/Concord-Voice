@@ -117,11 +117,18 @@ type fakeCoupon struct {
 }
 
 type fakePortal struct {
-	ID        string            `json:"id"`
-	Object    string            `json:"object"`
-	Active    bool              `json:"active"`
-	IsDefault bool              `json:"is_default"`
-	Metadata  map[string]string `json:"metadata"`
+	ID        string              `json:"id"`
+	Object    string              `json:"object"`
+	Active    bool                `json:"active"`
+	IsDefault bool                `json:"is_default"`
+	Metadata  map[string]string   `json:"metadata"`
+	Features  *fakePortalFeatures `json:"features,omitempty"`
+}
+
+type fakePortalFeatures struct {
+	SubscriptionUpdate struct {
+		Enabled bool `json:"enabled"`
+	} `json:"subscription_update"`
 }
 
 // fakeSubscription is the wire shape of a Stripe Subscription as the runtime

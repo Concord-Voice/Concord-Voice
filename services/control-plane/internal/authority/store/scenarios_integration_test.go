@@ -70,23 +70,46 @@ func TestSubmitBelowTheHardDiskFloorIs503DiskForEveryRequest(t *testing.T) {
 	e.errorAs(rr.Bytes, 503, ac.ErrorDisk) // a replay too (D-232)
 }
 
+// cancelAtReplicationProbe ends the request only after it reaches step 12.
+type cancelAtReplicationProbe struct {
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (p *cancelAtReplicationProbe) Replicated(context.Context, *sql.Conn, string) (bool, error) {
+	p.calls++
+	p.cancel()
+	return false, nil
+}
+
 // D-200: the fresh, replay and refusal paths all wait on the gate.
 func TestSubmitPathsPassTheGate(t *testing.T) {
 	e := newEnv(t)
 	a := e.r.NewAccount(t)
 	b := a.EnrollNew(t)
 	e.commitOK(a, b.Bytes)
-	requireGate(t, e.f, true)
-	e.s.txDL = 150 * 1e6
 	fresh := e.r.NewAccount(t)
-	for name, body := range map[string][]byte{
+	bodies := map[string][]byte{
 		"fresh":   fresh.EnrollNew(t).Bytes,
 		"replay":  b.Bytes,
 		"refusal": a.Suspend(t, ac.ActorOperator).Bytes, // recorded wrong_state
-	} {
-		if out := e.submit(body); out.Code != string(ac.ErrorReplication) || bytes.Contains(out.Body, []byte("committed")) {
-			t.Fatalf("%s with replication unconfirmed = %+v, want 503 replication and no outcome bytes", name, out)
-		}
+	}
+	requireGate(t, e.f, true)
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			probe := &cancelAtReplicationProbe{cancel: cancel}
+			e.s.probe = probe
+			out := e.s.Submit(ctx, body)
+			if probe.calls == 0 {
+				t.Fatal("request never reached the replication probe")
+			}
+			wantBody := ac.ErrorEnvelope{Code: string(ac.ErrorReplication)}.Encode()
+			if out.HTTP != 503 || out.Kind != KindError || out.Code != string(ac.ErrorReplication) || !bytes.Equal(out.Body, wantBody) {
+				t.Fatalf("with replication unconfirmed = %+v, want 503 replication and no signed outcome bytes", out)
+			}
+		})
 	}
 }
 

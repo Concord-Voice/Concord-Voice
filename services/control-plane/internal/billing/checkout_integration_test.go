@@ -532,3 +532,73 @@ func commitWhenWaiting(db *sql.DB, tx *sql.Tx, marker string) error {
 	}
 	return errors.New("no query waited on the lock")
 }
+
+// A Checkout completed in Stripe whose webhook has not landed is not in the
+// database. Stripe's own listing catches it before a second session opens (S9).
+func TestCheckout_LiveStripeSubscriptionWithoutRowIs409(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	env.Fake.seedCustomer("cus_payer")
+	user := newPayer(t, env.testEnv, "cus_payer")
+	env.Fake.seedSubscription("sub_unseen", "cus_payer", PlanSupersonic, "month", time.Now().Add(720*time.Hour).Unix())
+
+	requireError(t, postCheckout(env.Svc, user, bodySupersonicMonthly), http.StatusConflict, checkoutErrManage)
+	assert.Empty(t, env.Fake.requestsTo(http.MethodPost, sessionsListPath), "no second session")
+}
+
+func TestCheckout_EndedStripeSubscriptionDoesNotBlock(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	env.Fake.seedCustomer("cus_payer")
+	user := newPayer(t, env.testEnv, "cus_payer")
+	env.Fake.seedSubscription("sub_dead", "cus_payer", PlanSupersonic, "month", time.Now().Unix()).Status = "incomplete_expired"
+
+	assert.Equal(t, http.StatusCreated, postCheckout(env.Svc, user, bodySupersonicMonthly).Code)
+}
+
+func TestCheckout_SubscriptionListErrorIs503(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	env.Fake.seedCustomer("cus_payer")
+	user := newPayer(t, env.testEnv, "cus_payer")
+	env.Fake.failOn(http.MethodGet, "/v1/subscriptions", http.StatusInternalServerError, serverErrorBody)
+
+	requireError(t, postCheckout(env.Svc, user, bodySupersonicMonthly), http.StatusServiceUnavailable, portalErrUnavailable)
+	assert.Empty(t, env.Fake.requestsTo(http.MethodPost, sessionsListPath))
+}
+
+// Checkouts for one Customer run one at a time (S9, R43): a held lock makes the
+// next request wait instead of racing it.
+func TestCheckout_SerializedPerCustomer(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	env.Fake.seedCustomer("cus_payer")
+	user := newPayer(t, env.testEnv, "cus_payer")
+	conn, err := env.Svc.lockSubscription(context.Background(), checkoutLockPrefix+"cus_payer")
+	require.NoError(t, err)
+
+	done := make(chan int, 1)
+	go func() { done <- postCheckout(env.Svc, user, bodySupersonicMonthly).Code }()
+	select {
+	case code := <-done:
+		t.Fatalf("checkout finished (%d) while another held the Customer's lock", code)
+	case <-time.After(300 * time.Millisecond):
+	}
+	env.Svc.unlockSubscription(context.Background(), conn, checkoutLockPrefix+"cus_payer")
+	assert.Equal(t, http.StatusCreated, <-done)
+}
+
+func TestCheckout_NoFreeSlotIs503(t *testing.T) {
+	env := newCheckoutEnv(t, foundersConfig(config.BillingPurchaseModeOn))
+	env.Fake.seedCustomer("cus_payer")
+	user := newPayer(t, env.testEnv, "cus_payer")
+	wait := checkoutSlotWait
+	checkoutSlotWait = 50 * time.Millisecond
+	for range cap(checkoutSlots) {
+		checkoutSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for range cap(checkoutSlots) {
+			<-checkoutSlots
+		}
+		checkoutSlotWait = wait
+	})
+
+	assert.Equal(t, http.StatusServiceUnavailable, postCheckout(env.Svc, user, bodySupersonicMonthly).Code)
+}
