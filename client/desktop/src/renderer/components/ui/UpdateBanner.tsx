@@ -88,8 +88,11 @@ const UpdateBanner: React.FC = () => {
         // No action — stays hidden or dismissed
       }),
       globalThis.electron.onUpdateError(() => {
-        // Reset to available so user can retry; main process logs details
-        setState((prev) => (prev === 'downloading' ? 'available' : prev));
+        // Reset to available so user can retry; main process logs details.
+        // An install attempt starts from `downloaded`, and a refused install may
+        // discard the downloaded selection, so offer Download again rather than
+        // a Restart Now that can only fail. Re-downloading reuses a still-valid cache.
+        setState((prev) => (prev === 'downloading' || prev === 'downloaded' ? 'available' : prev));
         setProgress(null);
       }),
       ...(globalThis.electron.onUpdateRollback

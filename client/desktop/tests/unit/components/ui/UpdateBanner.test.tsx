@@ -264,6 +264,40 @@ describe('UpdateBanner', () => {
     });
   });
 
+  it('offers Download again when an install attempt fails from downloaded', async () => {
+    render(<UpdateBanner />);
+    eventCallbacks.updateDownloaded({ version: '1.2.0' });
+    await vi.waitFor(() => {
+      expect(screen.getByText('Restart Now')).toBeInTheDocument();
+    });
+    eventCallbacks.updateError({
+      message: 'Update blocked: Windows signature verification failed.',
+      securityEvent: true,
+      subtype: 'publisher-failure',
+    });
+    await vi.waitFor(() => {
+      expect(screen.getByText('Update available: v1.2.0')).toBeInTheDocument();
+      expect(screen.getByText('Download')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Restart Now')).not.toBeInTheDocument();
+  });
+
+  it('keeps the rollback banner when an update error arrives', async () => {
+    render(<UpdateBanner />);
+    eventCallbacks.updateRollback({
+      fromVersion: '1.2.0',
+      toVersion: '1.1.0',
+      message: 'Rolled back',
+    });
+    await vi.waitFor(() => {
+      expect(screen.getByText('Rolled back')).toBeInTheDocument();
+    });
+    eventCallbacks.updateError({ message: 'Network error' });
+    await vi.waitFor(() => {
+      expect(screen.getByText('Rolled back')).toBeInTheDocument();
+    });
+  });
+
   // ─── Dismiss behavior ─────────────────────────────────────────────
 
   it('hides banner when dismissed', async () => {

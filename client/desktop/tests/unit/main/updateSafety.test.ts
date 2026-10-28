@@ -29,8 +29,8 @@ function createMockLogger() {
     error: vi.fn(),
     debug: vi.fn(),
     flush: vi.fn(),
-    getLogPath: vi.fn(() => '/tmp/test-logs/update-2026-03-25.log'),
-    getLogDir: vi.fn(() => '/tmp/test-logs'),
+    getLogPath: vi.fn(() => path.join(os.homedir(), 'logs', 'update-2026-03-25.log')),
+    getLogDir: vi.fn(() => path.join(os.homedir(), 'logs')),
   };
 }
 
@@ -39,9 +39,14 @@ function createMockLogger() {
 describe('updateSafety', () => {
   let tmpDir: string;
   let userDataDir: string;
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
 
   beforeEach(() => {
     tmpDir = makeTmpDir();
+    vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
+    vi.stubEnv('LOCALAPPDATA', path.join(tmpDir, 'local'));
+    vi.stubEnv('XDG_CACHE_HOME', path.join(tmpDir, 'cache'));
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
     userDataDir = path.join(tmpDir, 'userData');
     fs.mkdirSync(userDataDir, { recursive: true });
     mockGetPath.mockImplementation((key: string) => {
@@ -54,6 +59,8 @@ describe('updateSafety', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {
@@ -65,6 +72,226 @@ describe('updateSafety', () => {
     vi.resetModules();
     return import('../../../src/main/updateSafety');
   }
+
+  function createPendingCache(): string {
+    const root = path.join(tmpDir, 'cache', 'ConcordVoice');
+    const pending = path.join(root, 'pending');
+    fs.mkdirSync(pending, { recursive: true });
+    fs.mkdirSync(path.join(root, 'app-old'));
+    fs.writeFileSync(path.join(root, 'current.blockmap'), 'differential base');
+    fs.writeFileSync(path.join(root, 'Update.exe'), 'installed updater');
+    fs.writeFileSync(path.join(root, 'app-old', 'keep'), 'installed application');
+    return pending;
+  }
+
+  function expectCacheRootPreserved(pending: string): void {
+    const root = path.dirname(pending);
+    expect(fs.readFileSync(path.join(root, 'current.blockmap'), 'utf8')).toBe('differential base');
+    expect(fs.readFileSync(path.join(root, 'Update.exe'), 'utf8')).toBe('installed updater');
+    expect(fs.readFileSync(path.join(root, 'app-old', 'keep'), 'utf8')).toBe(
+      'installed application'
+    );
+  }
+
+  describe('canonical pending cache boundary (#2455)', () => {
+    it.each([
+      ['win32', { LOCALAPPDATA: 'local-override' }, ['local-override']],
+      ['win32', {}, ['home', 'AppData', 'Local']],
+      ['darwin', {}, ['home', 'Library', 'Caches']],
+      ['linux', { XDG_CACHE_HOME: 'cache-override' }, ['cache-override']],
+      ['linux', {}, ['home', '.cache']],
+    ] as const)('resolves the %s platform cache with %j', async (platform, overrides, suffix) => {
+      const { resolvePendingUpdateCacheDir } = await loadModule();
+      const env: NodeJS.ProcessEnv = {};
+      for (const [key, value] of Object.entries(overrides)) env[key] = path.join(tmpDir, value);
+      expect(resolvePendingUpdateCacheDir(platform, path.join(tmpDir, 'home'), env)).toBe(
+        path.join(tmpDir, ...suffix, 'ConcordVoice', 'pending')
+      );
+    });
+
+    it('logs an absent cache without creating it', async () => {
+      const { purgePendingUpdateCache } = await loadModule();
+      const logger = createMockLogger();
+      expect(purgePendingUpdateCache(logger)).toBe('absent');
+      expect(logger.info).toHaveBeenCalledWith(expect.stringMatching(/absent/i));
+      expect(fs.existsSync(path.join(tmpDir, 'cache', 'ConcordVoice'))).toBe(false);
+    });
+
+    it('reports an absent pending directory while preserving its existing root', async () => {
+      const root = path.join(tmpDir, 'cache', 'ConcordVoice');
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(root, 'current.blockmap'), 'base');
+      const { purgePendingUpdateCache } = await loadModule();
+      const logger = createMockLogger();
+
+      expect(purgePendingUpdateCache(logger)).toBe('absent');
+      expect(logger.info).toHaveBeenCalledWith(expect.stringMatching(/absent/i));
+      expect(fs.readFileSync(path.join(root, 'current.blockmap'), 'utf8')).toBe('base');
+      expect(fs.existsSync(path.join(root, 'pending'))).toBe(false);
+    });
+
+    it('refuses a relative environment cache target before deleting anything', async () => {
+      vi.stubEnv('XDG_CACHE_HOME', 'relative-cache');
+      const unlink = vi.spyOn(fs, 'unlinkSync');
+      const remove = vi.spyOn(fs, 'rmSync');
+      const { purgePendingUpdateCache } = await loadModule();
+
+      expect(purgePendingUpdateCache(createMockLogger())).toBe('failed');
+      expect(unlink).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    it.each(['parent', 'pending'])('refuses a non-directory %s boundary', async (boundary) => {
+      const root = path.join(tmpDir, 'cache', 'ConcordVoice');
+      fs.mkdirSync(boundary === 'parent' ? path.dirname(root) : root, { recursive: true });
+      const file = boundary === 'parent' ? root : path.join(root, 'pending');
+      fs.writeFileSync(file, 'not a directory');
+      const { purgePendingUpdateCache } = await loadModule();
+
+      expect(purgePendingUpdateCache(createMockLogger())).toBe('failed');
+      expect(fs.readFileSync(file, 'utf8')).toBe('not a directory');
+    });
+
+    it.each(['parent', 'pending'])(
+      'refuses a symbolic-link %s without touching its target',
+      async (boundary) => {
+        const root = path.join(tmpDir, 'cache', 'ConcordVoice');
+        const target = path.join(tmpDir, 'outside');
+        const targetPending = boundary === 'parent' ? path.join(target, 'pending') : target;
+        fs.mkdirSync(targetPending, { recursive: true });
+        fs.writeFileSync(path.join(targetPending, 'keep'), 'outside data');
+        fs.mkdirSync(boundary === 'parent' ? path.dirname(root) : root, { recursive: true });
+        fs.symlinkSync(target, boundary === 'parent' ? root : path.join(root, 'pending'), 'dir');
+        const { purgePendingUpdateCache } = await loadModule();
+        const logger = createMockLogger();
+
+        expect(purgePendingUpdateCache(logger)).toBe('failed');
+        expect(fs.readFileSync(path.join(targetPending, 'keep'), 'utf8')).toBe('outside data');
+        expect(logger.warn).toHaveBeenCalled();
+      }
+    );
+
+    it('unlinks a pending child symlink without traversing its target', async () => {
+      const pending = createPendingCache();
+      const target = path.join(tmpDir, 'outside');
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, 'keep'), 'outside data');
+      fs.symlinkSync(target, path.join(pending, 'linked-directory'), 'dir');
+      fs.mkdirSync(path.join(pending, 'real-directory'));
+      fs.writeFileSync(path.join(pending, 'real-directory', 'installer'), 'stale');
+      const { purgePendingUpdateCache } = await loadModule();
+
+      expect(purgePendingUpdateCache(createMockLogger())).toBe('purged');
+      expect(fs.readdirSync(pending)).toEqual([]);
+      expect(fs.readFileSync(path.join(target, 'keep'), 'utf8')).toBe('outside data');
+      expectCacheRootPreserved(pending);
+    });
+
+    it('reports partial deletion failure while removing other pending entries', async () => {
+      const pending = createPendingCache();
+      const blocked = path.join(pending, 'blocked.exe');
+      fs.writeFileSync(blocked, 'locked');
+      fs.writeFileSync(path.join(pending, 'other.exe'), 'stale');
+      const unlink = fs.unlinkSync.bind(fs);
+      vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+        if (file === blocked) throw Object.assign(new Error('locked'), { code: 'EACCES' });
+        return unlink(file);
+      });
+      const { purgePendingUpdateCache } = await loadModule();
+      const logger = createMockLogger();
+
+      expect(purgePendingUpdateCache(logger)).toBe('failed');
+      expect(fs.readdirSync(pending)).toEqual(['blocked.exe']);
+      expect(logger.warn).toHaveBeenCalled();
+      expect(logger.info).not.toHaveBeenCalledWith(
+        expect.stringMatching(/purged.*pending|pending.*purged/i)
+      );
+      expectCacheRootPreserved(pending);
+    });
+
+    it('preserves a deferred retry marker when canonical pending cleanup fails', async () => {
+      const pending = createPendingCache();
+      const blocked = path.join(pending, 'locked.exe');
+      fs.writeFileSync(blocked, 'locked');
+      const marker = path.join(userDataDir, 'update-cleanup.json');
+      fs.writeFileSync(
+        marker,
+        JSON.stringify({
+          backupPath: '',
+          cacheDirPath: pending,
+          logDir: '',
+          timestamp: Date.now() - 2 * 60 * 60 * 1000,
+        })
+      );
+      const unlink = fs.unlinkSync.bind(fs);
+      vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+        if (file === blocked) throw Object.assign(new Error('locked'), { code: 'EACCES' });
+        return unlink(file);
+      });
+      const { runDeferredCleanup } = await loadModule();
+      const logger = createMockLogger();
+      await runDeferredCleanup(logger);
+
+      expect(fs.existsSync(marker), 'failed pending purge must retain retry intent').toBe(true);
+      expect(fs.readFileSync(blocked, 'utf8')).toBe('locked');
+      expect(logger.info).not.toHaveBeenCalledWith('Deferred cleanup complete');
+    });
+
+    it('discarding only an obsolete sentinel preserves a successor pending artifact', async () => {
+      const pending = createPendingCache();
+      const successor = path.join(pending, 'successor.exe');
+      fs.writeFileSync(successor, 'new selection');
+      const sentinel = path.join(userDataDir, 'update-sentinel.json');
+      fs.writeFileSync(sentinel, '{}');
+      const { discardPreparedUpdate } = await loadModule();
+
+      discardPreparedUpdate(createMockLogger(), false);
+
+      expect(fs.existsSync(sentinel)).toBe(false);
+      expect(fs.readFileSync(successor, 'utf8')).toBe('new selection');
+      expectCacheRootPreserved(pending);
+    });
+
+    it('discarding a rejected preparation removes its sentinel, pending bytes and obsolete metadata', async () => {
+      const pending = createPendingCache();
+      fs.writeFileSync(path.join(pending, 'rejected.exe'), 'rejected');
+      const sentinel = path.join(userDataDir, 'update-sentinel.json');
+      const metadata = path.join(userDataDir, 'pending-update-v2.json');
+      fs.writeFileSync(sentinel, '{}');
+      fs.writeFileSync(metadata, '{}');
+      const backup = path.join(tmpDir, 'backup.AppImage');
+      fs.writeFileSync(backup, 'recovery backup');
+      const { discardPreparedUpdate } = await loadModule();
+
+      discardPreparedUpdate(createMockLogger());
+
+      expect(fs.existsSync(sentinel)).toBe(false);
+      expect(fs.existsSync(metadata)).toBe(false);
+      expect(fs.readdirSync(pending)).toEqual([]);
+      expect(fs.readFileSync(backup, 'utf8')).toBe('recovery backup');
+      expectCacheRootPreserved(pending);
+    });
+
+    it('reports a sentinel that could not be discarded without deleting a successor cache', async () => {
+      const pending = createPendingCache();
+      fs.writeFileSync(path.join(pending, 'successor.exe'), 'successor');
+      const sentinel = path.join(userDataDir, 'update-sentinel.json');
+      fs.writeFileSync(sentinel, '{}');
+      const unlink = fs.unlinkSync.bind(fs);
+      vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+        if (file === sentinel) throw Object.assign(new Error('locked'), { code: 'EACCES' });
+        return unlink(file);
+      });
+      const { discardPreparedUpdate } = await loadModule();
+      const logger = createMockLogger();
+
+      discardPreparedUpdate(logger, false);
+
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/sentinel/i));
+      expect(fs.existsSync(sentinel)).toBe(true);
+      expect(fs.readFileSync(path.join(pending, 'successor.exe'), 'utf8')).toBe('successor');
+    });
+  });
 
   // ────────────────────────────────────────────────────────────────────
   // checkUpdateSentinel
@@ -370,9 +597,8 @@ describe('updateSafety', () => {
       ).resolves.not.toThrow();
     });
 
-    it('purges electron-updater cache directory', async () => {
-      const cacheDir = path.join(userDataDir, 'concord-voice-updater');
-      fs.mkdirSync(cacheDir, { recursive: true });
+    it('purges canonical pending downloads and preserves root siblings after success (#2455)', async () => {
+      const cacheDir = createPendingCache();
       fs.writeFileSync(path.join(cacheDir, 'downloaded-update.exe'), 'binary');
       fs.writeFileSync(path.join(cacheDir, 'manifest.yml'), 'yaml');
 
@@ -388,7 +614,8 @@ describe('updateSafety', () => {
 
       // Cache dir should be empty (directory itself may still exist)
       const remaining = fs.readdirSync(cacheDir);
-      expect(remaining.length).toBe(0);
+      expect(remaining.length, 'successful update must purge the canonical pending cache').toBe(0);
+      expectCacheRootPreserved(cacheDir);
     });
 
     it('prunes empty log files', async () => {
@@ -558,9 +785,8 @@ describe('updateSafety', () => {
       expect(fs.existsSync(sentinelFile)).toBe(false);
     });
 
-    it('purges download cache', async () => {
-      const cacheDir = path.join(userDataDir, 'concord-voice-updater');
-      fs.mkdirSync(cacheDir, { recursive: true });
+    it('purges canonical pending downloads and preserves root siblings after rollback (#2455)', async () => {
+      const cacheDir = createPendingCache();
       fs.writeFileSync(path.join(cacheDir, 'bad-update.exe'), 'bad');
 
       const { finalizeRollback } = await loadModule();
@@ -572,7 +798,11 @@ describe('updateSafety', () => {
         toVersion: '2.0.0',
       });
 
-      expect(fs.readdirSync(cacheDir).length).toBe(0);
+      expect(
+        fs.readdirSync(cacheDir).length,
+        'rollback must purge the canonical pending cache'
+      ).toBe(0);
+      expectCacheRootPreserved(cacheDir);
     });
 
     it('does NOT delete any log files', async () => {
@@ -621,6 +851,34 @@ describe('updateSafety', () => {
   // ────────────────────────────────────────────────────────────────────
 
   describe('runDeferredCleanup', () => {
+    it('ignores a stale persisted deletion target and purges only canonical pending (#2455)', async () => {
+      const pending = createPendingCache();
+      fs.writeFileSync(path.join(pending, 'stale.exe'), 'stale installer');
+      const unrelated = path.join(tmpDir, 'unrelated');
+      fs.mkdirSync(unrelated);
+      fs.writeFileSync(path.join(unrelated, 'keep'), 'not updater data');
+      fs.writeFileSync(
+        path.join(userDataDir, 'update-cleanup.json'),
+        JSON.stringify({
+          backupPath: '',
+          cacheDirPath: unrelated,
+          logDir: '',
+          timestamp: Date.now() - 2 * 60 * 60 * 1000,
+        })
+      );
+      const { runDeferredCleanup } = await loadModule();
+
+      await runDeferredCleanup(createMockLogger());
+
+      expect(
+        fs.existsSync(path.join(unrelated, 'keep')),
+        'a persisted cacheDirPath must not authorize deletion outside canonical pending'
+      ).toBe(true);
+      expect(fs.readFileSync(path.join(unrelated, 'keep'), 'utf8')).toBe('not updater data');
+      expect(fs.readdirSync(pending)).toEqual([]);
+      expectCacheRootPreserved(pending);
+    });
+
     it('does nothing when no cleanup file exists', async () => {
       const { runDeferredCleanup } = await loadModule();
       const logger = createMockLogger();
@@ -632,8 +890,7 @@ describe('updateSafety', () => {
       const backupFile = path.join(tmpDir, 'old.backup');
       fs.writeFileSync(backupFile, 'old-backup');
 
-      const cacheDir = path.join(userDataDir, 'concord-voice-updater');
-      fs.mkdirSync(cacheDir, { recursive: true });
+      const cacheDir = createPendingCache();
       fs.writeFileSync(path.join(cacheDir, 'stale.exe'), 'stale');
 
       const manifest = {
@@ -650,6 +907,7 @@ describe('updateSafety', () => {
 
       expect(fs.existsSync(backupFile)).toBe(false);
       expect(fs.readdirSync(cacheDir).length).toBe(0);
+      expectCacheRootPreserved(cacheDir);
       expect(fs.existsSync(path.join(userDataDir, 'update-cleanup.json'))).toBe(false);
       expect(logger.info).toHaveBeenCalledWith(
         expect.stringContaining('Deferred cleanup complete')

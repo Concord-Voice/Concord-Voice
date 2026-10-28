@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { ALLOWED_WINDOWS_PUBLISHERS } from '../../../src/shared/allowedWindowsPublishers';
 
 // ── Hoisted mocks ────────────────────────────────────────────────────────
 
@@ -25,6 +26,8 @@ const mockLogger = vi.hoisted(() => ({
 }));
 
 const mockVerifyLinuxArtifact = vi.hoisted(() => vi.fn());
+const mockDiscardPreparedUpdate = vi.hoisted(() => vi.fn());
+const mockPrepareForUpdate = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const PUBLIC_RECOVERY_FEED_URL =
   'https://github.com/Concord-Voice/Concord-Voice/releases/latest/download';
 
@@ -70,7 +73,8 @@ vi.mock('../../../src/main/updateLogger', () => ({
 }));
 
 vi.mock('../../../src/main/updateSafety', () => ({
-  prepareForUpdate: vi.fn().mockResolvedValue(true),
+  prepareForUpdate: mockPrepareForUpdate,
+  discardPreparedUpdate: mockDiscardPreparedUpdate,
 }));
 
 vi.mock('../../../src/main/splashWindow', () => ({
@@ -298,7 +302,9 @@ describe('updater', () => {
       ).verifyUpdateCodeSignature;
       expect(hook).toBeTypeOf('function');
       const result = await hook(['Concord Voice LLC'], 'C:\\fake\\installer.exe');
-      expect(result).toMatch(/PS failed|extractChain threw/);
+      expect(result).toMatch(/signature verification failed/i);
+      expect(result).not.toContain('PS failed');
+      expect(JSON.stringify(mockLogger.error.mock.calls)).not.toContain('PS failed');
     });
 
     it('returns null (pass) when verifyChain returns null', async () => {
@@ -342,8 +348,10 @@ describe('updater', () => {
         }
       ).verifyUpdateCodeSignature;
       const result = await hook(['Concord Voice LLC'], 'C:\\fake\\installer.exe');
-      expect(result).toMatch(/unauthorized publisher/);
+      expect(result).toMatch(/signature verification failed/i);
+      expect(result).not.toContain('Evil Co');
       expect(mockLogger.error).toHaveBeenCalledWith(expect.stringMatching(/SECURITY/));
+      expect(JSON.stringify(mockLogger.error.mock.calls)).not.toContain('Evil Co');
     });
   });
 
@@ -561,8 +569,13 @@ describe('updater', () => {
       expect(releaseOrder!).toBeLessThan(quitOrder!);
     });
 
-    it('does NOT verify on win32 (windows path unchanged)', async () => {
+    it('does not run the Linux verifier on win32', async () => {
       setPlatform('win32');
+      const extractWindowsChain = vi.fn().mockResolvedValue([]);
+      vi.doMock('../../../src/main/verifyWindowsSignature', () => ({
+        extractChain: extractWindowsChain,
+        verifyChain: vi.fn().mockReturnValue(null),
+      }));
       const updater = await import('../../../src/main/updater');
       updater.initAutoUpdater(() => mockWindow);
       armDownloaded('C:/cache/ConcordVoice-2.0.0-windows-x64-Setup.exe');
@@ -570,7 +583,264 @@ describe('updater', () => {
       await updater.safeQuitAndInstall();
 
       expect(mockVerifyLinuxArtifact).not.toHaveBeenCalled();
+      expect(extractWindowsChain).toHaveBeenCalledWith(
+        'C:/cache/ConcordVoice-2.0.0-windows-x64-Setup.exe'
+      );
       expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('cached Windows install verification (#2455)', () => {
+    let originalPlatform: PropertyDescriptor | undefined;
+    const extractChain = vi.fn();
+    const releaseQuitVeto = vi.fn();
+    const send = vi.fn();
+    const window = {
+      isDestroyed: () => false,
+      webContents: { send },
+    } as unknown as import('electron').BrowserWindow;
+    const installer = 'C:/owned-cache/ConcordVoice/pending/update.exe';
+    const validChain = [
+      { subjectCN: ALLOWED_WINDOWS_PUBLISHERS[0], issuerCN: 'Microsoft ID Verified CS EOC CA 01' },
+      {
+        subjectCN: 'Microsoft ID Verified CS EOC CA 01',
+        issuerCN: 'Microsoft Identity Verification Root CA 2020',
+      },
+    ];
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      extractChain.mockReset().mockResolvedValue(validChain);
+      releaseQuitVeto.mockReset();
+      send.mockReset();
+      mockDiscardPreparedUpdate.mockReset();
+      mockPrepareForUpdate.mockReset().mockResolvedValue(true);
+      mockAutoUpdater.downloadUpdate.mockReset().mockResolvedValue([]);
+      vi.doMock('../../../src/main/verifyWindowsSignature', async (importOriginal) => {
+        const actual =
+          await importOriginal<typeof import('../../../src/main/verifyWindowsSignature')>();
+        return { ...actual, extractChain };
+      });
+    });
+
+    afterEach(() => {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      vi.doUnmock('../../../src/main/verifyWindowsSignature');
+    });
+
+    async function armCachedUpdate(downloadedFile: string | undefined = installer) {
+      const { updater } = await loadModule();
+      updater.initAutoUpdater(() => window, releaseQuitVeto);
+      // A cache hit emits this event without invoking the download-time hook.
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile });
+      expect(extractChain).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.downloadUpdate).not.toHaveBeenCalled();
+      return updater;
+    }
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    }
+
+    it('accepts the valid fixture through the real pinned-chain download hook (positive control)', async () => {
+      await armCachedUpdate();
+      const hook = mockAutoUpdater.verifyUpdateCodeSignature as (
+        publishers: string[],
+        file: string
+      ) => Promise<string | null>;
+
+      await expect(hook([...ALLOWED_WINDOWS_PUBLISHERS], installer)).resolves.toBeNull();
+      expect(extractChain).toHaveBeenCalledWith(installer);
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+    });
+
+    it('verifies the cached artifact before releasing the quit veto and installing', async () => {
+      const updater = await armCachedUpdate();
+      await updater.safeQuitAndInstall();
+
+      expect(
+        extractChain,
+        'cached Windows installs must run Authenticode extraction'
+      ).toHaveBeenCalledWith(installer);
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+      expect(releaseQuitVeto).toHaveBeenCalledOnce();
+      expect(extractChain.mock.invocationCallOrder[0]).toBeLessThan(
+        releaseQuitVeto.mock.invocationCallOrder[0]
+      );
+      expect(releaseQuitVeto.mock.invocationCallOrder[0]).toBeLessThan(
+        mockAutoUpdater.quitAndInstall.mock.invocationCallOrder[0]
+      );
+    });
+
+    it.each(['wrong publisher', 'wrong intermediate', 'extraction unavailable'])(
+      'refuses a cached artifact when %s and discards the rejected selection',
+      async (failure) => {
+        if (failure === 'wrong publisher') {
+          extractChain.mockResolvedValue([
+            { ...validChain[0], subjectCN: 'Untrusted Publisher' },
+            validChain[1],
+          ]);
+        } else if (failure === 'wrong intermediate') {
+          extractChain.mockResolvedValue([
+            { ...validChain[0], issuerCN: 'Untrusted CA' },
+            validChain[1],
+          ]);
+        } else {
+          extractChain.mockRejectedValue(new Error('private PowerShell diagnostic'));
+        }
+        const updater = await armCachedUpdate();
+        await updater.safeQuitAndInstall();
+
+        expect(
+          mockAutoUpdater.quitAndInstall,
+          'cached artifacts must not install without a valid pinned Authenticode chain'
+        ).not.toHaveBeenCalled();
+        expect(releaseQuitVeto).not.toHaveBeenCalled();
+        expect(mockDiscardPreparedUpdate).toHaveBeenCalled();
+        expect(send).toHaveBeenCalledWith(
+          'update:error',
+          expect.objectContaining({ message: expect.any(String) })
+        );
+        expect(JSON.stringify(send.mock.calls)).not.toContain('private PowerShell diagnostic');
+      }
+    );
+
+    it('refuses a cached Windows event with no artifact path', async () => {
+      const updater = await armCachedUpdate('');
+      await updater.safeQuitAndInstall();
+
+      expect(
+        mockAutoUpdater.quitAndInstall,
+        'a missing Windows artifact cannot be verified or installed'
+      ).not.toHaveBeenCalled();
+      expect(releaseQuitVeto).not.toHaveBeenCalled();
+      expect(extractChain).not.toHaveBeenCalled();
+    });
+
+    it('blocks installation while an admitted download is changing the upstream selection', async () => {
+      const updater = await armCachedUpdate();
+      const download = deferred<string[]>();
+      mockAutoUpdater.downloadUpdate.mockReturnValue(download.promise);
+      const downloading = updater.downloadUpdate();
+      await updater.safeQuitAndInstall();
+
+      expect(mockPrepareForUpdate).not.toHaveBeenCalled();
+      expect(extractChain).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      download.resolve([installer]);
+      await downloading;
+      await updater.safeQuitAndInstall();
+      expect(extractChain).toHaveBeenCalledWith(installer);
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('blocks a download and duplicate install while verification owns the updater', async () => {
+      const updater = await armCachedUpdate();
+      const verification = deferred<typeof validChain>();
+      const started = deferred<void>();
+      extractChain.mockImplementation(() => {
+        started.resolve();
+        return verification.promise;
+      });
+      const installing = updater.safeQuitAndInstall();
+      await started.promise;
+
+      await expect(updater.downloadUpdate()).rejects.toThrow(/install|progress/i);
+      await updater.safeQuitAndInstall();
+      expect(mockAutoUpdater.downloadUpdate).not.toHaveBeenCalled();
+      expect(mockPrepareForUpdate).toHaveBeenCalledOnce();
+      expect(extractChain).toHaveBeenCalledOnce();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      verification.resolve(validChain);
+      await installing;
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('a failed admitted download does not leave installation permanently blocked', async () => {
+      const updater = await armCachedUpdate();
+      mockAutoUpdater.downloadUpdate.mockRejectedValueOnce(new Error('download unavailable'));
+
+      await expect(updater.downloadUpdate()).rejects.toThrow('download unavailable');
+      await updater.safeQuitAndInstall();
+
+      expect(extractChain).toHaveBeenCalledWith(installer);
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('rejects a same-path same-version replacement event during verification without purging its bytes', async () => {
+      const updater = await armCachedUpdate();
+      const verification = deferred<typeof validChain>();
+      const started = deferred<void>();
+      extractChain.mockImplementationOnce(() => {
+        started.resolve();
+        return verification.promise;
+      });
+      const installing = updater.safeQuitAndInstall();
+      await started.promise;
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: installer });
+      verification.resolve(validChain);
+      await installing;
+
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      expect(releaseQuitVeto).not.toHaveBeenCalled();
+      expect(mockDiscardPreparedUpdate).toHaveBeenCalledExactlyOnceWith(mockLogger, false);
+      await updater.safeQuitAndInstall();
+      expect(extractChain).toHaveBeenCalledTimes(2);
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('detects replacement during preparation before verifying or deleting the successor', async () => {
+      const updater = await armCachedUpdate();
+      const preparation = deferred<boolean>();
+      mockPrepareForUpdate.mockReturnValueOnce(preparation.promise);
+      const installing = updater.safeQuitAndInstall();
+      getEventHandler('update-downloaded')({
+        version: '3.0.0',
+        downloadedFile: 'C:/owned-cache/new.exe',
+      });
+      preparation.resolve(true);
+      await installing;
+
+      expect(extractChain).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      expect(mockDiscardPreparedUpdate).toHaveBeenCalledExactlyOnceWith(mockLogger, false);
+    });
+
+    it('a rejected selection cannot be retried and a later download can establish a valid new selection', async () => {
+      const updater = await armCachedUpdate();
+      extractChain.mockRejectedValueOnce(new Error('unavailable'));
+      await updater.safeQuitAndInstall();
+      await updater.safeQuitAndInstall();
+      expect(extractChain).toHaveBeenCalledOnce();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+
+      await updater.downloadUpdate();
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: installer });
+      await updater.safeQuitAndInstall();
+      expect(extractChain).toHaveBeenCalledTimes(2);
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('still refuses installation when rejected-artifact cleanup throws', async () => {
+      const updater = await armCachedUpdate();
+      extractChain.mockRejectedValue(new Error('unavailable'));
+      mockDiscardPreparedUpdate.mockImplementationOnce(() => {
+        throw new Error('cleanup failed');
+      });
+      // Whether the cleanup failure is reported or propagated, it cannot release
+      // the quit veto or hand the rejected installer to the OS.
+      await updater.safeQuitAndInstall().catch(() => undefined);
+
+      expect(mockDiscardPreparedUpdate).toHaveBeenCalled();
+      expect(releaseQuitVeto).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      await updater.downloadUpdate();
+      expect(mockAutoUpdater.downloadUpdate).toHaveBeenCalledOnce();
     });
   });
 });

@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import { UPDATE_ENDPOINT_URL } from '../shared/updateEndpoint';
 import { ALLOWED_WINDOWS_PUBLISHERS } from '../shared/allowedWindowsPublishers';
 import { createUpdateLogger, type UpdateLogger } from './updateLogger';
-import { prepareForUpdate } from './updateSafety';
+import { prepareForUpdate, discardPreparedUpdate } from './updateSafety';
 import { updateSplashStatus, showSplashProgress, updateSplashError } from './splashWindow';
 import { extractChain, verifyChain } from './verifyWindowsSignature';
 import { verifyLinuxArtifact, type LinuxVerifyResult } from './verifyLinuxSignature';
@@ -78,10 +78,34 @@ let releaseQuitVetoForUpdate: (() => void) | null = null;
 let handlersRegistered = false;
 let logger: UpdateLogger | null = null;
 let pendingUpdateVersion: string | null = null;
-// Captured from the update-downloaded event for the Linux pre-install
-// signature gate (#653). The path to the downloaded artifact in the
-// electron-updater cache.
+// Captured artifact selection for the Windows and Linux install gates.
+// Every downloaded event advances its identity, including same-path reuse.
 let pendingDownloadedFile: string | null = null;
+let pendingGeneration = 0;
+let installInFlight = false;
+let downloadsInFlight = 0;
+
+type WindowsVerification = 'verified' | 'rejected' | 'unavailable';
+
+/** Shared extraction and chain policy for the download and install gates. */
+async function verifyWindowsUpdateSignature(
+  filePath: string,
+  publisherNames: readonly string[]
+): Promise<WindowsVerification> {
+  try {
+    const chain = await extractChain(filePath);
+    if (verifyChain(chain, publisherNames) !== null) {
+      logger?.error('SECURITY: Windows update signature rejected by publisher/intermediate policy');
+      return 'rejected';
+    }
+    logger?.info('Runtime chain verification passed');
+    return 'verified';
+  } catch {
+    // PowerShell output can contain local paths; expose only the bounded verdict.
+    logger?.warn('Windows update signature extraction unavailable');
+    return 'unavailable';
+  }
+}
 
 /**
  * Returns the module logger, throwing if it has not been initialized.
@@ -163,20 +187,8 @@ function ensureUpdaterReady(): void {
       publisherNames: string[],
       filePath: string
     ): Promise<string | null> => {
-      try {
-        const chain = await extractChain(filePath);
-        const result = verifyChain(chain, publisherNames);
-        if (result === null) {
-          logger?.info('Runtime chain verification passed');
-        } else {
-          logger?.error(`SECURITY: chain verification rejected update — ${result}`);
-        }
-        return result;
-      } catch (err) {
-        const msg = `extractChain threw: ${(err as Error).message}`;
-        logger?.error(`SECURITY: ${msg}`);
-        return msg;
-      }
+      const result = await verifyWindowsUpdateSignature(filePath, publisherNames);
+      return result === 'verified' ? null : 'Windows update signature verification failed';
     };
   }
 
@@ -221,6 +233,7 @@ function ensureUpdaterReady(): void {
   });
 
   autoUpdater.on('update-downloaded', (event: UpdateDownloadedEvent) => {
+    pendingGeneration += 1;
     pendingUpdateVersion = event.version;
     pendingDownloadedFile = event.downloadedFile;
     requireLogger().info(`Downloaded v${event.version} — ready to install`);
@@ -326,8 +339,15 @@ export async function forceCheckForUpdates(
   await autoUpdater.checkForUpdates();
 }
 
-export function downloadUpdate(): Promise<string[]> {
-  return autoUpdater.downloadUpdate();
+export async function downloadUpdate(): Promise<string[]> {
+  if (installInFlight) throw new Error('Update installation in progress. Please try again later.');
+  // Upstream changes its installer selection before emitting update-downloaded.
+  downloadsInFlight += 1;
+  try {
+    return await autoUpdater.downloadUpdate();
+  } finally {
+    downloadsInFlight -= 1;
+  }
 }
 
 /**
@@ -338,12 +358,88 @@ export function downloadUpdate(): Promise<string[]> {
  * (a config/availability state, not evidence of tampering). The `.sig` is
  * fetched from the same static public recovery feed the updater already uses.
  */
-async function verifyLinuxUpdateBeforeInstall(): Promise<LinuxVerifyResult> {
-  if (!pendingDownloadedFile) {
+async function verifyLinuxUpdateBeforeInstall(file: string | null): Promise<LinuxVerifyResult> {
+  if (!file) {
     return { verified: false, reason: 'no downloaded artifact path captured', kind: 'unavailable' };
   }
-  const sigUrl = `${UPDATE_ENDPOINT_URL}/${path.basename(pendingDownloadedFile)}.sig`;
-  return verifyLinuxArtifact(pendingDownloadedFile, sigUrl, net.fetch);
+  const sigUrl = `${UPDATE_ENDPOINT_URL}/${path.basename(file)}.sig`;
+  return verifyLinuxArtifact(file, sigUrl, net.fetch);
+}
+
+/** Refuse a Windows installer whose trust could not be re-established this session. */
+function refuseUnverifiedWindowsInstaller(verdict: Exclude<WindowsVerification, 'verified'>): void {
+  pendingUpdateVersion = null;
+  pendingDownloadedFile = null;
+  pendingGeneration += 1;
+  discardPreparedUpdate(requireLogger());
+  updateSplashError('Update could not be verified');
+  sendToRenderer(
+    'update:error',
+    verdict === 'rejected'
+      ? {
+          message:
+            'Update blocked: Windows signature verification failed. Please download the update again.',
+          securityEvent: true,
+          subtype: 'publisher-failure',
+        }
+      : {
+          message:
+            'Update could not be verified right now. Please download the update again and retry.',
+        }
+  );
+}
+
+/** Report a Linux pre-install refusal with tamper-vs-availability copy. */
+function refuseUnverifiedLinuxInstaller(
+  result: Extract<LinuxVerifyResult, { verified: false }>
+): void {
+  if (result.kind === 'tampered') {
+    requireLogger().error(`SECURITY: Linux update signature INVALID — ${result.reason}`);
+    updateSplashError('Update blocked: signature verification failed');
+    sendToRenderer('update:error', {
+      message: `Update blocked: ${result.reason}`,
+      securityEvent: true,
+      subtype: 'signature-failure',
+    });
+    return;
+  }
+  requireLogger().warn(`Linux update could not be verified — ${result.reason}`);
+  updateSplashError('Update could not be verified — try again later');
+  sendToRenderer('update:error', {
+    message: `Update could not be verified right now (${result.reason}). Please try again later, or download the latest from the official Releases page.`,
+  });
+}
+
+/**
+ * Platform pre-install signature gate. Returns true only when installation may
+ * proceed; every refusal (including a selection that changed during the await)
+ * has already been reported to the renderer.
+ */
+async function passesPlatformInstallGate(
+  downloadedFile: string | null,
+  abandonStaleSelection: () => boolean
+): Promise<boolean> {
+  if (process.platform === 'win32') {
+    // Cached NSIS bytes bypass the download hook in electron-updater 6.8.9.
+    // Re-establish trust in this session using the binary-owned publisher policy.
+    const verdict = downloadedFile
+      ? await verifyWindowsUpdateSignature(downloadedFile, ALLOWED_WINDOWS_PUBLISHERS)
+      : 'unavailable';
+    if (abandonStaleSelection()) return false;
+    if (verdict !== 'verified') {
+      refuseUnverifiedWindowsInstaller(verdict);
+      return false;
+    }
+  }
+  if (process.platform === 'linux') {
+    const result = await verifyLinuxUpdateBeforeInstall(downloadedFile);
+    if (abandonStaleSelection()) return false;
+    if (!result.verified) {
+      refuseUnverifiedLinuxInstaller(result);
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -352,70 +448,62 @@ async function verifyLinuxUpdateBeforeInstall(): Promise<LinuxVerifyResult> {
  * install is aborted and the user is notified (#384).
  */
 export async function safeQuitAndInstall(): Promise<void> {
+  if (installInFlight || downloadsInFlight > 0) {
+    sendToRenderer('update:error', {
+      message: 'An update operation is in progress. Please try again later.',
+    });
+    return;
+  }
   const currentVersion = app.getVersion();
   const targetVersion = pendingUpdateVersion;
-
+  const downloadedFile = pendingDownloadedFile;
+  const generation = pendingGeneration;
   if (!targetVersion) {
     logger?.error('safeQuitAndInstall called but no pending update version');
     sendToRenderer('update:error', { message: 'No update downloaded.' });
     return;
   }
-
-  logger?.info(`Preparing safe update: v${currentVersion} → v${targetVersion}`);
-
-  const prepared = await prepareForUpdate(currentVersion, targetVersion, requireLogger());
-  if (!prepared) {
-    logger?.error('Failed to prepare safety backup, aborting update install');
+  // Own the install before the first await; public downloads cannot overlap it.
+  installInFlight = true;
+  const selectionIsCurrent = (): boolean =>
+    pendingGeneration === generation &&
+    pendingUpdateVersion === targetVersion &&
+    pendingDownloadedFile === downloadedFile;
+  const abandonStaleSelection = (): boolean => {
+    if (selectionIsCurrent()) return false;
+    discardPreparedUpdate(requireLogger(), false);
+    logger?.warn('Update selection changed; install aborted');
     sendToRenderer('update:error', {
-      message: 'Failed to create safety backup. Update aborted — you can retry.',
+      message: 'The downloaded update changed. Please try installing again.',
     });
-    return;
-  }
-
-  // On macOS/Windows no file backup is taken (Squirrel.Mac / NSIS handle the
-  // atomic swap); prepareForUpdate() only writes the rollback sentinel. The old
-  // wording falsely implied a backup. The sentinel log already reports
-  // "(backup: none)" accurately. Linux AppImage is the only path that backs up.
-
-  // Linux has no electron-updater signature hook (verifyUpdateCodeSignature is
-  // Windows-only), so verify the downloaded artifact's detached Ed25519
-  // signature against the bundled public key here — the single install choke
-  // point — BEFORE handing off. Fail-closed: refuse on ANY verification
-  // failure. quitAndInstall() follows a successful verify with no intervening
-  // await, minimizing the verify->install TOCTOU window (spec §6, #653).
-  //
-  // The refusal is the same for both failure kinds; the kind only shapes the
-  // user message (#653 / Gitar review). A cryptographic verify-false ('tampered')
-  // is genuine evidence of an altered artifact → the security banner. An
-  // availability failure ('unavailable' — network/IO or missing `.sig`)
-  // is retryable → a non-alarming "try again" message, so a transient blip
-  // doesn't cry wolf and erode the tamper warning's credibility.
-  if (process.platform === 'linux') {
-    const result = await verifyLinuxUpdateBeforeInstall();
-    if (!result.verified) {
-      if (result.kind === 'tampered') {
-        requireLogger().error(`SECURITY: Linux update signature INVALID — ${result.reason}`);
-        updateSplashError('Update blocked: signature verification failed');
-        sendToRenderer('update:error', {
-          message: `Update blocked: ${result.reason}`,
-          securityEvent: true,
-          subtype: 'signature-failure',
-        });
-      } else {
-        requireLogger().warn(`Linux update could not be verified — ${result.reason}`);
-        updateSplashError('Update could not be verified — try again later');
-        sendToRenderer('update:error', {
-          message: `Update could not be verified right now (${result.reason}). Please try again later, or download the latest from the official Releases page.`,
-        });
-      }
+    return true;
+  };
+  try {
+    logger?.info(`Preparing safe update: v${currentVersion} → v${targetVersion}`);
+    const prepared = await prepareForUpdate(currentVersion, targetVersion, requireLogger());
+    if (abandonStaleSelection()) return;
+    if (!prepared) {
+      logger?.error('Failed to prepare safety backup, aborting update install');
+      sendToRenderer('update:error', {
+        message: 'Failed to create safety backup. Update aborted — you can retry.',
+      });
       return;
     }
-  }
+    if (!(await passesPlatformInstallGate(downloadedFile, abandonStaleSelection))) return;
 
-  logger?.info('Safety sentinel written, proceeding with quitAndInstall()');
-  // ponytail: shared install choke point; native before-quit-for-update stays as a macOS fallback.
-  releaseQuitVetoForUpdate?.();
-  autoUpdater.quitAndInstall();
+    if (abandonStaleSelection()) return;
+    logger?.info('Safety sentinel written, proceeding with quitAndInstall()');
+    // No await between final selection check, veto release, and installer handoff.
+    releaseQuitVetoForUpdate?.();
+    autoUpdater.quitAndInstall();
+  } catch {
+    logger?.error('Update installation aborted: safety operation unavailable');
+    sendToRenderer('update:error', {
+      message: 'Update installation could not be prepared. Please try again later.',
+    });
+  } finally {
+    installInFlight = false;
+  }
 }
 
 export function getAllowPrerelease(): boolean {

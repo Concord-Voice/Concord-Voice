@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { UPDATER_CACHE_DIR_NAME } from '../shared/updaterCache';
 import { app } from 'electron';
 import type { UpdateLogger } from './updateLogger';
 
@@ -24,7 +26,7 @@ export interface SentinelResult {
 
 interface CleanupManifest {
   backupPath: string;
-  cacheDirPath: string;
+  cacheDirPath?: string; // Legacy metadata only; never a deletion target.
   logDir: string;
   timestamp: number;
 }
@@ -82,26 +84,92 @@ function isLogFileTrivial(filePath: string): boolean {
   }
 }
 
-/** Recursively remove all files inside a directory (not the directory itself). */
-function purgeDirectory(dirPath: string, logger: UpdateLogger): void {
+/** Match electron-updater 6.8.9's platform cache root, independent of userData. */
+export function resolvePendingUpdateCacheDir(
+  platform: NodeJS.Platform = process.platform,
+  home: string = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  let root: string;
+  if (platform === 'win32') root = env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+  else if (platform === 'darwin') root = path.join(home, 'Library', 'Caches');
+  else root = env.XDG_CACHE_HOME || path.join(home, '.cache');
+  return path.join(root, UPDATER_CACHE_DIR_NAME, 'pending');
+}
+
+/** lstat both app-specific boundaries so a redirected parent cannot widen deletion. */
+function inspectPendingBoundaries(
+  pending: string,
+  logger: UpdateLogger
+): 'safe' | 'absent' | 'failed' {
   try {
-    if (!fs.existsSync(dirPath)) return;
-    const entries = fs.readdirSync(dirPath);
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry);
-      try {
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          fs.rmSync(fullPath, { recursive: true, force: true });
-        } else {
-          fs.unlinkSync(fullPath);
-        }
-      } catch (err) {
-        logger.warn(`Failed to remove ${fullPath}: ${(err as Error).message}`);
+    for (const directory of [path.dirname(pending), pending]) {
+      const stat = fs.lstatSync(directory);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        logger.warn('Pending update cache cleanup failed: unsafe cache directory');
+        return 'failed';
       }
     }
-  } catch (err) {
-    logger.warn(`Failed to read directory ${dirPath}: ${(err as Error).message}`);
+    return 'safe';
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      logger.info('Pending update cache absent; nothing to purge');
+      return 'absent';
+    }
+    logger.warn('Pending update cache cleanup failed: directory inspection unavailable');
+    return 'failed';
+  }
+}
+
+/** Remove one pending entry without following symlinks. Returns false on failure. */
+function removePendingEntry(child: string, logger: UpdateLogger): boolean {
+  try {
+    const stat = fs.lstatSync(child);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      fs.rmSync(child, { recursive: true, force: true });
+    } else {
+      fs.unlinkSync(child);
+    }
+    return true;
+  } catch {
+    logger.warn('Pending update cache cleanup failed: could not remove an entry');
+    return false;
+  }
+}
+
+/** Only pending download bytes are disposable; cache siblings belong to the updater. */
+export function purgePendingUpdateCache(logger: UpdateLogger): 'absent' | 'purged' | 'failed' {
+  const pending = resolvePendingUpdateCacheDir();
+  if (!path.isAbsolute(pending)) {
+    logger.warn('Pending update cache cleanup failed: non-absolute cache root');
+    return 'failed';
+  }
+  const boundaries = inspectPendingBoundaries(pending, logger);
+  if (boundaries !== 'safe') return boundaries;
+
+  let failed = false;
+  try {
+    for (const entry of fs.readdirSync(pending)) {
+      if (!removePendingEntry(path.join(pending, entry), logger)) failed = true;
+    }
+  } catch {
+    failed = true;
+    logger.warn('Pending update cache cleanup failed: could not read entries');
+  }
+  if (failed) return 'failed';
+  logger.info('Purged pending update cache');
+  return 'purged';
+}
+
+/** A stale install continuation may remove its sentinel, but not its successor's bytes. */
+export function discardPreparedUpdate(logger: UpdateLogger, purgePending = true): void {
+  const sentinel = sentinelPath();
+  if (!safeUnlink(sentinel) && fs.existsSync(sentinel)) {
+    logger.warn('Could not remove aborted update sentinel');
+  }
+  if (purgePending) {
+    purgePendingUpdateCache(logger);
+    purgeUpdaterMetadata(logger);
   }
 }
 
@@ -251,10 +319,8 @@ export async function finalizeUpdate(
 
   // Write deferred cleanup manifest as safety net (in case we crash mid-cleanup)
   const logDir = logger.getLogDir();
-  const cacheDirPath = getCacheDir();
   const manifest: CleanupManifest = {
     backupPath: sentinel.backupPath || '',
-    cacheDirPath,
     logDir,
     timestamp: Date.now(),
   };
@@ -277,10 +343,7 @@ export async function finalizeUpdate(
   }
 
   // 3. Purge electron-updater download cache
-  if (cacheDirPath && fs.existsSync(cacheDirPath)) {
-    purgeDirectory(cacheDirPath, logger);
-    logger.info('Purged electron-updater download cache');
-  }
+  const cacheOutcome = purgePendingUpdateCache(logger);
 
   // 4. Purge empty/trivial log files
   pruneTrivialLogs(logDir, logger);
@@ -289,9 +352,12 @@ export async function finalizeUpdate(
   purgeUpdaterMetadata(logger);
 
   // 6. Remove cleanup manifest (cleanup completed successfully)
-  safeUnlink(cleanupPath());
-
-  logger.info('Post-update cleanup complete');
+  if (cacheOutcome === 'failed') {
+    logger.warn('Post-update cleanup incomplete; pending cache cleanup will retry');
+  } else {
+    safeUnlink(cleanupPath());
+    logger.info('Post-update cleanup complete');
+  }
 }
 
 /**
@@ -309,11 +375,7 @@ export async function finalizeRollback(
   safeUnlink(sentinelPath());
 
   // 2. Purge download cache (the downloaded update was bad)
-  const cacheDirPath = getCacheDir();
-  if (cacheDirPath && fs.existsSync(cacheDirPath)) {
-    purgeDirectory(cacheDirPath, logger);
-    logger.info('Purged bad update from download cache');
-  }
+  const cacheOutcome = purgePendingUpdateCache(logger);
 
   // 3. Remove stale electron-updater metadata
   purgeUpdaterMetadata(logger);
@@ -321,7 +383,8 @@ export async function finalizeRollback(
   // Do NOT delete logs — they're the forensic trail
   // Do NOT delete backup — may still be needed for manual recovery
 
-  logger.info('Rollback cleanup complete (logs preserved)');
+  if (cacheOutcome === 'failed') logger.warn('Rollback cleanup incomplete (logs preserved)');
+  else logger.info('Rollback cleanup complete (logs preserved)');
 }
 
 /**
@@ -338,27 +401,21 @@ export async function runDeferredCleanup(logger: UpdateLogger): Promise<void> {
   logger.info('Running deferred post-update cleanup from previous session');
 
   if (manifest.backupPath) safeUnlink(manifest.backupPath);
-  if (manifest.cacheDirPath && fs.existsSync(manifest.cacheDirPath)) {
-    purgeDirectory(manifest.cacheDirPath, logger);
-  }
+  const cacheOutcome = purgePendingUpdateCache(logger);
   if (manifest.logDir) {
     pruneTrivialLogs(manifest.logDir, logger);
   }
   purgeUpdaterMetadata(logger);
 
-  safeUnlink(cleanupPath());
-  logger.info('Deferred cleanup complete');
+  if (cacheOutcome === 'failed') {
+    logger.warn('Deferred cleanup incomplete; pending cache cleanup will retry');
+  } else {
+    safeUnlink(cleanupPath());
+    logger.info('Deferred cleanup complete');
+  }
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────
-
-/**
- * Get electron-updater's download cache directory.
- * electron-updater stores downloads in <userData>/<app-name>-updater/
- */
-function getCacheDir(): string {
-  return path.join(app.getPath('userData'), 'concord-voice-updater');
-}
 
 /** Remove empty or trivial log files from the log directory. */
 function pruneTrivialLogs(logDir: string, logger: UpdateLogger): void {

@@ -1,6 +1,6 @@
 # Update Trust Model
 
-> **Status:** Living document. Last updated 2026-06-30 (#654).
+> **Status:** Living document. Last updated 2026-10-24 (#2455).
 > **Audience:** Concord Voice contributors, security reviewers, and users who want to understand what they trust when accepting an auto-update.
 
 ## What users implicitly trust when accepting an auto-update
@@ -31,8 +31,13 @@ This document describes which of those properties each platform verifies, and ho
 
 - **Build-time:** artifacts are signed by Microsoft Azure Trusted Signing using OIDC federation (no long-lived keys in CI). Leaf certs are 72-hour short-lived, auto-renewed daily. All signatures are RFC 3161 timestamped, so they remain valid past leaf expiry.
 - **CI verification** (`build-desktop.yml` — "Verify Windows signature" step, which runs [`client/desktop/scripts/verify-windows-signature.ps1`](../../client/desktop/scripts/verify-windows-signature.ps1)): every build verifies Authenticode status, requires leaf CN `Concord Voice LLC`, requires RFC 3161 timestamp, and requires the issuer CN to match `^Microsoft ID Verified CS `. The checks live in a script file because the protected Semgrep scan cannot parse PowerShell inside a `run:` block ([`workflow-failure-patterns.md`](../reference/workflow-failure-patterns.md) P18).
-- **Install-time (electron-updater built-in):** verifies Authenticode signature validity and compares the leaf CN against the `publisherName` list in the packaged `app-update.yml`, generated from the shared `ALLOWED_WINDOWS_PUBLISHERS` constant ([`client/desktop/src/shared/allowedWindowsPublishers.ts`](../../client/desktop/src/shared/allowedWindowsPublishers.ts), currently `['Concord Voice LLC']`) by `scripts/generate-app-update.mts`. electron-updater reads the allow-list ONLY from this on-disk file — the key was absent before #2020, leaving both install-time checks dormant.
-- **Install-time (custom hook, added by #644, armed by #2020):** `verifyUpdateCodeSignature` extracts the full cert chain and rejects the update unless the leaf was issued by a cert matching `^Microsoft ID Verified CS `. This defeats the CN-collision attack where a publicly-trusted cert with matching leaf CN is obtained from a different CA. See [`client/desktop/src/main/verifyWindowsSignature.ts`](../../client/desktop/src/main/verifyWindowsSignature.ts).
+- **Download-time:** `electron-updater` invokes Concord's `verifyUpdateCodeSignature` hook for fresh NSIS downloads. The hook requires valid Windows Authenticode status, a leaf publisher in the packaged `app-update.yml` publisher list supplied by upstream, and an issuing intermediate matching `^Microsoft ID Verified CS `. That packaged list is generated from the shared `ALLOWED_WINDOWS_PUBLISHERS` constant (currently `Concord Voice LLC`) and arms upstream verification. See [`verifyWindowsSignature.ts`](../../client/desktop/src/main/verifyWindowsSignature.ts).
+- **Install-time (#2455):** every Windows `safeQuitAndInstall()` attempt independently verifies Authenticode, the compiled `ALLOWED_WINDOWS_PUBLISHERS` allowlist, and the Trusted Signing intermediate pin in the installing session, including installers reused from a previous session's cache. The packaged publisher list cannot broaden installation trust. `electron-updater` 6.8.9 can return a cache hit before invoking its download hook, so the hook alone is insufficient. Concord captures the pending artifact, blocks overlapping downloads and installs, and rejects an attempt if its pending generation changes while verification is running. A missing or rejected artifact never reaches `quitAndInstall()` or releases the quit veto.
+- **Rejection cleanup:** clears pending install metadata and the prepared-install sentinel, then attempts to purge only the canonical pending directory. Cleanup failure does not permit installation. Logs and differential-update metadata remain available.
+
+**Cache cleanup boundary:** build and runtime share `UPDATER_CACHE_DIR_NAME = 'ConcordVoice'`. The pending target is `<platform cache>/ConcordVoice/pending`: Windows uses `LOCALAPPDATA` (or `~/AppData/Local`), macOS uses `~/Library/Caches`, and other platforms use `XDG_CACHE_HOME` (or `~/.cache`). This is separate from Electron's `userData`. Deferred cleanup recomputes this target rather than trusting a persisted `cacheDirPath`. Cleanup requires an absolute target, refuses symlink or non-directory application/pending roots, and unlinks child symlinks without following them. It preserves root-level `current.blockmap`, logs, and historical installation siblings. Missing directories are reported as an absent/no-op outcome; partial failures are reported as failures. Finalization and deferred cleanup retain the retry marker on failure; rollback and discard do not create one.
+
+**Residual local-file race:** verification and OS execution are not atomic. A local process able to write the installer can replace its bytes after verification but before execution, including during asynchronous NSIS elevation or shell fallback. Likewise, cleanup's stable-path checks do not prevent hostile ancestor replacement during deletion. These controls do not claim protection against those local filesystem races.
 
 **What the user is trusting:** Microsoft Trusted Signing (which performs D-U-N-S-backed corporate verification before issuing to the allowed CN) + the Microsoft root of trust on Windows.
 
@@ -55,7 +60,7 @@ This document describes which of those properties each platform verifies, and ho
 **What this does NOT defend (by design):**
 
 - **Update freeze** — a feed-controlling attacker answering "you're up to date" (`update-not-available`) can pin a victim indefinitely to a specific signed-but-known-vulnerable build. This product rides the prerelease channel fleet-wide (`allowPrerelease` default true), so the consequence is concrete: indefinite pinning to a known-CVE *signed* build. Artifact signing provides zero mitigation. #654 adds public distribution provenance and Alpha/public byte binding, but freeze defense still needs a separate manifest-freshness control.
-- **The verify→install TOCTOU residual (accepted).** The client verifies the bytes at the downloaded path, then `quitAndInstall()` independently re-reads the **same** cached path with no install-time checksum. A local process with write access to the updater cache (under user-writable `userData`) could swap the file in the gap — a wider window than the Windows model, whose verify runs inside electron-updater's install flow. Accepted because it requires a local attacker who already has `userData` write (who can compromise the app more cheaply) and is parity with the unavoidable disk-read-at-install on every platform. Mitigated by calling `quitAndInstall()` immediately after a successful verify with no intervening `await`.
+- **The verify→install TOCTOU residual (accepted).** Linux verifies the captured artifact before handing off to `quitAndInstall()`, which independently reads the cached path. A local writer to the platform updater cache can replace the file between verification and execution. Windows has the same class of residual despite its install-time verification; neither path makes verification and OS execution atomic.
 
 **Key rotation** requires shipping a new client build (the trust anchor is bundled, not fetched). See [`[internal]refresh-linux-update-key.md`](../runbooks/refresh-linux-update-key.md).
 
@@ -74,16 +79,9 @@ The pin was removed after five fleet-wide outages between 2026-04 and 2026-08. I
 The packaged binary update feed is `https://github.com/Concord-Voice/Concord-Voice/releases/latest/download`. The API-hosted release directory remains an operational surface, but it is not the only packaged-client recovery path. API-host transport protections are:
 
 - **HTTPS only:** transport encryption + standard Web PKI cert validation on the server host.
-- **TLS-layer API pinning (#658):** in addition to standard Web PKI validation, clients pin the SPKI SHA-256 of the CloudFlare edge certificate for `api.concordvoice.chat`. See the dedicated subsection under §Per-platform trust model above.
+- **No API certificate pinning:** API-host and self-hosted connections use standard CA trust; the removed #658 control is described above.
 
-**What HTTPS + API pinning DOES guarantee:**
-
-- An attacker with a rogue cert for the API host (e.g., via a compromised intermediate CA) CANNOT MITM API-host traffic, because the rogue cert's SPKI will not match either pin.
-
-**What HTTPS + API pinning does NOT guarantee:**
-
-- That the server host itself has not been compromised (an attacker with root on the origin could serve hostile API responses or alter any API-hosted release directory — this is outside pinning's scope; the artifact-level signing layer from #644 is what defends update artifacts).
-- Self-hosted deployments at a different `apiBase`: pinning is SaaS-only; self-hosted deployments use system-CA trust.
+HTTPS protects transport under Web PKI trust. It does not prevent an attacker with a trusted rogue certificate from intercepting traffic, or prevent a compromised origin from serving hostile responses or altered artifacts. Artifact signing supplies the independent update-authenticity check.
 
 Those gaps are why the per-platform artifact trust anchors above are load-bearing. The public recovery feed is transport-diverse from the API host, but artifact signing remains the update-authenticity boundary.
 
@@ -119,7 +117,7 @@ Step 4 catches the concrete threat of a tampered manifest between sign and publi
 - **Public release attestations are distribution provenance, not Alpha build provenance.** Public desktop release assets mirrored to `Concord-Voice/Concord-Voice` are attested by the public repo workflow after #654 and can be verified with `gh attestation verify --repo Concord-Voice/Concord-Voice --signer-workflow github.com/Concord-Voice/Concord-Voice/.github/workflows/public-release-attestation.yml`. Alpha-private Gate B remains disabled until Alpha is public or on GitHub Enterprise Cloud, so original private build-runner provenance remains a known gap.
 - **No certificate transparency monitoring.** We do not monitor public CT logs for the issuance of certs matching our leaf CN from CAs outside the pinned Microsoft chain. Future work.
 - **No binary transparency / Rekor publication.** Our release hashes are not published to a public transparency log. Future work.
-- **Linux update freeze + verify→install TOCTOU.** Linux update *artifact* signing shipped in #653 (see the Linux section above) — but a feed-controlling attacker can still pin a victim to a known-vulnerable *signed* build via update-freeze, and a local `userData`-write attacker has a narrow verify→install swap window. Both are accepted residuals; freeze defense still needs a separate manifest-freshness/attestation control.
+- **Linux update freeze + verify→install TOCTOU.** Linux update *artifact* signing shipped in #653 (see the Linux section above) — but a feed-controlling attacker can still pin a victim to a known-vulnerable *signed* build via update-freeze, and a local updater-cache writer can replace an artifact between verification and execution on Linux or Windows. Both are accepted residuals; freeze defense still needs a separate manifest-freshness/attestation control.
 - **Chain validity is asserted at the leaf, not walked end-to-end by our hook.** `verifyWindowsSignature.ts` requires `Get-AuthenticodeSignature` to return `Status = Valid` on the downloaded installer — that status already covers signature integrity, root-of-trust chaining, expiry (including timestamp validity), and revocation via the Windows certificate store. On top of that, our hook inspects chain _structure_ to enforce the leaf CN allow-list and issuer-prefix pin. We do not separately walk or re-validate each intermediate; we trust the OS-level chain build that produced the `Valid` status. If that upstream check is ever bypassed, our structural checks alone would not detect a revoked or untrusted intermediate.
 
 ## Related documents

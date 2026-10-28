@@ -11,6 +11,7 @@
 
 import { UPDATE_ENDPOINT_URL } from '../src/constants/updateEndpoint.mts';
 import { ALLOWED_WINDOWS_PUBLISHERS } from '../src/constants/allowedWindowsPublishers.mts';
+import { UPDATER_CACHE_DIR_NAME } from '../src/constants/updaterCache.mts';
 import { stringify } from 'yaml';
 import { fileURLToPath } from 'node:url';
 
@@ -22,12 +23,12 @@ export function renderAppUpdateYaml(url: string = UPDATE_ENDPOINT_URL): string {
   //
   // publisherName arms NsisUpdater.verifySignature: electron-updater reads the
   // Windows publisher allow-list ONLY from this on-disk file (never from the
-  // runtime setFeedURL call), so omitting it silently disables install-time
+  // runtime setFeedURL call), so omitting it silently disables download-time
   // Authenticode verification and the #644 issuer-pin hook (#2020).
   return stringify({
     provider: 'generic',
     url,
-    updaterCacheDirName: 'ConcordVoice',
+    updaterCacheDirName: UPDATER_CACHE_DIR_NAME,
     publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
   });
 }

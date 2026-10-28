@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Windows updates now recheck the installer before restarting, including downloads
+saved from an earlier session.
+
 The desktop app now re-checks its saved copy of the web app whenever that copy's
 signature changes, and refuses to load it if the new signature is not valid.
 
@@ -155,6 +158,8 @@ you verify your email.
 - **Up Arrow edits your last message** (internal development reference omitted) — in an empty message box, Up Arrow opens your most recent message for editing, in channels, direct messages and voice text chat. It keeps its usual cursor behaviour while the box holds text, a reply or an attached file, while an input method is composing, and with Shift, Ctrl, Alt or Cmd held. When your newest message is still sending, failed to send or cannot be read, Up Arrow does nothing rather than opening an older message. Any message edit now opens with the cursor at the end of the text, saving or cancelling it returns focus to the message box you were using, and the edit box has an accessible name. If an edit cannot be saved, the edit box opens again with your text. An edit you leave open closes when you switch channels, and a message that cannot be read offers Delete but not Edit.
 
 ### Fixed
+
+- **Cached Windows installers are checked again before installation** (#2455) — signature and publisher checks run for both fresh and saved downloads. Rejected installers cannot launch, and cleanup preserves differential-update metadata.
 
 - **Billing recovery and public mirror publication** (internal development reference omitted) — recovery changes only subscriptions owned by its environment, and canceled seat requests still notify members using their current tier. The mobile podspec's public homepage lets the source mirror publish.
 

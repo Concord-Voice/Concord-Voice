@@ -4,6 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { renderAppUpdateYaml } from './generate-app-update.mts';
 import { UPDATE_ENDPOINT_URL } from '../src/constants/updateEndpoint.mts';
 import { ALLOWED_WINDOWS_PUBLISHERS } from '../src/constants/allowedWindowsPublishers.mts';
+import { UPDATER_CACHE_DIR_NAME } from '../src/shared/updaterCache';
 
 describe('UPDATE_ENDPOINT_URL', () => {
   it('uses HTTPS', () => {
@@ -87,6 +88,7 @@ describe('renderAppUpdateYaml', () => {
     // Decouples electron-updater's cache dir from app.getName()/productName so a
     // display-name change never churns ~/Library/Caches/<name>. See ADR-0020 D1.
     expect(parsed.updaterCacheDirName).toBe('ConcordVoice');
+    expect(parsed.updaterCacheDirName).toBe(UPDATER_CACHE_DIR_NAME);
   });
 
   it('ends with a trailing newline (POSIX text-file convention)', () => {
