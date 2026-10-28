@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"reflect"
 	"testing"
 	"time"
@@ -16,9 +17,9 @@ import (
 // A database failure never reads as a refusal or a success: every owner verb
 // and both hold routes answer it with an error that is none of the store's
 // verdict sentinels, and with no result. Three failures, each at a different
-// depth: the pool is closed (no connection at all), the verb's own call is
-// cancelled right after its leader check (the next statement on it fails), and meta is
-// locked beyond lock_timeout (the verb's own statements fail inside its
+// depth: the pool is closed (no connection at all), the verb's own connection
+// is ended right after its leader check (the next statement on it fails), and
+// meta is locked beyond lock_timeout (the verb's own statements fail inside its
 // transaction).
 
 type faultKind int
@@ -54,10 +55,23 @@ func newFaultEnv(t *testing.T, kind faultKind, unreconciled bool) *faultEnv {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 	var hook func(context.Context, *sql.Conn) (bool, error)
-	if kind == connectionFails { // a leader check that says primary, then the call is gone
-		hook = func(context.Context, *sql.Conn) (bool, error) {
-			cancel()
-			return false, nil
+	if kind == connectionFails { // a leader check that says primary, then the connection is gone
+		// Closing the driver connection makes every later statement on it fail.
+		// Cancelling the context instead is racy: lib/pq sends the cancel
+		// asynchronously, so a short read can still finish.
+		hook = func(_ context.Context, c *sql.Conn) (bool, error) {
+			err := c.Raw(func(dc any) error {
+				closer, ok := dc.(io.Closer)
+				if !ok {
+					return errors.New("the driver connection has no Close")
+				}
+				return closer.Close()
+			})
+			if err != nil {
+				// Otherwise the verb fails on this error, not on the fault under test.
+				t.Errorf("connectionFails fault: closing the driver connection: %v", err)
+			}
+			return false, err
 		}
 	}
 	o, err := OpenOwner(OwnerConfig{DB: ownerPool, Signer: e.r.RSK, Anchors: e.r.AnchorBytes, InRecovery: hook})
