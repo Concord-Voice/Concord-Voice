@@ -8,6 +8,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/subscriptions"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -40,6 +41,7 @@ func wireBilling(
 	db *sql.DB,
 	cache *entitlements.Cache,
 	notifier entitlements.SessionNotifier,
+	seats billing.SeatNotifier,
 	counters *opsmetrics.Counters,
 	log *logger.Logger,
 ) *billing.Service {
@@ -53,6 +55,7 @@ func wireBilling(
 		Environment: cfg.Environment,
 		Changer:     billing.NewTierChanger(cache, notifier),
 		Counters:    counters,
+		Seats:       seats,
 		Log:         log,
 	})
 }
@@ -66,4 +69,16 @@ func startBillingWorkers(ctx context.Context, svc *billing.Service) {
 	}
 	go svc.RunOutboxWorker(ctx)
 	go svc.RunDriftWorker(ctx)
+}
+
+// erasedSeatNotifier adapts billing's post-erasure seat pushes to the users
+// package's callback, so neither package imports the other.
+func erasedSeatNotifier(svc *billing.Service) users.ErasedSeatNotifier {
+	return func(ctx context.Context, seats []users.ErasedSeat) {
+		out := make([]billing.ErasedSeat, 0, len(seats))
+		for _, seat := range seats {
+			out = append(out, billing.ErasedSeat{SeatID: seat.SeatID, Survivor: seat.Survivor, Holder: seat.Holder})
+		}
+		svc.OnSeatsErased(ctx, out)
+	}
 }

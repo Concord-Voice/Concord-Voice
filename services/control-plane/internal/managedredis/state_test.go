@@ -162,7 +162,7 @@ func TestRuntimeRejectsGenerationReplayAndPreservesLastGood(t *testing.T) {
 	require.Equal(t, "synthetic-password", got.Password)
 }
 
-func TestRuntimeFreshnessExpiresAtEarlierOfCredentialAndLastSuccessfulFetch(t *testing.T) {
+func TestRuntimeKeepsServingAStaleCredentialUntilValidUntil(t *testing.T) {
 	scope := credentialTestScope()
 	fetchAt := credentialTestNow
 	reader := &mutableCredentialReader{name: scope.Name}
@@ -171,8 +171,20 @@ func TestRuntimeFreshnessExpiresAtEarlierOfCredentialAndLastSuccessfulFetch(t *t
 	require.NoError(t, err)
 	require.NoError(t, runtime.Refresh(context.Background()))
 
-	require.NoError(t, runtime.Fresh(fetchAt.Add(119*time.Second)))
-	require.Error(t, runtime.Fresh(fetchAt.Add(120*time.Second)))
+	require.False(t, runtime.Stale(fetchAt.Add(119*time.Second)))
+	// A provider outage past the stale age is an alert, not an app outage.
+	require.True(t, runtime.Stale(fetchAt.Add(120*time.Second)))
+	require.NoError(t, runtime.Fresh(fetchAt.Add(120*time.Second)))
+	require.NoError(t, runtime.Fresh(fetchAt.Add(10*time.Minute-time.Second)))
+	require.Error(t, runtime.Fresh(fetchAt.Add(10*time.Minute)))
+	require.True(t, runtime.Stale(fetchAt.Add(10*time.Minute)), "the stale alert keeps firing after expiry")
+}
+
+func TestRuntimeColdRuntimeIsNotStale(t *testing.T) {
+	scope := credentialTestScope()
+	runtime, err := NewRuntime(&mutableCredentialReader{name: scope.Name}, scope, "control-plane", func() time.Time { return credentialTestNow })
+	require.NoError(t, err)
+	require.False(t, runtime.Stale(credentialTestNow.Add(time.Hour)))
 }
 
 func TestRuntimeCredentialValidityCanShortenFetchFreshness(t *testing.T) {
@@ -198,9 +210,9 @@ func TestRuntimeTokenRenewalDoesNotResetCredentialFreshness(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, runtime.Refresh(context.Background()))
 
-	// Token renewal has no credential-reader call; only a validated provider fetch may reset freshness.
+	// Token renewal has no credential-reader call; only a validated provider fetch may reset staleness.
 	now = fetchAt.Add(120 * time.Second)
-	require.Error(t, runtime.Fresh(now))
+	require.True(t, runtime.Stale(now))
 	require.Equal(t, 1, reader.callCount())
 }
 

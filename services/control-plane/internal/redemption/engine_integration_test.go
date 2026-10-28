@@ -434,17 +434,20 @@ func TestRedeem_ConcurrentSameUserPremiumCodesNoDeadlock(t *testing.T) {
 func intPtr(i int) *int              { return &i }
 func timePtr(t time.Time) *time.Time { return &t }
 
-// insertStripeRow inserts a live Stripe-sourced premium row carrying the unique
-// ids subscriptions_stripe_identity_check requires, and returns its id.
-func insertStripeRow(t *testing.T, db *sql.DB, user uuid.UUID, periodEnd time.Time) uuid.UUID {
+// insertStripeRow inserts a live Stripe-sourced monthly Supersonic row
+// carrying the unique ids subscriptions_stripe_identity_check requires, and
+// returns its id. A canceling row is set to end at periodEnd; a renewing one
+// takes code credit (#2033 D1).
+func insertStripeRow(t *testing.T, db *sql.DB, user uuid.UUID, periodEnd time.Time, canceling bool) uuid.UUID {
 	t.Helper()
 	var id uuid.UUID
 	require.NoError(t, db.QueryRow(
 		`INSERT INTO subscriptions
-		     (user_id, tier, status, source, current_period_end, stripe_subscription_id, stripe_customer_id)
-		 VALUES ($1, 'premium', 'active', 'stripe', $2, $3, $4)
+		     (user_id, tier, status, source, current_period_end, stripe_subscription_id, stripe_customer_id,
+		      plan, billing_interval, cancel_at_period_end)
+		 VALUES ($1, 'premium', 'active', 'stripe', $2, $3, $4, 'supersonic', 'month', $5)
 		 RETURNING id`,
-		user, periodEnd, "sub_test_"+uuid.NewString(), "cus_test_"+uuid.NewString(),
+		user, periodEnd, "sub_test_"+uuid.NewString(), "cus_test_"+uuid.NewString(), canceling,
 	).Scan(&id))
 	return id
 }
@@ -512,14 +515,16 @@ func redeemPremiumMonth(t *testing.T, db *sql.DB, user uuid.UUID, batchID string
 }
 
 // TestRedeem_PremiumNeverWritesStripeRow is the #2033 regression lock (spec
-// §5): a Stripe payer's redemption leaves the Stripe row byte-identical (same
-// current_period_end, same updated_at, every column) and grants the month on a
-// separate code row, which the ledger links.
+// §5): a canceling Stripe payer's redemption leaves the Stripe row
+// byte-identical (same current_period_end, same updated_at, every column) and
+// grants the month on a separate code row, which the ledger links. The month
+// starts where the paid period ends.
 func TestRedeem_PremiumNeverWritesStripeRow(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()
 	user := insertUser(t, db)
-	stripeID := insertStripeRow(t, db, user, time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second))
+	stripeEnd := time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second)
+	stripeID := insertStripeRow(t, db, user, stripeEnd, true)
 	before := subscriptionRowText(t, db, stripeID)
 
 	notifier := &recordingNotifier{}
@@ -532,26 +537,26 @@ func TestRedeem_PremiumNeverWritesStripeRow(t *testing.T) {
 	require.NoError(t, db.QueryRow(
 		`SELECT id, current_period_end FROM subscriptions WHERE user_id = $1 AND source = 'code'`, user,
 	).Scan(&codeID, &codeEnd))
-	assert.WithinDuration(t, time.Now().AddDate(0, 1, 0), codeEnd, time.Minute)
+	assert.WithinDuration(t, stripeEnd.AddDate(0, 1, 0), codeEnd, time.Second, "the month follows the paid period")
 	assert.Equal(t, uuid.NullUUID{UUID: codeID, Valid: true}, ledgerSubscription(t, db, user),
 		"the ledger links the code row, not the Stripe row")
 
 	// OldTier is "free" here although the payer is premium: the grant only
-	// sees code rows. PR-2's D1 refuses this redemption (409 already_covered),
-	// so only NewTier is pinned.
+	// sees code rows, so only NewTier is pinned.
 	require.Len(t, notifier.calls, 1)
 	assert.Equal(t, "premium", notifier.calls[0][2])
 }
 
 // TestRedeem_PremiumExtendsCodeRowBesideStripeRow (Review Focus RF1): a user
-// with a live code row AND a live Stripe row redeems; only the code row is
-// extended and the Stripe row is untouched. The Stripe row is inserted first,
-// so a select that ignored source would find it first.
+// with a live code row AND a live, canceling Stripe row that ends first
+// redeems; only the code row is extended and the Stripe row is untouched. The
+// Stripe row is inserted first, so a select that ignored source would find it
+// first.
 func TestRedeem_PremiumExtendsCodeRowBesideStripeRow(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()
 	user := insertUser(t, db)
-	stripeID := insertStripeRow(t, db, user, time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second))
+	stripeID := insertStripeRow(t, db, user, time.Now().UTC().AddDate(0, 0, 5).Truncate(time.Second), true)
 	codeEnd := time.Now().UTC().AddDate(0, 0, 10).Truncate(time.Second)
 	codeID := insertCodeRow(t, db, user, codeEnd)
 	stripeBefore := subscriptionRowText(t, db, stripeID)
@@ -598,4 +603,38 @@ func TestRedeem_PremiumExtendsLapsedUnsweptCodeRow(t *testing.T) {
 
 	require.Len(t, notifier.calls, 1)
 	assert.Equal(t, "premium", notifier.calls[0][2])
+}
+
+// TestRedeem_SeatMemberRefusesPremiumCode: a user seated on a live Wing gets
+// ErrSeatMember for a premium code, and the code stays unredeemed (#2033 D5).
+func TestRedeem_SeatMemberRefusesPremiumCode(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	payer, holder := insertUser(t, db), insertUser(t, db)
+	var sub uuid.UUID
+	require.NoError(t, db.QueryRow(`INSERT INTO subscriptions
+		(user_id, tier, status, source, current_period_end, stripe_customer_id, stripe_subscription_id, plan)
+		VALUES ($1, 'premium', 'active', 'stripe', $2, $3, $4, 'wing') RETURNING id`,
+		payer, time.Now().Add(24*time.Hour), "cus_"+uuid.NewString(), "sub_"+uuid.NewString()).Scan(&sub))
+	_, err := db.Exec(`INSERT INTO subscription_seats
+		(subscription_id, payer_user_id, holder_user_id, state, invite_expires_at, activated_at)
+		VALUES ($1, $2, $3, 'active', NOW() + INTERVAL '7 days', NOW())`, sub, payer, holder)
+	require.NoError(t, err)
+	code := issueOne(t, db, redemption.IssueSpec{
+		GrantKind: redemption.GrantPremiumSubscription, GrantParams: map[string]any{"months": 1},
+		SingleUse: true, MaxRedeems: intPtr(1), BatchID: "test-seat-member",
+	})
+
+	_, err = newEngine(db, &recordingNotifier{}).Redeem(context.Background(), holder, code)
+	require.ErrorIs(t, err, redemption.ErrSeatMember)
+	assert.Zero(t, codeRowCount(t, db, holder))
+	var redeemed int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM code_redemptions WHERE user_id = $1`, holder).Scan(&redeemed))
+	assert.Zero(t, redeemed, "the refused code stays unredeemed")
+
+	// The seat ends; the same code now redeems.
+	_, err = db.Exec(`UPDATE subscription_seats SET state = 'left', ended_at = NOW(), end_reason = 'holder_left'`)
+	require.NoError(t, err)
+	_, err = newEngine(db, &recordingNotifier{}).Redeem(context.Background(), holder, code)
+	require.NoError(t, err)
 }

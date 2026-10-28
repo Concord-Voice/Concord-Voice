@@ -190,6 +190,34 @@ func TestPollManagedRedisRefreshesBeforeWaitingAndAcknowledgesOnlyFreshState(t *
 	require.Equal(t, "refresh", reported)
 }
 
+func TestPollManagedRedisReportsStaleCredentialButKeepsServing(t *testing.T) {
+	_, reader := managedRedisTestRuntime(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	scope := managedredis.SecretScope{Project: "project", Environment: "staging", Path: "/sync/redis", Name: "REDIS_CONTROL_PLANE_CREDENTIAL"}
+	runtime, err := managedredis.NewRuntime(reader, scope, "control-plane", func() time.Time { return now })
+	require.NoError(t, err)
+	require.NoError(t, runtime.Refresh(context.Background()))
+	reader.name = "OTHER_SECRET"
+	// The first failed poll lands one second before the stale age, the second on it.
+	now = now.Add(managedredis.StaleCredentialAge - time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	var reported []string
+	pollManagedRedisWith(ctx, runtime, nil, func(context.Context, *managedredis.Runtime, *redis.Client) error {
+		t.Error("a failed refresh must not be acknowledged")
+		return nil
+	}, time.Millisecond, func(kind string) {
+		reported = append(reported, kind)
+		if len(reported) == 2 { // second failed refresh, before its staleness check
+			now = now.Add(time.Second)
+		}
+		if kind == "freshness" {
+			cancel()
+		}
+	})
+	require.Equal(t, []string{"refresh", "refresh", "freshness"}, reported)
+	require.NoError(t, runtime.Fresh(now), "a stale credential keeps serving until validUntil")
+}
+
 func TestPollManagedRedisRefreshesAfterTicker(t *testing.T) {
 	runtime, reader := managedRedisTestRuntime(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,7 +340,7 @@ func TestAcknowledgeManagedRedisRejectsCredentialThatStalesDuringWhoAmI(t *testi
 		seen <- n
 	}()
 	err = acknowledgeManagedRedisUsing(context.Background(), runtime, func(context.Context) (string, error) {
-		now = now.Add(121 * time.Second)
+		now = now.Add(time.Hour)
 		return "cv_cp_7", nil
 	}, socketPath)
 	require.ErrorContains(t, err, "managed Redis primary identity not applied")

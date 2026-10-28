@@ -371,9 +371,11 @@ plan you select.
 ### 7.3 Free Trial
 
 When paid subscriptions become available, we will offer a 30-day free
-trial to new users who register with the Services. The account will then
-be charged according to the user's chosen subscription at the end of the
-free trial.
+trial of the Supersonic plan to new users who register with the Services.
+An account may receive one free trial. The account will then be charged
+for the Supersonic plan at the end of the free trial unless the user
+cancels before then. Other plans, including Wing, do not include a free
+trial and are charged when purchased.
 
 ### 7.4 Cancellation
 

@@ -117,7 +117,7 @@ describe('useConnectionRecovery', () => {
     await vi.dynamicImportSettled();
 
     expect(voiceService.emergencyCleanup).not.toHaveBeenCalled();
-    expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+    expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
   });
 
   it('does not start grace period if already in recovery', () => {

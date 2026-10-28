@@ -9,8 +9,11 @@ import (
 	redisauth "github.com/redis/go-redis/v9/auth"
 )
 
-// MaxCredentialAge limits how long a successfully fetched credential remains usable.
-const MaxCredentialAge = 120 * time.Second
+// StaleCredentialAge is how long after the last validated provider fetch the
+// runtime reports its credential as stale. A stale credential keeps serving
+// until its ValidUntil, so a provider outage raises an alert, not an app outage;
+// Redis ACL revocation still cuts it off.
+const StaleCredentialAge = 120 * time.Second
 
 const exactReadTimeout = 5 * time.Second
 const providerLoginTimeout = 10 * time.Second
@@ -127,7 +130,7 @@ func (r *Runtime) Subscribe(listener redisauth.CredentialsListener) (redisauth.C
 	}, nil
 }
 
-// Fresh rejects cold, expired, or stale runtime state.
+// Fresh rejects cold or expired runtime state.
 func (r *Runtime) Fresh(now time.Time) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -139,13 +142,22 @@ func (r *Runtime) Now() time.Time { return r.now() }
 
 func (r *Runtime) freshLocked(now time.Time) error {
 	if r.current.Generation == 0 || now.Before(r.current.ValidFrom) ||
-		!now.Before(r.current.ValidUntil) || !now.Before(r.fetched.Add(MaxCredentialAge)) {
+		!now.Before(r.current.ValidUntil) {
 		return errUnavailable
 	}
 	return nil
 }
 
-// Snapshot returns an immutable credential only while runtime state is fresh.
+// Stale reports that the last validated provider fetch is older than
+// StaleCredentialAge. It stays true after ValidUntil, so the alert keeps firing
+// for the whole outage; Snapshot refuses the expired credential separately.
+func (r *Runtime) Stale(now time.Time) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.current.Generation != 0 && !now.Before(r.fetched.Add(StaleCredentialAge))
+}
+
+// Snapshot returns an immutable credential only while runtime state is usable.
 func (r *Runtime) Snapshot(now time.Time) (Credential, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

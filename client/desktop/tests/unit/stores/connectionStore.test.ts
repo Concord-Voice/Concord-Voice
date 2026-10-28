@@ -11,7 +11,7 @@ describe('connectionStore', () => {
     expect(state.phase).toBe('stable');
     expect(state.diagnostics).toBeNull();
     expect(state.lostAt).toBeNull();
-    expect(state.lastVoiceChannelId).toBeNull();
+    expect(state.pendingVoiceRejoin).toBeNull();
     expect(state.recoveryAttempts).toBe(0);
     expect(state.wireViolationCount).toBe(0);
   });
@@ -56,12 +56,14 @@ describe('connectionStore', () => {
     expect(useConnectionStore.getState().phase).toBe('fatal');
   });
 
-  it('tracks last voice channel ID', () => {
-    useConnectionStore.getState().setLastVoiceChannelId('voice-123');
-    expect(useConnectionStore.getState().lastVoiceChannelId).toBe('voice-123');
+  it('cancels voice rejoin on ordinary reset and preserves it on recovery reset', () => {
+    const ticket = { channelId: 'voice-123', authGeneration: 1, cleanup: Promise.resolve(null) };
+    useConnectionStore.getState().setPendingVoiceRejoin(ticket);
+    useConnectionStore.getState().reset({ preserveVoiceRejoin: true });
+    expect(useConnectionStore.getState().pendingVoiceRejoin).toBe(ticket);
 
-    useConnectionStore.getState().setLastVoiceChannelId(null);
-    expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+    useConnectionStore.getState().reset();
+    expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
   });
 
   it('increments recovery attempts', () => {
@@ -89,7 +91,11 @@ describe('connectionStore', () => {
 
   it('resets all state', () => {
     useConnectionStore.getState().startGracePeriod();
-    useConnectionStore.getState().setLastVoiceChannelId('voice-1');
+    useConnectionStore.getState().setPendingVoiceRejoin({
+      channelId: 'voice-1',
+      authGeneration: 1,
+      cleanup: Promise.resolve(null),
+    });
     useConnectionStore.getState().incrementRecoveryAttempts();
     useConnectionStore.getState().incrementWireViolation();
     useConnectionStore.getState().setDiagnostics({
@@ -106,7 +112,7 @@ describe('connectionStore', () => {
     expect(state.phase).toBe('stable');
     expect(state.diagnostics).toBeNull();
     expect(state.lostAt).toBeNull();
-    expect(state.lastVoiceChannelId).toBeNull();
+    expect(state.pendingVoiceRejoin).toBeNull();
     expect(state.recoveryAttempts).toBe(0);
     expect(state.wireViolationCount).toBe(0);
   });

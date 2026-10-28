@@ -6,8 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Billing recovery now checks environment ownership before changing a subscription,
+and canceled seat requests still notify members using their current tier. The
+mobile pod's public homepage also lets the public source mirror publish again.
+
+Self-hosted calls that go through the bundled TURN relay no longer fail when the
+relay and the media server share one public address.
+
+A Wing subscription can now share Supersonic with one friend. Invite a friend
+from Settings ▸ Subscription; they get Supersonic once they accept, for as long
+as your Wing is active. You can change your +1 once every 30 days.
+
+Opening the web address in a browser now shows a link to download the desktop
+app, instead of an "Update Required" prompt that could not be completed.
+
+Subscribers can change plans in Settings and see the amount due before an
+immediate switch. They can withdraw a change booked for renewal before choosing another.
+Scheduled confirmations stay tied to the renewal date shown in their preview.
+If a card needs authentication, Stripe opens its hosted invoice page and applies
+the plan change after payment succeeds.
+Opening billing no longer withdraws a booked change, and confirming cancellation
+keeps access through the paid period, including after a scheduled change takes
+effect. The plan card shows the subscriber's
+actual Stripe price, including a Founders rate.
+
+New subscribers get a 30-day free trial of Supersonic. Your card is collected
+up front, and billing starts when the trial ends unless you cancel. Wing has no
+trial and starts billing when you subscribe.
+
+Settings ▸ Subscription is ready for paid plans. Once purchasing opens, it
+lists each plan with its monthly and yearly price, shows your current plan, and
+opens a secure Stripe page to subscribe or manage billing.
+
 Your failed channel messages stay available to retry after a brief disconnect.
 Camera recovery honors codec settings you save while capture restarts.
+
+Redeeming a premium code while you have a paid subscription now adds credit to
+your account, which your next renewals use before your card is charged. A code
+for a different plan shows the credit amount and asks you to confirm first. If
+your subscription is set to end, the code's time starts when the paid period
+ends.
 
 If suspicious use of a sign-in session is detected, that account stays blocked
 until session revocation finishes, even after a temporary server error.
@@ -110,6 +148,10 @@ you verify your email.
 
 ### Fixed
 
+- **Billing recovery and public mirror publication** (internal development reference omitted) — recovery changes only subscriptions owned by its environment, and canceled seat requests still notify members using their current tier. The mobile podspec's public homepage lets the source mirror publish.
+
+- **Calls keep mute and deafen choices through recovery** (internal development reference omitted) — reconnecting after an outage or falling back from encrypted voice no longer turns your microphone or speakers back on. Direct message calls also retain their call type when they rejoin.
+- **Offscreen attachments release decrypted memory** (internal development reference omitted) — images, videos and manually loaded audio in chat history stop holding their decrypted data after they scroll away and are no longer in use. Busy public profile-photo requests use the default silhouette when the image service is at capacity.
 - **Failed channel messages survive reconnects** (internal development reference omitted) — your pending and failed sends keep their text and retry controls after a brief outage. Reply previews are cleared, and message purges, access loss and sign-out still clear the affected history.
 - **Camera recovery honors saved settings** (internal development reference omitted) — codec and HDR settings saved while camera capture restarts now replace the earlier recovery choice. Room compatibility checks still apply.
 - **Subscription updates arrive in order** (internal development reference omitted) — an older downgrade notification can no longer follow a newer upgrade for the same subscription and lower your active capabilities.

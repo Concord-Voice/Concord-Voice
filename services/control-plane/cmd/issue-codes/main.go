@@ -36,6 +36,7 @@ import (
 type issueOptions struct {
 	GrantKind  string
 	Months     int
+	Plan       string
 	Count      int
 	Prefix     string
 	SingleUse  bool
@@ -82,6 +83,7 @@ func parseFlags(fs *flag.FlagSet, args []string) issueOptions {
 	var (
 		grantKind  = fs.String("grant-kind", "", "Grant catalog key (e.g. premium:subscription, feature:custom_themes, cosmetic:profile_badge)")
 		months     = fs.Int("months", 0, "Months for premium:subscription grants (sets grant_params {\"months\":N}); ignored for other kinds")
+		plan       = fs.String("plan", "", "Plan for premium:subscription grants: supersonic (the default when unset) or wing. Sets grant_params {\"plan\":P}")
 		count      = fs.Int("count", 1, "Number of codes to mint")
 		prefix     = fs.String("prefix", "", "Non-secret support prefix (e.g. CV, PROMO); ≤16 chars")
 		singleUse  = fs.Bool("single-use", true, "Mark codes single-use (one-off). Set --single-use=false for promo codes")
@@ -98,6 +100,7 @@ func parseFlags(fs *flag.FlagSet, args []string) issueOptions {
 	return issueOptions{
 		GrantKind:  *grantKind,
 		Months:     *months,
+		Plan:       *plan,
 		Count:      *count,
 		Prefix:     *prefix,
 		SingleUse:  *singleUse,
@@ -151,8 +154,15 @@ func buildSpec(opts issueOptions) (redemption.IssueSpec, error) {
 	}
 
 	var params map[string]any
+	if opts.Months > 0 || opts.Plan != "" {
+		params = map[string]any{}
+	}
 	if opts.Months > 0 {
-		params = map[string]any{"months": opts.Months}
+		params["months"] = opts.Months
+	}
+	if opts.Plan != "" {
+		// The issuer refuses a plan other than supersonic or wing.
+		params["plan"] = opts.Plan
 	}
 
 	return redemption.IssueSpec{

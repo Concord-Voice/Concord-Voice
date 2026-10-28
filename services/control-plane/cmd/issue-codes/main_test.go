@@ -193,6 +193,22 @@ func TestBuildSpec(t *testing.T) {
 		assert.Equal(t, redemption.IssuerContextCLI, spec.Context)
 	})
 
+	t.Run("plan alone sets grant_params plan", func(t *testing.T) {
+		spec, err := buildSpec(issueOptions{
+			GrantKind: redemption.GrantPremiumSubscription, Plan: redemption.PlanWing, Count: 1, MaxRedeems: "1",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"plan": redemption.PlanWing}, spec.GrantParams)
+	})
+
+	t.Run("plan with months sets both", func(t *testing.T) {
+		spec, err := buildSpec(issueOptions{
+			GrantKind: redemption.GrantPremiumSubscription, Months: 12, Plan: redemption.PlanSupersonic, Count: 1, MaxRedeems: "1",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"months": 12, "plan": redemption.PlanSupersonic}, spec.GrantParams)
+	})
+
 	t.Run("unlimited (empty max-redeems) → nil MaxRedeems", func(t *testing.T) {
 		spec, err := buildSpec(issueOptions{
 			GrantKind: "feature:custom_themes", Count: 1, MaxRedeems: "unlimited",
@@ -261,6 +277,7 @@ func TestParseFlags(t *testing.T) {
 	opts := parseFlags(fs, []string{
 		"--grant-kind=premium:subscription",
 		"--months=3",
+		"--plan=wing",
 		"--count=7",
 		"--prefix=CV",
 		"--single-use=false",
@@ -271,6 +288,7 @@ func TestParseFlags(t *testing.T) {
 	})
 	assert.Equal(t, "premium:subscription", opts.GrantKind)
 	assert.Equal(t, 3, opts.Months)
+	assert.Equal(t, "wing", opts.Plan)
 	assert.Equal(t, 7, opts.Count)
 	assert.Equal(t, "CV", opts.Prefix)
 	assert.False(t, opts.SingleUse)

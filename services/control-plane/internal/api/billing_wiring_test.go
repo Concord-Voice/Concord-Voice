@@ -54,15 +54,15 @@ func TestWireBilling_NilWithoutKeysOrOnSelfHost(t *testing.T) {
 	log := logger.New("test")
 
 	t.Run("SaaS without keys wires nothing", func(t *testing.T) {
-		assert.Nil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSaaS, false), nil, nil, nil, nil, log))
+		assert.Nil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSaaS, false), nil, nil, nil, nil, nil, log))
 	})
 	t.Run("self-hosted with keys wires nothing", func(t *testing.T) {
-		assert.Nil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSelfHosted, true), nil, nil, nil, nil, log))
+		assert.Nil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSelfHosted, true), nil, nil, nil, nil, nil, log))
 	})
 	t.Run("self-hosted without keys wires nothing", func(t *testing.T) {
-		assert.Nil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSelfHosted, false), nil, nil, nil, nil, log))
+		assert.Nil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSelfHosted, false), nil, nil, nil, nil, nil, log))
 	})
 	t.Run("SaaS with a test key builds the service", func(t *testing.T) {
-		assert.NotNil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSaaS, true), nil, nil, nil, nil, log))
+		assert.NotNil(t, wireBilling(context.Background(), billingCfg(config.InstanceTypeSaaS, true), nil, nil, nil, nil, nil, log))
 	})
 }

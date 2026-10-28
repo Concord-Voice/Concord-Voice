@@ -97,6 +97,7 @@ services:
       - "--static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set}"
       - "--realm=${TURN_REALM:-${DOMAIN:?DOMAIN must be set}}"
       - --listening-ip=0.0.0.0
+      - "--external-ip=${PUBLIC_IP}/${PUBLIC_IP}"
       - "--external-ip=${PUBLIC_IP:?PUBLIC_IP must be set}"
       - --cert=/etc/coturn/certs/cert.pem
       - --pkey=/etc/coturn/certs/key.pem
@@ -180,7 +181,7 @@ services:
       TURN_SERVER_HOST: "${TURN_SERVER_HOST:-turn.${DOMAIN:?DOMAIN must be set}}"
       TURN_SECRET: "${TURN_SECRET:?TURN_SECRET must be set}"
       TURN_REALM: "${TURN_REALM:-${DOMAIN:?DOMAIN must be set}}"
-      ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,spa-cache://concord,https://spa.${DOMAIN}"
+      ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,app://concord-mobile,spa-cache://concord,https://spa.${DOMAIN}"
       MFA_ENCRYPTION_KEY: "${MFA_ENCRYPTION_KEY:?MFA_ENCRYPTION_KEY must be set}"
       MFA_ENCRYPTION_KEY_VERSION: "${MFA_ENCRYPTION_KEY_VERSION:-1}"
       MFA_ENCRYPTION_KEYS_RETIRED: "${MFA_ENCRYPTION_KEYS_RETIRED:-}"
@@ -239,7 +240,7 @@ services:
       REDIS_INFISICAL_CLIENT_ID: ${REDIS_MEDIA_PLANE_CLIENT_ID:-}
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379"
       ANNOUNCED_IP: "${PUBLIC_IP:?PUBLIC_IP must be set}"
-      ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,spa-cache://concord,https://spa.${DOMAIN}"
+      ALLOWED_ORIGINS: "https://api.${DOMAIN:?DOMAIN must be set},https://${DOMAIN},app://concord,app://concord-mobile,spa-cache://concord,https://spa.${DOMAIN}"
       RTC_MIN_PORT: "40000"
       RTC_MAX_PORT: "41999"
       NUM_WORKERS: "3"

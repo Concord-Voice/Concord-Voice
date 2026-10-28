@@ -33,8 +33,13 @@ const (
 	// stripeMsgNoSuchCustomer starts Stripe's message for an unknown Customer.
 	stripeMsgNoSuchCustomer = "No such customer"
 
-	checkoutLiveStripeSQL = `SELECT EXISTS (SELECT 1 FROM subscriptions
-		WHERE user_id = $1 AND source = 'stripe' AND ` + entitlements.LiveRowPredicate + `)`
+	// Historical Stripe rows survive cancellation and expiry. A prior paid
+	// subscription also makes the account ineligible for its first trial.
+	// Only Supersonic carries the trial (D6, Mark 2026-10-24); Wing starts paid.
+	checkoutStripeHistorySQL = `SELECT
+		EXISTS (SELECT 1 FROM subscriptions WHERE user_id = $1 AND source = 'stripe' AND ` + entitlements.LiveRowPredicate + `),
+		EXISTS (SELECT 1 FROM subscriptions WHERE user_id = $1 AND source = 'stripe')`
+	checkoutTrialDays = 30
 )
 
 // Checkout return URLs: code constants, never request values (spec §8 step 7).
@@ -83,7 +88,8 @@ func (s *Service) CheckoutSession(c *gin.Context) {
 			return
 		}
 	}
-	if !s.checkoutPreconditions(c, userID) {
+	eligible, ok := s.checkoutPreconditions(c, userID)
+	if !ok {
 		return
 	}
 	cus, err := s.ensureCustomer(ctx, userID)
@@ -92,7 +98,7 @@ func (s *Service) CheckoutSession(c *gin.Context) {
 		abortWebhook(c, http.StatusServiceUnavailable, portalErrUnavailable)
 		return
 	}
-	session, err := s.openSession(ctx, userID, cus, price, req.Plan)
+	session, err := s.openSession(ctx, userID, cus, price, req.Plan, eligible)
 	if err != nil {
 		s.logCheckoutFailure(err, cus)
 		abortWebhook(c, http.StatusServiceUnavailable, portalErrUnavailable)
@@ -104,29 +110,41 @@ func (s *Service) CheckoutSession(c *gin.Context) {
 	})
 }
 
-// checkoutPreconditions writes the advisory 409 for a caller who already has
-// a live Stripe subscription (spec §8 step 3). It takes no lock: Stripe's
-// one-subscription limit and Reconcile are the backstops (R1, R43).
-func (s *Service) checkoutPreconditions(c *gin.Context, userID uuid.UUID) bool {
-	var live bool
-	if err := s.DB.QueryRowContext(c.Request.Context(), checkoutLiveStripeSQL, userID).Scan(&live); err != nil {
-		s.Log.Error("billing: checkout live-subscription check failed",
-			logKeyErrorClass, errorClass(err), logKeyStage, "checkout_live_check")
+// checkoutPreconditions writes the advisory 409s (spec §8 step 3): a caller
+// who already has a live Stripe subscription, or (PR-5) holds an active Wing
+// seat that entitles. It takes no lock: Stripe's one-subscription limit and
+// Reconcile (its holder_subscribed transition) are the backstops (R1, R43, F5).
+func (s *Service) checkoutPreconditions(c *gin.Context, userID uuid.UUID) (bool, bool) {
+	var live, prior bool
+	if err := s.DB.QueryRowContext(c.Request.Context(), checkoutStripeHistorySQL, userID).Scan(&live, &prior); err != nil {
+		s.Log.Error("billing: checkout Stripe history check failed",
+			logKeyErrorClass, errorClass(err), logKeyStage, "checkout_history_check")
 		abortWebhook(c, http.StatusServiceUnavailable, portalErrUnavailable)
-		return false
+		return false, false
 	}
 	if live {
 		abortWebhook(c, http.StatusConflict, checkoutErrManage)
-		return false
+		return false, false
 	}
-	return true
+	seated, err := s.holdsLiveSeat(c.Request.Context(), userID)
+	if err != nil {
+		s.Log.Error("billing: checkout seat check failed",
+			logKeyErrorClass, errorClass(err), logKeyStage, errorStage(err))
+		abortWebhook(c, http.StatusServiceUnavailable, portalErrUnavailable)
+		return false, false
+	}
+	if seated {
+		abortWebhook(c, http.StatusConflict, checkoutErrSeatMember)
+		return false, false
+	}
+	return !prior, true
 }
 
 // openSession expires the Customer's open sessions and creates the new one.
 // If Stripe says the Customer is missing and a retrieve confirms it was
 // deleted, the mapping is replaced and the create retried once (F18).
-func (s *Service) openSession(ctx context.Context, userID uuid.UUID, cus string, price *stripe.Price, plan string) (*stripe.CheckoutSession, error) {
-	session, err := s.createSession(ctx, userID, cus, price, plan)
+func (s *Service) openSession(ctx context.Context, userID uuid.UUID, cus string, price *stripe.Price, plan string, trialEligible bool) (*stripe.CheckoutSession, error) {
+	session, err := s.createSession(ctx, userID, cus, price, plan, trialEligible)
 	if err == nil || !isCustomerMissing(err) {
 		return session, err
 	}
@@ -137,16 +155,16 @@ func (s *Service) openSession(ctx context.Context, userID uuid.UUID, cus string,
 	if err != nil {
 		return nil, err
 	}
-	return s.createSession(ctx, userID, fresh, price, plan)
+	return s.createSession(ctx, userID, fresh, price, plan, trialEligible)
 }
 
-func (s *Service) createSession(ctx context.Context, userID uuid.UUID, cus string, price *stripe.Price, plan string) (*stripe.CheckoutSession, error) {
+func (s *Service) createSession(ctx context.Context, userID uuid.UUID, cus string, price *stripe.Price, plan string, trialEligible bool) (*stripe.CheckoutSession, error) {
 	// Kept until S9 proves the one-subscription limit blocks concurrent
 	// completions (spec §8 step 5, R43).
 	if err := s.expireOpenSessions(ctx, cus); err != nil {
 		return nil, err
 	}
-	session, err := s.Stripe.V1CheckoutSessions.Create(ctx, s.sessionParams(userID, cus, price, plan))
+	session, err := s.Stripe.V1CheckoutSessions.Create(ctx, s.sessionParams(userID, cus, price, plan, trialEligible))
 	if err != nil {
 		return nil, withStage("create_checkout_session", fmt.Errorf("billing: checkout: create session: %w", err))
 	}
@@ -175,13 +193,14 @@ func (s *Service) expireUnheldSession(ctx context.Context, sessionID, cus string
 
 // sessionParams builds the session create (spec §8 step 6). It never sets
 // allow_promotion_codes.
-func (s *Service) sessionParams(userID uuid.UUID, cus string, price *stripe.Price, plan string) *stripe.CheckoutSessionCreateParams {
+func (s *Service) sessionParams(userID uuid.UUID, cus string, price *stripe.Price, plan string, trialEligible bool) *stripe.CheckoutSessionCreateParams {
 	params := &stripe.CheckoutSessionCreateParams{
 		Mode:                      stripe.String(string(stripe.CheckoutSessionModeSubscription)),
 		Customer:                  stripe.String(cus),
 		ClientReferenceID:         stripe.String(userID.String()),
 		LineItems:                 []*stripe.CheckoutSessionCreateLineItemParams{{Price: stripe.String(price.ID), Quantity: stripe.Int64(1)}},
 		AllowedPaymentMethodTypes: stripe.StringSlice([]string{"card"}),
+		PaymentMethodCollection:   stripe.String("always"),
 		// USD only (decision P3-C): no converted local-currency price, whatever
 		// the Dashboard default says.
 		AdaptivePricing: &stripe.CheckoutSessionCreateAdaptivePricingParams{Enabled: stripe.Bool(false)},
@@ -191,6 +210,9 @@ func (s *Service) sessionParams(userID uuid.UUID, cus string, price *stripe.Pric
 		ExpiresAt:  stripe.Int64(s.now().Add(checkoutSessionTTL).Unix()),
 		SuccessURL: stripe.String(ReturnURLCheckoutSuccess),
 		CancelURL:  stripe.String(ReturnURLCheckoutCancel),
+	}
+	if trialEligible && plan == PlanSupersonic {
+		params.SubscriptionData.TrialPeriodDays = stripe.Int64(checkoutTrialDays)
 	}
 	if s.foundersActive() {
 		params.Discounts = []*stripe.CheckoutSessionCreateDiscountParams{{Coupon: stripe.String(CouponFoundersID)}}

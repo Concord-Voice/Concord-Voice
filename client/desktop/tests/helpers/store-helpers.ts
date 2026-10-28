@@ -11,6 +11,7 @@ import { useFriendStore } from '../../src/renderer/stores/chat/friendStore';
 import { useConnectionStore } from '../../src/renderer/stores/ui/connectionStore';
 import { usePrivacyStore } from '../../src/renderer/stores/ui/privacyStore';
 import { useSubscriptionStore } from '../../src/renderer/stores/auth/subscriptionStore';
+import { useBillingStore } from '../../src/renderer/stores/auth/billingStore';
 import { useMFAChallengeStore } from '../../src/renderer/stores/auth/mfaChallengeStore';
 import { useSavedGifsStore } from '../../src/renderer/stores/chat/savedGifsStore';
 import { useChannelScrollStore } from '../../src/renderer/stores/chat/channelScrollStore';
@@ -82,6 +83,7 @@ export function resetAllStores(): void {
   useConnectionStore.getState().reset();
   usePrivacyStore.getState().clearPrivacy();
   useSubscriptionStore.getState().reset();
+  useBillingStore.getState().reset();
   useSettingsStore.getState().setAllowNsfwContent(false);
   useMFAChallengeStore.getState().clearChallenge();
   useSavedGifsStore.setState({ gifs: [] });

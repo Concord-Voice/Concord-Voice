@@ -48,8 +48,9 @@ COPY --from=builder /app/package*.json ./
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
     /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
-# Run as non-root user
-RUN addgroup -S appuser && adduser -S appuser -G appuser
+# Run as non-root user. UID/GID 10007 is fixed and differs from control-plane
+# (10006) so the managed Redis controller can tell the two apart by peer UID.
+RUN addgroup -S -g 10007 appuser && adduser -S -u 10007 -G appuser appuser
 RUN chown -R appuser:appuser /app
 
 # GID 10001 is reserved for the host security-event bind mounts. Keep any

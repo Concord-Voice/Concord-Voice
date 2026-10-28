@@ -29,39 +29,27 @@ func wantPriceForm(lookupKey, plan, product, unitAmount, interval string) url.Va
 	}
 }
 
-// wantPortalCreateForm is the spec §6 Portal configuration body for the given
-// product IDs and the four price IDs in catalog order.
-func wantPortalCreateForm(prodS, prodW, sm, sy, wm, wy string) url.Values {
+// wantPortalCreateForm is the spec §6 Portal configuration body.
+// Plan switching is disabled, so it needs no product or price IDs.
+func wantPortalCreateForm() url.Values {
 	return url.Values{
-		"features[customer_update][allowed_updates][0]":                            {"email"},
-		"features[customer_update][allowed_updates][1]":                            {"address"},
-		"features[customer_update][enabled]":                                       {"true"},
-		"features[invoice_history][enabled]":                                       {"true"},
-		"features[payment_method_update][enabled]":                                 {"true"},
-		"features[subscription_cancel][enabled]":                                   {"true"},
-		"features[subscription_cancel][mode]":                                      {"at_period_end"},
-		"features[subscription_cancel][proration_behavior]":                        {"none"},
-		"features[subscription_update][default_allowed_updates][0]":                {"price"},
-		"features[subscription_update][enabled]":                                   {"true"},
-		"features[subscription_update][products][0][adjustable_quantity][enabled]": {"false"},
-		"features[subscription_update][products][0][prices][0]":                    {sm},
-		"features[subscription_update][products][0][prices][1]":                    {sy},
-		"features[subscription_update][products][0][product]":                      {prodS},
-		"features[subscription_update][products][1][adjustable_quantity][enabled]": {"false"},
-		"features[subscription_update][products][1][prices][0]":                    {wm},
-		"features[subscription_update][products][1][prices][1]":                    {wy},
-		"features[subscription_update][products][1][product]":                      {prodW},
-		"features[subscription_update][proration_behavior]":                        {"always_invoice"},
-		"metadata[concord_portal]":                                                 {"v1"},
+		"features[customer_update][allowed_updates][0]":     {"email"},
+		"features[customer_update][allowed_updates][1]":     {"address"},
+		"features[customer_update][enabled]":                {"true"},
+		"features[invoice_history][enabled]":                {"true"},
+		"features[payment_method_update][enabled]":          {"true"},
+		"features[subscription_cancel][enabled]":            {"true"},
+		"features[subscription_cancel][mode]":               {"at_period_end"},
+		"features[subscription_cancel][proration_behavior]": {"none"},
+		"features[subscription_update][enabled]":            {"false"},
+		"metadata[concord_portal]":                          {"v1"},
 	}
 }
 
-// wantPortalUpdateForm adds what only the update sends: reactivation and the
-// cleared schedule_at_period_end conditions.
-func wantPortalUpdateForm(prodS, prodW, sm, sy, wm, wy string) url.Values {
-	form := wantPortalCreateForm(prodS, prodW, sm, sy, wm, wy)
+// wantPortalUpdateForm adds what only the update sends: reactivation.
+func wantPortalUpdateForm() url.Values {
+	form := wantPortalCreateForm()
 	form["active"] = []string{"true"}
-	form["features[subscription_update][schedule_at_period_end][conditions]"] = []string{""}
 	return form
 }
 
@@ -116,7 +104,7 @@ func TestBootstrap_FreshAccountCreatesEverything(t *testing.T) {
 		{Method: http.MethodPost, Path: "/v1/coupons", IdempotencyKey: "concord-stripe-bootstrap-v1:coupon:founders-50",
 			Form: url.Values{"duration": {"forever"}, "id": {"founders-50"}, "percent_off": {"50.0000"}}},
 		{Method: http.MethodPost, Path: "/v1/billing_portal/configurations", IdempotencyKey: "concord-stripe-bootstrap-v1:portal_configuration:v1",
-			Form: wantPortalCreateForm("prod_1", "prod_2", "price_1", "price_2", "price_3", "price_4")},
+			Form: wantPortalCreateForm()},
 	}, f.writes())
 
 	writes := f.writes()
@@ -142,7 +130,7 @@ func TestBootstrap_SecondRunCreatesNothing(t *testing.T) {
 	require.Len(t, second, 1, "a second run may only re-assert the Portal configuration")
 	assert.Equal(t, http.MethodPost, second[0].Method)
 	assert.Equal(t, "/v1/billing_portal/configurations/bpc_1", second[0].Path)
-	assert.Equal(t, wantPortalUpdateForm("prod_1", "prod_2", "price_1", "price_2", "price_3", "price_4"), second[0].Form)
+	assert.Equal(t, wantPortalUpdateForm(), second[0].Form)
 	assert.NotEmpty(t, second[0].IdempotencyKey, "the SDK sends its own random key on an update")
 	assert.False(t, strings.HasPrefix(second[0].IdempotencyKey, idempotencyPrefix),
 		"an update must not reuse an identity key: its body changes when a price ID does")
@@ -189,7 +177,7 @@ func TestBootstrap_PartiallyProvisionedAccount(t *testing.T) {
 	assert.Equal(t, "/v1/prices", writes[1].Path)
 	assert.Equal(t, wantPriceForm("wing_monthly", "wing", "prod_W", "1499", "month"), writes[1].Form)
 	assert.Equal(t, "/v1/billing_portal/configurations", writes[2].Path)
-	assert.Equal(t, wantPortalCreateForm("prod_S", "prod_W", "price_SM", "price_1", "price_2", "price_WY"), writes[2].Form)
+	assert.Equal(t, wantPortalCreateForm(), writes[2].Form)
 	for _, w := range writes {
 		assert.NotEqual(t, "/v1/billing_portal/configurations/bpc_dashboard_default", w.Path,
 			"a configuration without concord_portal=v1 is never changed")

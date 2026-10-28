@@ -1,6 +1,7 @@
 package managedredis
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -49,19 +50,30 @@ func TestParsePolicyAcceptsScopedTwoGenerationOverlap(t *testing.T) {
 	require.Len(t, got.Services["media-plane"].Generations, 2)
 }
 
-func TestParsePolicyRequiresTargetThroughOverlap(t *testing.T) {
+// Re-reading an in-flight rotation must keep parsing as its old generation
+// runs out; refusing it was the rotation deadlock. The controller checks the
+// overlap when it accepts a new policy instead.
+func TestParsePolicyLeavesOverlapToTheController(t *testing.T) {
 	policy := policyTestValue()
-	service := policy.Services[controlPlaneService]
+	for name, service := range policy.Services {
+		service.Generations[0].ValidUntil = policyTestNow
+		policy.Services[name] = service
+	}
+	_, err := ParsePolicy(marshalPolicy(t, policy), policyTestScope(), policyTestNow)
+	require.NoError(t, err, "an expired old generation still parses")
+
+	short := policyTestValue()
+	service := short.Services[controlPlaneService]
 	service.Generations[0].ValidUntil = policyTestNow.Add(time.Hour)
 	service.Generations[1].ValidUntil = policyTestNow.Add(MinimumOverlap - time.Second)
-	policy.Services[controlPlaneService] = service
-	_, err := ParsePolicy(marshalPolicy(t, policy), policyTestScope(), policyTestNow)
-	require.Error(t, err, "a short-lived target cannot replace a longer-lived old user")
-
-	service.Generations[1].ValidUntil = policyTestNow.Add(MinimumOverlap)
-	policy.Services[controlPlaneService] = service
-	_, err = ParsePolicy(marshalPolicy(t, policy), policyTestScope(), policyTestNow)
+	short.Services[controlPlaneService] = service
+	_, err = ParsePolicy(marshalPolicy(t, short), policyTestScope(), policyTestNow)
 	require.NoError(t, err)
+
+	controller, _ := newControllerFixture(t, &fakeRedisAdmin{users: map[string]bool{}})
+	require.NoError(t, controller.PrepareInitial(initialSameRotationPolicy()))
+	require.ErrorIs(t, controller.Reconcile(context.Background(), short), errController,
+		"a short-lived target cannot replace a longer-lived old user")
 }
 
 func TestParsePolicyRejectsGenerationBeyondMediaSafeInteger(t *testing.T) {
@@ -164,9 +176,9 @@ func TestParsePolicyRejectsInvalidGenerationSets(t *testing.T) {
 			s.Generations[1].PasswordHash = "#1111111111111111111111111111111111111111111111111111111111111111 on +@all"
 			p.Services["control-plane"] = s
 		}},
-		{name: "overlap below minimum", mutate: func(p *Policy) {
+		{name: "expired target", mutate: func(p *Policy) {
 			s := p.Services["control-plane"]
-			s.Generations[0].ValidUntil = policyTestNow.Add(119 * time.Second)
+			s.Generations[1].ValidUntil = policyTestNow
 			p.Services["control-plane"] = s
 		}},
 	} {

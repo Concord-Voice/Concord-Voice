@@ -8,8 +8,10 @@
 import { useCallback } from 'react';
 import { ConnectionState, getWebSocketService } from '../../services/messaging/websocketService';
 import { e2eeService } from '../../services/e2ee/e2eeService';
-import { useConnectionStore } from '../../stores/ui/connectionStore';
+import { getVoiceActionGeneration } from '../../services/voice/voiceActionGeneration';
+import { useConnectionStore, type VoiceRejoinState } from '../../stores/ui/connectionStore';
 import { useUserStore } from '../../stores/auth/userStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { useServerStore } from '../../stores/chat/serverStore';
@@ -20,6 +22,12 @@ import {
   beginPostLoginHydrationGuard,
   isHydrationLifecycleCurrent,
 } from '../../services/system/postLoginHydrationLifecycle';
+
+// Rejoin must wait for the teardown that invalidates the old media session.
+// Otherwise a fast control-plane reconnect can build a new call which a late
+// voice-service import immediately destroys.
+// A later outage supersedes both the old import and any rejoin it scheduled.
+let voiceRecoveryGeneration = 0;
 
 /** Run preflight diagnostics after grace period expires and route to the appropriate recovery path. */
 async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocketService>) {
@@ -53,41 +61,86 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
   // the client may be missing key-revocation and membership events, so bounded
   // staleness (the 15s window) is the fail-closed budget for keeping the call
   // up. Capture the channel first so the recovery-path reconnect can rejoin.
-  // Capture the rejoin stash SYNCHRONOUSLY at preflight entry, then RETRACT it
-  // below if the cleanup that justifies it doesn't run. Two races bound the
-  // design and this is the only shape that closes both:
-  //  - Gitar (PR #2873): if the stash is set but emergencyCleanup is later
-  //    skipped (user left voice during the import window), a persisted stash
-  //    phantom-rejoins a channel they deliberately left. Closed by retracting
-  //    the stash in the skip/failure branches below.
-  //  - A stash written INSIDE the async .then() (an earlier cut) could land
-  //    AFTER a reconnect's connectionStore.reset() cleared it — orphaning a
-  //    stale value a later outage cycle would replay. Closed by writing the
-  //    stash synchronously here, before control returns to the event loop, so
-  //    any reconnect handler observes the written value and reset() clears it.
-  // The stash is live only because part 2 revived the previously dead rejoin.
-  // Cleanup keys on connectionState alone (a mid-join 'connecting' session with
-  // no channel id yet still needs teardown); only the stash needs a channel id.
+  // Store the cleanup-backed ticket synchronously before yielding. An ordinary
+  // connection reset cancels it; recovery reconnects explicitly preserve it
+  // until the pending cleanup and rejoin complete. Cleanup keys on
+  // connectionState alone (a mid-join session with no channel id still needs
+  // teardown); only the ticket needs a channel id.
   const voiceState = useVoiceStore.getState();
-  if (voiceState.connectionState !== 'disconnected' && voiceState.activeChannelId) {
-    store.setLastVoiceChannelId(voiceState.activeChannelId);
-  }
+  const generation = voiceRecoveryGeneration;
+  const authGeneration = useAuthStore.getState().authGeneration;
   if (voiceState.connectionState !== 'disconnected') {
-    import('../../services/voice/voiceService')
+    const expectedChannelId = voiceState.activeChannelId;
+    const expectedVoiceActionGeneration = getVoiceActionGeneration();
+    const cleanup = import('../../services/voice/voiceService')
       .then(({ voiceService }) => {
-        if (useVoiceStore.getState().connectionState === 'disconnected') {
-          // User left voice during the import window — teardown is a no-op, so
-          // retract the stash or the reconnect rejoins a channel they left.
-          store.setLastVoiceChannelId(null);
-          return;
+        if (authGeneration !== useAuthStore.getState().authGeneration) {
+          if (
+            expectedChannelId &&
+            useConnectionStore.getState().pendingVoiceRejoin?.cleanup === cleanup
+          ) {
+            useConnectionStore.getState().setPendingVoiceRejoin(null);
+          }
+          return null;
         }
+        if (
+          (expectedChannelId &&
+            useConnectionStore.getState().pendingVoiceRejoin?.cleanup !== cleanup) ||
+          (!expectedChannelId && generation !== voiceRecoveryGeneration)
+        )
+          return null;
+        const currentVoice = useVoiceStore.getState();
+        if (
+          currentVoice.connectionState === 'disconnected' ||
+          getVoiceActionGeneration() !== expectedVoiceActionGeneration
+        ) {
+          // A user action can supersede this cleanup even while the voice
+          // import is pending. Internal rebuilds do not advance that action
+          // counter and still need fail-closed cleanup during a long outage.
+          if (
+            expectedChannelId &&
+            useConnectionStore.getState().pendingVoiceRejoin?.cleanup === cleanup
+          ) {
+            useConnectionStore.getState().setPendingVoiceRejoin(null);
+          }
+          return null;
+        }
+        // Authorization can assign a channel after preflight captured a mid-join
+        // null ID. An internal rebuild can also replace the room without a user
+        // action. Both still need outage teardown; only an explicit action above
+        // may supersede it. Do not rejoin the old room after cleaning a new one.
+        if (
+          expectedChannelId &&
+          currentVoice.activeChannelId !== expectedChannelId &&
+          useConnectionStore.getState().pendingVoiceRejoin?.cleanup === cleanup
+        ) {
+          useConnectionStore.getState().setPendingVoiceRejoin(null);
+        }
+        // The user can mute during the lazy import. Capture the last choice
+        // immediately before cleanup resets the store.
+        const privacyIntent: VoiceRejoinState = {
+          joinType: currentVoice.isDMCall ? 'dm' : 'channel',
+          isMuted: currentVoice.isMuted,
+          isDeafened: currentVoice.isDeafened,
+        };
+        const voiceActionGeneration = voiceService.getVoiceActionGeneration();
         voiceService.emergencyCleanup();
+        return { privacyIntent, voiceActionGeneration };
       })
       .catch(() => {
         // Voice module never loaded — no teardown happened, so the session is
-        // still live and needs no rejoin; retract the unjustified stash.
-        store.setLastVoiceChannelId(null);
+        // still live and needs no rejoin; retract the unjustified ticket.
+        if (
+          expectedChannelId &&
+          useConnectionStore.getState().pendingVoiceRejoin?.cleanup === cleanup
+        ) {
+          useConnectionStore.getState().setPendingVoiceRejoin(null);
+        }
+        return null;
       });
+    if (expectedChannelId) {
+      store.setPendingVoiceRejoin({ channelId: expectedChannelId, authGeneration, cleanup });
+    }
   }
 
   // Guard the lazy import: a stale SPA chunk here previously rejected and was
@@ -145,6 +198,7 @@ function handleConnectionLoss(wsService: ReturnType<typeof getWebSocketService>)
   const connStore = useConnectionStore.getState();
   if (connStore.phase !== 'stable') return;
 
+  voiceRecoveryGeneration += 1;
   connStore.startGracePeriod();
   wsService.setAggressiveReconnect(true);
 
@@ -157,6 +211,56 @@ function handleConnectionLoss(wsService: ReturnType<typeof getWebSocketService>)
   setTimeout(() => {
     runPreflightDiagnostics(wsService).catch(console.debug);
   }, 15_000);
+}
+
+/** Resume a torn-down call only for the current outage, account, and voice owner. */
+function schedulePendingVoiceRejoin(): void {
+  const voiceRejoin = useConnectionStore.getState().pendingVoiceRejoin;
+  if (!voiceRejoin) return;
+  const generation = voiceRecoveryGeneration;
+  voiceRejoin.cleanup
+    .then((cleanupResult) => {
+      if (
+        useConnectionStore.getState().pendingVoiceRejoin !== voiceRejoin ||
+        generation !== voiceRecoveryGeneration
+      )
+        return;
+      if (!cleanupResult || useAuthStore.getState().authGeneration !== voiceRejoin.authGeneration) {
+        useConnectionStore.getState().setPendingVoiceRejoin(null);
+        return;
+      }
+      return import('../../services/voice/voiceService').then(({ voiceService }) => {
+        if (
+          useConnectionStore.getState().pendingVoiceRejoin !== voiceRejoin ||
+          generation !== voiceRecoveryGeneration
+        )
+          return;
+        if (
+          useAuthStore.getState().authGeneration !== voiceRejoin.authGeneration ||
+          voiceService.getVoiceActionGeneration() !== cleanupResult.voiceActionGeneration
+        ) {
+          useConnectionStore.getState().setPendingVoiceRejoin(null);
+          return;
+        }
+        // A user-initiated join while cleanup/import was pending owns voice.
+        const currentVoice = useVoiceStore.getState();
+        if (currentVoice.connectionState !== 'disconnected' || currentVoice.activeChannelId) {
+          useConnectionStore.getState().setPendingVoiceRejoin(null);
+          return;
+        }
+        const { privacyIntent } = cleanupResult;
+        currentVoice.setMuted(privacyIntent.isMuted);
+        currentVoice.setDeafened(privacyIntent.isDeafened);
+        useConnectionStore.getState().setPendingVoiceRejoin(null);
+        return voiceService.joinChannel(voiceRejoin.channelId, privacyIntent.joinType, {
+          privacyIntent,
+          expectedAuthGeneration: voiceRejoin.authGeneration,
+        });
+      });
+    })
+    .catch(() => {
+      /* voice module not available */
+    });
 }
 
 /**
@@ -175,11 +279,8 @@ function handleReconnected(
   wsService.setAggressiveReconnect(false);
 
   if (phase === 'recovery_a' || phase === 'preflight') {
-    // Capture the voice stash BEFORE reset() below wipes it (reset() nulls
-    // lastVoiceChannelId). The pre-fix grace-period branch read it AFTER
-    // reset(), which made the auto-rejoin dead code — every reconnect found
-    // null and silently dropped the user from voice.
-    const lastVoiceId = useConnectionStore.getState().lastVoiceChannelId;
+    // Preserve the cleanup-backed ticket through this recovery-owned reset.
+    // An external reset discards it, so a later outage cannot replay old voice.
     // Floated intentionally — runRecoveryModule never rejects (it swallows a
     // stale-chunk import failure and triggers self-heal), so this cannot
     // surface as the Uncaught (in promise) seen in the origin-502-storm logs.
@@ -215,7 +316,7 @@ function handleReconnected(
       },
       'recoveryReset'
     );
-    useConnectionStore.getState().reset();
+    useConnectionStore.getState().reset({ preserveVoiceRejoin: true });
     runRecoveryModule(
       () => import('../../services/system/recoveryService'),
       (m) => m.clearCrashFlag(),
@@ -234,20 +335,15 @@ function handleReconnected(
     // Voice was torn down when the grace period expired (preflight entry), so
     // rejoin the channel the user was in. Blips shorter than the grace period
     // never reach preflight and keep their live media session — this fires
-    // only after a genuine sustained outage. reset() above already cleared the
-    // stash, so a second reconnect cannot double-join.
-    if (lastVoiceId) {
-      import('../../services/voice/voiceService')
-        .then(({ voiceService }) => voiceService.joinChannel(lastVoiceId))
-        .catch(() => {
-          /* voice module not available */
-        });
-    }
+    // only after a genuine sustained outage. reset() above preserves this
+    // recovery-owned ticket. It survives another outage, but is consumed before
+    // starting a join so a duplicate reconnect cannot double-join.
+    schedulePendingVoiceRejoin();
     return;
   }
 
   if (phase === 'grace_period') {
-    useConnectionStore.getState().reset();
+    useConnectionStore.getState().reset({ preserveVoiceRejoin: true });
     // The socket does not replay missed messages. The purge disconnect fence
     // may also have cleared the mounted chat, so request its guarded backfill.
     globalThis.dispatchEvent(new CustomEvent('connection-recovered'));
@@ -257,10 +353,10 @@ function handleReconnected(
         console.debug('[WebSocket] validate_epochs failed:', err);
       });
     }
-    // No voice rejoin here: a reconnect inside the grace period never tore
-    // voice down (see handleConnectionLoss), so there is nothing to restore —
-    // the media session is still live. lastVoiceChannelId is only ever set at
-    // preflight entry, which is past this phase.
+    // A normal grace reconnect kept its media session alive. A prior sustained
+    // outage may already have torn voice down and queued a rejoin when this
+    // newer blip started; resume that ticket under the current generation.
+    schedulePendingVoiceRejoin();
     return;
   }
 

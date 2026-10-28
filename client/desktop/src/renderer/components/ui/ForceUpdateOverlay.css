@@ -175,3 +175,19 @@
 .force-update-escape {
   margin-top: 12px;
 }
+
+/* ── DesktopAppRequired: the same card, full-page in a plain browser ── */
+
+.desktop-app-required {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 16px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.desktop-app-required .force-update-btn {
+  text-decoration: none;
+}

@@ -83,6 +83,21 @@ describe('RedeemCodeForm (#1304)', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/already redeemed/i);
   });
 
+  it('on 409 seat_member says the code was not used (#2033 PR-5)', async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(REDEEM_PATH, () => HttpResponse.json({ error: 'seat_member' }, { status: 409 }))
+    );
+    render(<RedeemCodeForm onRedeemed={() => {}} />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), 'PROMO-SEAT');
+    await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/friend's Wing/);
+    expect(alert).toHaveTextContent(/not used/);
+  });
+
   it('on 429 shows the rate-limited alert', async () => {
     const user = userEvent.setup();
     server.use(http.post(REDEEM_PATH, () => HttpResponse.json({ error: 'x' }, { status: 429 })));
@@ -215,5 +230,129 @@ describe('RedeemCodeForm (#1304)', () => {
     await user.click(screen.getByRole('button', { name: 'Redeem' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/Could not reach the server/i);
+  });
+  describe('code credit on a live subscription (#2033 D1)', () => {
+    const quote = {
+      error: 'credit_confirmation_required',
+      credit: { amount: 4497, currency: 'usd', code_plan: 'wing', subscribed_plan: 'supersonic' },
+    };
+
+    it('shows the quote and re-sends with confirm_credit on Add', async () => {
+      const user = userEvent.setup();
+      const onRedeemed = vi.fn();
+      const bodies: unknown[] = [];
+      server.use(
+        http.post(REDEEM_PATH, async ({ request }) => {
+          const body = (await request.json()) as { confirm_credit?: boolean };
+          bodies.push(body);
+          return body.confirm_credit
+            ? HttpResponse.json({ success: true, description: 'Added $44.97 of credit.' })
+            : HttpResponse.json(quote, { status: 409 });
+        })
+      );
+      render(<RedeemCodeForm onRedeemed={onRedeemed} />);
+
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'WING-CODE');
+      await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+      const group = await screen.findByRole('group', { name: 'Confirm credit' });
+      await waitFor(() => expect(group).toHaveFocus());
+      expect(group).toHaveTextContent(
+        'This code is for Wing, and you subscribe to Supersonic. It becomes $44.97 of credit'
+      );
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Add $44.97 credit' }));
+
+      expect(await screen.findByRole('status')).toHaveTextContent('Added $44.97 of credit.');
+      expect(bodies).toEqual([{ code: 'WING-CODE' }, { code: 'WING-CODE', confirm_credit: true }]);
+      await waitFor(() => expect(onRedeemed).toHaveBeenCalledTimes(1));
+      expect(screen.queryByRole('group', { name: 'Confirm credit' })).not.toBeInTheDocument();
+    });
+
+    it('Cancel dismisses the quote without redeeming', async () => {
+      const user = userEvent.setup();
+      let calls = 0;
+      server.use(
+        http.post(REDEEM_PATH, () => {
+          calls++;
+          return HttpResponse.json(quote, { status: 409 });
+        })
+      );
+      render(<RedeemCodeForm onRedeemed={() => {}} />);
+
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'WING-CODE');
+      await user.click(screen.getByRole('button', { name: 'Redeem' }));
+      await user.click(await screen.findByRole('button', { name: 'Cancel' }));
+
+      expect(screen.queryByRole('group', { name: 'Confirm credit' })).not.toBeInTheDocument();
+      expect(screen.getByRole('textbox', { name: 'Code' })).toHaveFocus();
+      expect(calls).toBe(1);
+    });
+
+    it('editing the code drops a pending quote', async () => {
+      const user = userEvent.setup();
+      server.use(http.post(REDEEM_PATH, () => HttpResponse.json(quote, { status: 409 })));
+      render(<RedeemCodeForm onRedeemed={() => {}} />);
+
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'WING-CODE');
+      await user.click(screen.getByRole('button', { name: 'Redeem' }));
+      await screen.findByRole('group', { name: 'Confirm credit' });
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'X');
+
+      expect(screen.queryByRole('group', { name: 'Confirm credit' })).not.toBeInTheDocument();
+    });
+
+    it.each([
+      ['a string amount', { amount: '44.97' }],
+      ['a non-USD currency', { ...quote.credit, currency: 'eur' }],
+      ['a zero amount', { ...quote.credit, amount: 0 }],
+      ['a negative amount', { ...quote.credit, amount: -4497 }],
+      ['a fractional amount', { ...quote.credit, amount: 44.97 }],
+    ])('a 409 quote with %s falls back to the already-redeemed alert', async (_name, credit) => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(REDEEM_PATH, () =>
+          HttpResponse.json({ error: 'credit_confirmation_required', credit }, { status: 409 })
+        )
+      );
+      render(<RedeemCodeForm onRedeemed={() => {}} />);
+
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'WING-CODE');
+      await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(/already redeemed/i);
+      expect(screen.queryByRole('group', { name: 'Confirm credit' })).not.toBeInTheDocument();
+    });
+
+    it('on 503 says the code was not used', async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(REDEEM_PATH, () =>
+          HttpResponse.json({ error: 'billing_unavailable' }, { status: 503 })
+        )
+      );
+      render(<RedeemCodeForm onRedeemed={() => {}} />);
+
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'SUPERSONIC-CODE');
+      await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(/Your code was not used/);
+    });
+
+    it('any other 503 does not promise the code was unused', async () => {
+      const user = userEvent.setup();
+      server.use(
+        http.post(REDEEM_PATH, () => HttpResponse.json({ error: 'overloaded' }, { status: 503 }))
+      );
+      render(<RedeemCodeForm onRedeemed={() => {}} />);
+
+      await user.type(screen.getByRole('textbox', { name: 'Code' }), 'SUPERSONIC-CODE');
+      await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent('Could not redeem the code right now. Please try again.');
+      expect(alert).not.toHaveTextContent(/not used/);
+    });
   });
 });

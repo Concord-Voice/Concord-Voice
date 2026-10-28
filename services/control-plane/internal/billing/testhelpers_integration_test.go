@@ -140,8 +140,8 @@ func seedStripeSub(t *testing.T, db *sql.DB, userID uuid.UUID, subID, customerID
 	_, err := db.Exec(
 		`INSERT INTO subscriptions
 		   (user_id, tier, status, source, stripe_customer_id, stripe_subscription_id,
-		    current_period_end, plan, billing_interval)
-		 VALUES ($1, $2, $3, 'stripe', $4, $5, $6, 'wing', 'year')`,
+		    current_period_end, plan, billing_interval, stripe_unit_amount)
+		 VALUES ($1, $2, $3, 'stripe', $4, $5, $6, 'wing', 'year', 16489)`,
 		userID, entitlements.TierPremium, status, customerID, subID, periodEnd)
 	require.NoError(t, err, "seed stripe subscription row")
 }

@@ -126,7 +126,31 @@ type drainedObligation struct {
 	customTextAudience map[uuid.UUID]bool
 }
 
+// ErasedSeat is one Wing seat (#2033 PR-5) the erasure's cascade removes,
+// with the surviving party the erasure owes a push.
+type ErasedSeat struct {
+	SeatID   uuid.UUID
+	Survivor uuid.UUID
+	// Holder is true when the survivor held an active seat the erased user
+	// paid for, so the survivor may have lost premium.
+	Holder bool
+}
+
+// ErasedSeatNotifier tells the survivors of erased Wing seats after the
+// erasure commits. Best effort: it returns nothing.
+type ErasedSeatNotifier func(ctx context.Context, seats []ErasedSeat)
+
+// erasedSeatsQuery reads, before the cascade, the active seats the user pays
+// for (their holders) and the open seats the user holds or was invited to
+// (their payers). Read-only: the cascade deletes the rows (spec §10 step 2).
+const erasedSeatsQuery = `SELECT id, holder_user_id, TRUE FROM subscription_seats
+	WHERE payer_user_id = $1 AND state = 'active'
+	UNION ALL
+	SELECT id, payer_user_id, FALSE FROM subscription_seats
+	WHERE holder_user_id = $1 AND state IN ('pending', 'active')`
+
 type committedAccountDeletion struct {
+	seats            []ErasedSeat
 	channelIDs       pq.StringArray
 	serverIDs        pq.StringArray
 	drained          drainedObligation
@@ -179,6 +203,10 @@ type AccountService struct {
 	// erasureClearKey protects the audience carried over the shared NATS
 	// bus. It is derived from the deployment secret with a dedicated context.
 	erasureClearKey []byte
+
+	// seatsErased pushes the survivors of erased Wing seats. nil (billing not
+	// configured) skips the push; the cascade still frees every seat.
+	seatsErased ErasedSeatNotifier
 }
 
 // NewAccountService constructs an AccountService. The logger is optional;
@@ -193,6 +221,11 @@ func NewAccountService(db *sql.DB, log *logger.Logger) *AccountService {
 // suppression service used by presence-settings writers.
 func (s *AccountService) SetActivitySettingsCleanupHandler(handler *Handler) {
 	s.activityCleanup = handler
+}
+
+// SetErasedSeatNotifier binds the post-commit Wing seat pushes (#2033 PR-5).
+func (s *AccountService) SetErasedSeatNotifier(notify ErasedSeatNotifier) {
+	s.seatsErased = notify
 }
 
 // SetChannelDeletedBroadcaster binds the post-commit incomplete-channel event.
@@ -264,6 +297,9 @@ func (s *AccountService) DeleteAccount(
 	if committed != nil {
 		s.runPostCommitObligations(ctx, userID, committed.channelIDs,
 			committed.serverIDs, committed.drained, committed.stranded, committed.commitUnresolved)
+		if s.seatsErased != nil && len(committed.seats) > 0 && !committed.commitUnresolved {
+			s.seatsErased(ctx, committed.seats)
+		}
 	}
 	return operationErr
 }
@@ -372,7 +408,8 @@ func (s *AccountService) deleteAccount(
 			}
 		}
 	}()
-	channelIDs, serverIDs, plan, drained, stranded, err := s.deleteAccountTx(ctx, tx, userID, candidates, survivorSubjects)
+	var seats []ErasedSeat
+	channelIDs, serverIDs, plan, drained, stranded, err := s.deleteAccountTx(ctx, tx, userID, candidates, survivorSubjects, &seats)
 	if err != nil {
 		// CauseWriteFailed and friends prove no commit happened, so Abandon does
 		// NOT disconnect anyone on those causes -- the deferred rollback discards
@@ -391,6 +428,7 @@ func (s *AccountService) deleteAccount(
 	// the precise gap publishErasureCleared exists to close. So record it and
 	// fall through (rbac review, PR #2840).
 	committed := &committedAccountDeletion{
+		seats:      seats,
 		channelIDs: channelIDs, serverIDs: serverIDs, drained: drained,
 		stranded:         stranded,
 		survivorSubjects: append([]uuid.UUID(nil), (*survivorSubjects)...),
@@ -506,6 +544,7 @@ func (s *AccountService) deleteAccountTx(
 	userID string,
 	candidates []uuid.UUID,
 	survivorSubjects *[]uuid.UUID,
+	seats *[]ErasedSeat,
 ) (pq.StringArray, pq.StringArray, presencecapture.Plan, drainedObligation, erasedMedia, error) {
 	creatorID, lockedUserID, err := lockErasureSubjectsAndConversations(ctx, tx, userID, candidates)
 	if err != nil {
@@ -648,6 +687,10 @@ func (s *AccountService) deleteAccountTx(
 		ON CONFLICT (stripe_customer_id) DO NOTHING`, lockedUserID); err != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{},
 			fmt.Errorf("delete account: enqueue billing erasure of subscription customers: %w", err)
+	}
+
+	if *seats, err = captureErasedSeats(ctx, tx, lockedUserID); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{}, err
 	}
 
 	result, err := tx.ExecContext(ctx,
@@ -1053,4 +1096,29 @@ func (s *AccountService) publishErasureCleared(userID string, audience map[uuid.
 	if deliveryFailed && s.log != nil {
 		s.log.Error("Cross-replica presence clear failed", "failure_class", "delivery")
 	}
+}
+
+// captureErasedSeats reads the user's Wing seats before the users delete
+// cascades them away, so the survivors can be told after the commit.
+func captureErasedSeats(ctx context.Context, tx *sql.Tx, userID string) (seats []ErasedSeat, returnErr error) {
+	rows, err := tx.QueryContext(ctx, erasedSeatsQuery, userID)
+	if err != nil {
+		return nil, fmt.Errorf("delete account: capture wing seats: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("delete account: close wing seats: %w", closeErr))
+		}
+	}()
+	for rows.Next() {
+		var seat ErasedSeat
+		if err := rows.Scan(&seat.SeatID, &seat.Survivor, &seat.Holder); err != nil {
+			return nil, fmt.Errorf("delete account: scan wing seat: %w", err)
+		}
+		seats = append(seats, seat)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delete account: capture wing seats: %w", err)
+	}
+	return seats, nil
 }

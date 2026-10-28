@@ -1,4 +1,4 @@
-import React, { useId, useState } from 'react';
+import React, { useId, useRef, useState } from 'react';
 import Modal from './Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import './ConfirmActionModal.css';
@@ -20,6 +20,8 @@ interface ConfirmActionModalProps {
   extraContent?: React.ReactNode;
   /** Additional caller-owned confirmation gate. */
   confirmDisabled?: boolean;
+  /** Label for the cancel button; when set, the dialog opens with focus on it. */
+  cancelLabel?: string;
   /** When provided, user must type expectedValue to enable the confirm button */
   confirmationInput?: {
     label: React.ReactNode;
@@ -68,8 +70,10 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
   onConfirm,
   extraContent,
   confirmDisabled = false,
+  cancelLabel,
   confirmationInput,
 }) => {
+  const cancelRef = useRef<HTMLButtonElement>(null);
   const inputId = useId();
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -105,7 +109,13 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
   };
 
   return (
-    <Modal isOpen={isOpen} onClose={handleClose} title={title} width="small">
+    <Modal
+      isOpen={isOpen}
+      onClose={handleClose}
+      title={title}
+      width="small"
+      initialFocusRef={cancelLabel ? cancelRef : undefined}
+    >
       <div className="delete-server-content">
         <div className="delete-server-warning">
           <WarningIcon />
@@ -148,11 +158,12 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
         <div className="delete-server-actions">
           <button
             type="button"
+            ref={cancelRef}
             className="delete-server-cancel-btn"
             onClick={handleClose}
             disabled={isProcessing}
           >
-            Cancel
+            {cancelLabel ?? 'Cancel'}
           </button>
           <button
             type="button"

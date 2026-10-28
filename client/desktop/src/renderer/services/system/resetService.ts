@@ -44,6 +44,7 @@ import { useTotpAcceptedStore } from '../../stores/auth/totpAcceptedStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
+import { useBillingStore } from '../../stores/auth/billingStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
@@ -171,6 +172,10 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // above). subscriptionStore has no persist, but logout without app restart
   // would otherwise keep the stale set in memory.
   useSubscriptionStore.getState().reset();
+  // #2033: the subscription read, plan catalog and any Confirming wait belong to
+  // the account that is ending. reset() also retires in-flight reads and a
+  // Checkout or Portal launch, and stops the Confirming timer.
+  useBillingStore.getState().reset();
   useUserStore.getState().clearUser();
 
   // Clear user-specific layout content (serverFolders, serverOrder)

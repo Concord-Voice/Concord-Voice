@@ -27,6 +27,13 @@ const (
 	billingMePath      = "/api/v1/subscriptions/me"
 	billingPlansPath   = "/api/v1/billing/plans"
 	billingCheckout    = "/api/v1/billing/checkout-session"
+	billingSeatInvite  = "/api/v1/billing/seat/invite"
+	billingSeat        = "/api/v1/billing/seat"
+	billingSeatAccept  = "/api/v1/billing/seat-invites/00000000-0000-0000-0000-000000000001/accept"
+	billingPlanChange  = "/api/v1/billing/plan-change"
+	billingPlanPreview = "/api/v1/billing/plan-change/preview"
+	billingPlanKeep    = "/api/v1/billing/plan-change/cancel"
+	billingCancelSub   = "/api/v1/billing/subscription-cancel"
 )
 
 // billingRouter builds the production router (api.NewRouter) over the test
@@ -86,6 +93,11 @@ func TestRouter_BillingRoutesOnlyWhenConfigured(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingPortalPath, "{}", jsonHeader).Code)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodGet, billingPlansPath, "", nil).Code)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingCheckout, "{}", jsonHeader).Code)
+		assertSeatRoutes(t, router, http.StatusNotFound)
+		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingPlanChange, "{}", jsonHeader).Code)
+		for _, path := range []string{billingPlanPreview, billingPlanKeep, billingCancelSub} {
+			assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, path, "{}", jsonHeader).Code)
+		}
 	})
 
 	t.Run("self-hosted with keys: neither route exists", func(t *testing.T) {
@@ -94,6 +106,11 @@ func TestRouter_BillingRoutesOnlyWhenConfigured(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingPortalPath, "{}", jsonHeader).Code)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodGet, billingPlansPath, "", nil).Code)
 		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingCheckout, "{}", jsonHeader).Code)
+		assertSeatRoutes(t, router, http.StatusNotFound)
+		assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, billingPlanChange, "{}", jsonHeader).Code)
+		for _, path := range []string{billingPlanPreview, billingPlanKeep, billingCancelSub} {
+			assert.Equal(t, http.StatusNotFound, serve(router, http.MethodPost, path, "{}", jsonHeader).Code)
+		}
 	})
 
 	t.Run("test key: webhook rejects a bad signature, portal needs auth", func(t *testing.T) {
@@ -102,6 +119,11 @@ func TestRouter_BillingRoutesOnlyWhenConfigured(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodPost, billingPortalPath, "{}", jsonHeader).Code)
 		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodGet, billingPlansPath, "", nil).Code)
 		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodPost, billingCheckout, "{}", jsonHeader).Code)
+		assertSeatRoutes(t, router, http.StatusUnauthorized)
+		assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodPost, billingPlanChange, "{}", jsonHeader).Code)
+		for _, path := range []string{billingPlanPreview, billingPlanKeep, billingCancelSub} {
+			assert.Equal(t, http.StatusUnauthorized, serve(router, http.MethodPost, path, "{}", jsonHeader).Code)
+		}
 	})
 
 	// Buying needs a verified email; the verified-email gate answers before
@@ -140,4 +162,15 @@ func TestRouter_SubscriptionsMeCarriesBillingState(t *testing.T) {
 			assert.Equal(t, tc.want, resp["billing"])
 		})
 	}
+}
+
+// assertSeatRoutes checks the Wing seat routes (#2470) answer want without a
+// caller: 404 where billing is off, 401 where it is on.
+func assertSeatRoutes(t *testing.T, router *gin.Engine, want int) {
+	t.Helper()
+	jsonHeader := http.Header{"Content-Type": {"application/json"}}
+	assert.Equal(t, want, serve(router, http.MethodPost, billingSeatInvite, "{}", jsonHeader).Code)
+	assert.Equal(t, want, serve(router, http.MethodDelete, billingSeat, "", nil).Code)
+	assert.Equal(t, want, serve(router, http.MethodPost, billingSeat+"/leave", "", nil).Code)
+	assert.Equal(t, want, serve(router, http.MethodPost, billingSeatAccept, "", nil).Code)
 }

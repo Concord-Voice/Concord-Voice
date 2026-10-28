@@ -27,6 +27,7 @@ import { parseManagedCredential } from '../src/lib/redis.js';
 import { RedisService } from '../src/lib/redis.js';
 import { config } from '@/config/index.js';
 import { hostname } from 'node:os';
+import { logger } from '../src/lib/logger.js';
 
 type FakeClient = {
   isReady: boolean;
@@ -457,14 +458,9 @@ describe('RedisService managed credential lifecycle', () => {
     expect(acknowledge).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['expires while authentication is pending', 2_000, '2026-10-17T12:00:01.000Z'],
-    [
-      'exceeds the fetch freshness window during authentication',
-      120_001,
-      '2026-10-17T13:00:00.000Z',
-    ],
-  ])('discards a candidate that %s', async (_case, elapsed, validUntil) => {
+  it('discards a candidate that expires while authentication is pending', async () => {
+    const elapsed = 2_000;
+    const validUntil = '2026-10-17T12:00:01.000Z';
     let current = now;
     const active = fakeClient();
     const candidate = fakeClient();
@@ -504,8 +500,7 @@ describe('RedisService managed credential lifecycle', () => {
     expect(acknowledge).toHaveBeenCalledTimes(1);
     expect(candidate.destroy).toHaveBeenCalledOnce();
     expect(active.close).not.toHaveBeenCalled();
-    if (elapsed < 120_000) expect(active.multi).toHaveBeenCalledOnce();
-    else expect(active.multi).not.toHaveBeenCalled();
+    expect(active.multi).toHaveBeenCalledOnce();
     expect(candidate.multi).not.toHaveBeenCalled();
   });
 
@@ -645,7 +640,7 @@ describe('RedisService managed credential lifecycle', () => {
     expect(active.close).not.toHaveBeenCalled();
   });
 
-  it('rejects every Redis command family after the credential freshness deadline', async () => {
+  it('rejects every Redis command family once the credential reaches validUntil', async () => {
     let current = now;
     const client = fakeClient();
     const service = new RedisService({
@@ -660,7 +655,7 @@ describe('RedisService managed credential lifecycle', () => {
     expect(client.set).toHaveBeenCalled();
     expect(client.incr).toHaveBeenCalled();
     vi.clearAllMocks();
-    current = new Date(now.getTime() + 120_001);
+    current = new Date('2026-10-17T13:00:00.000Z');
 
     await service.initializeMediaInstance('blue').catch(() => undefined); // set/incr
     await service.guardRoomCreation('room-1').catch(() => undefined); // mGet
@@ -688,8 +683,7 @@ describe('RedisService managed credential lifecycle', () => {
   it.each([
     ['just before validUntil', '2026-10-17T12:00:01.000Z', 999, true],
     ['at validUntil', '2026-10-17T12:00:01.000Z', 1_000, false],
-    ['just before 120-second freshness cutoff', '2026-10-17T13:00:00.000Z', 119_999, true],
-    ['at 120-second freshness cutoff', '2026-10-17T13:00:00.000Z', 120_000, false],
+    ['past the 120-second stale age', '2026-10-17T13:00:00.000Z', 120_001, true],
   ])(
     'rechecks the managed credential %s before executing a built room-live batch',
     async (_case, validUntil, elapsed, shouldExecute) => {
@@ -727,7 +721,17 @@ describe('RedisService managed credential lifecycle', () => {
     await expect(service.connect()).rejects.toThrow();
   });
 
-  it('does not extend freshness after a failed credential refresh', async () => {
+  const staleAlerts = (): number =>
+    vi
+      .mocked(logger.error)
+      .mock.calls.filter(
+        ([, meta]) =>
+          (meta as { code?: string } | undefined)?.code === 'managed_redis_credential_stale'
+      ).length;
+
+  it('alerts on every failed poll from 120 s and keeps serving until validUntil', async () => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
     let current = now;
     const active = fakeClient();
     let reads = 0;
@@ -741,20 +745,125 @@ describe('RedisService managed credential lifecycle', () => {
       acknowledge: vi.fn().mockResolvedValue(undefined),
       now: () => current,
     });
+    const pollAt = async (elapsedMs: number) => {
+      current = new Date(now.getTime() + elapsedMs);
+      await vi.advanceTimersByTimeAsync(30_000);
+    };
 
-    await service.connect();
-    current = new Date(now.getTime() + 60_000);
-    await expect(service.refreshManagedCredential()).rejects.toThrow();
+    try {
+      await service.connect();
+      await pollAt(119_999);
+      expect(staleAlerts()).toBe(0);
+      await pollAt(120_000);
+      expect(staleAlerts()).toBe(1);
+      expect(logger.warn).not.toHaveBeenCalled();
+      await service.getRoomParticipants('room-1');
+      expect(active.sMembers).toHaveBeenCalledOnce();
+
+      // validUntil is 13:00, one hour after the fetch: serving stops, the alert does not.
+      await pollAt(3_600_000);
+      expect(staleAlerts()).toBe(2);
+      active.sMembers.mockClear();
+      await service.getRoomParticipants('room-1');
+      expect(active.sMembers).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('measures staleness on the monotonic clock when no clock is injected', async () => {
     vi.clearAllMocks();
-    current = new Date(now.getTime() + 120_001);
+    vi.useFakeTimers({ now });
+    let reads = 0;
+    const service = new RedisService({
+      readExact: vi.fn(async () => {
+        reads += 1;
+        if (reads === 1) return { value: first };
+        throw new Error('synthetic provider outage');
+      }),
+      createManagedClient: vi.fn(() => fakeClient()),
+      acknowledge: vi.fn().mockResolvedValue(undefined),
+    });
 
-    await service.getRoomParticipants('room-1');
+    try {
+      await service.connect();
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(staleAlerts()).toBe(0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(staleAlerts()).toBe(1);
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
 
-    expect(active.sMembers).not.toHaveBeenCalled();
+  it('does not report the provider stale while Redis is down and the provider answers', async () => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    let current = now;
+    const active = fakeClient();
+    const candidate = fakeClient();
+    candidate.connect.mockRejectedValue(new Error('ECONNREFUSED'));
+    const service = new RedisService({
+      readExact: vi.fn().mockResolvedValue({ value: first, returnedName: scope.name }),
+      createManagedClient: vi.fn().mockReturnValueOnce(active).mockReturnValue(candidate),
+      acknowledge: vi.fn().mockResolvedValue(undefined),
+      now: () => current,
+    });
+
+    try {
+      await service.connect();
+      active.isReady = false;
+      for (let poll = 1; poll <= 5; poll += 1) {
+        current = new Date(now.getTime() + poll * 30_000);
+        await vi.advanceTimersByTimeAsync(30_000);
+      }
+      expect(staleAlerts()).toBe(0);
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('rebuilds a retired client from the cached credential during a provider outage', async () => {
+    const active = fakeClient();
+    const replacement = fakeClient();
+    const createManagedClient = vi
+      .fn()
+      .mockReturnValueOnce(active)
+      .mockReturnValueOnce(replacement);
+    const acknowledge = vi.fn().mockResolvedValue(undefined);
+    const service = new RedisService({
+      readExact: vi
+        .fn()
+        .mockResolvedValueOnce({ value: first, returnedName: scope.name })
+        .mockRejectedValue(new Error('synthetic provider outage')),
+      createManagedClient,
+      acknowledge,
+      now: () => now,
+    });
+
+    try {
+      await service.connect();
+      const terminated = active.on.mock.calls.find(([event]) => event === 'terminated')?.[1] as
+        | (() => void)
+        | undefined;
+      terminated?.();
+
+      expect(active.destroy).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(replacement.connect).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(service.healthState().acceptingNewRooms).toBe(true));
+      await service.addParticipant('rebuilt-room', 'user-1');
+      expect(replacement.multi).toHaveBeenCalled();
+      expect(acknowledge).toHaveBeenCalledOnce();
+    } finally {
+      await service.close();
+    }
   });
 
   it.each(['terminated', 'ready'] as const)(
-    'stops reconnecting after freshness expiry and replaces the client on %s',
+    'stops reconnecting at validUntil and replaces the client on %s',
     async (event) => {
       let current = now;
       const active = fakeClient();
@@ -764,21 +873,42 @@ describe('RedisService managed credential lifecycle', () => {
         .mockReturnValueOnce(active)
         .mockReturnValueOnce(replacement);
       const service = new RedisService({
-        readExact: vi.fn().mockResolvedValue({ value: first, returnedName: scope.name }),
+        readExact: vi
+          .fn()
+          .mockResolvedValueOnce({ value: first, returnedName: scope.name })
+          .mockResolvedValue({
+            value: credential({
+              rotationId: 'rotation-test-13',
+              generation: 13,
+              username: 'cv_mp_13',
+              validUntil: '2026-10-17T14:00:00.000Z',
+            }),
+            returnedName: scope.name,
+          }),
         createManagedClient,
         acknowledge: vi.fn().mockResolvedValue(undefined),
         now: () => current,
       });
+      replacement.aclWhoAmI.mockResolvedValue('cv_mp_13');
       await service.connect();
       const socket = createManagedClient.mock.calls[0]?.[0]?.socket as {
         reconnectStrategy: (retries: number) => number | false;
       };
       expect(socket.reconnectStrategy(1)).toBeGreaterThan(0);
       const handler = active.on.mock.calls.find(([registered]) => registered === event)?.[1] as
-        (() => void) | undefined;
+        | (() => void)
+        | undefined;
       expect(handler).toBeTypeOf('function');
 
+      // Past the 120 s stale age but before validUntil, the client keeps reconnecting.
       current = new Date(now.getTime() + 120_001);
+      expect(socket.reconnectStrategy(1)).toBeGreaterThan(0);
+      if (event === 'ready') {
+        handler?.();
+        expect(active.destroy).not.toHaveBeenCalled();
+      }
+
+      current = new Date('2026-10-17T13:00:00.000Z');
       expect(socket.reconnectStrategy(1)).toBe(false);
       handler?.();
 

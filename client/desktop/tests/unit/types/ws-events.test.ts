@@ -2508,10 +2508,10 @@ describe('Server role events (#2359)', () => {
     }
   });
 
-  it('WebSocketEventSchema has exactly 83 members', () => {
+  it('WebSocketEventSchema has exactly 85 members', () => {
     // Pins the count quoted in [internal]rules/frontend.md and in the ws-events.ts
     // header, so a future addition cannot silently drift the docs.
-    expect(WebSocketEventSchema.options).toHaveLength(83);
+    expect(WebSocketEventSchema.options).toHaveLength(85);
   });
 });
 
@@ -2650,6 +2650,45 @@ describe('Control-socket token renewal ack (auth_renew_result)', () => {
   it('WebSocketEventSchema rejects an auth_renew_result envelope with a non-boolean ok', () => {
     expect(
       WebSocketEventSchema.safeParse({ type: 'auth_renew_result', data: { ok: 'yes' } }).success
+    ).toBe(false);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// Wing seat events (#2033 PR-5)
+// ════════════════════════════════════════════════════════════════════════
+
+describe('Wing seat events (#2033 PR-5)', () => {
+  it('parses subscription_seat_invite with ids only', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'subscription_seat_invite',
+      data: { invite_id: 'seat-1', expires_at: '2026-10-31T00:00:00Z' },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('parses subscription_seat_updated for every seat state', () => {
+    for (const state of ['pending', 'active', 'declined', 'expired', 'revoked', 'left']) {
+      const result = WebSocketEventSchema.safeParse({
+        type: 'subscription_seat_updated',
+        data: { seat_id: 'seat-1', state },
+      });
+      expect(result.success, state).toBe(true);
+    }
+  });
+
+  it('rejects an unknown seat state and a missing id', () => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'subscription_seat_updated',
+        data: { seat_id: 'seat-1', state: 'gone' },
+      }).success
+    ).toBe(false);
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'subscription_seat_invite',
+        data: { expires_at: '2026-10-31T00:00:00Z' },
+      }).success
     ).toBe(false);
   });
 });

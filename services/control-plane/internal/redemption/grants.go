@@ -29,6 +29,9 @@ type GrantResult struct {
 	// the engine runs entitlements.OnTierChange AFTER the transaction commits.
 	TierChanged      bool
 	OldTier, NewTier string
+	// creditQueued is set when the grant became a billing_credit_outbox row
+	// (#2033 D1), for the engine to apply after the commit.
+	creditQueued bool
 }
 
 // GrantEffect applies one grant_kind's side effect INSIDE the redeem
@@ -122,8 +125,11 @@ const defaultPremiumMonths = 1
 // idx_subscriptions_user_live_code allows at most one in a live status: if that
 // row exists it extends from the greater of NOW() and the existing period end
 // (so stacking codes accumulate); otherwise it inserts a fresh code row. A
-// Stripe row is never read or written here, so a redemption cannot move a
-// Stripe billing period (#2033 spec §5 regression lock).
+// Stripe row is never written here, so a redemption cannot move a Stripe
+// billing period (#2033 spec §5 regression lock). It is read for one thing: a
+// live Stripe subscription set to end (a renewing one takes code credit
+// instead, #2033 D1 in engine.go) pushes the start out to where the paid
+// period ends, so the code's months follow it rather than run in parallel.
 //
 // All SQL is parameterized. The tier move (free→premium, or premium→premium
 // extension) is reported via GrantResult so the engine fires OnTierChange after
@@ -173,6 +179,18 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 	if hasExisting && periodEnd.Valid && periodEnd.Time.After(base) {
 		base = periodEnd.Time
 	}
+	var stripeEnd sql.NullTime
+	if err := tx.QueryRowContext(ctx, `
+		SELECT MAX(COALESCE(cancel_at, current_period_end))
+		  FROM subscriptions
+		 WHERE user_id = $1
+		   AND source = 'stripe'
+		   AND `+entitlements.LiveRowPredicate, userID).Scan(&stripeEnd); err != nil {
+		return GrantResult{}, fmt.Errorf("redemption: read stripe period end: %w", err)
+	}
+	if stripeEnd.Valid && stripeEnd.Time.After(base) {
+		base = stripeEnd.Time
+	}
 	newEnd := base.AddDate(0, months, 0)
 
 	var subID uuid.UUID
@@ -199,8 +217,8 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 	// oldTier: premium if the user held a code row in a live status, else free.
 	// That row may have lapsed without the expiry sweep flipping it yet, so this
 	// can over-report premium for a grant that has already ended. Stripe rows
-	// are not consulted, so a Stripe payer reads as free here; PR-2's D1 refuses
-	// that redemption (409 already_covered). The engine uses this to decide
+	// are not consulted, so a canceling Stripe payer reads as free here, which
+	// only costs a redundant (harmless) live update. The engine uses this to decide
 	// whether OnTierChange is a no-op (both premium) or a real upgrade
 	// (free→premium). Either way OnTierChange invalidates the cache and pushes
 	// the live update.

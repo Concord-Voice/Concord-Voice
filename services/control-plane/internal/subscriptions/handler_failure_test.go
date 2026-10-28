@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/subscriptions"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -54,7 +56,25 @@ func TestGetMe_NoRowsRemainsFree(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, map[string]any{"tier": "free", "status": "none", "billing": "available"}, resp)
+	assert.Equal(t, map[string]any{"tier": "free", "status": "none", "billing": "available", "trial_available": true}, resp)
+}
+
+func TestGetMe_TrialEligibilityErrorKeepsStatus(t *testing.T) {
+	trialEnd := time.Date(2026, time.November, 22, 0, 0, 0, 0, time.UTC)
+	db := sql.OpenDB(statusConnector{
+		values:   []driver.Value{"premium", "trialing", "stripe", trialEnd, "supersonic", "month", false, false, nil},
+		trialErr: true,
+	})
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	w := statusResponse(db)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.JSONEq(t, `{
+		"tier":"premium","status":"trialing","source":"stripe",
+		"current_period_end":"2026-11-22T00:00:00Z","billing":"available","trial_available":false,
+		"stripe":{"plan":"supersonic","interval":"month","status":"trialing",
+			"current_period_end":"2026-11-22T00:00:00Z","canceling":false,"founders_rate":false,"schedule_attached":false}
+	}`, w.Body.String())
 }
 
 func statusResponse(db *sql.DB) *httptest.ResponseRecorder {
@@ -70,7 +90,10 @@ func statusResponse(db *sql.DB) *httptest.ResponseRecorder {
 	return w
 }
 
-type statusConnector struct{ values []driver.Value }
+type statusConnector struct {
+	values   []driver.Value
+	trialErr bool
+}
 
 func (c statusConnector) Connect(context.Context) (driver.Conn, error) {
 	return statusConn(c), nil
@@ -83,7 +106,10 @@ func (statusDriver) Open(string) (driver.Conn, error) {
 	return nil, errors.New("use the test connector")
 }
 
-type statusConn struct{ values []driver.Value }
+type statusConn struct {
+	values   []driver.Value
+	trialErr bool
+}
 
 func (statusConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("test connection does not prepare statements")
@@ -92,16 +118,32 @@ func (statusConn) Close() error { return nil }
 func (statusConn) Begin() (driver.Tx, error) {
 	return nil, errors.New("test connection does not begin transactions")
 }
-func (c statusConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+func (c statusConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "SELECT NOT EXISTS") {
+		if c.trialErr {
+			return nil, errors.New("trial query unavailable")
+		}
+		return &statusRows{values: []driver.Value{true}, columns: []string{"trial_available"}}, nil
+	}
+	if strings.Contains(query, "subscription_seats") {
+		return &statusRows{columns: []string{"seat"}}, nil // no Wing seat side (PR-5)
+	}
 	return &statusRows{values: c.values}, nil
 }
 
-type statusRows struct{ values []driver.Value }
+type statusRows struct {
+	values  []driver.Value
+	columns []string
+}
 
-func (statusRows) Columns() []string {
+func (r *statusRows) Columns() []string {
+	if r.columns != nil {
+		return r.columns
+	}
 	return []string{
 		"tier", "status", "source", "current_period_end",
 		"plan", "billing_interval", "founders_rate", "cancel_at_period_end", "cancel_at",
+		"stripe_unit_amount", "stripe_schedule_id", "pending_plan", "pending_billing_interval", "pending_change_at",
 	}
 }
 func (statusRows) Close() error { return nil }

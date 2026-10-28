@@ -7,7 +7,8 @@ import (
 	"time"
 )
 
-// MinimumOverlap is the required validity window for both generations.
+// MinimumOverlap is the validity both generations must have left when the
+// controller accepts a new two-generation policy.
 const MinimumOverlap = 180 * time.Second
 
 const maxJSONSafeGeneration = 1<<53 - 1
@@ -45,7 +46,10 @@ type AdminBootstrap struct {
 	Password string      `json:"password"`
 }
 
-// ParsePolicy validates the bounded monotonic ACL policy.
+// ParsePolicy validates the bounded monotonic ACL policy. The target must be
+// valid now; an old generation may be past its validUntil, so re-reading an
+// in-flight rotation never refuses it. The controller checks MinimumOverlap
+// only when it accepts a new policy, and it removes an expired old user itself.
 func ParsePolicy(raw []byte, expectedScope SecretScope, now time.Time) (Policy, error) {
 	var policy Policy
 	if err := decodeExact(raw, &policy); err != nil || policy.Version != 1 ||
@@ -85,10 +89,10 @@ func reservedServiceUsername(username string) bool {
 		canonicalUsernameBefore(mediaPlaneService, maxJSONSafeGeneration, username)
 }
 
-func validPolicyGeneration(generation PolicyGeneration, now time.Time) bool {
+func validPolicyGeneration(generation PolicyGeneration, now time.Time, allowExpired bool) bool {
 	return generation.Generation != 0 && generation.Generation <= maxJSONSafeGeneration && aclUsername.MatchString(generation.Username) && generation.Username != "default" &&
 		aclHash.MatchString(generation.PasswordHash) && !generation.ValidFrom.IsZero() &&
-		generation.ValidUntil.After(generation.ValidFrom) && !now.Before(generation.ValidFrom) && now.Before(generation.ValidUntil)
+		generation.ValidUntil.After(generation.ValidFrom) && !now.Before(generation.ValidFrom) && (allowExpired || now.Before(generation.ValidUntil))
 }
 
 func validatePolicyService(serviceName string, service PolicyService, now time.Time, seenUsers map[string]struct{}) error {
@@ -96,46 +100,33 @@ func validatePolicyService(serviceName string, service PolicyService, now time.T
 		return errInvalid
 	}
 	seenGenerations := make(map[uint64]struct{}, 2)
-	var targetValidUntil, oldValidUntil time.Time
+	targetPresent := false
 	for _, generation := range service.Generations {
-		generationTarget, generationOld, err := validateAndRecordGeneration(serviceName, generation, service.TargetGeneration, now, seenUsers, seenGenerations)
-		if err != nil {
+		if err := validateAndRecordGeneration(serviceName, generation, service.TargetGeneration, now, seenUsers, seenGenerations); err != nil {
 			return err
 		}
-		if !generationTarget.IsZero() {
-			targetValidUntil = generationTarget
-		}
-		if !generationOld.IsZero() {
-			oldValidUntil = generationOld
-		}
+		targetPresent = targetPresent || generation.Generation == service.TargetGeneration
 	}
-	deadline := now.Add(MinimumOverlap)
-	if targetValidUntil.IsZero() || len(service.Generations) == 2 &&
-		(targetValidUntil.Before(deadline) || oldValidUntil.Before(deadline)) {
+	if !targetPresent {
 		return errInvalid
 	}
 	return nil
 }
 
-func validateAndRecordGeneration(service string, generation PolicyGeneration, target uint64, now time.Time, seenUsers map[string]struct{}, seenGenerations map[uint64]struct{}) (time.Time, time.Time, error) {
-	if !validPolicyGeneration(generation, now) || generation.Username != canonicalUsername(service, generation.Generation) {
-		return time.Time{}, time.Time{}, errInvalid
+func validateAndRecordGeneration(service string, generation PolicyGeneration, target uint64, now time.Time, seenUsers map[string]struct{}, seenGenerations map[uint64]struct{}) error {
+	if generation.Generation > target || !validPolicyGeneration(generation, now, generation.Generation != target) ||
+		generation.Username != canonicalUsername(service, generation.Generation) {
+		return errInvalid
 	}
 	if _, duplicate := seenUsers[generation.Username]; duplicate {
-		return time.Time{}, time.Time{}, errInvalid
+		return errInvalid
 	}
 	if _, duplicate := seenGenerations[generation.Generation]; duplicate {
-		return time.Time{}, time.Time{}, errInvalid
+		return errInvalid
 	}
 	seenUsers[generation.Username] = struct{}{}
 	seenGenerations[generation.Generation] = struct{}{}
-	if generation.Generation == target {
-		return generation.ValidUntil, time.Time{}, nil
-	}
-	if generation.Generation > target {
-		return time.Time{}, time.Time{}, errInvalid
-	}
-	return time.Time{}, generation.ValidUntil, nil
+	return nil
 }
 
 // ParseAdminBootstrap validates the scoped controller identity.

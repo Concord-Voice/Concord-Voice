@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -96,6 +97,9 @@ func TestHandleRedeemError_Mapping(t *testing.T) {
 		{"generic invalid", ErrCodeNotValid, http.StatusBadRequest, genericInvalidMessage},
 		{"already redeemed", ErrAlreadyRedeemed, http.StatusConflict, ""},
 		{"unexpected error", context.DeadlineExceeded, http.StatusInternalServerError, ""},
+		{"credit needs confirmation", &CreditConfirmationError{Amount: 4497, Currency: "usd", CodePlan: PlanWing, SubscribedPlan: PlanSupersonic},
+			http.StatusConflict, `{"credit":{"amount":4497,"currency":"usd","code_plan":"wing","subscribed_plan":"supersonic"},"error":"credit_confirmation_required"}`},
+		{"credit unavailable", fmt.Errorf("%w: stripe down", ErrCreditUnavailable), http.StatusServiceUnavailable, `"billing_unavailable"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,6 +139,18 @@ func TestValidateSpec_CountBounds(t *testing.T) {
 		})
 		assert.NoError(t, err)
 	})
+}
+
+// A premium code may only name a plan Concord sells (#2033 D1), so no code is
+// minted that a subscriber's redemption would refuse.
+func TestValidateSpec_PremiumPlan(t *testing.T) {
+	iss := NewIssuer(nil, NewCatalog(), nil)
+	spec := func(params map[string]any) IssueSpec {
+		return IssueSpec{GrantKind: GrantPremiumSubscription, GrantParams: params, Count: 1, SingleUse: true, MaxRedeems: intPtrLocal(1)}
+	}
+	assert.NoError(t, iss.validateSpec(spec(nil)), "no plan is a Supersonic code")
+	assert.NoError(t, iss.validateSpec(spec(map[string]any{"plan": "wing"})))
+	assert.ErrorIs(t, iss.validateSpec(spec(map[string]any{"plan": "platinum"})), errIssuePlanUnknown)
 }
 
 // TestGenerate_RejectsOverLimitCount pins the HTTP boundary guard: an over-limit
@@ -273,6 +289,11 @@ func TestHandleIssueError_ValidationBranch(t *testing.T) {
 	h.handleIssueError(c, errIssueGrantUnknown)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "grant_kind not supported")
+
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	h.handleIssueError(c, errIssuePlanUnknown)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "an unknown premium plan is an operator error")
 }
 
 // TestRevokeBatch_EmptyBatchID rejects an empty batch id BEFORE any DB call (the

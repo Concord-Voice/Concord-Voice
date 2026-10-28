@@ -398,9 +398,19 @@ func closeFailedJournal(file *os.File) error {
 	return errController
 }
 
+// durableFailureCodeLocked keeps a failure code only while a journaled intent
+// still needs it; provider and policy read failures are transient and must not
+// survive a restart and block ValidateRestoredPolicy.
+func (c *Controller) durableFailureCodeLocked() string {
+	if c.intent == "" {
+		return ""
+	}
+	return c.failureCode
+}
+
 func (c *Controller) snapshotJournalLocked() rotationJournal {
 	j := rotationJournal{Version: 1, Effective: c.policy, Phase: c.state, Intent: c.intent,
-		Revoked: make(map[string]revokedIdentity, 2), FailureCode: c.failureCode,
+		Revoked: make(map[string]revokedIdentity, 2), FailureCode: c.durableFailureCodeLocked(),
 		LastRequiredAckAt: c.lastRequiredAckAt, RecoveryAt: c.recoveryAt, ValidatedAt: c.validatedAt}
 	for service, floor := range c.revoked {
 		j.Revoked[service] = revokedIdentity{Generation: floor.Generation}

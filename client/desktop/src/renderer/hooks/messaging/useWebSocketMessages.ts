@@ -43,6 +43,7 @@ import { useConnectionStore } from '../../stores/ui/connectionStore';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
+import { useBillingStore } from '../../stores/auth/billingStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { useRichPresenceStore, type OtherPresenceByUser } from '../../stores/ui/richPresenceStore';
 import { speak as ttsSpeak } from '../../services/system/ttsService';
@@ -1835,8 +1836,35 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // Entitlements changed (#1297) — server pushes the full capability set on
     // any tier change. The wire payload is validated at the dispatch boundary,
     // so update the store directly — no re-fetch round-trip.
+    // Once billing details are loaded (#2033), any push re-reads the subscription:
+    // a cancel, resume, payment recovery or a code-covered purchase changes the
+    // row without changing the tier, and only the read can show it.
     const unsubEntitlements = wsService.on('entitlements_changed', (msg) => {
       useSubscriptionStore.getState().setEntitlement(msg.data);
+      const billing = useBillingStore.getState();
+      if (billing.pending || billing.me !== null) void billing.fetchMe();
+    });
+
+    // Wing seats (#2033 PR-5): both events carry ids only, so re-read /me.
+    // A new invite also nudges, once, unless the user is in DND (presence or
+    // notification settings), as friend_request_received does. No nav dot.
+    const unsubSeatInvite = wsService.on('subscription_seat_invite', (msg) => {
+      void useBillingStore.getState().fetchMe();
+      if (isDoNotDisturb()) return;
+      notificationSoundService.play('friend-request');
+      if (desktopNotificationService.shouldNotifyAccount()) {
+        desktopNotificationService.notify({
+          title: 'Wing invite',
+          senderDisplayName: 'Concord',
+          body: 'A friend invited you to their Wing. Open Settings ▸ Subscription to answer.',
+          targetType: 'account',
+          targetId: msg.data.invite_id,
+          senderId: '',
+        });
+      }
+    });
+    const unsubSeatUpdated = wsService.on('subscription_seat_updated', () => {
+      void useBillingStore.getState().fetchMe();
     });
 
     // A purge event can be lost if the server exits before its in-memory
@@ -1881,6 +1909,13 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         useSubscriptionStore
           .getState()
           .hydrate()
+          .then(() => {
+            // A push lost during the outage is never seen (#2033), so the
+            // reconnect hydrate re-reads loaded billing details too.
+            const billing = useBillingStore.getState();
+            if (billing.pending || billing.me !== null) return billing.fetchMe();
+            return undefined;
+          })
           .catch((err) => {
             // hydrate() is internally fail-closed and never rejects; this handler
             // only satisfies no-floating-promises without the `void` operator (S3735).
@@ -2653,6 +2688,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubFriendOrgUpdated();
       unsubPresenceOverridesUpdated();
       unsubEntitlements();
+      unsubSeatInvite();
+      unsubSeatUpdated();
       unsubEntitlementsResync();
       unsubPresenceSnapshot();
       unsubPresence();

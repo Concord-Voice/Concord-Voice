@@ -1,111 +1,88 @@
-import { useCallback, useEffect, useState } from 'react';
-import { apiFetch, safeJson } from '../../services/system/apiClient';
+import { useEffect } from 'react';
+import {
+  useBillingStore,
+  type BillingMe,
+  type SeatInfo,
+  type SeatInvite,
+  type StripeRow,
+} from '../../stores/auth/billingStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 
-// Subscription status for Settings ▸ Account ▸ Subscription. Reads
-// GET /api/v1/subscriptions/me (the read-only status companion to the
-// entitlement set) on mount and exposes tier/status/source/expiry so the
-// PlanCard can render the active plan's neutral source and optional expiry.
+// Subscription status for Settings ▸ Account ▸ Subscription: a thin selector
+// over billingStore's `GET /api/v1/subscriptions/me` read (#2033 PR-4).
 //
-// The entitlementStore (#1297) carries only the resolved `tier`; this hook adds
-// the grant's status/source/expiry which the store does not hold. `refetch` is
-// called by the RedeemCodeForm after a successful redeem so the status view
-// updates immediately (the server ALSO pushes entitlements_changed, which
-// updates the store's tier live — this hook re-reads the richer status shape).
+// The entitlement store (#1297) carries only the resolved `tier`. This adds the
+// grant's status, source and expiry, the instance's billing mode, and the live
+// Stripe and code rows, and the Wing seat side. The read runs on mount and again whenever the store's
+// tier changes (an entitlements_changed push), so a redeem or a purchase shows
+// without an explicit refetch; `refetch` is the Retry and post-redeem re-read.
 //
-// Never blocks the page: on any fetch or malformed-response error the hook falls back to the
-// subscriptionStore's tier (itself fail-closed to free) with status 'unknown'
-// and surfaces `error`. Cached entitlement access is separate from verified status.
+// Never blocks the page: when the read fails or returns a partial body the hook
+// falls back to the entitlement store's tier (itself fail-closed to free) with
+// status 'unknown' and `error` set. Cached access is never shown as verified.
 
-export type SubscriptionSource = 'code' | 'stripe';
+export type SubscriptionSource = 'code' | 'stripe' | 'seat';
+export type BillingMode = BillingMe['billing'];
 
 export interface SubscriptionInfo {
   tier: string;
   status: string;
   source?: SubscriptionSource;
   expiry?: string; // RFC 3339 UTC, present only when the grant has a period end
+  billing: BillingMode;
+  trialAvailable?: boolean;
+  stripe?: StripeRow;
+  codeExpiry?: string | null; // undefined: no live code row; null: a code row that never lapses
+  seat?: SeatInfo; // the caller's Wing seat side (#2033 PR-5)
+  invites: SeatInvite[]; // open Wing invites the caller may answer
   loading: boolean;
   error: boolean;
   refetch: () => void;
 }
 
-function normalizeSource(source: unknown): SubscriptionSource | undefined {
-  return source === 'code' || source === 'stripe' ? source : undefined;
-}
-
 export function useSubscription(): SubscriptionInfo {
-  const [state, setState] = useState<Omit<SubscriptionInfo, 'refetch'>>({
-    tier: 'free',
-    status: 'loading',
-    loading: true,
-    error: false,
-  });
-  // Read the store tier as the fail-open-safe fallback (it is itself fail-closed
-  // to the free floor, so this can never fabricate premium).
+  const me = useBillingStore((s) => s.me);
+  const meError = useBillingStore((s) => s.meError);
+  const fetchMe = useBillingStore((s) => s.fetchMe);
+  // The fail-closed fallback tier, and the signal that a push changed access.
   const storeTier = useSubscriptionStore((s) => s.entitlement.tier);
 
-  const load = useCallback(async () => {
-    setState((prev) => ({ ...prev, loading: true, error: false }));
-    try {
-      const res = await apiFetch('/api/v1/subscriptions/me');
-      if (!res.ok) throw new Error(`subscriptions/me ${res.status}`);
-      const data = await safeJson<unknown>(res);
-      // A successful HTTP response is not proof of access when required status
-      // fields are missing. Never synthesize free/none from a partial payload.
-      if (
-        !data ||
-        typeof data !== 'object' ||
-        Array.isArray(data) ||
-        !('tier' in data) ||
-        typeof data.tier !== 'string' ||
-        !('status' in data) ||
-        typeof data.status !== 'string'
-      ) {
-        throw new Error('Invalid subscription status response');
-      }
-      setState({
-        tier: data.tier,
-        status: data.status,
-        source: normalizeSource('source' in data ? data.source : undefined),
-        expiry:
-          'current_period_end' in data && typeof data.current_period_end === 'string'
-            ? data.current_period_end
-            : undefined,
-        loading: false,
-        error: false,
-      });
-    } catch {
-      // Never block the page: fall back to the store's (fail-closed) tier.
-      setState({
-        tier: storeTier,
-        status: 'unknown',
-        source: undefined,
-        expiry: undefined,
-        loading: false,
-        error: true,
-      });
-    }
-  }, [storeTier]);
-
-  // load is a useCallback keyed on storeTier, so this fires on mount AND whenever
-  // the store tier changes live (the entitlements_changed WS push after a redeem
-  // updates the store) — refreshing the richer status shape without an explicit
-  // refetch. `refetch` remains for the immediate post-redeem re-read.
   useEffect(() => {
-    // load() handles all errors internally (its body is a try/catch that resolves
-    // to a fail-closed state and never rejects); the .catch is a belt-and-suspenders
-    // guard so a floating rejection can never surface as an unhandled promise.
-    load().catch(() => {
-      /* load() already set the fail-closed error state */
-    });
-  }, [load]);
+    // fetchMe resolves its own failures into `meError` and never rejects.
+    void fetchMe();
+  }, [fetchMe, storeTier]);
+
+  const refetch = (): void => {
+    void fetchMe();
+  };
+
+  // A failed refresh keeps showing the last good read; the error state is
+  // only for when no read has succeeded yet.
+  if (me === null) {
+    return {
+      tier: storeTier,
+      status: 'unknown',
+      billing: 'not_configured',
+      invites: [],
+      loading: !meError,
+      error: meError,
+      refetch,
+    };
+  }
 
   return {
-    ...state,
-    refetch: () => {
-      load().catch(() => {
-        /* load() already set the fail-closed error state */
-      });
-    },
+    tier: me.tier,
+    status: me.status,
+    source: me.source,
+    expiry: me.current_period_end,
+    billing: me.billing,
+    trialAvailable: me.trial_available,
+    stripe: me.stripe,
+    codeExpiry: me.code ? me.code.current_period_end : undefined,
+    seat: me.seat,
+    invites: me.invites,
+    loading: false,
+    error: false,
+    refetch,
   };
 }

@@ -24,7 +24,7 @@ const CREATE_GUARD_TIMEOUT_MS = 1_000;
 // shortcut: 256 is an unmeasured fail-closed queue ceiling; replace with observed peak in-flight joins before enabling placement.
 const REDIS_COMMAND_QUEUE_MAX_LENGTH = 256;
 const MANAGED_CREDENTIAL_NAME = 'REDIS_MEDIA_PLANE_CREDENTIAL';
-const MANAGED_FRESHNESS_MS = 120_000;
+const MANAGED_STALE_MS = 120_000;
 const MANAGED_POLL_MS = 30_000;
 const MANAGED_AUTH_TIMEOUT_MS = 10_000;
 const MANAGED_DRAIN_MS = 30_000;
@@ -209,29 +209,23 @@ export class RedisService {
 
   private managedFresh(): boolean {
     if (config.redisCredentialMode !== 'managed') return true;
-    return this.credentialFresh(
-      this.managedCredential,
-      this.managedFetchedAt,
-      this.managedFetchedMonotonic
-    );
+    return this.credentialFresh(this.managedCredential, this.managedFetchedAt);
   }
 
-  private credentialFresh(
-    credential: ManagedCredential | null,
-    fetchedAt: number,
-    fetchedMonotonic: number
-  ): boolean {
-    const until = credential && Date.parse(credential.validUntil);
+  // A stale credential keeps serving until validUntil: a provider outage is an
+  // alert, not an app outage, and Redis ACL revocation still cuts it off. The
+  // age alone decides staleness, so the alert keeps firing after validUntil.
+  private managedStale(): boolean {
+    if (config.redisCredentialMode !== 'managed' || !this.managedCredential) return false;
     const age = this.managedOptions.now
-      ? this.now().getTime() - fetchedAt
-      : performance.now() - fetchedMonotonic;
-    return (
-      !!until &&
-      fetchedAt > 0 &&
-      this.now().getTime() < until &&
-      age >= 0 &&
-      age < MANAGED_FRESHNESS_MS
-    );
+      ? this.now().getTime() - this.managedFetchedAt
+      : performance.now() - this.managedFetchedMonotonic;
+    return age >= MANAGED_STALE_MS;
+  }
+
+  private credentialFresh(credential: ManagedCredential | null, fetchedAt: number): boolean {
+    const until = credential && Date.parse(credential.validUntil);
+    return !!until && fetchedAt > 0 && this.now().getTime() < until;
   }
 
   setSecurityEventEmitter(emit: EmitSecurityEvent | undefined): void {
@@ -273,7 +267,7 @@ export class RedisService {
 
   async connect(): Promise<void> {
     if (config.redisCredentialMode === 'managed') {
-      const cold = this.client === null;
+      const cold = this.managedCredential === null;
       try {
         await this.refreshManagedCredential();
       } catch {
@@ -301,6 +295,14 @@ export class RedisService {
                 ? error.message
                 : 'managed_redis_refresh_failed';
             logger.error('Managed Redis refresh failed', { code });
+            if (this.managedStale()) {
+              logger.error(
+                'Managed Redis credential stale; serving the last validated generation',
+                {
+                  code: 'managed_redis_credential_stale',
+                }
+              );
+            }
           });
         }, MANAGED_POLL_MS);
         this.managedPoll.unref();
@@ -406,9 +408,10 @@ export class RedisService {
     if (!sameManagedCredential(candidate, previous)) {
       throw new Error('managed_redis_generation_changed');
     }
-    if (!this.client?.isReady) return false;
+    // A validated same-generation read resets staleness even while Redis is down.
     this.managedFetchedAt = now.getTime();
     this.managedFetchedMonotonic = fetchedMonotonic;
+    if (!this.client?.isReady) return false;
     if (this.managedAckPending) await this.acknowledgeApplied();
     return true;
   }
@@ -501,14 +504,21 @@ export class RedisService {
       name: MANAGED_CREDENTIAL_NAME,
     };
     const endpoint = managedEndpoint();
-    const { credential, now, fetchedMonotonic } = await this.fetchManagedCredential(scope);
+    let fetched: { credential: ManagedCredential; now: Date; fetchedMonotonic: number };
+    try {
+      fetched = await this.fetchManagedCredential(scope);
+    } catch (error) {
+      await this.rebuildFromCachedCredential(endpoint);
+      throw error;
+    }
+    const { credential, now, fetchedMonotonic } = fetched;
     if (await this.reuseCurrentManagedCredential(credential, now, fetchedMonotonic)) return;
     const candidate = await this.createAuthenticatedManagedClient(credential, endpoint);
     if (this.managedClosed) {
       candidate.destroy();
       throw new Error('managed_redis_closed');
     }
-    if (!this.credentialFresh(credential, now.getTime(), fetchedMonotonic)) {
+    if (!this.credentialFresh(credential, now.getTime())) {
       candidate.destroy();
       throw new Error('managed_redis_candidate_rejected');
     }
@@ -523,6 +533,37 @@ export class RedisService {
     if (old) this.drainOldManagedClient(old);
     await this.acknowledgeApplied();
     logger.info('Managed Redis generation applied');
+  }
+
+  // Provider outage with no client (a Redis stall retired it): rebuild from the
+  // last validated credential so serving continues until validUntil.
+  private async rebuildFromCachedCredential(endpoint: {
+    host: string;
+    port: number;
+  }): Promise<void> {
+    const credential = this.managedCredential;
+    if (this.client || !credential || !this.managedFresh()) return;
+    let candidate: RedisClientType;
+    try {
+      candidate = await this.createAuthenticatedManagedClient(credential, endpoint);
+    } catch {
+      return;
+    }
+    if (
+      this.managedClosed ||
+      this.client ||
+      this.managedCredential !== credential ||
+      !this.managedFresh()
+    ) {
+      candidate.destroy();
+      return;
+    }
+    this.client = candidate;
+    this.redisReachable = true;
+    this.restored();
+    logger.warn('Managed Redis client rebuilt from the last validated generation', {
+      code: 'managed_redis_cached_rebuild',
+    });
   }
 
   private async managedDeadline<T>(promise: Promise<T>, ms: number, code: string): Promise<T> {
@@ -666,7 +707,9 @@ export class RedisService {
     this.degraded();
     client.destroy(); // Flushes already-written reads, which caller-side deadlines cannot cancel.
     void this.connect()
-      .then(() => this.refreshAcceptingNewRooms())
+      .catch(() => {})
+      // connect() throws during a provider outage even when it rebuilt the client.
+      .then(() => (this.client ? this.refreshAcceptingNewRooms() : undefined))
       .catch(() => {});
   }
 

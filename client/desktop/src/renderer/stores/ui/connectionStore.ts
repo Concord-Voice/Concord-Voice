@@ -16,6 +16,21 @@ export type RecoveryPhase =
   | 'recovery_b' // Client issue — soft restart attempt
   | 'fatal'; // Unrecoverable — show full overlay
 
+export interface VoiceRejoinState {
+  readonly joinType: 'channel' | 'dm';
+  readonly isMuted: boolean;
+  readonly isDeafened: boolean;
+}
+
+export interface PendingVoiceRejoin {
+  readonly channelId: string;
+  readonly authGeneration: number;
+  readonly cleanup: Promise<{
+    privacyIntent: VoiceRejoinState;
+    voiceActionGeneration: number;
+  } | null>;
+}
+
 interface ConnectionState {
   /** Current recovery phase */
   phase: RecoveryPhase;
@@ -26,8 +41,8 @@ interface ConnectionState {
   /** Timestamp when connection was lost */
   lostAt: number | null;
 
-  /** Voice channel the user was in when connection dropped (for grace-period rejoin) */
-  lastVoiceChannelId: string | null;
+  /** Ephemeral call intent, cleared by ordinary connection resets. */
+  pendingVoiceRejoin: PendingVoiceRejoin | null;
 
   /** Number of recovery attempts in this disconnection episode */
   recoveryAttempts: number;
@@ -65,8 +80,8 @@ interface ConnectionState {
   /** Transition to fatal (unrecoverable — user action required) */
   enterFatal: () => void;
 
-  /** Store the voice channel ID before emergency cleanup */
-  setLastVoiceChannelId: (id: string | null) => void;
+  /** Store the cleanup-backed voice rejoin ticket. */
+  setPendingVoiceRejoin: (ticket: PendingVoiceRejoin | null) => void;
 
   /** Increment recovery attempt counter */
   incrementRecoveryAttempts: () => void;
@@ -78,14 +93,14 @@ interface ConnectionState {
   incrementWireViolation: () => void;
 
   /** Reset everything (called when connection is restored or session resets) */
-  reset: () => void;
+  reset: (options?: { preserveVoiceRejoin?: boolean }) => void;
 }
 
 export const useConnectionStore = createStore<ConnectionState>()((set) => ({
   phase: 'stable',
   diagnostics: null,
   lostAt: null,
-  lastVoiceChannelId: null,
+  pendingVoiceRejoin: null,
   recoveryAttempts: 0,
   wireViolationCount: 0,
 
@@ -117,7 +132,7 @@ export const useConnectionStore = createStore<ConnectionState>()((set) => ({
       phase: 'fatal',
     }),
 
-  setLastVoiceChannelId: (id) => set({ lastVoiceChannelId: id }),
+  setPendingVoiceRejoin: (ticket) => set({ pendingVoiceRejoin: ticket }),
 
   incrementRecoveryAttempts: () =>
     set((s) => ({
@@ -129,13 +144,13 @@ export const useConnectionStore = createStore<ConnectionState>()((set) => ({
       wireViolationCount: s.wireViolationCount + 1,
     })),
 
-  reset: () =>
-    set({
+  reset: (options) =>
+    set((state) => ({
       phase: 'stable',
       diagnostics: null,
       lostAt: null,
-      lastVoiceChannelId: null,
+      pendingVoiceRejoin: options?.preserveVoiceRejoin ? state.pendingVoiceRejoin : null,
       recoveryAttempts: 0,
       wireViolationCount: 0,
-    }),
+    })),
 }));

@@ -109,9 +109,6 @@ var catalogPrices = []catalogPrice{
 // Portal values shared by create and update. stripe-go has distinct create
 // and update param types, so the shared values are plain strings.
 var (
-	portalDefaultAllowedUpdates = []string{
-		string(stripe.BillingPortalConfigurationFeaturesSubscriptionUpdateDefaultAllowedUpdatePrice),
-	}
 	portalCustomerAllowedUpdates = []string{
 		string(stripe.BillingPortalConfigurationFeaturesCustomerUpdateAllowedUpdateEmail),
 		string(stripe.BillingPortalConfigurationFeaturesCustomerUpdateAllowedUpdateAddress),
@@ -132,12 +129,6 @@ type bootstrapRun struct {
 	dryRun bool
 	state  *catalogState
 	report *BootstrapReport
-}
-
-// portalPlan is one product's entry in the Portal's plan switcher.
-type portalPlan struct {
-	product string
-	prices  []string
 }
 
 // Bootstrap provisions the Stripe catalog of spec §6 idempotently: products
@@ -501,14 +492,14 @@ func (r *bootstrapRun) ensurePortalConfiguration(ctx context.Context) error {
 		r.record(KindPortalConfiguration, PortalMetadataVersion, "", ActionCreate)
 		return nil
 	case existing != nil:
-		pc, err := r.c.V1BillingPortalConfigurations.Update(ctx, existing.ID, newPortalUpdateParams(r.portalPlans()))
+		pc, err := r.c.V1BillingPortalConfigurations.Update(ctx, existing.ID, newPortalUpdateParams())
 		if err != nil {
 			return fmt.Errorf("billing: bootstrap: update portal configuration %s: %w", existing.ID, err)
 		}
 		r.record(KindPortalConfiguration, PortalMetadataVersion, pc.ID, ActionUpdate)
 		return nil
 	}
-	pc, err := r.c.V1BillingPortalConfigurations.Create(ctx, newPortalCreateParams(r.portalPlans()))
+	pc, err := r.c.V1BillingPortalConfigurations.Create(ctx, newPortalCreateParams())
 	if err != nil {
 		return fmt.Errorf("billing: bootstrap: create portal configuration: %w", err)
 	}
@@ -516,39 +507,9 @@ func (r *bootstrapRun) ensurePortalConfiguration(ctx context.Context) error {
 	return nil
 }
 
-// portalPlans returns both products, each with its prices in catalog order
-// (monthly, then yearly). It runs after every product and price exists.
-func (r *bootstrapRun) portalPlans() []portalPlan {
-	plans := make([]portalPlan, 0, len(catalogProducts))
-	for _, product := range catalogProducts {
-		plan := portalPlan{product: r.state.productID(product.plan)}
-		for _, price := range catalogPrices {
-			if price.plan == product.plan {
-				plan.prices = append(plan.prices, r.state.prices[price.lookupKey].ID)
-			}
-		}
-		plans = append(plans, plan)
-	}
-	return plans
-}
-
-// newPortalCreateParams builds the spec §6 configuration: plan switching
-// between the four prices with quantity fixed, always_invoice proration and
-// no scheduled downgrades (D16(b)); cancel at period end without proration;
-// payment method update; invoice history; email and address updates. Price
-// is the only allowed update, so the Portal offers no promotion codes. No
-// default_return_url: every Portal session passes its own return_url.
-func newPortalCreateParams(plans []portalPlan) *stripe.BillingPortalConfigurationCreateParams {
-	products := make([]*stripe.BillingPortalConfigurationCreateFeaturesSubscriptionUpdateProductParams, 0, len(plans))
-	for _, plan := range plans {
-		products = append(products, &stripe.BillingPortalConfigurationCreateFeaturesSubscriptionUpdateProductParams{
-			AdjustableQuantity: &stripe.BillingPortalConfigurationCreateFeaturesSubscriptionUpdateProductAdjustableQuantityParams{
-				Enabled: stripe.Bool(false),
-			},
-			Prices:  stripe.StringSlice(plan.prices),
-			Product: stripe.String(plan.product),
-		})
-	}
+// newPortalCreateParams disables Portal plan switching while retaining
+// period-end cancellation, card updates and invoice history.
+func newPortalCreateParams() *stripe.BillingPortalConfigurationCreateParams {
 	params := &stripe.BillingPortalConfigurationCreateParams{
 		Features: &stripe.BillingPortalConfigurationCreateFeaturesParams{
 			CustomerUpdate: &stripe.BillingPortalConfigurationCreateFeaturesCustomerUpdateParams{
@@ -562,12 +523,7 @@ func newPortalCreateParams(plans []portalPlan) *stripe.BillingPortalConfiguratio
 				Mode:              stripe.String(stripe.BillingPortalConfigurationFeaturesSubscriptionCancelModeAtPeriodEnd),
 				ProrationBehavior: stripe.String(stripe.BillingPortalConfigurationFeaturesSubscriptionCancelProrationBehaviorNone),
 			},
-			SubscriptionUpdate: &stripe.BillingPortalConfigurationCreateFeaturesSubscriptionUpdateParams{
-				DefaultAllowedUpdates: stripe.StringSlice(portalDefaultAllowedUpdates),
-				Enabled:               stripe.Bool(true),
-				Products:              products,
-				ProrationBehavior:     stripe.String(stripe.BillingPortalConfigurationFeaturesSubscriptionUpdateProrationBehaviorAlwaysInvoice),
-			},
+			SubscriptionUpdate: &stripe.BillingPortalConfigurationCreateFeaturesSubscriptionUpdateParams{Enabled: stripe.Bool(false)},
 		},
 		Metadata: map[string]string{PortalMetadataKey: PortalMetadataVersion},
 	}
@@ -575,23 +531,8 @@ func newPortalCreateParams(plans []portalPlan) *stripe.BillingPortalConfiguratio
 	return params
 }
 
-// newPortalUpdateParams sends the same features as newPortalCreateParams,
-// reactivates the configuration, and clears any schedule_at_period_end
-// conditions someone added in the Dashboard: a scheduled downgrade blocks
-// cancellation (D16).
-func newPortalUpdateParams(plans []portalPlan) *stripe.BillingPortalConfigurationUpdateParams {
-	products := make([]*stripe.BillingPortalConfigurationUpdateFeaturesSubscriptionUpdateProductParams, 0, len(plans))
-	for _, plan := range plans {
-		products = append(products, &stripe.BillingPortalConfigurationUpdateFeaturesSubscriptionUpdateProductParams{
-			AdjustableQuantity: &stripe.BillingPortalConfigurationUpdateFeaturesSubscriptionUpdateProductAdjustableQuantityParams{
-				Enabled: stripe.Bool(false),
-			},
-			Prices:  stripe.StringSlice(plan.prices),
-			Product: stripe.String(plan.product),
-		})
-	}
-	schedule := &stripe.BillingPortalConfigurationUpdateFeaturesSubscriptionUpdateScheduleAtPeriodEndParams{}
-	schedule.AddUnsetField(stripe.BillingPortalConfigurationUpdateFeaturesSubscriptionUpdateScheduleAtPeriodEndParamsUnsetFieldConditions)
+// newPortalUpdateParams reasserts those features on the owned configuration.
+func newPortalUpdateParams() *stripe.BillingPortalConfigurationUpdateParams {
 	return &stripe.BillingPortalConfigurationUpdateParams{
 		Active: stripe.Bool(true),
 		Features: &stripe.BillingPortalConfigurationUpdateFeaturesParams{
@@ -607,11 +548,7 @@ func newPortalUpdateParams(plans []portalPlan) *stripe.BillingPortalConfiguratio
 				ProrationBehavior: stripe.String(stripe.BillingPortalConfigurationFeaturesSubscriptionCancelProrationBehaviorNone),
 			},
 			SubscriptionUpdate: &stripe.BillingPortalConfigurationUpdateFeaturesSubscriptionUpdateParams{
-				DefaultAllowedUpdates: stripe.StringSlice(portalDefaultAllowedUpdates),
-				Enabled:               stripe.Bool(true),
-				Products:              products,
-				ProrationBehavior:     stripe.String(stripe.BillingPortalConfigurationFeaturesSubscriptionUpdateProrationBehaviorAlwaysInvoice),
-				ScheduleAtPeriodEnd:   schedule,
+				Enabled: stripe.Bool(false),
 			},
 		},
 		Metadata: map[string]string{PortalMetadataKey: PortalMetadataVersion},

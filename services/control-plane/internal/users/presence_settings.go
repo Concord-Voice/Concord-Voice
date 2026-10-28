@@ -228,18 +228,18 @@ func activityPolicyFromWrite(
 		return presence.ActivityPolicySettings{}, presence.ActivityPolicySettings{}, err
 	}
 	return presence.ActivityPolicySettings{
-			MasterEnabled:          operation.BeforeMasterEnabled,
-			ServerVoiceTier:        beforeServerTier,
-			ServerVoiceShowDetails: operation.BeforeServerVoiceShowDetails,
-			PrivateCallTier:        beforePrivateTier,
-			PrivateCallShowDetails: operation.BeforePrivateCallShowDetails,
-		}, presence.ActivityPolicySettings{
-			MasterEnabled:          after.MasterEnabled,
-			ServerVoiceTier:        afterServerTier,
-			ServerVoiceShowDetails: after.ServerVoiceShowDetails,
-			PrivateCallTier:        afterPrivateTier,
-			PrivateCallShowDetails: after.PrivateCallShowDetails,
-		}, nil
+		MasterEnabled:          operation.BeforeMasterEnabled,
+		ServerVoiceTier:        beforeServerTier,
+		ServerVoiceShowDetails: operation.BeforeServerVoiceShowDetails,
+		PrivateCallTier:        beforePrivateTier,
+		PrivateCallShowDetails: operation.BeforePrivateCallShowDetails,
+	}, presence.ActivityPolicySettings{
+		MasterEnabled:          after.MasterEnabled,
+		ServerVoiceTier:        afterServerTier,
+		ServerVoiceShowDetails: after.ServerVoiceShowDetails,
+		PrivateCallTier:        afterPrivateTier,
+		PrivateCallShowDetails: after.PrivateCallShowDetails,
+	}, nil
 }
 
 func presenceTierValue(tier *int, field string) (sql.NullInt64, int, string) {

@@ -28,6 +28,11 @@ var (
 	// only that THIS authenticated user already redeemed THIS code, which they
 	// performed themselves, not whether the code is otherwise valid.
 	ErrAlreadyRedeemed = errors.New("redemption: already redeemed")
+	// ErrSeatMember: a premium code redeemed by a user whose access comes from
+	// an active Wing seat (#2033 D1, seat-member half, PR-5). The redemption
+	// rolls back, so the code stays unredeemed and is there for the user if
+	// the payer removes the seat.
+	ErrSeatMember = errors.New("redemption: covered by a wing seat")
 )
 
 // Notifier runs the post-commit live-update (cache invalidate + WS push). It is
@@ -44,6 +49,7 @@ type Engine struct {
 	db       *sql.DB
 	catalog  *Catalog
 	notifier Notifier
+	crediter Crediter // nil: no code credit (see SetCrediter)
 }
 
 // NewEngine builds the redeem engine.
@@ -74,6 +80,14 @@ type RedeemOutcome struct {
 // Every failure mode that means "not redeemable" returns ErrCodeNotValid so the
 // HTTP layer can present one generic error (no oracle).
 func (e *Engine) Redeem(ctx context.Context, userID uuid.UUID, rawInput string) (RedeemOutcome, error) {
+	return e.RedeemConfirmed(ctx, userID, rawInput, false)
+}
+
+// RedeemConfirmed is Redeem with the user's answer to a code-credit
+// confirmation (#2033 D1): confirmCredit lets a code for another plan become
+// face-value credit on the user's live Stripe subscription. Without it that
+// case returns *CreditConfirmationError and redeems nothing.
+func (e *Engine) RedeemConfirmed(ctx context.Context, userID uuid.UUID, rawInput string, confirmCredit bool) (_ RedeemOutcome, err error) {
 	canonical, err := NormalizeAndValidate(rawInput)
 	if err != nil {
 		// Checksum failure: a typo or random probe. Reject WITHOUT a DB hit and
@@ -86,8 +100,13 @@ func (e *Engine) Redeem(ctx context.Context, userID uuid.UUID, rawInput string) 
 	if err != nil {
 		return RedeemOutcome{}, fmt.Errorf("redemption: begin tx: %w", err)
 	}
-	// Rollback is a no-op after a successful Commit; safe to always defer.
-	defer func() { _ = tx.Rollback() }()
+	// Rollback is a no-op after a successful Commit (sql.ErrTxDone); any other
+	// rollback failure joins the returned error.
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			err = errors.Join(err, fmt.Errorf("redemption: rollback: %w", rbErr))
+		}
+	}()
 
 	// ── Step 2: lock the user, then atomic claim ────────────────────────
 	if err := lockUser(ctx, tx, userID); err != nil {
@@ -114,7 +133,28 @@ func (e *Engine) Redeem(ctx context.Context, userID uuid.UUID, rawInput string) 
 	}
 
 	// ── Step 4: apply the grant effect + back-fill (same tx) ───────────
-	result, err := applyGrant(ctx, tx, effect, userID, claim.grantKind, claim.grantBytes, redemptionID)
+	// A premium code on a live, renewing Stripe subscription becomes credit
+	// instead (#2033 D1).
+	var result GrantResult
+	sub, subscribed := stripeSub{}, false
+	if claim.grantKind == GrantPremiumSubscription {
+		if sub, subscribed, err = liveStripeSub(ctx, tx, userID); err != nil {
+			return RedeemOutcome{}, err
+		}
+		if !subscribed {
+			if err := refuseSeatMember(ctx, tx, userID); err != nil {
+				return RedeemOutcome{}, err
+			}
+		}
+	}
+	if subscribed && !sub.canceling {
+		result, err = e.creditGrant(ctx, tx, sub, claim, redemptionID, confirmCredit)
+		if err == nil {
+			err = linkSubscription(ctx, tx, result, redemptionID)
+		}
+	} else {
+		result, err = applyGrant(ctx, tx, effect, userID, claim.grantKind, claim.grantBytes, redemptionID)
+	}
 	if err != nil {
 		return RedeemOutcome{}, err
 	}
@@ -123,7 +163,14 @@ func (e *Engine) Redeem(ctx context.Context, userID uuid.UUID, rawInput string) 
 	if err := tx.Commit(); err != nil {
 		return RedeemOutcome{}, fmt.Errorf("redemption: commit: %w", err)
 	}
-	return e.notifyAfterCommit(ctx, userID, result)
+	outcome, err := e.notifyAfterCommit(ctx, userID, result)
+	if result.creditQueued {
+		// Committed: apply it off the request path, so a slow Stripe never holds
+		// the response. ApplyCredit detaches from ctx; billing's outbox worker
+		// retries any failure.
+		go e.crediter.ApplyCredit(ctx, redemptionID)
+	}
+	return outcome, err
 }
 
 // lockUser takes the redeeming user's row FOR UPDATE, first in the transaction.
@@ -220,17 +267,26 @@ func applyGrant(ctx context.Context, tx *sql.Tx, effect GrantEffect, userID uuid
 		return GrantResult{}, fmt.Errorf("redemption: apply grant: %w", err)
 	}
 
-	// Back-fill the resulting subscription id on the ledger row (premium grants).
-	if result.SubscriptionID.Valid {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE code_redemptions
-			   SET resulting_subscription_id = $1
-			 WHERE id = $2`,
-			result.SubscriptionID.UUID, redemptionID); err != nil {
-			return GrantResult{}, fmt.Errorf("redemption: link subscription: %w", err)
-		}
+	if err := linkSubscription(ctx, tx, result, redemptionID); err != nil {
+		return GrantResult{}, err
 	}
 	return result, nil
+}
+
+// linkSubscription back-fills the resulting subscription id on the ledger row
+// (premium grants, and code credit, which names the credited Stripe row).
+func linkSubscription(ctx context.Context, tx *sql.Tx, result GrantResult, redemptionID uuid.UUID) error {
+	if !result.SubscriptionID.Valid {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE code_redemptions
+		   SET resulting_subscription_id = $1
+		 WHERE id = $2`,
+		result.SubscriptionID.UUID, redemptionID); err != nil {
+		return fmt.Errorf("redemption: link subscription: %w", err)
+	}
+	return nil
 }
 
 // notifyAfterCommit runs the step-5 post-commit live update. Done AFTER commit so

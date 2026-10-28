@@ -489,12 +489,20 @@ async function joinVoiceChannel(
   co?: Record<string, unknown>,
   joinType: 'channel' | 'dm' = 'channel',
   response?: Record<string, unknown>,
-  opts?: { internalRebuild?: boolean }
+  opts?: {
+    internalRebuild?: boolean;
+    privacyIntent?: { isMuted: boolean; isDeafened: boolean };
+    expectedAuthGeneration?: number;
+  },
+  onMicPublication?: (track: MediaStreamTrack) => void,
+  authorization?: Promise<ReturnType<typeof makeJoinResponse>>
 ) {
   setupAuth();
   mockApiFetch.mockResolvedValueOnce({
     ok: true,
-    json: vi.fn().mockResolvedValue({ ...makeJoinResponse(co), ...response }),
+    json: vi
+      .fn()
+      .mockReturnValue(authorization ?? Promise.resolve({ ...makeJoinResponse(co), ...response })),
   });
   mockSocket.connected = true;
 
@@ -515,7 +523,14 @@ async function joinVoiceChannel(
 
   mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'mic-1' }]));
   const micProducer = createMockProducer('prod-mic', 'mic');
-  sendTransport.produce.mockResolvedValue(micProducer);
+  if (onMicPublication) {
+    sendTransport.produce.mockImplementation(async ({ track }: { track: MediaStreamTrack }) => {
+      onMicPublication(track);
+      return micProducer;
+    });
+  } else {
+    sendTransport.produce.mockResolvedValue(micProducer);
+  }
 
   await voiceService.joinChannel('channel-1', joinType, opts);
   return { sendTransport, recvTransport, micProducer };
@@ -677,6 +692,80 @@ describe('VoiceService', () => {
     mockSocket.connected = false;
     useAuthStore.setState({ accessToken: 'refreshed-access-token' });
     expect(mockSocket.emit).not.toHaveBeenCalled();
+  });
+
+  it('cancels a queued recovery join when authentication switches during authorization', async () => {
+    const authorization = deferred<ReturnType<typeof makeJoinResponse>>();
+    // The helper starts a new auth lifecycle before calling joinChannel.
+    const expectedAuthGeneration = useAuthStore.getState().authGeneration + 1;
+    const joining = joinVoiceChannel(
+      undefined,
+      'channel',
+      undefined,
+      {
+        privacyIntent: { isMuted: true, isDeafened: true },
+        expectedAuthGeneration,
+      },
+      undefined,
+      authorization.promise
+    );
+    await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledOnce());
+    useAuthStore.setState((state) => ({
+      accessToken: 'successor-login',
+      authGeneration: state.authGeneration + 1,
+    }));
+    authorization.resolve(makeJoinResponse());
+
+    await expect(joining).rejects.toThrow();
+    expect(mockCreateSendTransport).not.toHaveBeenCalled();
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+  });
+
+  it('does not publish a recovery microphone after the user leaves during authorization', async () => {
+    const authorization = deferred<ReturnType<typeof makeJoinResponse>>();
+    const expectedAuthGeneration = useAuthStore.getState().authGeneration + 1;
+    const joining = joinVoiceChannel(
+      undefined,
+      'channel',
+      undefined,
+      {
+        privacyIntent: { isMuted: false, isDeafened: false },
+        expectedAuthGeneration,
+      },
+      undefined,
+      authorization.promise
+    );
+    await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledOnce());
+    await voiceService.leaveChannel();
+    authorization.resolve(makeJoinResponse());
+
+    await expect(joining).rejects.toThrow();
+    expect(mockCreateSendTransport).not.toHaveBeenCalled();
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+  });
+
+  it('cancels an initial join still authorizing after emergency cleanup', async () => {
+    const authorization = deferred<ReturnType<typeof makeJoinResponse>>();
+    const joining = joinVoiceChannel(
+      undefined,
+      'channel',
+      undefined,
+      undefined,
+      undefined,
+      authorization.promise
+    );
+    await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledOnce());
+    expect(useVoiceStore.getState().connectionState).toBe('connecting');
+
+    voiceService.emergencyCleanup();
+    authorization.resolve(makeJoinResponse());
+
+    await expect(joining).rejects.toThrow();
+    const { io } = await import('socket.io-client');
+    expect(io).not.toHaveBeenCalled();
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().connectionState).toBe('disconnected');
   });
 
   it('does not send a successor login token to the previous media session', async () => {
@@ -1068,6 +1157,31 @@ describe('VoiceService', () => {
     describe('microphone capture join regressions', () => {
       beforeEach(() => {
         useVoiceStore.setState({ joinError: null } as Parameters<typeof useVoiceStore.setState>[0]);
+      });
+
+      it('keeps recovery privacy intent in force through microphone publication', async () => {
+        expect(useVoiceStore.getState().isMuted).toBe(false);
+        expect(useVoiceStore.getState().isDeafened).toBe(false);
+        let privacyAtPublication:
+          { track: MediaStreamTrack; isMuted: boolean; isDeafened: boolean } | undefined;
+
+        const { sendTransport, micProducer } = await joinVoiceChannel(
+          undefined,
+          'channel',
+          undefined,
+          { privacyIntent: { isMuted: true, isDeafened: true } },
+          (track) => {
+            const { isMuted, isDeafened } = useVoiceStore.getState();
+            privacyAtPublication = { track, isMuted, isDeafened };
+          }
+        );
+
+        expect(sendTransport.produce).toHaveBeenCalledOnce();
+        expect(privacyAtPublication).toMatchObject({ isMuted: true, isDeafened: true });
+        expect(privacyAtPublication?.track.enabled).toBe(false);
+        expect(micProducer.pause).toHaveBeenCalled();
+        expect(micProducer.resume).not.toHaveBeenCalled();
+        expect(mockSocket.emit).toHaveBeenCalledWith('set-deafen', { isDeafened: true });
       });
 
       it.each(['channel', 'dm'] as const)(
@@ -2382,6 +2496,30 @@ describe('VoiceService', () => {
       expect(mockSocket.emit).toHaveBeenCalledWith('set-deafen', { isDeafened: true });
       expect(emergencyCleanup).not.toHaveBeenCalled();
       emergencyCleanup.mockRestore();
+    });
+
+    it('cancels an ownership-refusal rebuild after an auth lifecycle change', async () => {
+      let finishLeave!: () => void;
+      const leaveGate = new Promise<void>((resolve) => {
+        finishLeave = resolve;
+      });
+      const leaveSpy = vi.spyOn(voiceService, 'leaveChannel').mockReturnValue(leaveGate);
+      const joinSpy = vi.spyOn(voiceService, 'joinChannel').mockResolvedValue(undefined);
+      try {
+        const rebuild = (voiceService as any).retryResumeAfterOwnershipRefusal(
+          'channel-1',
+          'channel'
+        ) as Promise<void>;
+        expect(leaveSpy).toHaveBeenCalledWith({ internalRebuild: true });
+        useAuthStore.getState().beginAuthLifecycle('successor-token', 'successor-session');
+        finishLeave();
+        await rebuild;
+        expect(joinSpy).not.toHaveBeenCalled();
+      } finally {
+        finishLeave();
+        leaveSpy.mockRestore();
+        joinSpy.mockRestore();
+      }
     });
 
     it('cleans up when an ownership-refusal rebuild fails after disconnecting', async () => {
@@ -9366,6 +9504,8 @@ describe('receive-transform bypass probe', () => {
       await vi.waitFor(() => {
         expect(svc.joinChannel).toHaveBeenCalledWith('chan-1', 'channel', {
           internalRebuild: true,
+          privacyIntent: { isMuted: false, isDeafened: false },
+          expectedAuthGeneration: expect.any(Number),
         });
       });
     } finally {
@@ -9397,6 +9537,8 @@ describe('receive-transform bypass probe', () => {
       await vi.waitFor(() => {
         expect(svc.joinChannel).toHaveBeenCalledWith('chan-1', 'channel', {
           internalRebuild: true,
+          privacyIntent: { isMuted: false, isDeafened: false },
+          expectedAuthGeneration: expect.any(Number),
         });
       });
       expect(svc.leaveChannel).toHaveBeenCalledTimes(1);
@@ -9411,6 +9553,125 @@ describe('receive-transform bypass probe', () => {
       expect(c2.close).toHaveBeenCalled(); // still fails closed
     } finally {
       svc.leaveChannel = origLeave;
+      svc.joinChannel = origJoin;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('keeps self-mute and self-deafen in force when the legacy fallback rejoins', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('RTCRtpSender', { prototype: { createEncodedStreams: () => ({}) } });
+    useVoiceStore.setState({
+      activeChannelId: 'chan-1',
+      isDMCall: false,
+      isMuted: true,
+      isDeafened: true,
+    });
+
+    const leaveSpy = vi.spyOn(svc, 'leaveChannel');
+    const origJoin = svc.joinChannel;
+    let privacyAtRejoin: { isMuted: boolean; isDeafened: boolean } | undefined;
+    svc.joinChannel = vi.fn().mockImplementation(async () => {
+      const { isMuted, isDeafened } = useVoiceStore.getState();
+      privacyAtRejoin = { isMuted, isDeafened };
+    });
+    try {
+      const consumer = fakeConsumer('privacy-fallback', 500);
+      svc.consumers.set(consumer.id, consumer);
+      svc.bypassProbes.set(consumer.id, {
+        senderUserId: 'user-1',
+        phase: 'reattached',
+        attempt: 1,
+      });
+
+      await svc.evaluateBypassProbe(consumer.id, 0);
+      await vi.waitFor(() => expect(privacyAtRejoin).toBeDefined());
+
+      expect(leaveSpy).toHaveBeenCalledWith({ internalRebuild: true });
+      expect(privacyAtRejoin).toEqual({ isMuted: true, isDeafened: true });
+    } finally {
+      leaveSpy.mockRestore();
+      svc.joinChannel = origJoin;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('keeps a mute made while the legacy fallback is closing producers', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('RTCRtpSender', { prototype: { createEncodedStreams: () => ({}) } });
+    useVoiceStore.setState({
+      activeChannelId: 'chan-1',
+      isDMCall: false,
+      isMuted: false,
+      isDeafened: false,
+    });
+
+    let finishCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    const cleanupSpy = vi.spyOn(svc as any, 'cleanup').mockReturnValue(cleanupGate);
+    const origJoin = svc.joinChannel;
+    svc.joinChannel = vi.fn().mockResolvedValue(undefined);
+    try {
+      const consumer = fakeConsumer('privacy-during-leave', 500);
+      svc.consumers.set(consumer.id, consumer);
+      svc.bypassProbes.set(consumer.id, {
+        senderUserId: 'user-1',
+        phase: 'reattached',
+        attempt: 1,
+      });
+      await svc.evaluateBypassProbe(consumer.id, 0);
+      await vi.waitFor(() => expect(cleanupSpy).toHaveBeenCalled());
+
+      useVoiceStore.getState().setMuted(true);
+      useVoiceStore.getState().setDeafened(true);
+      finishCleanup();
+      await vi.waitFor(() => expect(svc.joinChannel).toHaveBeenCalled());
+
+      expect(svc.joinChannel).toHaveBeenCalledWith('chan-1', 'channel', {
+        internalRebuild: true,
+        privacyIntent: { isMuted: true, isDeafened: true },
+        expectedAuthGeneration: expect.any(Number),
+      });
+    } finally {
+      finishCleanup();
+      cleanupSpy.mockRestore();
+      svc.joinChannel = origJoin;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('cancels a legacy fallback rebuild when authentication changes during cleanup', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('RTCRtpSender', { prototype: { createEncodedStreams: () => ({}) } });
+    useVoiceStore.setState({ activeChannelId: 'chan-1', isDMCall: false });
+
+    let finishCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    const cleanupSpy = vi.spyOn(svc as any, 'cleanup').mockReturnValue(cleanupGate);
+    const origJoin = svc.joinChannel;
+    svc.joinChannel = vi.fn().mockResolvedValue(undefined);
+    try {
+      const consumer = fakeConsumer('auth-during-legacy-rebuild', 500);
+      svc.consumers.set(consumer.id, consumer);
+      svc.bypassProbes.set(consumer.id, {
+        senderUserId: 'user-1',
+        phase: 'reattached',
+        attempt: 1,
+      });
+      await svc.evaluateBypassProbe(consumer.id, 0);
+      await vi.waitFor(() => expect(cleanupSpy).toHaveBeenCalled());
+
+      useAuthStore.getState().beginAuthLifecycle('successor-token', 'successor-session');
+      finishCleanup();
+      await vi.dynamicImportSettled();
+      expect(svc.joinChannel).not.toHaveBeenCalled();
+    } finally {
+      finishCleanup();
+      cleanupSpy.mockRestore();
       svc.joinChannel = origJoin;
       consoleError.mockRestore();
     }

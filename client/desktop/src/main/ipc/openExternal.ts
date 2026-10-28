@@ -1,5 +1,5 @@
 import { ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
-import { isPermittedFrameUrl } from './frameValidation';
+import { requireTrustedSender } from './frameValidation';
 
 /**
  * open-external IPC handler — routes renderer link clicks to `shell.openExternal`
@@ -50,9 +50,8 @@ export function registerOpenExternalHandler(
   ipcMain.handle(
     CHANNEL,
     async (event: IpcMainInvokeEvent, url: unknown): Promise<OpenExternalResult> => {
-      const senderUrl = event.senderFrame?.url ?? '';
       const remoteSpaOrigin = remoteSpaOriginProvider?.() ?? null;
-      if (!isPermittedFrameUrl(senderUrl, remoteSpaOrigin)) {
+      if (!requireTrustedSender(event, remoteSpaOrigin)) {
         return { ok: false, reason: 'untrusted-sender' };
       }
       if (typeof url !== 'string') {

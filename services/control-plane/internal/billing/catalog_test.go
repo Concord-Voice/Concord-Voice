@@ -84,7 +84,7 @@ func decodePlans(t *testing.T, w *httptest.ResponseRecorder) plansBody {
 }
 
 func TestFoundersUnitAmount_RoundsDown(t *testing.T) {
-	for unit, want := range map[int64]int64{899: 449, 9889: 4944, 1499: 749, 16489: 8244, 1000: 500, 1: 0} {
+	for unit, want := range map[int64]int64{899: 449, 9889: 4944, 1499: 749, 16489: 8244, 1000: 500, 1: 0, 9223372036854775807: 4611686018427387903} {
 		assert.Equal(t, want, foundersUnitAmount(unit), "unit %d", unit)
 	}
 }

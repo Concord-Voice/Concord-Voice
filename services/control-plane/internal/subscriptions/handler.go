@@ -47,13 +47,16 @@ const sourceStripe = "stripe"
 // CurrentPeriodEnd describe the row that enforcement honors (see getMeQuery);
 // Stripe and Code describe the first live row of each source.
 type StatusDTO struct {
-	Tier             string     `json:"tier"`
-	Status           string     `json:"status"`
-	Source           string     `json:"source,omitempty"`
-	CurrentPeriodEnd *string    `json:"current_period_end,omitempty"`
-	Billing          string     `json:"billing"`
-	Stripe           *StripeDTO `json:"stripe,omitempty"`
-	Code             *CodeDTO   `json:"code,omitempty"`
+	Tier             string      `json:"tier"`
+	Status           string      `json:"status"`
+	Source           string      `json:"source,omitempty"`
+	CurrentPeriodEnd *string     `json:"current_period_end,omitempty"`
+	Billing          string      `json:"billing"`
+	TrialAvailable   bool        `json:"trial_available"`
+	Stripe           *StripeDTO  `json:"stripe,omitempty"`
+	Code             *CodeDTO    `json:"code,omitempty"`
+	Seat             *SeatDTO    `json:"seat,omitempty"`    // PR-5
+	Invites          []InviteDTO `json:"invites,omitempty"` // PR-5
 }
 
 // StripeDTO describes the user's live Stripe-sourced row.
@@ -65,6 +68,11 @@ type StripeDTO struct {
 	Canceling        bool    `json:"canceling"`
 	EndsAt           *string `json:"ends_at,omitempty"`
 	FoundersRate     bool    `json:"founders_rate"`
+	UnitAmount       *int64  `json:"unit_amount,omitempty"`
+	ScheduleAttached bool    `json:"schedule_attached"`
+	PendingPlan      *string `json:"pending_plan,omitempty"`
+	PendingInterval  *string `json:"pending_interval,omitempty"`
+	PendingChangeAt  *string `json:"pending_change_at,omitempty"`
 }
 
 // CodeDTO describes the user's live code-sourced row.
@@ -100,18 +108,24 @@ func NewHandler(db *sql.DB, log *logger.Logger, billingState string) *Handler {
 // Since migration 000179 a user can hold one live code row and live Stripe rows
 // at once, so the order is explicit. The first row fills the legacy top-level
 // fields and must be the row enforcement honors: a premium row before any other
-// tier, then a Stripe row before a code row (#2033 spec §5; PR-5 puts the seat
-// between them), then the latest period end (a NULL end, which never lapses,
+// tier, then a Stripe row before a code row (#2033 spec §5; withSeatRow puts
+// an entitling Wing seat between them), then the latest period end (a NULL end, which never lapses,
 // sorts first), then id so the pick is deterministic. Both operands of the
 // concatenation are constants.
 const getMeQuery = `SELECT tier, status, source, current_period_end,
-	       plan, billing_interval, founders_rate, cancel_at_period_end, cancel_at
+	       plan, billing_interval, founders_rate, cancel_at_period_end, cancel_at,
+	       stripe_unit_amount, stripe_schedule_id, pending_plan, pending_billing_interval, pending_change_at
 	  FROM subscriptions
 	 WHERE user_id = $1 AND ` + entitlements.LiveRowPredicate + `
 	 ORDER BY CASE WHEN tier = 'premium' THEN 0 ELSE 1 END,
 	          CASE WHEN source = 'stripe' THEN 0 ELSE 1 END,
 	          current_period_end DESC NULLS FIRST,
 	          id`
+
+// Canceled and expired Stripe rows remain in subscriptions. Their existence
+// excludes a second trial even when the account currently has no live row.
+const trialAvailableQuery = `SELECT NOT EXISTS (
+	SELECT 1 FROM subscriptions WHERE user_id = $1 AND source = 'stripe')`
 
 // liveRow is one scanned row of getMeQuery.
 type liveRow struct {
@@ -121,11 +135,17 @@ type liveRow struct {
 	foundersRate         bool
 	cancelAtPeriodEnd    bool
 	cancelAt             sql.NullTime
+	unitAmount           sql.NullInt64
+	scheduleID           sql.NullString
+	pendingPlan          sql.NullString
+	pendingInterval      sql.NullString
+	pendingChangeAt      sql.NullTime
 }
 
 func (r *liveRow) scan(rows *sql.Rows) error {
 	return rows.Scan(&r.tier, &r.status, &r.source, &r.periodEnd,
-		&r.plan, &r.interval, &r.foundersRate, &r.cancelAtPeriodEnd, &r.cancelAt)
+		&r.plan, &r.interval, &r.foundersRate, &r.cancelAtPeriodEnd, &r.cancelAt,
+		&r.unitAmount, &r.scheduleID, &r.pendingPlan, &r.pendingInterval, &r.pendingChangeAt)
 }
 
 // rfc3339UTC formats t as an RFC 3339 UTC timestamp.
@@ -156,11 +176,18 @@ func nullStringPtr(s sql.NullString) *string {
 // period end when cancel_at_period_end, else absent (spec §8).
 func (r *liveRow) stripeDTO() *StripeDTO {
 	dto := &StripeDTO{
-		Plan:         nullStringPtr(r.plan),
-		Interval:     nullStringPtr(r.interval),
-		Status:       r.status,
-		Canceling:    r.cancelAtPeriodEnd || r.cancelAt.Valid,
-		FoundersRate: r.foundersRate,
+		Plan:             nullStringPtr(r.plan),
+		Interval:         nullStringPtr(r.interval),
+		Status:           r.status,
+		Canceling:        r.cancelAtPeriodEnd || r.cancelAt.Valid,
+		FoundersRate:     r.foundersRate,
+		ScheduleAttached: r.scheduleID.Valid,
+		PendingPlan:      nullStringPtr(r.pendingPlan),
+		PendingInterval:  nullStringPtr(r.pendingInterval),
+		PendingChangeAt:  nullTimeString(r.pendingChangeAt),
+	}
+	if r.unitAmount.Valid {
+		dto.UnitAmount = &r.unitAmount.Int64
 	}
 	if r.periodEnd.Valid {
 		dto.CurrentPeriodEnd = rfc3339UTC(r.periodEnd.Time)
@@ -174,12 +201,16 @@ func (r *liveRow) stripeDTO() *StripeDTO {
 	return dto
 }
 
-// buildStatus folds the ordered live rows into the response: the first row
-// fills the legacy fields, the first Stripe row the stripe object and the first
-// code row the code object. No rows yields the free default.
-func (h *Handler) buildStatus(live []liveRow) StatusDTO {
+// buildStatus folds the ordered live rows, with a member seat in its place,
+// into the response: the first row fills the legacy fields, the first Stripe
+// row the stripe object and the first code row the code object. No rows and no
+// seat yields the free default; the seat and invites are attached either way.
+func (h *Handler) buildStatus(rows []liveRow, seats seatRead) StatusDTO {
+	live := withSeatRow(rows, seats.member)
 	if len(live) == 0 {
-		return h.freeDefault()
+		dto := h.freeDefault()
+		dto.Seat, dto.Invites = seats.seat, seats.invites
+		return dto
 	}
 	first := live[0]
 	dto := StatusDTO{
@@ -188,6 +219,8 @@ func (h *Handler) buildStatus(live []liveRow) StatusDTO {
 		Source:           first.source,
 		CurrentPeriodEnd: nullTimeString(first.periodEnd),
 		Billing:          h.billing,
+		Seat:             seats.seat,
+		Invites:          seats.invites,
 	}
 	for i := range live {
 		switch live[i].source {
@@ -195,6 +228,7 @@ func (h *Handler) buildStatus(live []liveRow) StatusDTO {
 			if dto.Stripe == nil {
 				dto.Stripe = live[i].stripeDTO()
 			}
+		case sourceSeat:
 		default:
 			if dto.Code == nil {
 				dto.Code = &CodeDTO{CurrentPeriodEnd: nullTimeString(live[i].periodEnd)}
@@ -229,14 +263,20 @@ func (h *Handler) readLiveRows(ctx context.Context, userID string) ([]liveRow, e
 
 // GetMe handles GET /api/v1/subscriptions/me. It returns the acting user's live
 // subscription status: the legacy top-level fields describe the row enforcement
-// honors (see getMeQuery), "stripe" and "code" describe the first live row of
-// each source, and "billing" reports whether billing exists on this instance.
+// honors (see getMeQuery and withSeatRow), "stripe" and "code" describe the
+// first live row of each source, "seat" and "invites" the caller's Wing seat
+// side, and "billing" reports whether billing exists on this instance.
 // No live row returns the free-default shape. Query, scan or iteration errors
-// return 503 without confirming a tier.
+// in the live-row read return 503 without confirming a tier. A failed trial
+// eligibility read defaults to false while preserving the subscription status.
 func (h *Handler) GetMe(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	live, err := h.readLiveRows(c.Request.Context(), userID)
+	var seats seatRead
+	if err == nil {
+		seats, err = h.readSeats(c.Request.Context(), userID, hasStripeRow(live))
+	}
 	if err != nil {
 		// Report unavailability without confirming a tier. The user id passes
 		// through sanitizeID (CWE-117) and no row values are logged (PII-safe).
@@ -244,5 +284,22 @@ func (h *Handler) GetMe(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "subscription status unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, h.buildStatus(live))
+	var trialAvailable bool
+	if err := h.db.QueryRowContext(c.Request.Context(), trialAvailableQuery, userID).Scan(&trialAvailable); err != nil {
+		h.log.Error("subscriptions: trial eligibility read failed", "user_id", sanitizeID(userID), "error", err.Error())
+		trialAvailable = false
+	}
+	status := h.buildStatus(live, seats)
+	status.TrialAvailable = trialAvailable
+	c.JSON(http.StatusOK, status)
+}
+
+// hasStripeRow reports whether any live row is the user's own Stripe row.
+func hasStripeRow(live []liveRow) bool {
+	for i := range live {
+		if live[i].source == sourceStripe {
+			return true
+		}
+	}
+	return false
 }

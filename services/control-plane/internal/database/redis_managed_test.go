@@ -151,7 +151,7 @@ func TestNewFreshnessHookRejectsStaleOrdinaryCommand(t *testing.T) {
 
 	// Freshness is bounded by the injected runtime clock, so the hook can be
 	// tested at the exact expiry boundary without a timer or wall-clock sleep.
-	now = now.Add(120 * time.Second)
+	now = now.Add(time.Hour)
 	require.Error(t, client.Ping(context.Background()).Err())
 }
 
@@ -164,7 +164,7 @@ func TestNewFreshnessHookRejectsStalePipeline(t *testing.T) {
 	client.AddHook(NewFreshnessHook(runtime))
 	require.NoError(t, client.Ping(context.Background()).Err())
 
-	now = now.Add(120 * time.Second)
+	now = now.Add(time.Hour)
 	pipe := client.Pipeline()
 	pipe.Ping(context.Background())
 	_, err := pipe.Exec(context.Background())
@@ -178,7 +178,7 @@ func TestFreshnessHookRejectsConnectionThatStalesDuringDial(t *testing.T) {
 	dial := NewFreshnessHook(runtime).DialHook(func(context.Context, string, string) (net.Conn, error) {
 		client, other := net.Pipe()
 		peer = other
-		now = now.Add(120 * time.Second)
+		now = now.Add(time.Hour)
 		return client, nil
 	})
 	conn, err := dial(context.Background(), "tcp", "127.0.0.1:6379")
@@ -418,7 +418,7 @@ func TestNewManagedRedisClientRequiresFreshRuntimeAndConnects(t *testing.T) {
 	require.NoError(t, client.Ping(context.Background()).Err())
 	require.NoError(t, client.Close())
 	// Expiration prevents a client from opening even when its endpoint is reachable.
-	now = now.Add(121 * time.Second)
+	now = now.Add(time.Hour)
 	_, err = NewManagedRedisClient(context.Background(), mini.Addr(), nil, runtime)
 	require.Error(t, err)
 }

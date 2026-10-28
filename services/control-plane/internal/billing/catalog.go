@@ -83,7 +83,8 @@ func (cc *catalogCache) set(prices []sellablePrice, expires time.Time) {
 // cent (Mark, Phase-2 gate P3-B): the price shown is never more than what the
 // user pays, and no fraction of a cent is hidden.
 func foundersUnitAmount(unit int64) int64 {
-	return unit * (100 - foundersPercent) / 100
+	rate := int64(100 - foundersPercent)
+	return (unit/100)*rate + (unit%100)*rate/100
 }
 
 // foundersActive reports whether founders pricing applies now: strictly before

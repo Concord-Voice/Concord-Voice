@@ -120,6 +120,10 @@ func TestDeadlockProbe_RedemptionReconcileErasure(t *testing.T) {
 	fake := newFakeStripe(t)
 	env := newTestService(t, fake)
 	engine := redemption.NewEngine(env.DB, redemption.NewCatalog(), env.Changer)
+	// A redemption that lands after its user's reconcile takes the code-credit
+	// path (#2033 D1), which locks the Stripe row and queues the credit in the
+	// outbox inside the transaction; it must keep the same order.
+	engine.SetCrediter(env.Svc)
 	accounts := users.NewAccountService(env.DB, env.Svc.Log)
 
 	erased, healed := 0, 0
@@ -168,7 +172,7 @@ func TestDeadlockProbe_RedemptionReconcileErasure(t *testing.T) {
 
 func redeemOp(engine *redemption.Engine, userID uuid.UUID, code string) func(context.Context) error {
 	return func(ctx context.Context) error {
-		_, err := engine.Redeem(ctx, userID, code)
+		_, err := engine.RedeemConfirmed(ctx, userID, code, true) // a probe sub may be on another plan
 		return err
 	}
 }

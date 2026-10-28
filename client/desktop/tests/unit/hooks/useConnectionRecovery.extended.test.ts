@@ -31,8 +31,18 @@ vi.mock('@/renderer/services/messaging/websocketService', () => ({
 
 const mockEmergencyCleanup = vi.fn();
 const mockJoinChannel = vi.fn().mockResolvedValue(undefined);
+const mockLeaveChannel = vi.fn().mockResolvedValue(undefined);
+let mockVoiceActionGeneration = 0;
+vi.mock('@/renderer/services/voice/voiceActionGeneration', () => ({
+  getVoiceActionGeneration: () => mockVoiceActionGeneration,
+}));
 vi.mock('@/renderer/services/voice/voiceService', () => ({
-  voiceService: { emergencyCleanup: mockEmergencyCleanup, joinChannel: mockJoinChannel },
+  voiceService: {
+    emergencyCleanup: mockEmergencyCleanup,
+    joinChannel: mockJoinChannel,
+    leaveChannel: mockLeaveChannel,
+    getVoiceActionGeneration: () => mockVoiceActionGeneration,
+  },
 }));
 
 const mockRunPreflight = vi.fn();
@@ -70,6 +80,7 @@ import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecov
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockVoiceActionGeneration = 0;
   vi.useFakeTimers();
   useConnectionStore.getState().reset();
   useVoiceStore.setState({
@@ -120,7 +131,7 @@ describe('useConnectionRecovery — extended', () => {
       result.current('RECONNECTING' as never);
       await vi.dynamicImportSettled();
 
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
       expect(mockEmergencyCleanup).not.toHaveBeenCalled();
     });
 
@@ -152,7 +163,7 @@ describe('useConnectionRecovery — extended', () => {
       await vi.advanceTimersByTimeAsync(15_000);
       await vi.dynamicImportSettled();
 
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBe('voice-123');
+      expect(useConnectionStore.getState().pendingVoiceRejoin?.channelId).toBe('voice-123');
       expect(mockEmergencyCleanup).toHaveBeenCalledTimes(1);
     });
 
@@ -174,7 +185,21 @@ describe('useConnectionRecovery — extended', () => {
       await vi.dynamicImportSettled();
 
       expect(mockEmergencyCleanup).toHaveBeenCalledTimes(1);
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
+    });
+
+    it('still cleans up when the same join gains its channel during the voice import', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: null, connectionState: 'connecting' });
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      useVoiceStore.getState().setActiveChannel('voice-123');
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
     });
 
     it('retracts the stash and skips cleanup if voice ends during the import window (Gitar #2873)', async () => {
@@ -196,7 +221,7 @@ describe('useConnectionRecovery — extended', () => {
       await vi.dynamicImportSettled(); // flush import → guarded .then() re-checks + retracts
 
       expect(mockEmergencyCleanup).not.toHaveBeenCalled();
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
     });
 
     it('does not touch voice at grace expiry when no session is active', async () => {
@@ -208,7 +233,7 @@ describe('useConnectionRecovery — extended', () => {
       await vi.advanceTimersByTimeAsync(15_000);
       await vi.dynamicImportSettled();
 
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
       expect(mockEmergencyCleanup).not.toHaveBeenCalled();
     });
 
@@ -228,7 +253,7 @@ describe('useConnectionRecovery — extended', () => {
 
       expect(mockEmergencyCleanup).not.toHaveBeenCalled();
       expect(mockJoinChannel).not.toHaveBeenCalled();
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
     });
 
     it('enters preflight after 15s if still disconnected', async () => {
@@ -393,19 +418,331 @@ describe('useConnectionRecovery — extended', () => {
   });
 
   describe('CONNECTED during recovery_a', () => {
-    it('rejoins the voice channel captured at grace expiry', async () => {
-      // Sustained outage: preflight tore voice down and stashed the channel;
-      // the recovery reconnect restores it. (Short blips never set the stash.)
-      useConnectionStore.getState().enterRecoveryA();
-      useConnectionStore.getState().setLastVoiceChannelId('voice-123');
+    it('restores DM kind and self-mute/deafen at rejoin after preflight cleanup', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({
+        activeChannelId: 'dm-123',
+        connectionState: 'connected',
+        isDMCall: true,
+        isMuted: true,
+        isDeafened: true,
+      });
+      // emergencyCleanup resets the voice store in production. Keep that effect
+      // here so the rejoin observes the state after teardown, not the setup state.
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      let privacyAtRejoin: { isMuted: boolean; isDeafened: boolean } | undefined;
+      mockJoinChannel.mockImplementationOnce(async () => {
+        const { isMuted, isDeafened } = useVoiceStore.getState();
+        privacyAtRejoin = { isMuted, isDeafened };
+      });
 
       const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
 
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+      expect(useConnectionStore.getState().pendingVoiceRejoin?.channelId).toBe('dm-123');
       result.current('CONNECTED' as never);
       await vi.dynamicImportSettled();
 
-      expect(mockJoinChannel).toHaveBeenCalledWith('voice-123');
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(mockJoinChannel).toHaveBeenCalledOnce();
+      expect.soft(mockJoinChannel).toHaveBeenCalledWith(
+        'dm-123',
+        'dm',
+        expect.objectContaining({
+          privacyIntent: { joinType: 'dm', isMuted: true, isDeafened: true },
+        })
+      );
+      expect.soft(privacyAtRejoin).toEqual({ isMuted: true, isDeafened: true });
+    });
+
+    it('uses a mute made during the voice import before emergency cleanup', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({
+        activeChannelId: 'voice-123',
+        connectionState: 'connected',
+        isMuted: false,
+        isDeafened: false,
+      });
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      useVoiceStore.getState().setMuted(true);
+      useVoiceStore.getState().setDeafened(true);
+      await vi.dynamicImportSettled();
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).toHaveBeenCalledWith(
+        'voice-123',
+        'channel',
+        expect.objectContaining({
+          privacyIntent: { joinType: 'channel', isMuted: true, isDeafened: true },
+        })
+      );
+    });
+
+    it('does not rejoin the old call after the user joins and leaves another call', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+
+      // Reconnect schedules a rejoin through an async continuation. Before it
+      // runs, the user makes a different call and explicitly leaves it. Merely
+      // checking "disconnected" mistakes that final state for untouched voice.
+      result.current('CONNECTED' as never);
+      mockJoinChannel.mockImplementationOnce(async () => {
+        mockVoiceActionGeneration += 1;
+        useVoiceStore.setState({ activeChannelId: 'new-voice', connectionState: 'connected' });
+      });
+      mockLeaveChannel.mockImplementationOnce(async () => {
+        mockVoiceActionGeneration += 1;
+        useVoiceStore.getState().reset();
+      });
+      await mockJoinChannel('new-voice', 'channel');
+      await mockLeaveChannel();
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).toHaveBeenCalledTimes(1);
+      expect(mockJoinChannel).not.toHaveBeenCalledWith(
+        'old-voice',
+        expect.anything(),
+        expect.anything()
+      );
+    });
+
+    it('does not rejoin under a successor auth lifecycle', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+      result.current('CONNECTED' as never);
+      // Logging out and signing in changes authGeneration even if the new
+      // account is also authorized to see the same channel id.
+      useAuthStore.getState().beginAuthLifecycle('successor-token', 'successor-session');
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+    });
+
+    it('does not replay a ticket after an external connection reset and later outage', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+
+      // The retry UI can reset the phase before CONNECTED. The stale ticket
+      // must not survive that reset and join a call on a later short outage.
+      useConnectionStore.getState().reset();
+      result.current('CONNECTED' as never);
+      result.current('RECONNECTING' as never);
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+    });
+
+    it('does not tear down a same-channel successor during the lazy voice import', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'voice-123', connectionState: 'connected' });
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000); // Dispatches the import without resolving it.
+      // A user leave/rejoin begins in voiceService before it changes the store.
+      mockVoiceActionGeneration += 1;
+      useVoiceStore.getState().reset();
+      useVoiceStore.getState().setActiveChannel('voice-123');
+      useVoiceStore.getState().setConnectionState('connected');
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+    });
+
+    it('still tears down an automatic same-channel rebuild during a long outage', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'voice-123', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementation(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      // An internal media rebuild replaces the session without user action.
+      useVoiceStore.getState().reset();
+      useVoiceStore.getState().setActiveChannel('voice-123');
+      useVoiceStore.getState().setConnectionState('connected');
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+      expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+    });
+
+    it('tears down an internal room replacement without rejoining the old room', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementation(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      useVoiceStore.getState().setActiveChannel('new-voice');
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+      expect(useConnectionStore.getState().pendingVoiceRejoin).toBeNull();
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+    });
+
+    it('does not rejoin after an explicit leave starts before the voice import resolves', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'voice-123', connectionState: 'connected' });
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      // leaveChannel increments this before its asynchronous producer cleanup.
+      // The voice store can still describe the old call at this point.
+      mockVoiceActionGeneration += 1;
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+    });
+
+    it('rejoins only the latest call after another outage supersedes a queued rejoin', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementation(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      result.current('CONNECTED' as never);
+      // A second outage starts before the first rejoin continuation resumes.
+      useVoiceStore.setState({ activeChannelId: 'new-voice', connectionState: 'connected' });
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).toHaveBeenCalledTimes(1);
+      expect(mockJoinChannel).toHaveBeenCalledWith(
+        'new-voice',
+        'channel',
+        expect.objectContaining({
+          privacyIntent: { joinType: 'channel', isMuted: false, isDeafened: false },
+        })
+      );
+    });
+
+    it('keeps a torn-down call pending through a second outage before rejoin', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      result.current('CONNECTED' as never);
+      // The first rejoin import is queued; no user voice action has occurred.
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).toHaveBeenCalledOnce();
+      expect(mockJoinChannel).toHaveBeenCalledWith(
+        'old-voice',
+        'channel',
+        expect.objectContaining({
+          expectedAuthGeneration: expect.any(Number),
+        })
+      );
+    });
+
+    it('rejoins a torn-down call on the second grace reconnect without another outage', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({
+        activeChannelId: 'dm-queued',
+        connectionState: 'connected',
+        isDMCall: true,
+        isMuted: true,
+        isDeafened: true,
+      });
+      mockEmergencyCleanup.mockImplementationOnce(() => useVoiceStore.getState().reset());
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+      expect(mockEmergencyCleanup).toHaveBeenCalledOnce();
+
+      // The first reconnect queues its async rejoin. A fresh, short outage
+      // supersedes that callback before it runs, but has no new voice session
+      // to tear down. Its grace reconnect must consume the existing ticket.
+      result.current('CONNECTED' as never);
+      result.current('RECONNECTING' as never);
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).toHaveBeenCalledOnce();
+      expect(mockJoinChannel).toHaveBeenCalledWith(
+        'dm-queued',
+        'dm',
+        expect.objectContaining({
+          privacyIntent: { joinType: 'dm', isMuted: true, isDeafened: true },
+        })
+      );
+      expect(useConnectionStore.getState().phase).toBe('stable');
+    });
+
+    it('does not let an older outage cleanup erase the next voice stash', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'old-voice', connectionState: 'connected' });
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      result.current('CONNECTED' as never);
+      useVoiceStore.setState({ activeChannelId: 'new-voice', connectionState: 'connected' });
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000);
+      await vi.dynamicImportSettled();
+
+      expect(useConnectionStore.getState().pendingVoiceRejoin?.channelId).toBe('new-voice');
+      expect(mockJoinChannel).not.toHaveBeenCalled();
     });
 
     it('performs recovery reset and fetches user', async () => {

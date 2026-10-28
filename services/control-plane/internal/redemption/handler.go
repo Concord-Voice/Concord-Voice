@@ -42,6 +42,9 @@ func NewHandler(engine *Engine, issuer *Issuer, adminToken string, log *logger.L
 
 type redeemRequest struct {
 	Code string `json:"code" binding:"required"`
+	// ConfirmCredit answers a 409 credit_confirmation_required: turn a code for
+	// another plan into face-value credit (#2033 D1).
+	ConfirmCredit bool `json:"confirm_credit"`
 }
 
 // Redeem handles POST /api/v1/redeem. It is rate-limited at the route (per-user
@@ -63,7 +66,7 @@ func (h *Handler) Redeem(c *gin.Context) {
 		return
 	}
 
-	outcome, err := h.engine.Redeem(c.Request.Context(), userID, req.Code)
+	outcome, err := h.engine.RedeemConfirmed(c.Request.Context(), userID, req.Code, req.ConfirmCredit)
 	if err != nil {
 		h.handleRedeemError(c, userID, err)
 		return
@@ -81,6 +84,13 @@ func (h *Handler) Redeem(c *gin.Context) {
 //   - ErrCodeNotValid / unknown grant_kind / checksum fail → 400 generic message.
 //   - ErrAlreadyRedeemed → 409 (idempotent "already redeemed"; not an oracle —
 //     it only reflects THIS user's own prior redemption).
+//   - ErrSeatMember → 409 seat_member (access comes from a Wing seat; the code
+//     stays unredeemed, PR-5)
+//   - *CreditConfirmationError → 409 credit_confirmation_required with the
+//     quote; nothing was redeemed (#2033 D1). It tells a subscriber the code is
+//     valid without consuming it, which is the point: they hold the code and
+//     must see what it becomes before it is spent.
+//   - ErrCreditUnavailable → 503 billing_unavailable; nothing was redeemed.
 //   - any other (post-commit notify error, infra error) → the grant may have
 //     succeeded; we log and still 200 with the description if present, else 500.
 //
@@ -89,6 +99,7 @@ func (h *Handler) Redeem(c *gin.Context) {
 // The user id is run through sanitizeID before logging (CWE-117 defense, even
 // though a parsed uuid is structurally hex-only — uniform sanitize per #1645).
 func (h *Handler) handleRedeemError(c *gin.Context, userID uuid.UUID, err error) {
+	var confirm *CreditConfirmationError
 	switch {
 	case errors.Is(err, ErrCodeNotValid):
 		h.log.Info("redeem rejected", "outcome", "invalid", "user_id", sanitizeID(userID.String()))
@@ -96,6 +107,15 @@ func (h *Handler) handleRedeemError(c *gin.Context, userID uuid.UUID, err error)
 	case errors.Is(err, ErrAlreadyRedeemed):
 		h.log.Info("redeem rejected", "outcome", "already_redeemed", "user_id", sanitizeID(userID.String()))
 		c.JSON(http.StatusConflict, gin.H{"error": "You have already redeemed this code."})
+	case errors.As(err, &confirm):
+		h.log.Info("redeem rejected", "outcome", "credit_confirmation_required", "user_id", sanitizeID(userID.String()))
+		c.JSON(http.StatusConflict, gin.H{"error": "credit_confirmation_required", "credit": confirm})
+	case errors.Is(err, ErrSeatMember):
+		h.log.Info("redeem rejected", "outcome", "seat_member", "user_id", sanitizeID(userID.String()))
+		c.JSON(http.StatusConflict, gin.H{"error": "seat_member"})
+	case errors.Is(err, ErrCreditUnavailable):
+		h.log.Error("redeem rejected", "outcome", "credit_unavailable", "user_id", sanitizeID(userID.String()), "error", err.Error())
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "billing_unavailable"})
 	default:
 		// An error AFTER a successful commit (post-commit notify) still means
 		// the grant landed — the engine returns the description alongside the
@@ -211,7 +231,8 @@ func (h *Handler) handleIssueError(c *gin.Context, err error) {
 		errors.Is(err, errIssueGrantUnknown),
 		errors.Is(err, errIssuePromoNoExpiry),
 		errors.Is(err, errIssuePrefixTooLong),
-		errors.Is(err, errIssueBatchIDTooLong):
+		errors.Is(err, errIssueBatchIDTooLong),
+		errors.Is(err, errIssuePlanUnknown):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	default:
 		h.log.Error("redemption issue error", "error", err.Error())

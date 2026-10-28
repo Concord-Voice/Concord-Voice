@@ -188,6 +188,7 @@ func TestPortal_CancelFlowCarriesSubscription(t *testing.T) {
 	latest := later.AddDate(1, 0, 0)
 	seedStripeSub(t, env.DB, env.User, "sub_older_live", env.Customer, "active", earlier)
 	seedStripeSub(t, env.DB, env.User, "sub_newer_live", env.Customer, "active", later)
+	env.Fake.seedSubscription("sub_newer_live", env.Customer, PlanWing, "year", later.Unix())
 	// A canceled row with the latest period end is not live and is never chosen.
 	seedStripeSub(t, env.DB, env.User, "sub_dead_latest", env.Customer, "canceled", latest)
 	// A live code row has no Stripe subscription to cancel in the Portal.

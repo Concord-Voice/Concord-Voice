@@ -44,7 +44,7 @@ func NewTierChanger(cache *entitlements.Cache, notifier entitlements.SessionNoti
 }
 
 // Deps is what NewService needs; a struct because the list would otherwise be
-// seven parameters.
+// eight parameters.
 type Deps struct {
 	DB          *sql.DB
 	Stripe      *stripe.Client
@@ -52,6 +52,7 @@ type Deps struct {
 	Environment string // cfg.Environment; compared with a subscription's metadata concord_env
 	Changer     TierChanger
 	Counters    *opsmetrics.Counters // nil-safe
+	Seats       SeatNotifier         // nil: seat events are not pushed (PR-5)
 	Log         *logger.Logger
 }
 

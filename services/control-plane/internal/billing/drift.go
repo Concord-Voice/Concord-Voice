@@ -92,6 +92,18 @@ const (
 
 	pruneEventsSQL = `DELETE FROM stripe_webhook_events
 		WHERE processed_at < NOW() - make_interval(secs => $1)`
+
+	// expireInvitesSQL materializes lapsed Wing invites (spec §9 Expiry). It
+	// locks only the seat rows it updates, so it cannot close a cycle with a
+	// seat op; an accept that holds one re-checks expiry under its own lock.
+	// $1 is the batch size.
+	expireInvitesSQL = `UPDATE subscription_seats
+		SET state = 'expired', end_reason = 'invite_expired', ended_at = NOW()
+		WHERE id IN (SELECT id FROM subscription_seats
+			WHERE state = 'pending' AND invite_expires_at <= NOW()
+			ORDER BY invite_expires_at LIMIT $1
+			FOR UPDATE SKIP LOCKED)
+		RETURNING id, payer_user_id, holder_user_id`
 )
 
 // DriftReport is what one RunDrift pass did.
@@ -102,6 +114,7 @@ type DriftReport struct {
 	Failed      int // selected rows whose reconcile returned an error
 	Discovered  int // subscriptions found in Stripe that changed a local row
 	Pruned      int // dedupe rows deleted
+	Expired     int // Wing invites that lapsed (PR-5)
 }
 
 // RunDriftWorker runs a drift pass at startup and then every driftInterval
@@ -124,7 +137,7 @@ func (s *Service) logDriftSummary(report DriftReport) {
 	}
 	attrs := []any{
 		"fetched", report.Fetched, "corrected", report.Corrections, "failed", report.Failed,
-		"discovered", report.Discovered, "pruned", report.Pruned,
+		"discovered", report.Discovered, "pruned", report.Pruned, "invites_expired", report.Expired,
 	}
 	if report.Failed > 0 {
 		s.Log.Warn("billing: drift pass finished", attrs...)
@@ -134,14 +147,14 @@ func (s *Service) logDriftSummary(report DriftReport) {
 }
 
 // RunDrift runs one pass: reconcile the most urgent live rows, run discovery,
-// prune old events. A subscription whose reconcile fails is logged and skipped;
+// prune old events, expire lapsed Wing invites. A subscription whose reconcile fails is logged and skipped;
 // the error returned is a failed stage query or ctx ending, and the report
 // still describes the work that was done. Each pass that did anything logs one
 // summary line.
 func (s *Service) RunDrift(ctx context.Context) (report DriftReport, err error) {
 	defer func() { s.logDriftSummary(report) }()
 	var errs []error
-	stages := []func(context.Context, *DriftReport) error{s.driftRows, s.discover, s.pruneEvents}
+	stages := []func(context.Context, *DriftReport) error{s.driftRows, s.discover, s.pruneEvents, s.expireInvites}
 	for _, stage := range stages {
 		if err := ctx.Err(); err != nil {
 			return report, err
@@ -289,6 +302,30 @@ func (s *Service) pruneEvents(ctx context.Context, report *DriftReport) error {
 		return withStage("prune_events", fmt.Errorf("billing: drift: prune events: %w", err))
 	}
 	report.Pruned = int(n)
+	return nil
+}
+
+// expireInvites marks up to driftBatch lapsed pending invites expired and
+// tells both sides. The pushes run after the statement's own commit.
+func (s *Service) expireInvites(ctx context.Context, report *DriftReport) (err error) {
+	rows, err := s.DB.QueryContext(ctx, expireInvitesSQL, driftBatch)
+	if err != nil {
+		return withStage("expire_invites", fmt.Errorf("billing: drift: expire invites: %w", err))
+	}
+	var out seatOutcome
+	for rows.Next() {
+		c := seatChange{state: SeatStateExpired}
+		if err := rows.Scan(&c.seatID, &c.payer, &c.holder); err != nil {
+			_ = rows.Close()
+			return withStage("expire_invites", fmt.Errorf("billing: drift: scan expired invite: %w", err))
+		}
+		out.changes = append(out.changes, c)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return withStage("expire_invites", fmt.Errorf("billing: drift: expire invites: %w", err))
+	}
+	report.Expired = len(out.changes)
+	s.afterSeatCommit(ctx, out)
 	return nil
 }
 

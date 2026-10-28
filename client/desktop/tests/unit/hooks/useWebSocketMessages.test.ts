@@ -7,6 +7,8 @@ import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
+import { useBillingStore } from '@/renderer/stores/auth/billingStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
@@ -851,6 +853,152 @@ describe('useWebSocketMessages', () => {
       });
       expect(useSubscriptionStore.getState().entitlement.tier).toBe('premium');
       expect(useSubscriptionStore.getState().entitlement.allowMusicMode).toBe(true);
+    });
+
+    it('re-reads the subscription on a push only while a purchase is Confirming (#2033)', () => {
+      const fetchMe = vi.fn().mockResolvedValue(undefined);
+      const original = useBillingStore.getState().fetchMe;
+      useBillingStore.setState({ fetchMe });
+      try {
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        const handler = ws.handlers.get('entitlements_changed');
+        const push = {
+          type: 'entitlements_changed',
+          data: { ...FREE_ENTITLEMENT, tier: 'premium' },
+        };
+        act(() => handler?.(push));
+        expect(fetchMe).not.toHaveBeenCalled();
+
+        useBillingStore.setState({ pending: true });
+        act(() => handler?.(push));
+        expect(fetchMe).toHaveBeenCalledTimes(1);
+      } finally {
+        useBillingStore.setState({ fetchMe: original, pending: false });
+      }
+    });
+
+    it('re-reads loaded billing details on a same-tier push (cancel, resume, payment recovery)', () => {
+      const fetchMe = vi.fn().mockResolvedValue(undefined);
+      const original = useBillingStore.getState().fetchMe;
+      useBillingStore.setState({
+        fetchMe,
+        pending: false,
+        me: { tier: 'premium' } as never,
+      });
+      try {
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        const handler = ws.handlers.get('entitlements_changed');
+        act(() =>
+          handler?.({
+            type: 'entitlements_changed',
+            data: { ...FREE_ENTITLEMENT, tier: 'premium' },
+          })
+        );
+        expect(fetchMe).toHaveBeenCalledTimes(1);
+      } finally {
+        useBillingStore.setState({ fetchMe: original, me: null });
+      }
+    });
+
+    it('re-reads the subscription and nudges once on a Wing invite (#2033 PR-5)', async () => {
+      const fetchMe = vi.fn().mockResolvedValue(undefined);
+      const original = useBillingStore.getState().fetchMe;
+      useBillingStore.setState({ fetchMe });
+      const { desktopNotificationService } =
+        await import('@/renderer/services/system/desktopNotificationService');
+      const notify = vi.spyOn(desktopNotificationService, 'notify').mockImplementation(() => {});
+      vi.spyOn(desktopNotificationService, 'shouldNotifyAccount').mockReturnValue(true);
+      try {
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        act(() =>
+          ws.handlers.get('subscription_seat_invite')?.({
+            type: 'subscription_seat_invite',
+            data: { invite_id: 'seat-1', expires_at: '2026-10-31T00:00:00Z' },
+          })
+        );
+        expect(fetchMe).toHaveBeenCalledTimes(1);
+        expect(mockPlay).toHaveBeenCalledWith('friend-request');
+        expect(notify).toHaveBeenCalledWith(
+          expect.objectContaining({ title: 'Wing invite', targetType: 'account' })
+        );
+
+        act(() =>
+          ws.handlers.get('subscription_seat_updated')?.({
+            type: 'subscription_seat_updated',
+            data: { seat_id: 'seat-1', state: 'active' },
+          })
+        );
+        expect(fetchMe).toHaveBeenCalledTimes(2);
+        expect(notify).toHaveBeenCalledTimes(1);
+      } finally {
+        useBillingStore.setState({ fetchMe: original });
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('keeps a Wing invite silent under DND but still re-reads (#2033 PR-5)', async () => {
+      const fetchMe = vi.fn().mockResolvedValue(undefined);
+      const original = useBillingStore.getState().fetchMe;
+      useBillingStore.setState({ fetchMe });
+      useMemberStore.setState({ selfStatus: 'dnd' });
+      const { desktopNotificationService } =
+        await import('@/renderer/services/system/desktopNotificationService');
+      const notify = vi.spyOn(desktopNotificationService, 'notify').mockImplementation(() => {});
+      try {
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        act(() =>
+          ws.handlers.get('subscription_seat_invite')?.({
+            type: 'subscription_seat_invite',
+            data: { invite_id: 'seat-1', expires_at: '2026-10-31T00:00:00Z' },
+          })
+        );
+        expect(fetchMe).toHaveBeenCalledTimes(1);
+        expect(mockPlay).not.toHaveBeenCalledWith('friend-request');
+        expect(notify).not.toHaveBeenCalled();
+      } finally {
+        useBillingStore.setState({ fetchMe: original });
+        useMemberStore.setState({ selfStatus: 'online' });
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('re-reads the subscription after the reconnect hydrate while Confirming (#2033)', async () => {
+      const fetchMe = vi.fn().mockResolvedValue(undefined);
+      const original = useBillingStore.getState().fetchMe;
+      useBillingStore.setState({ fetchMe });
+      vi.spyOn(useSubscriptionStore.getState(), 'hydrate').mockResolvedValue(undefined);
+      try {
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        act(() => ws.emitConnectionChange(ConnectionState.CONNECTED));
+        await Promise.resolve();
+        expect(fetchMe).not.toHaveBeenCalled();
+
+        useBillingStore.setState({ pending: true });
+        act(() => ws.emitConnectionChange(ConnectionState.CONNECTED));
+        await vi.waitFor(() => expect(fetchMe).toHaveBeenCalledTimes(1));
+      } finally {
+        useBillingStore.setState({ fetchMe: original });
+      }
+    });
+
+    it('re-reads loaded billing details after the reconnect hydrate (#2033)', async () => {
+      const fetchMe = vi.fn().mockResolvedValue(undefined);
+      const original = useBillingStore.getState().fetchMe;
+      useBillingStore.setState({ fetchMe, pending: false, me: { tier: 'premium' } as never });
+      vi.spyOn(useSubscriptionStore.getState(), 'hydrate').mockResolvedValue(undefined);
+      try {
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        act(() => ws.emitConnectionChange(ConnectionState.CONNECTED));
+        await vi.waitFor(() => expect(fetchMe).toHaveBeenCalledTimes(1));
+      } finally {
+        useBillingStore.setState({ fetchMe: original, me: null });
+      }
     });
   });
 });

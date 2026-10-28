@@ -97,8 +97,9 @@ func outboxBackoff(attempts int) time.Duration {
 	return min(d, outboxMaxBackoff)
 }
 
-// RunOutboxWorker processes the outbox at startup and then every
-// outboxInterval until ctx is canceled. It blocks; start it with go.
+// RunOutboxWorker processes the erasure and code-credit outboxes at startup
+// and then every outboxInterval until ctx is canceled. It blocks; start it
+// with go.
 func (s *Service) RunOutboxWorker(ctx context.Context) {
 	runTicker(ctx, outboxInterval, func(ctx context.Context) {
 		deleted, err := s.ProcessOutbox(ctx)
@@ -108,6 +109,14 @@ func (s *Service) RunOutboxWorker(ctx context.Context) {
 				logKeyErrorClass, errorClass(err), logKeyStage, errorStage(err))
 		case deleted > 0:
 			s.Log.Info("billing: erased Stripe customers", "deleted", deleted)
+		}
+		applied, err := s.ProcessCreditOutbox(ctx)
+		switch {
+		case err != nil && ctx.Err() == nil:
+			s.Log.Warn("billing: code credit outbox pass failed",
+				logKeyErrorClass, errorClass(err), logKeyStage, errorStage(err))
+		case applied > 0:
+			s.Log.Info("billing: applied code credits", "applied", applied)
 		}
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/billing"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/redemption"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -41,13 +42,19 @@ func TestBuildRedemptionHandler_Constructs(t *testing.T) {
 
 	t.Run("with admin token", func(t *testing.T) {
 		cfg := &config.Config{RedemptionAdminToken: "0123456789abcdef0123456789abcdef"} //nolint:gosec // test fixture // pragma: allowlist secret
-		h := buildRedemptionHandler(nil, entCache, notifier, cfg, log)
+		h := buildRedemptionHandler(nil, entCache, notifier, nil, cfg, log)
 		require.NotNil(t, h)
 	})
 
 	t.Run("empty admin token still constructs", func(t *testing.T) {
 		cfg := &config.Config{RedemptionAdminToken: ""}
-		h := buildRedemptionHandler(nil, entCache, notifier, cfg, log)
+		h := buildRedemptionHandler(nil, entCache, notifier, nil, cfg, log)
+		require.NotNil(t, h)
+	})
+
+	t.Run("with billing constructs", func(t *testing.T) {
+		cfg := &config.Config{}
+		h := buildRedemptionHandler(nil, entCache, notifier, billing.NewService(billing.Deps{}), cfg, log)
 		require.NotNil(t, h)
 	})
 }

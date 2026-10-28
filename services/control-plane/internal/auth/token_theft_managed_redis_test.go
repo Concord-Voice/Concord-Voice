@@ -100,7 +100,7 @@ func TestTokenTheftRecovery_ManagedColdConnection(t *testing.T) {
 				})
 				switch mode {
 				case "expired_snapshot", "expired_factory":
-					now = now.Add(managedredis.MaxCredentialAge)
+					now = now.Add(time.Hour) // the credential's validUntil
 				case "superseded_snapshot":
 					reader.credential.Generation++
 					reader.credential.Username = "cv_cp_13"
@@ -227,7 +227,7 @@ func TestTokenTheftRecovery_RejectsCredentialChangeBeforeReceipt(t *testing.T) {
 					// freshness check, so the receipt must perform its own check.
 					switch change {
 					case "expired":
-						clock.Store(initial.Add(managedredis.MaxCredentialAge).Unix())
+						clock.Store(initial.Add(time.Hour).Unix()) // the credential's validUntil
 					case "superseded":
 						reader.credential.Generation++
 						reader.credential.Username = "cv_cp_13"

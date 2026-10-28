@@ -481,6 +481,42 @@ describe('DesktopNotificationService', () => {
     });
   });
 
+  // ── account notices (Wing invite, #2033 PR-5) ─────────────────────
+
+  describe('account notices', () => {
+    it('shouldNotifyAccount follows the master toggle, DND and quiet hours', () => {
+      expect(desktopNotificationService.shouldNotifyAccount()).toBe(true);
+      useNotificationStore.setState({ doNotDisturb: true });
+      expect(desktopNotificationService.shouldNotifyAccount()).toBe(false);
+      useNotificationStore.setState({ doNotDisturb: false, desktopNotificationsEnabled: false });
+      expect(desktopNotificationService.shouldNotifyAccount()).toBe(false);
+      useNotificationStore.setState({
+        desktopNotificationsEnabled: true,
+        quietHoursEnabled: true,
+        quietHoursStart: '00:00',
+        quietHoursEnd: '23:59',
+      });
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 9, 24, 12, 0));
+      expect(desktopNotificationService.shouldNotifyAccount()).toBe(false);
+    });
+
+    it('an account notice click focuses the window without navigating', async () => {
+      desktopNotificationService.notify({
+        title: 'Wing invite',
+        senderDisplayName: 'Concord',
+        body: 'A friend invited you to their Wing.',
+        targetType: 'account',
+        targetId: 'seat-1',
+        senderId: '',
+      });
+      mockOnClick.handler!();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(mockFocusWindow).toHaveBeenCalled();
+      expect(mockSetPendingNavigation).not.toHaveBeenCalled();
+    });
+  });
+
   // ── badge ─────────────────────────────────────────────────────────
 
   it('does not touch the OS badge — badgeSync owns it (#2403)', () => {

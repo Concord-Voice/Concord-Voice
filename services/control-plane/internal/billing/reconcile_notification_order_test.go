@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -115,10 +116,13 @@ func (c *notificationOrderConn) QueryContext(_ context.Context, q string, _ []dr
 	switch q {
 	case payerByCustomerSQL:
 		return notificationOrderResult(c.s.user), nil
-	case lockPayerSQL:
-		return notificationOrderResult(int64(1)), nil
+	case lockUsersAscSQL:
+		return notificationOrderResult(c.s.user), nil
+	case seatPartiesSQL, activeHolderSQL, ownOpenSeatSQL, heldActiveSeatSQL:
+		return &notificationOrderRows{cols: []string{"id"}}, nil
 	case selectStoredRowSQL:
-		return notificationOrderResult(c.s.user, c.s.tier, c.s.status, "cus_scan", c.s.end, false, "wing", "year", false, nil), nil
+		return notificationOrderResult(c.s.user, c.s.tier, c.s.status, "cus_scan", c.s.end, false, "wing", "year", false, nil,
+			int64(16489), nil, nil, nil, nil), nil
 	case countLiveStripeRowsSQL:
 		if c.s.status == "active" {
 			return notificationOrderResult(int64(1)), nil
@@ -320,4 +324,47 @@ func TestPushTier_EachRecipientGetsNotificationBudget(t *testing.T) {
 		assert.ErrorIs(t, notification.Err(), context.Canceled, "each recipient cleans up its own timer")
 	}
 	assert.True(t, changer.contexts[0] != changer.contexts[1], "the owner's budget cannot reuse the payer's expired context")
+}
+
+func TestAfterSeatCommit_RequestCancellationStillPushesCurrentTier(t *testing.T) {
+	for _, requestState := range []string{"live", "canceled", "deadline expired"} {
+		for _, currentTier := range []string{"free", "premium"} {
+			t.Run(requestState+" current tier "+currentTier, func(t *testing.T) {
+				holder := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+				staleTier := "premium"
+				status := "canceled"
+				if currentTier == "premium" {
+					staleTier = "free"
+					status = "active"
+				}
+				store := &notificationOrderStore{user: holder.String(), status: status, tier: currentTier}
+				db := sql.OpenDB(notificationOrderConnector{store})
+				t.Cleanup(func() { require.NoError(t, db.Close()) })
+				current, err := entitlements.ResolveTierChecked(t.Context(), db, holder.String())
+				require.NoError(t, err)
+				require.Equal(t, currentTier, current, "fixture must resolve the later committed tier before cancellation")
+				changer := &recordingChanger{}
+				svc := NewService(Deps{DB: db, Changer: changer, Log: logger.NewWithWriter(&syncBuffer{})})
+				ctx := t.Context()
+				switch requestState {
+				case "canceled":
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					cancel()
+					require.ErrorIs(t, ctx.Err(), context.Canceled)
+				case "deadline expired":
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithDeadline(ctx, time.Unix(1, 0))
+					defer cancel()
+					require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+				}
+
+				svc.afterSeatCommit(ctx, seatOutcome{tiers: []tierMove{{user: holder, before: currentTier, after: staleTier}}})
+
+				calls := changer.Calls()
+				require.Len(t, calls, 1, "a committed seat change must still notify its holder")
+				assert.Equal(t, current, calls[0].New, "notification must use the current database tier instead of the stale seat outcome")
+			})
+		}
+	}
 }

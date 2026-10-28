@@ -93,7 +93,6 @@ const (
 
 const (
 	payerByCustomerSQL = `SELECT user_id FROM stripe_customers WHERE stripe_customer_id = $1`
-	lockPayerSQL       = `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`
 	selfHealMappingSQL = `INSERT INTO stripe_customers (user_id, stripe_customer_id) VALUES ($1, $2)
 		ON CONFLICT DO NOTHING`
 	customerByUserSQL = `SELECT stripe_customer_id FROM stripe_customers WHERE user_id = $1`
@@ -101,7 +100,8 @@ const (
 		ON CONFLICT (event_id) DO NOTHING`
 
 	selectStoredRowSQL = `SELECT user_id, tier, status, stripe_customer_id, current_period_end,
-		cancel_at_period_end, plan, billing_interval, founders_rate, cancel_at
+		cancel_at_period_end, plan, billing_interval, founders_rate, cancel_at,
+		stripe_unit_amount, stripe_schedule_id, pending_plan, pending_billing_interval, pending_change_at
 		FROM subscriptions WHERE stripe_subscription_id = $1 FOR UPDATE`
 
 	// upsertRowSQL never changes user_id on conflict: a row stays with the
@@ -110,8 +110,9 @@ const (
 	// records that it ran (F27).
 	upsertRowSQL = `INSERT INTO subscriptions
 		(user_id, tier, status, source, stripe_customer_id, stripe_subscription_id,
-		 current_period_end, cancel_at_period_end, plan, billing_interval, founders_rate, cancel_at)
-		VALUES ($1, $2, $3, 'stripe', $4, $5, $6, $7, $8, $9, $10, $11)
+		 current_period_end, cancel_at_period_end, plan, billing_interval, founders_rate, cancel_at,
+		 stripe_unit_amount, stripe_schedule_id, pending_plan, pending_billing_interval, pending_change_at)
+		VALUES ($1, $2, $3, 'stripe', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL DO UPDATE SET
 		 tier = EXCLUDED.tier,
 		 status = EXCLUDED.status,
@@ -122,6 +123,11 @@ const (
 		 billing_interval = EXCLUDED.billing_interval,
 		 founders_rate = EXCLUDED.founders_rate,
 		 cancel_at = EXCLUDED.cancel_at,
+		 stripe_unit_amount = EXCLUDED.stripe_unit_amount,
+		 stripe_schedule_id = EXCLUDED.stripe_schedule_id,
+		 pending_plan = EXCLUDED.pending_plan,
+		 pending_billing_interval = EXCLUDED.pending_billing_interval,
+		 pending_change_at = EXCLUDED.pending_change_at,
 		 updated_at = NOW()`
 
 	// countLiveStripeRowsSQL concatenates the shared predicate as a constant.
@@ -158,6 +164,9 @@ type reconcileOutcome struct {
 	owner       uuid.UUID
 	ownerBefore string
 	ownerAfter  string
+
+	// seats is what the seat transitions owe after the commit (PR-5).
+	seats seatOutcome
 }
 
 // Reconcile fetches subID from Stripe under its advisory lock and writes the
@@ -192,6 +201,7 @@ func (s *Service) Reconcile(ctx context.Context, subID, eventID, eventType strin
 	if out.owner != uuid.Nil && (out.changed || out.ownerBefore != out.ownerAfter) {
 		s.pushTier(ctx, subID, out.owner, out.ownerBefore, out.ownerAfter)
 	}
+	s.afterSeatCommit(ctx, out.seats)
 	return out.changed, nil
 }
 
@@ -306,6 +316,26 @@ func (s *Service) fetchSubscription(ctx context.Context, subID string) (rowField
 		s.Log.Error("billing: subscription has no customer; nothing written", logKeySubID, subID)
 		return rowFields{}, nil, fmt.Errorf("%w: no customer", ErrUnactionable)
 	}
+	booked := false
+	if sub.Metadata[metadataKeyEnv] == s.Environment {
+		booked, err = s.completeAuthenticatedMixedChange(ctx, sub)
+	}
+	if err != nil {
+		return rowFields{}, nil, withStage(stageFetchSub, fmt.Errorf("billing: reconcile: finish authenticated mixed change: %w", err))
+	}
+	if booked {
+		sub, err = s.Stripe.V1Subscriptions.Retrieve(ctx, subID, params)
+		if err != nil {
+			return rowFields{}, nil, withStage(stageFetchSub, fmt.Errorf("billing: reconcile: refresh mixed booking: %w", err))
+		}
+		fields, err = classify(sub)
+		if err != nil {
+			return rowFields{}, nil, fmt.Errorf("%w: no current period end", ErrUnactionable)
+		}
+	}
+	if err := s.classifyPendingChange(ctx, &fields); err != nil {
+		return rowFields{}, nil, withStage(stageFetchSub, fmt.Errorf("billing: reconcile: retrieve schedule: %w", err))
+	}
 	return fields, sub.Metadata, nil
 }
 
@@ -322,12 +352,16 @@ func (s *Service) writeSubscription(ctx context.Context, conn *sql.Conn, in reco
 		s.logRollback(tx.Rollback(), "billing: reconcile rollback failed", logKeySubID, in.subID)
 	}()
 
-	payer, err := s.resolvePayer(ctx, tx, in)
+	payer, locked, err := s.resolvePayer(ctx, tx, in)
 	if err != nil {
 		return reconcileOutcome{}, err
 	}
 	out := reconcileOutcome{payer: payer, statusAfter: in.fields.Status}
 	if out.before, err = resolveTier(ctx, tx, payer, stageTierBefore); err != nil {
+		return reconcileOutcome{}, err
+	}
+	holder, holderBefore, err := seatHolderBefore(ctx, tx, in.subID)
+	if err != nil {
 		return reconcileOutcome{}, err
 	}
 	old, found, err := loadStoredRow(ctx, tx, in.subID)
@@ -341,6 +375,9 @@ func (s *Service) writeSubscription(ctx context.Context, conn *sql.Conn, in reco
 		}
 	}
 	if out.changed, out.statusBefore, err = s.upsertRow(ctx, tx, payer, in, old, found); err != nil {
+		return reconcileOutcome{}, err
+	}
+	if out.seats, err = s.reconcileSeats(ctx, tx, in, payer, locked, holder, holderBefore, out.changed); err != nil {
 		return reconcileOutcome{}, err
 	}
 	if err := s.finishWrite(ctx, tx, in, &out); err != nil {
@@ -382,20 +419,22 @@ func resolveTier(ctx context.Context, tx *sql.Tx, userID uuid.UUID, stage string
 }
 
 // resolvePayer finds the user who pays for the subscription and locks that
-// user's row FOR UPDATE before anything is written (R-a). A mapped customer's
+// user's row FOR UPDATE before anything is written (R-a), together with the
+// seat parties this reconcile may move (PR-5), ascending; it returns that
+// locked set. A mapped customer's
 // user is the payer. An unmapped customer's payer comes from the
 // subscription's metadata, and the mapping is then self-healed. A payer whose
 // row is gone (erasure committed, or a user that never existed here) is
 // unactionable: no row, no mapping, no outbox row and no Stripe call (R31).
-func (s *Service) resolvePayer(ctx context.Context, tx *sql.Tx, in reconcileInput) (uuid.UUID, error) {
+func (s *Service) resolvePayer(ctx context.Context, tx *sql.Tx, in reconcileInput) (uuid.UUID, map[uuid.UUID]bool, error) {
 	payer, mapped, err := s.lookupPayer(ctx, tx, in)
 	if err != nil {
-		return uuid.Nil, err
+		return uuid.Nil, nil, err
 	}
 
-	exists, err := lockUser(ctx, tx, payer)
+	exists, locked, err := lockPayerAndSeatParties(ctx, tx, in.subID, payer)
 	if err != nil {
-		return uuid.Nil, err
+		return uuid.Nil, nil, err
 	}
 	if !exists {
 		if mapped {
@@ -403,14 +442,14 @@ func (s *Service) resolvePayer(ctx context.Context, tx *sql.Tx, in reconcileInpu
 		} else {
 			s.logUnresolvablePayer("billing: subscription metadata names no user here; nothing written", in)
 		}
-		return uuid.Nil, fmt.Errorf("%w: payer absent", ErrUnactionable)
+		return uuid.Nil, nil, fmt.Errorf("%w: payer absent", ErrUnactionable)
 	}
 	if !mapped {
 		if err := s.healUnlessTerminal(ctx, tx, payer, in); err != nil {
-			return uuid.Nil, err
+			return uuid.Nil, nil, err
 		}
 	}
-	return payer, nil
+	return payer, locked, nil
 }
 
 // healUnlessTerminal self-heals the mapping for an unmapped customer, except
@@ -486,19 +525,6 @@ func (s *Service) logUnresolvablePayer(msg string, in reconcileInput) {
 	s.Log.Warn(msg, attrs...)
 }
 
-// lockUser locks the user's row FOR UPDATE and reports whether it exists.
-func lockUser(ctx context.Context, tx *sql.Tx, userID uuid.UUID) (bool, error) {
-	var one int
-	err := tx.QueryRowContext(ctx, lockPayerSQL, userID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, withStage(stageLockPayer, fmt.Errorf("billing: reconcile: lock payer: %w", err))
-	}
-	return true, nil
-}
-
 // selfHealMapping records the customer for a payer found through metadata, as
 // a lost checkout.session.completed would have. A user already mapped to a
 // different customer keeps that mapping; the conflict is logged and the
@@ -549,6 +575,7 @@ func (s *Service) upsertRow(ctx context.Context, tx *sql.Tx, payer uuid.UUID, in
 	if _, err := tx.ExecContext(ctx, upsertRowSQL,
 		payer, f.Tier, f.Status, f.CustomerID, in.subID,
 		f.PeriodEnd, f.CancelAtPeriodEnd, f.Plan, f.Interval, f.FoundersRate, f.CancelAt,
+		f.UnitAmount, f.ScheduleID, f.PendingPlan, f.PendingInterval, f.PendingChangeAt,
 	); err != nil {
 		return false, "", withStage(stageUpsert, fmt.Errorf("billing: reconcile: upsert subscription: %w", err))
 	}
@@ -572,7 +599,8 @@ func loadStoredRow(ctx context.Context, tx *sql.Tx, subID string) (storedRow, bo
 	var customer sql.NullString
 	err := tx.QueryRowContext(ctx, selectStoredRowSQL, subID).Scan(
 		&r.userID, &r.fields.Tier, &r.fields.Status, &customer, &r.periodEnd,
-		&r.fields.CancelAtPeriodEnd, &r.fields.Plan, &r.fields.Interval, &r.fields.FoundersRate, &r.fields.CancelAt)
+		&r.fields.CancelAtPeriodEnd, &r.fields.Plan, &r.fields.Interval, &r.fields.FoundersRate, &r.fields.CancelAt,
+		&r.fields.UnitAmount, &r.fields.ScheduleID, &r.fields.PendingPlan, &r.fields.PendingInterval, &r.fields.PendingChangeAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storedRow{}, false, nil
 	}
@@ -594,7 +622,12 @@ func (r storedRow) sameAs(f rowFields) bool {
 		o.Plan == f.Plan &&
 		o.Interval == f.Interval &&
 		o.FoundersRate == f.FoundersRate &&
-		sameNullTime(o.CancelAt, f.CancelAt)
+		sameNullTime(o.CancelAt, f.CancelAt) &&
+		o.UnitAmount == f.UnitAmount &&
+		o.ScheduleID == f.ScheduleID &&
+		o.PendingPlan == f.PendingPlan &&
+		o.PendingInterval == f.PendingInterval &&
+		sameNullTime(o.PendingChangeAt, f.PendingChangeAt)
 }
 
 // sameNullTime compares two nullable instants by value, not by location.

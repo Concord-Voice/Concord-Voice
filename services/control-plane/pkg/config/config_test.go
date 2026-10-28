@@ -1133,6 +1133,8 @@ func TestLoadDefaultAllowedOriginsIncludesAppScheme(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, cfg.AllowedOrigins, "app://concord")
 	assert.Contains(t, cfg.AllowedOrigins, "spa-cache://concord")
+	// The mobile app's fixed WebSocket origin (#206).
+	assert.Contains(t, cfg.AllowedOrigins, "app://concord-mobile")
 	// Defensive: verify dev defaults still present
 	assert.Contains(t, cfg.AllowedOrigins, "http://localhost:3001")
 }

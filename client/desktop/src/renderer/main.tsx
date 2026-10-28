@@ -2,6 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { HashRouter } from 'react-router';
 import App from './App';
+import DesktopAppRequired, { isUnsupportedBrowser } from './components/ui/DesktopAppRequired';
 import { installSelfHealHandlers } from './spaSelfHealClient';
 import { ModalProvider } from './components/ui/ModalContext';
 import { configureRefreshFailureReset } from './services/system/apiClient';
@@ -97,12 +98,18 @@ if (!container) {
 
 const root = createRoot(container);
 
-root.render(
-  <React.StrictMode>
-    <HashRouter>
-      <ModalProvider>
-        <App />
-      </ModalProvider>
-    </HashRouter>
-  </React.StrictMode>
-);
+// A plain browser has no preload bridge and cannot pass the server's
+// client-version or attestation gates, so it gets the download page instead.
+if (isUnsupportedBrowser()) {
+  root.render(<DesktopAppRequired />);
+} else {
+  root.render(
+    <React.StrictMode>
+      <HashRouter>
+        <ModalProvider>
+          <App />
+        </ModalProvider>
+      </HashRouter>
+    </React.StrictMode>
+  );
+}

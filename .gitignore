@@ -68,6 +68,7 @@ lerna-debug.log*
 package-lock.json
 !client/desktop/package-lock.json
 !services/media-plane/package-lock.json
+!client/mobile/package-lock.json
 !.github/tools/license-checker/package-lock.json
 yarn.lock
 pnpm-lock.yaml

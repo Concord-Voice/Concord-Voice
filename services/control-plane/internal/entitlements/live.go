@@ -44,12 +44,30 @@ type Querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// resolveTierQuery reads the tier of every live row the user holds. Both
-// operands are constants, so no SQL text is built at run time.
-const resolveTierQuery = `SELECT tier FROM subscriptions WHERE user_id = $1 AND ` + LiveRowPredicate
+// LiveSeatParentPredicate is the one definition of "this Wing seat entitles its
+// holder right now" (#2033 spec §9, PR-5). It is a fragment over
+// `subscription_seats s JOIN subscriptions ON subscriptions.id =
+// s.subscription_id` and relies on LiveRowPredicate's columns being unique to
+// subscriptions in that join, so use it with no third table. The seat must be
+// active and its parent a live, premium, Stripe-billed Wing: a parent that is
+// paused, unpaid, past its period, malformed (tier free) or no longer a Wing
+// suspends the seat through this join, with no write.
+const LiveSeatParentPredicate = `s.state = 'active'
+	AND subscriptions.source = 'stripe' AND subscriptions.plan = 'wing'
+	AND subscriptions.tier = 'premium' AND ` + LiveRowPredicate
+
+// resolveTierQuery reads the tier of every live row the user holds, and the
+// tier of the parent of an active Wing seat the user holds. Every operand is a
+// constant, so no SQL text is built at run time.
+const resolveTierQuery = `SELECT tier FROM subscriptions WHERE user_id = $1 AND ` + LiveRowPredicate + `
+	UNION ALL
+	SELECT subscriptions.tier FROM subscription_seats s
+	  JOIN subscriptions ON subscriptions.id = s.subscription_id
+	 WHERE s.holder_user_id = $1 AND ` + LiveSeatParentPredicate
 
 // ResolveTierQ returns the highest-ranked tier (by Rank) across the user's live
-// subscription rows, read through q. Since migration 000179 a user may hold one
+// subscription rows and the parent of an active Wing seat they hold (see
+// LiveSeatParentPredicate), read through q. Since migration 000179 a user may hold one
 // live code row and live Stripe rows at once, so no single row is "the"
 // subscription. It fails closed to TierFree on no live row and on any error
 // (the query, a row scan or the iteration), even after a premium row was read:

@@ -36,11 +36,13 @@ type fakeStripe struct {
 	// Runtime resources (PR-2): what the webhook, Reconcile, the outbox and
 	// the Portal endpoint read and write.
 	subscriptions []*fakeSubscription
+	schedules     map[string]*fakeSchedule
 	customers     map[string]bool // customer ids that exist
 	// deletedCustomers are ids this account once held and deleted: Stripe
 	// still retrieves them, as {"deleted": true}.
 	deletedCustomers map[string]bool
 	sessions         []*fakeSession
+	balanceTxns      []map[string]any // customer balance transactions, in creation order
 	requests         []fakeRequest
 	seq              map[string]int
 	failures         map[string]fakeFailure // keyed by "METHOD /path"
@@ -126,21 +128,41 @@ type fakePortal struct {
 // code reads it: items carry an expanded price, customer is always an id, and
 // discounts are ids unless the request expands them (see retrieveSubscription).
 type fakeSubscription struct {
-	ID                string            `json:"id"`
-	Object            string            `json:"object"`
-	Status            string            `json:"status"`
-	Customer          string            `json:"customer"`
-	CancelAt          int64             `json:"cancel_at"`
-	CancelAtPeriodEnd bool              `json:"cancel_at_period_end"`
-	Metadata          map[string]string `json:"metadata"`
-	Items             fakeSubItems      `json:"items"`
-	Discounts         []any             `json:"discounts"`
-	couponIDs         []string          // test-side source of Discounts
+	ID                        string                           `json:"id"`
+	Object                    string                           `json:"object"`
+	Status                    string                           `json:"status"`
+	Customer                  string                           `json:"customer"`
+	CancelAt                  int64                            `json:"cancel_at"`
+	CancelAtPeriodEnd         bool                             `json:"cancel_at_period_end"`
+	Metadata                  map[string]string                `json:"metadata"`
+	Items                     fakeSubItems                     `json:"items"`
+	Discounts                 []any                            `json:"discounts"`
+	Schedule                  string                           `json:"schedule,omitempty"`
+	AutomaticTax              *stripe.SubscriptionAutomaticTax `json:"automatic_tax,omitempty"`
+	LatestInvoice             any                              `json:"latest_invoice,omitempty"`
+	PendingUpdate             map[string]any                   `json:"pending_update,omitempty"`
+	couponIDs                 []string                         // test-side source of Discounts
+	pendingPaymentStatus      string                           // test-side failed payment status
+	pendingPriorPaymentStatus string                           // earlier invoice attempt
+	pendingInvoiceURL         string                           // optional test-side hosted invoice override
+	pendingPriceID            string                           // test-side pending update target
+	pendingMetadata           map[string]string                // test-side metadata awaiting payment
 }
 
 type fakeSubItems struct {
 	Object string        `json:"object"`
 	Data   []fakeSubItem `json:"data"`
+}
+
+type fakeSchedule struct {
+	ID           string            `json:"id"`
+	Object       string            `json:"object"`
+	Status       string            `json:"status"`
+	Metadata     map[string]string `json:"metadata"`
+	CurrentPhase struct {
+		StartDate int64 `json:"start_date"`
+		EndDate   int64 `json:"end_date"`
+	} `json:"current_phase"`
 }
 
 type fakeSubItem struct {
@@ -213,6 +235,7 @@ func newFakeStripe(t *testing.T) *fakeStripe {
 		coupons:   map[string]*fakeCoupon{},
 		portals:   []*fakePortal{},
 		customers: map[string]bool{},
+		schedules: map[string]*fakeSchedule{},
 		seq:       map[string]int{},
 		failures:  map[string]fakeFailure{},
 		replayed:  map[string]bool{},
@@ -259,6 +282,13 @@ func (f *fakeStripe) handler() http.Handler {
 	mux.HandleFunc("POST /v1/billing_portal/configurations", f.createPortal)
 	mux.HandleFunc("POST /v1/billing_portal/configurations/{id}", f.updatePortal)
 	mux.HandleFunc("GET /v1/subscriptions/{id}", f.retrieveSubscription)
+	mux.HandleFunc("POST /v1/subscriptions/{id}", f.updateSubscription)
+	mux.HandleFunc("POST /v1/invoices/create_preview", f.createInvoicePreview)
+	mux.HandleFunc("GET /v1/invoices/{id}", f.retrieveInvoice)
+	mux.HandleFunc("POST /v1/subscription_schedules", f.createSchedule)
+	mux.HandleFunc("GET /v1/subscription_schedules/{id}", f.retrieveSchedule)
+	mux.HandleFunc("POST /v1/subscription_schedules/{id}", f.updateSchedule)
+	mux.HandleFunc("POST /v1/subscription_schedules/{id}/release", f.releaseSchedule)
 	mux.HandleFunc("GET /v1/subscriptions", f.listSubscriptions)
 	mux.HandleFunc("DELETE /v1/customers/{id}", f.deleteCustomer)
 	mux.HandleFunc("GET /v1/customers/{id}", f.retrieveCustomer)
@@ -267,6 +297,8 @@ func (f *fakeStripe) handler() http.Handler {
 	mux.HandleFunc("POST /v1/billing_portal/sessions", f.createPortalSession)
 	mux.HandleFunc("POST /v1/customers", f.createCustomer)
 	mux.HandleFunc("POST /v1/checkout/sessions", f.createSession)
+	mux.HandleFunc("POST /v1/customers/{id}/balance_transactions", f.createBalanceTransaction)
+	mux.HandleFunc("GET /v1/customers/{id}/balance_transactions", f.listBalanceTransactions)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -371,11 +403,15 @@ func (f *fakeStripe) seedCustomer(id string) {
 func (f *fakeStripe) seedSubscription(id, customerID, plan, interval string, periodEnd int64, coupons ...string) *fakeSubscription {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	amount := int64(899)
+	if offer, ok := findOffer(plan, interval); ok {
+		amount = offer.unitAmount
+	}
 	price := &fakePrice{
 		ID: f.nextID("price"), Object: "price", Active: true, Currency: "usd",
 		Metadata:  map[string]string{PlanMetadataKey: plan},
 		Recurring: fakeRecurring{Interval: interval, IntervalCount: 1, UsageType: "licensed"},
-		Type:      "recurring", UnitAmount: 899,
+		Type:      "recurring", UnitAmount: amount,
 	}
 	sub := &fakeSubscription{
 		ID: id, Object: "subscription", Status: "active", Customer: customerID,
@@ -590,11 +626,170 @@ func (f *fakeStripe) updatePortal(w http.ResponseWriter, r *http.Request) {
 func (f *fakeStripe) retrieveSubscription(w http.ResponseWriter, r *http.Request) {
 	for _, sub := range f.subscriptions {
 		if sub.ID == r.PathValue("id") {
-			f.writeJSON(w, f.renderSubscription(sub, requestsExpand(r.Form, "discounts")))
+			shown := f.renderSubscription(sub, requestsExpand(r.Form, "discounts"))
+			if sub.LatestInvoice != nil && requestsExpand(r.Form, "latest_invoice") {
+				shown.LatestInvoice = map[string]any{"id": "in_" + sub.ID, "object": "invoice"}
+			}
+			f.writeJSON(w, shown)
 			return
 		}
 	}
 	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+func (f *fakeStripe) updateSubscription(w http.ResponseWriter, r *http.Request) {
+	for _, sub := range f.subscriptions {
+		if sub.ID != r.PathValue("id") {
+			continue
+		}
+		if sub.Schedule != "" {
+			f.writeRaw(w, http.StatusBadRequest, invalidRequestBody)
+			return
+		}
+		if r.Form.Get("cancel_at_period_end") == "true" {
+			sub.CancelAtPeriodEnd = true
+			f.writeJSON(w, f.renderSubscription(sub, requestsExpand(r.Form, "discounts")))
+			return
+		}
+		priceID := r.Form.Get("items[0][price]")
+		if priceID == "" {
+			f.applySubscriptionMetadata(sub, r.Form)
+			f.writeJSON(w, f.renderSubscription(sub, requestsExpand(r.Form, "discounts")))
+			return
+		}
+		for _, price := range f.prices {
+			if price.ID != priceID {
+				continue
+			}
+			if r.Form.Get("payment_behavior") == "pending_if_incomplete" && sub.pendingPaymentStatus != "" {
+				sub.PendingUpdate = map[string]any{"expires_at": int64(1900000000)}
+				sub.LatestInvoice = "in_" + sub.ID
+				sub.pendingPriceID = priceID
+				sub.pendingMetadata = map[string]string{}
+				for key, values := range r.Form {
+					if strings.HasPrefix(key, "metadata[") && strings.HasSuffix(key, "]") && len(values) > 0 {
+						sub.pendingMetadata[strings.TrimSuffix(strings.TrimPrefix(key, "metadata["), "]")] = values[0]
+					}
+				}
+				f.writeJSON(w, f.renderSubscription(sub, requestsExpand(r.Form, "discounts")))
+				return
+			}
+			sub.Items.Data[0].Price = price
+			f.applySubscriptionMetadata(sub, r.Form)
+			f.writeJSON(w, f.renderSubscription(sub, requestsExpand(r.Form, "discounts")))
+			return
+		}
+		f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+		return
+	}
+	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+func (f *fakeStripe) applySubscriptionMetadata(sub *fakeSubscription, form url.Values) {
+	for key, values := range form {
+		if strings.HasPrefix(key, "metadata[") && strings.HasSuffix(key, "]") && len(values) > 0 {
+			name := strings.TrimSuffix(strings.TrimPrefix(key, "metadata["), "]")
+			if values[0] == "" {
+				delete(sub.Metadata, name)
+			} else {
+				sub.Metadata[name] = values[0]
+			}
+		}
+	}
+}
+
+func (f *fakeStripe) createInvoicePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Form.Get("subscription") == "" || r.Form.Get("subscription_details[items][0][price]") == "" {
+		f.writeRaw(w, http.StatusBadRequest, invalidRequestBody)
+		return
+	}
+	f.writeJSON(w, map[string]any{"object": "invoice", "currency": "usd", "amount_due": int64(500)})
+}
+
+func (f *fakeStripe) retrieveInvoice(w http.ResponseWriter, r *http.Request) {
+	for _, sub := range f.subscriptions {
+		if "in_"+sub.ID != r.PathValue("id") || sub.PendingUpdate == nil {
+			continue
+		}
+		invoiceURL := sub.pendingInvoiceURL
+		if invoiceURL == "" {
+			invoiceURL = "https://invoice.stripe.com/i/test_" + sub.ID
+		}
+		payments := []any{}
+		if sub.pendingPriorPaymentStatus != "" {
+			payments = append(payments, map[string]any{
+				"object": "invoice_payment", "payment": map[string]any{"type": "payment_intent", "payment_intent": map[string]any{
+					"id": "pi_prior_" + sub.ID, "object": "payment_intent", "status": sub.pendingPriorPaymentStatus,
+				}},
+			})
+		}
+		payments = append(payments, map[string]any{
+			"object": "invoice_payment", "payment": map[string]any{"type": "payment_intent", "payment_intent": map[string]any{
+				"id": "pi_" + sub.ID, "object": "payment_intent", "status": sub.pendingPaymentStatus,
+			}},
+		})
+		f.writeJSON(w, map[string]any{
+			"id": "in_" + sub.ID, "object": "invoice", "hosted_invoice_url": invoiceURL,
+			"payments": map[string]any{"object": "list", "data": payments},
+		})
+		return
+	}
+	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+func (f *fakeStripe) createSchedule(w http.ResponseWriter, r *http.Request) {
+	for _, sub := range f.subscriptions {
+		if sub.ID != r.Form.Get("from_subscription") {
+			continue
+		}
+		if sub.Schedule != "" {
+			f.writeRaw(w, http.StatusBadRequest, invalidRequestBody)
+			return
+		}
+		schedule := &fakeSchedule{ID: f.nextID("sub_sched"), Object: "subscription_schedule", Status: "active", Metadata: map[string]string{}}
+		schedule.CurrentPhase.StartDate = sub.Items.Data[0].CurrentPeriodEnd - 30*24*3600
+		schedule.CurrentPhase.EndDate = sub.Items.Data[0].CurrentPeriodEnd
+		f.schedules[schedule.ID] = schedule
+		sub.Schedule = schedule.ID
+		f.writeJSON(w, schedule)
+		return
+	}
+	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+func (f *fakeStripe) retrieveSchedule(w http.ResponseWriter, r *http.Request) {
+	if schedule := f.schedules[r.PathValue("id")]; schedule != nil {
+		f.writeJSON(w, schedule)
+		return
+	}
+	f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+}
+
+func (f *fakeStripe) updateSchedule(w http.ResponseWriter, r *http.Request) {
+	schedule := f.schedules[r.PathValue("id")]
+	if schedule == nil || schedule.Status != "active" {
+		f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+		return
+	}
+	for k, v := range formMetadata(r.Form) {
+		schedule.Metadata[k] = v
+	}
+	f.writeJSON(w, schedule)
+}
+
+func (f *fakeStripe) releaseSchedule(w http.ResponseWriter, r *http.Request) {
+	schedule := f.schedules[r.PathValue("id")]
+	if schedule == nil || schedule.Status != "active" {
+		f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
+		return
+	}
+	schedule.Status = "released"
+	for _, sub := range f.subscriptions {
+		if sub.Schedule == schedule.ID {
+			sub.Schedule = ""
+		}
+	}
+	f.writeJSON(w, schedule)
 }
 
 func (f *fakeStripe) renderSubscription(sub *fakeSubscription, expandDiscounts bool) fakeSubscription {
@@ -660,6 +855,40 @@ func (f *fakeStripe) retrieveCustomer(w http.ResponseWriter, r *http.Request) {
 	default:
 		f.writeRaw(w, http.StatusNotFound, resourceMissingBody)
 	}
+}
+
+// createBalanceTransaction answers a customer balance credit (code credit, D1).
+func (f *fakeStripe) createBalanceTransaction(w http.ResponseWriter, r *http.Request) {
+	amount, _ := strconv.ParseInt(r.Form.Get("amount"), 10, 64)
+	f.writeJSON(w, f.addBalanceTxn(r.PathValue("id"), amount, r.Form.Get("currency"),
+		map[string]string{"concord_redemption_id": r.Form.Get("metadata[concord_redemption_id]")}))
+}
+
+// addBalanceTxn stores a balance transaction; the caller holds f.mu.
+func (f *fakeStripe) addBalanceTxn(customer string, amount int64, currency string, metadata map[string]string) map[string]any {
+	txn := map[string]any{
+		"id": f.nextID("cbtxn"), "object": "customer_balance_transaction",
+		"customer": customer, "amount": amount, "currency": currency, "metadata": metadata,
+	}
+	f.balanceTxns = append(f.balanceTxns, txn)
+	return txn
+}
+
+// seedBalanceTxn stores a credit the account already holds for redemptionID.
+func (f *fakeStripe) seedBalanceTxn(customer, redemptionID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addBalanceTxn(customer, -2697, "usd", map[string]string{"concord_redemption_id": redemptionID})
+}
+
+func (f *fakeStripe) listBalanceTransactions(w http.ResponseWriter, r *http.Request) {
+	out := []map[string]any{}
+	for _, txn := range f.balanceTxns {
+		if txn["customer"] == r.PathValue("id") {
+			out = append(out, txn)
+		}
+	}
+	f.writeJSON(w, map[string]any{"object": "list", "url": r.URL.Path, "data": out})
 }
 
 func (f *fakeStripe) listSessions(w http.ResponseWriter, r *http.Request) {

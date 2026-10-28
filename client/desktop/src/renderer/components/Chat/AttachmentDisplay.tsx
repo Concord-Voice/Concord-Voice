@@ -88,10 +88,13 @@ interface LoadedAttachment {
 }
 
 const blobUrlCache = new Map<string, CachedBlob>();
+// Oversized blobs cannot join the retained LRU, but overlapping surfaces of
+// the same file must still share one URL until the final surface releases it.
+const uncachedLiveBlobs = new Map<string, { url: string; animated: boolean | null }>();
 let cachedBytes = 0;
 
 /**
- * File ids currently rendered by at least one mounted surface, with a count.
+ * File ids currently rendered by at least one active surface, with a count.
  *
  * Deliberately NOT a refcount stored on the cache entry. A handoff scheme —
  * loader retains, component releases — leaks a permanent reference whenever a
@@ -100,6 +103,34 @@ let cachedBytes = 0;
  * entirely by the effect below, so an abandoned load simply never registers.
  */
 const liveSurfaces = new Map<string, number>();
+
+// Intersection callbacks update this synchronously, before React flushes an
+// effect for the URL. It also covers a visible surface whose load is in flight.
+const viewportSurfaces = new Map<string, number>();
+
+function setViewportSurface(fileId: string, entering: boolean): void {
+  const next = (viewportSurfaces.get(fileId) ?? 0) + (entering ? 1 : -1);
+  if (next > 0) viewportSurfaces.set(fileId, next);
+  else viewportSurfaces.delete(fileId);
+}
+
+function revokeUnshownUrl(fileId: string, url: string): void {
+  if (blobUrlCache.get(fileId)?.url === url) return;
+  if (liveSurfaces.has(fileId) || viewportSurfaces.has(fileId)) return;
+  if (uncachedLiveBlobs.get(fileId)?.url === url) uncachedLiveBlobs.delete(fileId);
+  URL.revokeObjectURL(url);
+}
+
+function releaseOffscreenBlob(fileId: string, url: string): void {
+  if (liveSurfaces.has(fileId) || viewportSurfaces.has(fileId)) return;
+  const cached = blobUrlCache.get(fileId);
+  if (cached?.url === url) {
+    blobUrlCache.delete(fileId);
+    cachedBytes -= cached.bytes;
+  }
+  if (uncachedLiveBlobs.get(fileId)?.url === url) uncachedLiveBlobs.delete(fileId);
+  URL.revokeObjectURL(url);
+}
 
 /**
  * Hold this file id for as long as a surface renders its url, so eviction
@@ -113,9 +144,14 @@ const liveSurfaces = new Map<string, number>();
  * The realistic case — images already on screen when another arrives — is
  * covered, and the residual is a broken image rather than anything unsafe.
  */
-function useRetainedBlobUrl(fileId: string, url: string | null): void {
+function useRetainedBlobUrl(
+  fileId: string,
+  url: string | null,
+  active = true,
+  releaseOnExitRef?: { current: boolean }
+): void {
   useEffect(() => {
-    if (!url) return;
+    if (!url || !active) return;
     liveSurfaces.set(fileId, (liveSurfaces.get(fileId) ?? 0) + 1);
     return () => {
       const remaining = (liveSurfaces.get(fileId) ?? 1) - 1;
@@ -129,9 +165,13 @@ function useRetainedBlobUrl(fileId: string, url: string | null): void {
       // deliberately never cached, so the last surface to let go owns the
       // revoke -- otherwise declining to cache would trade an eviction storm
       // for a permanent leak.
-      if (!blobUrlCache.has(fileId)) URL.revokeObjectURL(url);
+      // The observer changes this flag when the surface exits; the latest
+      // value, not the value at effect setup, decides whether to evict.
+      // eslint-disable-next-line @eslint-react/exhaustive-deps -- Read the observer's latest exit state during cleanup.
+      if (releaseOnExitRef?.current) releaseOffscreenBlob(fileId, url);
+      else revokeUnshownUrl(fileId, url);
     };
-  }, [fileId, url]);
+  }, [fileId, url, active, releaseOnExitRef]);
 }
 
 /**
@@ -144,7 +184,7 @@ function useRetainedBlobUrl(fileId: string, url: string | null): void {
  */
 function evictOldestBlob(): boolean {
   for (const [fileId, entry] of blobUrlCache) {
-    if (liveSurfaces.has(fileId)) continue; // on screen — try the next-oldest
+    if (liveSurfaces.has(fileId) || viewportSurfaces.has(fileId)) continue;
     URL.revokeObjectURL(entry.url);
     cachedBytes -= entry.bytes;
     blobUrlCache.delete(fileId);
@@ -166,16 +206,21 @@ function evictOldestBlob(): boolean {
 export function __resetBlobCacheForTests(): void {
   for (const entry of blobUrlCache.values()) URL.revokeObjectURL(entry.url);
   blobUrlCache.clear();
+  for (const entry of uncachedLiveBlobs.values()) URL.revokeObjectURL(entry.url);
+  uncachedLiveBlobs.clear();
   liveSurfaces.clear();
+  viewportSurfaces.clear();
   inFlightLoads.clear();
   cachedBytes = 0;
 }
 
 function cacheBlobUrl(fileId: string, url: string, bytes: number, animated: boolean | null): void {
-  // Too large to retain: show it, do not cache it. useRetainedBlobUrl revokes it
-  // when the last surface unmounts -- without that this would leak, because the
-  // cache is otherwise the ONLY thing that ever revokes a url.
-  if (bytes > BLOB_CACHE_RETAIN_MAX_BYTES) return;
+  // Too large for the retained LRU: share its URL only while a surface needs
+  // it. The final surface release removes this transient entry and revokes it.
+  if (bytes > BLOB_CACHE_RETAIN_MAX_BYTES) {
+    uncachedLiveBlobs.set(fileId, { url, animated });
+    return;
+  }
 
   const superseded = blobUrlCache.get(fileId);
   if (superseded !== undefined) {
@@ -313,6 +358,8 @@ async function fetchAndDecrypt(
     blobUrlCache.set(fileId, cached);
     return { url: cached.url, animated: cached.animated };
   }
+  const uncached = uncachedLiveBlobs.get(fileId);
+  if (uncached) return uncached;
 
   // Coalesce concurrent loads of one attachment onto a single fetch + decrypt.
   // The same file legitimately appears on several surfaces at once (a message
@@ -437,19 +484,25 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(!url);
   const [error, setError] = useState<AttachmentFailure>(null);
-  // Keep this url alive while it is on screen (#2157 review, VULN-002-C):
-  // eviction may not revoke a blob a mounted surface is still pointing at.
-  useRetainedBlobUrl(attachment.id, url);
   // Byte count of a refusal, or null when the attachment was never refused.
   const [tooLarge, setTooLarge] = useState<{ bytes: number; truncated: boolean } | null>(null);
   // Aspect ratio learned from <img onLoad> as a fallback for messages whose
   // summary lacks pre-known width/height (e.g. older history rows fetched
   // from the server before the dim-plumbing was in place).
   const [naturalRatio, setNaturalRatio] = useState<number | null>(null);
-  const observerRef = useRef<IntersectionObserver | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const [inView, setInView] = useState(false);
+  // null means the observer has not delivered its initial viewport result.
+  const visibleRef = useRef<boolean | null>(null);
+  const urlRef = useRef(url);
+  const loadingRef = useRef(false);
+  const pinnedRef = useRef(false);
+  const releaseOnExitRef = useRef(false);
+  const loadRef = useRef<() => void>(() => undefined);
+  urlRef.current = url;
+  pinnedRef.current = focusWithin || lightboxOpen || menuPos !== null;
 
   // Save the decrypted image to disk via the native Save-As dialog (#1729).
   // The blob is already decrypted in-renderer; read its bytes and hand them to
@@ -471,14 +524,22 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   }, [url, attachment.id, attachment.mime_type]);
 
   const load = useCallback(async () => {
+    if (loadingRef.current || urlRef.current) return;
+    loadingRef.current = true;
     try {
+      setError(null);
       setLoading(true);
       const loaded = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
+      if (!visibleRef.current && !pinnedRef.current) {
+        releaseOffscreenBlob(attachment.id, loaded.url);
+        return;
+      }
       // Set the animation verdict BEFORE the url. `showLiveImage` gates on
       // `url !== null`, so nothing is rendered until the url lands — sequencing
       // it this way means the first paint already knows whether to pause,
       // rather than flashing one animated frame and then correcting itself.
       if (loaded.animated !== null) setSniffedAnimated(loaded.animated);
+      urlRef.current = loaded.url;
       setUrl(loaded.url);
     } catch (err) {
       // A refusal is a different failure from a broken fetch or decrypt: the
@@ -487,28 +548,59 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
         setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
       else setError(failureOf(err));
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   }, [attachment.id, attachment.file_size, channelId]);
+  loadRef.current = load;
 
   useEffect(() => {
-    if (url) return; // already loaded
     const el = containerRef.current;
     if (!el) return;
-
-    observerRef.current = new IntersectionObserver(
+    const observer = new IntersectionObserver(
       ([entry]) => {
+        if (entry.isIntersecting === visibleRef.current) return;
+        const wasVisible = visibleRef.current === true;
+        visibleRef.current = entry.isIntersecting;
+        if (entry.isIntersecting) setViewportSurface(attachment.id, true);
+        else if (wasVisible) setViewportSurface(attachment.id, false);
+        setInView(entry.isIntersecting);
         if (entry.isIntersecting) {
-          load();
-          observerRef.current?.disconnect();
+          releaseOnExitRef.current = false;
+          loadRef.current();
+        } else {
+          releaseOnExitRef.current = true;
+          if (!pinnedRef.current) {
+            urlRef.current = null;
+            setUrl(null);
+          }
         }
       },
       { rootMargin: '200px' }
     );
-    observerRef.current.observe(el);
-
-    return () => observerRef.current?.disconnect();
-  }, [url, load]);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      if (visibleRef.current) {
+        visibleRef.current = false;
+        setViewportSurface(attachment.id, false);
+      }
+    };
+  }, [attachment.id]);
+  // Unmounted history rows are released by the cache's byte budget. A row that
+  // remains mounted after scrolling out releases its decrypted bytes promptly.
+  useRetainedBlobUrl(
+    attachment.id,
+    url,
+    inView || pinnedRef.current || !releaseOnExitRef.current,
+    releaseOnExitRef
+  );
+  useEffect(() => {
+    if (releaseOnExitRef.current && !inView && !pinnedRef.current && url) {
+      urlRef.current = null;
+      setUrl(null);
+    }
+  }, [inView, focusWithin, lightboxOpen, menuPos, url]);
 
   // Compute the reserved box from pre-known summary dims when available, so
   // the optimistic message paints at the final size with no layout shift.
@@ -661,18 +753,35 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
   const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<AttachmentFailure>(null);
-  // Keep this url alive while it is on screen (#2157 review, VULN-002-C):
-  // eviction may not revoke a blob a mounted surface is still pointing at.
-  useRetainedBlobUrl(attachment.id, url);
   const [tooLarge, setTooLarge] = useState<{ bytes: number; truncated: boolean } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   // Videos auto-lazy-load so the browser can render the first frame as a natural
   // poster — no separate thumbnail pipeline needed. Audio stays click-to-load
   // because there's nothing visual to gain from prefetching the bytes.
   const autoLoad = attachment.file_type === 'video';
+  const [inView, setInView] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  // null means the observer has not delivered its initial viewport result.
+  const visibleRef = useRef<boolean | null>(null);
+  const urlRef = useRef(url);
+  const loadingRef = useRef(false);
+  const manuallyRequestedRef = useRef(false);
+  const focusedRef = useRef(false);
+  const playingRef = useRef(false);
+  const pinnedRef = useRef(false);
+  const releaseOnExitRef = useRef(false);
+  const loadRef = useRef<() => void>(() => undefined);
+  const hasPictureInPicture = useCallback(() => {
+    const video = containerRef.current?.querySelector('video');
+    return !!video && document.pictureInPictureElement === video;
+  }, []);
+  urlRef.current = url;
+  pinnedRef.current = focused || playing || manuallyRequestedRef.current || hasPictureInPicture();
 
   const load = useCallback(async () => {
-    if (url) return;
+    if (urlRef.current || loadingRef.current) return;
+    loadingRef.current = true;
     setError(null);
     setLoading(true);
     try {
@@ -681,32 +790,95 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
         channelId,
         attachment.file_size
       );
+      if (!visibleRef.current && !pinnedRef.current) {
+        releaseOffscreenBlob(attachment.id, blobUrl);
+        return;
+      }
+      urlRef.current = blobUrl;
       setUrl(blobUrl);
     } catch (err) {
       if (err instanceof AttachmentTooLargeError)
         setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
       else setError(failureOf(err));
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
-  }, [attachment.id, attachment.file_size, channelId, url]);
+  }, [attachment.id, attachment.file_size, channelId]);
+  loadRef.current = load;
 
   useEffect(() => {
-    if (!autoLoad || url) return;
+    const video = containerRef.current?.querySelector('video');
+    if (!video) return;
+    const onLeavePictureInPicture = () => {
+      if (!releaseOnExitRef.current) return;
+      const hasFocus = containerRef.current?.contains(document.activeElement) ?? false;
+      focusedRef.current = hasFocus;
+      pinnedRef.current = hasFocus || playingRef.current;
+      setFocused(hasFocus);
+      if (!pinnedRef.current) {
+        urlRef.current = null;
+        setUrl(null);
+      }
+    };
+    video.addEventListener('leavepictureinpicture', onLeavePictureInPicture);
+    return () => video.removeEventListener('leavepictureinpicture', onLeavePictureInPicture);
+  }, [url]);
+
+  useEffect(() => {
     const el = containerRef.current;
     if (!el || typeof IntersectionObserver === 'undefined') return;
     const observer = new IntersectionObserver(
       ([entry]) => {
+        if (entry.isIntersecting === visibleRef.current) return;
+        const wasVisible = visibleRef.current === true;
+        visibleRef.current = entry.isIntersecting;
+        if (entry.isIntersecting) setViewportSurface(attachment.id, true);
+        else if (wasVisible) setViewportSurface(attachment.id, false);
+        setInView(entry.isIntersecting);
         if (entry.isIntersecting) {
-          load();
-          observer.disconnect();
+          releaseOnExitRef.current = false;
+          if (autoLoad) loadRef.current();
+        } else {
+          releaseOnExitRef.current = true;
+          manuallyRequestedRef.current = false;
+          // Removing the focused Load button does not fire blur. Recheck the DOM
+          // so a paused player cannot keep a stale focus pin after scrolling away.
+          const hasFocus = el.contains(document.activeElement);
+          if (focusedRef.current !== hasFocus) {
+            focusedRef.current = hasFocus;
+            setFocused(hasFocus);
+          }
+          pinnedRef.current = focusedRef.current || playingRef.current || hasPictureInPicture();
+          if (!pinnedRef.current) {
+            urlRef.current = null;
+            setUrl(null);
+          }
         }
       },
       { rootMargin: '200px' }
     );
     observer.observe(el);
-    return () => observer.disconnect();
-  }, [autoLoad, url, load]);
+    return () => {
+      observer.disconnect();
+      if (visibleRef.current) {
+        visibleRef.current = false;
+        setViewportSurface(attachment.id, false);
+      }
+    };
+  }, [autoLoad, attachment.id, hasPictureInPicture]);
+  useRetainedBlobUrl(
+    attachment.id,
+    url,
+    inView || pinnedRef.current || !releaseOnExitRef.current,
+    releaseOnExitRef
+  );
+  useEffect(() => {
+    if (releaseOnExitRef.current && !inView && !pinnedRef.current && url) {
+      urlRef.current = null;
+      setUrl(null);
+    }
+  }, [inView, focused, playing, url]);
 
   const Icon = attachment.file_type === 'video' ? Film : Music;
   const label = attachment.file_type === 'video' ? 'video' : 'audio';
@@ -720,7 +892,40 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
   else if (loading) loadTitle = `Loading ${label}…`;
 
   return (
-    <div className="attachment-media-container" ref={containerRef}>
+    <div
+      className="attachment-media-container"
+      ref={containerRef}
+      onFocusCapture={() => {
+        focusedRef.current = true;
+        pinnedRef.current = true;
+        setFocused(true);
+      }}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) {
+          focusedRef.current = false;
+          pinnedRef.current =
+            playingRef.current || manuallyRequestedRef.current || hasPictureInPicture();
+          setFocused(false);
+        }
+      }}
+      onPlayCapture={() => {
+        playingRef.current = true;
+        pinnedRef.current = true;
+        setPlaying(true);
+      }}
+      onPauseCapture={() => {
+        playingRef.current = false;
+        pinnedRef.current =
+          focusedRef.current || manuallyRequestedRef.current || hasPictureInPicture();
+        setPlaying(false);
+      }}
+      onEndedCapture={() => {
+        playingRef.current = false;
+        pinnedRef.current =
+          focusedRef.current || manuallyRequestedRef.current || hasPictureInPicture();
+        setPlaying(false);
+      }}
+    >
       {url && attachment.file_type === 'video' && (
         <ThemedMediaPlayer src={url} variant="video" className="attachment-video" />
       )}
@@ -738,7 +943,11 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
       {!url && tooLarge === null && !terminal && (
         <button
           className="attachment-load-btn attachment-load-btn-rich"
-          onClick={load}
+          onClick={() => {
+            manuallyRequestedRef.current = true;
+            pinnedRef.current = true;
+            load();
+          }}
           disabled={loading}
         >
           <Icon size={20} />

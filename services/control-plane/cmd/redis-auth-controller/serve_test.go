@@ -277,11 +277,11 @@ func TestServeRuntimeRestoresStateBeforeOpeningSocketsAndStopsCleanly(t *testing
 	seedBootstrap.Password = strings.Repeat("o", 24)
 	uid := uint32(1002)
 	input := prepareInputs{project: policy.Scope.Project, environment: policy.Scope.Environment, path: policy.Scope.Path,
-		controlUID: uid, mediaUID: uid, aclGID: aclGID}
+		controlUID: uid, mediaUID: uid + 1, aclGID: aclGID}
 	seed, err := managedredis.NewController(managedredis.ControllerOptions{
 		Admin: &cliRedisAdmin{}, ACLPath: filepath.Join(aclDir, "users.acl"), JournalPath: filepath.Join(stateDir, "rotation.json"),
 		MarkerPath: markerPath, Bootstrap: seedBootstrap, Now: time.Now,
-		ExpectedUIDs: map[string]uint32{"control-plane": uid, "media-plane": uid},
+		ExpectedUIDs: map[string]uint32{"control-plane": input.controlUID, "media-plane": input.mediaUID},
 		ACLUID:       os.Geteuid(), ACLGID: input.aclGID,
 	})
 	require.NoError(t, err)
@@ -960,4 +960,94 @@ func TestServeSocketDropsOversizedFrame(t *testing.T) {
 	require.NoError(t, err)
 	_, err = bufio.NewReader(conn).ReadByte()
 	require.Error(t, err)
+}
+
+// expiryRotationFixture prepares rotation-12 (old 11, target 12) on a mutable
+// clock. With loadErr set, the ACL LOAD that accepts the rotation fails once.
+func expiryRotationFixture(t *testing.T, clock *time.Time, loadErr error) (*managedredis.Controller, *cliRedisAdmin, string, managedredis.Policy) {
+	t.Helper()
+	root := t.TempDir()
+	for _, dir := range []string{"state", "marker"} {
+		require.NoError(t, os.Mkdir(filepath.Join(root, dir), 0o700))
+	}
+	policy := cliTestPolicy(*clock)
+	bootstrapScope := policy.Scope
+	bootstrapScope.Name = "REDIS_ADMIN_BOOTSTRAP"
+	admin := &cliRedisAdmin{}
+	controller, err := managedredis.NewController(managedredis.ControllerOptions{
+		Admin: admin, ACLPath: filepath.Join(root, "users.acl"),
+		JournalPath: filepath.Join(root, "state", "rotation.json"), MarkerPath: filepath.Join(root, "marker", "activated"),
+		Bootstrap: managedredis.AdminBootstrap{Version: 1, Scope: bootstrapScope, Username: "cv_admin", Password: "synthetic-bootstrap-password"},
+		Now:       func() time.Time { return *clock }, ExpectedUIDs: map[string]uint32{"control-plane": 1002, "media-plane": 1003},
+	})
+	require.NoError(t, err)
+	initial := policy
+	initial.Services = make(map[string]managedredis.PolicyService, len(policy.Services))
+	for service, entry := range policy.Services {
+		entry.TargetGeneration = 11
+		entry.Generations = entry.Generations[:1]
+		initial.Services[service] = entry
+	}
+	require.NoError(t, controller.PrepareInitial(initial))
+	admin.loadErr = loadErr
+	require.Equal(t, loadErr != nil, controller.Reconcile(context.Background(), policy) != nil)
+	admin.loadErr = nil
+	return controller, admin, filepath.Join(root, "users.acl"), policy
+}
+
+func requireOldUsersRevoked(t *testing.T, aclPath string) {
+	t.Helper()
+	acl, err := os.ReadFile(aclPath) // #nosec G304 -- ACL path is under this test's temporary directory.
+	require.NoError(t, err)
+	require.NotContains(t, string(acl), "user cv_cp_11 ")
+	require.NotContains(t, string(acl), "user cv_mp_11 ")
+}
+
+func TestReconcileOnceRevokesExpiredOldUsersDuringProviderOutage(t *testing.T) {
+	for _, loadFailed := range []bool{false, true} {
+		name := "loaded"
+		var loadErr error
+		if loadFailed {
+			// A failed ACL LOAD while accepting the rotation leaves a reconcile
+			// intent that only a provider read clears.
+			name, loadErr = "pending reconcile", errors.New("synthetic ACL LOAD timeout")
+		}
+		t.Run(name, func(t *testing.T) {
+			clock := time.Now().Round(0)
+			controller, _, aclPath, policy := expiryRotationFixture(t, &clock, loadErr)
+			require.Equal(t, loadFailed, controller.ReconciliationPending())
+
+			clock = policy.Services["control-plane"].Generations[0].ValidUntil
+			require.Equal(t, "provider", reconcileOnce(context.Background(), controller, cliPolicyReader{name: "OTHER_SECRET"}, policy.Scope))
+			state, _, _ := controller.Status()
+			require.Equal(t, "failed", state, "the provider failure is still reported")
+			requireOldUsersRevoked(t, aclPath)
+		})
+	}
+}
+
+// The deploy rebuild gate reads "finalized" plus registered instances as proof
+// that every host ACKed, so an expiry revocation without every ACK must not
+// report it.
+func TestRevokeExpiredWithoutEveryAckDoesNotReportFinalized(t *testing.T) {
+	clock := time.Now().Round(0)
+	controller, _, aclPath, policy := expiryRotationFixture(t, &clock, nil)
+	ctx := context.Background()
+	require.NoError(t, controller.RegisterExpected(ctx, policy.RotationID, map[string][]string{"control-plane": {"cp-a"}, "media-plane": {"mp-a"}},
+		map[string]uint64{"control-plane": 12, "media-plane": 12}))
+	bindCLISlot(t, controller, "control-plane", "cp-a")
+	bindCLISlot(t, controller, "media-plane", "mp-a")
+	require.NoError(t, controller.RecordAck(ctx, "control-plane", 1002, managedredis.AppliedAck{Version: 1, RotationID: policy.RotationID,
+		Service: "control-plane", InstanceID: "cp-a", Generation: 12, Username: "cv_cp_12"})) // mp-a withholds its ACK
+
+	clock = policy.Services["control-plane"].Generations[0].ValidUntil
+	revoked, err := controller.RevokeExpired(ctx)
+	require.NoError(t, err)
+	require.True(t, revoked)
+	requireOldUsersRevoked(t, aclPath)
+	var status struct {
+		State string `json:"state"`
+	}
+	require.NoError(t, json.Unmarshal(handleControl(ctx, controller, 0, []byte("{\"operation\":\"status\"}\n")), &status))
+	require.Equal(t, "prepared", status.State)
 }

@@ -12,7 +12,7 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 83 schemas total: 79 subscriber events (handled via wsService.on) + 4
+ * 85 schemas total: 81 subscriber events (handled via wsService.on) + 4
  * envelope-only events (connected, connection_ready, heartbeat_ack,
  * auth_renew_result) consumed
  * internally by wsService.handleMessage — all must be in the union so that
@@ -1625,6 +1625,26 @@ export const EntitlementsChangedSchema = z.object({
     ),
 });
 
+/**
+ * Wing seats (#2033 PR-5). Ids only: the renderer re-reads
+ * `GET /subscriptions/me` and takes names from its friend list. Server
+ * emitter: billing.afterSeatCommit / OnSeatsErased via
+ * api.EntitlementNotifier.NotifySeat
+ * (services/control-plane/internal/billing/seats.go) — keep in lockstep.
+ */
+export const SubscriptionSeatInviteSchema = z.object({
+  type: z.literal('subscription_seat_invite'),
+  data: z.object({ invite_id: z.string(), expires_at: z.string() }),
+});
+
+export const SubscriptionSeatUpdatedSchema = z.object({
+  type: z.literal('subscription_seat_updated'),
+  data: z.object({
+    seat_id: z.string(),
+    state: z.enum(['pending', 'active', 'declined', 'expired', 'revoked', 'left']),
+  }),
+});
+
 // ──────────── System + envelope (5 events) — Task A11 ─────────────────
 
 /**
@@ -1823,7 +1843,7 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (83 schemas: 79 subscriber + 4 envelope)
+// 4. The discriminated union (85 schemas: 81 subscriber + 4 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 /** Message-expiration policy change (#1351).
@@ -2016,6 +2036,10 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   // Entitlements (1)
   EntitlementsChangedSchema,
 
+  // Wing seats (#2033 PR-5) (2)
+  SubscriptionSeatInviteSchema,
+  SubscriptionSeatUpdatedSchema,
+
   // Message purge (#1352) (3)
   ChannelPurgedSchema,
   DmPurgedSchema,
@@ -2030,7 +2054,7 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   HeartbeatAckSchema,
   AuthRenewResultSchema,
 ]);
-// TOTAL: 83 schemas (79 subscriber + 4 envelope-only;
+// TOTAL: 85 schemas (81 subscriber + 4 envelope-only;
 // +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive;
 // +6 server-role events #2359; +server_permissions_changed/permissions_changed
 // #3456; +auth_renew_result control-socket token renewal).
@@ -2154,6 +2178,8 @@ export type PresenceOverridesUpdatedPayload = z.infer<
 
 // Entitlements
 export type EntitlementsChangedPayload = z.infer<typeof EntitlementsChangedSchema>['data'];
+export type SubscriptionSeatInvitePayload = z.infer<typeof SubscriptionSeatInviteSchema>['data'];
+export type SubscriptionSeatUpdatedPayload = z.infer<typeof SubscriptionSeatUpdatedSchema>['data'];
 
 // Message purge (#1352)
 export type ChannelPurgedPayload = z.infer<typeof ChannelPurgedSchema>['data'];

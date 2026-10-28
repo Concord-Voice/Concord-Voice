@@ -50,6 +50,7 @@ var (
 	errIssuePromoNoExpiry  = errors.New("redemption: unlimited promotional codes require an expires_at")
 	errIssuePrefixTooLong  = errors.New("redemption: code_prefix exceeds 16 chars")
 	errIssueBatchIDTooLong = errors.New("redemption: batch_id exceeds 64 chars")
+	errIssuePlanUnknown    = errors.New("redemption: premium plan must be supersonic or wing")
 )
 
 // MaxBatchSize is the hard upper bound on the number of codes a single issue
@@ -101,6 +102,11 @@ func (i *Issuer) validateSpec(spec IssueSpec) error {
 	}
 	if len(spec.BatchID) > 64 {
 		return errIssueBatchIDTooLong
+	}
+	if spec.GrantKind == GrantPremiumSubscription {
+		if _, ok := codePlanFromParams(spec.GrantParams); !ok {
+			return errIssuePlanUnknown
+		}
 	}
 	// Unlimited promo (MaxRedeems nil AND not single-use) MUST carry a hard
 	// expiry (spec §5) — an unlimited, never-expiring code is an unbounded

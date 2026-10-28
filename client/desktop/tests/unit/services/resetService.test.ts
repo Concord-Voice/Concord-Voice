@@ -70,6 +70,7 @@ import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
+import { useBillingStore } from '@/renderer/stores/auth/billingStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
@@ -471,6 +472,23 @@ describe('resetService', () => {
       expect(useSubscriptionStore.getState().entitlement).toEqual(FREE_ENTITLEMENT);
       expect(useSubscriptionStore.getState().entitlement.tier).toBe('free');
       expect(useSubscriptionStore.getState().degraded).toBe(false);
+    });
+
+    it('clears the prior account’s subscription read and Confirming wait (#2033)', () => {
+      useBillingStore.setState({
+        me: { tier: 'premium', status: 'active', billing: 'available' },
+        pending: true,
+        notice: 'checkout_closed',
+        opening: 'portal',
+      });
+
+      gracefulReset();
+
+      const billing = useBillingStore.getState();
+      expect(billing.me).toBeNull();
+      expect(billing.pending).toBe(false);
+      expect(billing.notice).toBeNull();
+      expect(billing.opening).toBeNull();
     });
 
     // #3406, Codex round 7: the permission store holds the previous account's

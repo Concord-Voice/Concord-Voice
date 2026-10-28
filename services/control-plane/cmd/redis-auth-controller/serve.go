@@ -329,6 +329,14 @@ func reconcileOnce(ctx context.Context, controller *managedredis.Controller, pro
 			}
 		}
 	}
+	// Expiry revocation runs even when the provider read failed, so an outage
+	// cannot keep an expired old user enabled while this loop runs. A restart
+	// during the outage stops at the startup policy read instead.
+	if revoked, err := controller.RevokeExpired(attemptCtx); err != nil {
+		code = "reconcile"
+	} else if revoked {
+		log.Printf("managed Redis controller revoked expired old users")
+	}
 	if code != "" {
 		controller.ReportFailure(code)
 	}

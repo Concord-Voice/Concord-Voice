@@ -307,6 +307,7 @@ func truncateAllTablesOnce(db *sql.DB) error {
 		code_redemptions,
 		stripe_webhook_events,
 		billing_erasure_outbox,
+		billing_credit_outbox,
 		user_presence_settings
 	CASCADE`)
 	if err != nil {

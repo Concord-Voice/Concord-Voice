@@ -66,6 +66,8 @@ Verbs:
   validate-config     Validate base + dev compose overlay
   dev-code [email]    Print the latest dev-mode email verification code from the
                       control-plane log (empty SMTP_HOST = codes logged, not emailed)
+  billing-listen      Forward Stripe TEST-mode webhooks to the local control plane
+                      (stripe/stripe-cli in Docker; billing soak, epic #2033)
   console | repl      Interactive REPL: a concord> prompt that runs any verb
                       above without re-invoking this script each time
 
@@ -103,6 +105,7 @@ dispatch_verb() {
     freshstart)      verb_freshstart "$@" ;;
     validate-config) verb_validate_config "$@" ;;
     dev-code)        verb_dev_code "$@" ;;
+    billing-listen)  verb_billing_listen "$@" ;;
     console|repl)    verb_console "$@" ;;
     help|-h|--help)  usage ;;
     *)
@@ -1998,6 +2001,82 @@ verb_dev_code() {
   fi
 }
 
+# ── billing-listen ─────────────────────────────────────────────────────
+
+# Pinned by digest (multi-arch manifest list). Approved dev tool for the
+# billing soak (spec §16): nothing is installed on the host.
+readonly STRIPE_CLI_IMAGE="stripe/stripe-cli:v1.53.1@sha256:11c46caeead82e329f14823dd622d494b4cc8c1b9766f724d122d2af42c97540"
+readonly BILLING_WEBHOOK_PATH="/api/v1/billing/stripe/webhook"
+# The live endpoint's event list ([internal]stripe-billing.md § Dashboard-only
+# settings). The CLI refuses to listen without an event selector.
+readonly BILLING_WEBHOOK_EVENTS="checkout.session.completed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,customer.subscription.paused,customer.subscription.resumed,customer.deleted"
+# The .env the native control plane loads (godotenv, cwd services/control-plane).
+: "${BILLING_ENV_FILE:=$PROJECT_ROOT/services/control-plane/.env}"
+
+# billing_env_value <KEY> — the value of KEY from the environment, else from
+# BILLING_ENV_FILE, read the way godotenv reads it for the control plane:
+# optional `export`, spaces around `=`, single or double quotes, and a
+# trailing ` # comment`. The last assignment wins.
+billing_env_value() {
+  local key="$1"
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s' "${!key}"
+    return 0
+  fi
+  [[ -f "$BILLING_ENV_FILE" ]] || return 0
+  sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*(\"([^\"]*)\"|'([^']*)'|([^#[:space:]]*)).*$/\3\4\5/p" \
+    "$BILLING_ENV_FILE" | tail -1
+}
+
+# verb_billing_listen() — run `stripe listen` in Docker against the dev stack's
+# own TEST key and forward events to the native control plane's webhook. The
+# key reaches the container by variable name only, never on a command line.
+# It first prints the CLI's signing secret and says whether the control plane's
+# STRIPE_WEBHOOK_SECRET matches it, since a mismatch fails every delivery with
+# 400. Runs in the foreground; Ctrl-C stops it.
+verb_billing_listen() {
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage: $0 billing-listen"
+      echo "  Forward Stripe test-mode webhooks to http://localhost:8080${BILLING_WEBHOOK_PATH}."
+      echo "  Uses STRIPE_SECRET_KEY (rk_test_/sk_test_ only) from the environment or"
+      echo "  ${BILLING_ENV_FILE#"$PROJECT_ROOT"/}. See [internal]stripe-billing.md § Test-mode soak."
+      return 0
+      ;;
+    "") ;;
+    *) echo "verb_billing_listen: unknown argument '$1'" >&2; return 2 ;;
+  esac
+
+  local key
+  key="$(billing_env_value STRIPE_SECRET_KEY)"
+  if [[ "$key" != rk_test_* && "$key" != sk_test_* ]]; then
+    echo -e "${RED}✗${NC} STRIPE_SECRET_KEY must be a test-mode key (rk_test_ or sk_test_); billing-listen never runs live" >&2
+    return 2
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo -e "${RED}✗${NC} Docker is not running" >&2
+    return 2
+  fi
+
+  local run=(docker run --rm --init -e STRIPE_API_KEY
+    --add-host=host.docker.internal:host-gateway "$STRIPE_CLI_IMAGE")
+  local secret
+  if ! secret="$(STRIPE_API_KEY="$key" "${run[@]}" listen --print-secret 2>/dev/null)" \
+    || [[ "$secret" != whsec_* ]]; then
+    echo -e "${RED}✗${NC} stripe listen could not get a signing secret; check the key's permissions" >&2
+    return 1
+  fi
+  if [[ "$(billing_env_value STRIPE_WEBHOOK_SECRET)" == "$secret" ]]; then
+    [[ "$QUIET" -eq 0 ]] && echo -e "${GREEN}✓${NC} STRIPE_WEBHOOK_SECRET matches this listener"
+  else
+    echo -e "${YELLOW}⚠${NC} Set STRIPE_WEBHOOK_SECRET=${secret} in ${BILLING_ENV_FILE#"$PROJECT_ROOT"/} and restart the control plane," >&2
+    echo "    or every delivery fails signature verification (400)." >&2
+  fi
+
+  STRIPE_API_KEY="$key" "${run[@]}" listen --events "$BILLING_WEBHOOK_EVENTS" \
+    --forward-to "http://host.docker.internal:8080${BILLING_WEBHOOK_PATH}"
+}
+
 # console_prompt() — the REPL prompt. Deliberately trivial (no per-prompt docker
 # probe) so the prompt is instant.
 console_prompt() {
@@ -2009,7 +2088,7 @@ console_help() {
   cat <<'HELP'
 Commands (same as the CLI verbs):
   up | down | status | logs | restart | rebuild | freshstart
-  validate-config | dev-code [email]
+  validate-config | dev-code [email] | billing-listen
 REPL builtins:
   help | ?      Show this list
   clear         Clear the screen

@@ -18,6 +18,7 @@
 import { Device, types as mediasoupTypes } from 'mediasoup-client';
 import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from '../../stores/auth/authStore';
+import { advanceVoiceActionGeneration, getVoiceActionGeneration } from './voiceActionGeneration';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useUpdateStatusStore } from '../../stores/ui/updateStatusStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
@@ -795,7 +796,29 @@ const VOICE_JOINS_PAUSED_CODE = 'voice_joins_paused';
 const VOICE_JOINS_PAUSED_ERROR =
   'Voice is briefly paused for maintenance. Try again in a few minutes.';
 
+type VoiceJoinOwner = { authGeneration: number; voiceActionGeneration: number };
+
 class VoiceService {
+  /** Explicit joins and leaves supersede any queued outage rejoin. */
+  getVoiceActionGeneration(): number {
+    return getVoiceActionGeneration();
+  }
+
+  private requireRecoveryOwnership(owner?: VoiceJoinOwner): void {
+    if (
+      owner &&
+      (useAuthStore.getState().authGeneration !== owner.authGeneration ||
+        getVoiceActionGeneration() !== owner.voiceActionGeneration)
+    )
+      throw new E2EEInitializationSupersededError();
+  }
+
+  private requireJoinOwnership(owner: VoiceJoinOwner | undefined, cleanupGeneration: number): void {
+    this.requireRecoveryOwnership(owner);
+    if (this.emergencyCleanupGeneration !== cleanupGeneration)
+      throw new E2EEInitializationSupersededError();
+  }
+
   private socket: Socket | null = null;
   private mediaHandshake: { token: string | null; generation: number; admitted: boolean } | null =
     null;
@@ -892,6 +915,8 @@ class VoiceService {
   private localMicStream: MediaStream | null = null;
   /** Single-flight guard for initial channel/DM joins. */
   private joinInFlight = false;
+  /** A forced teardown invalidates every asynchronous stage of an active join. */
+  private emergencyCleanupGeneration = 0;
   /** Single-flight guard for #1790 network-change media-session resume. */
   private resumeInFlight = false;
   private localCameraStream: MediaStream | null = null;
@@ -3948,8 +3973,22 @@ class VoiceService {
   async joinChannel(
     channelId: string,
     joinType: 'channel' | 'dm' = 'channel',
-    opts?: { internalRebuild?: boolean }
+    opts?: {
+      internalRebuild?: boolean;
+      privacyIntent?: { readonly isMuted: boolean; readonly isDeafened: boolean };
+      expectedAuthGeneration?: number;
+    }
   ): Promise<void> {
+    if (!opts?.internalRebuild && !opts?.privacyIntent) advanceVoiceActionGeneration();
+    const cleanupGeneration = this.emergencyCleanupGeneration;
+    const recoveryOwner =
+      opts?.expectedAuthGeneration === undefined
+        ? undefined
+        : {
+            authGeneration: opts.expectedAuthGeneration,
+            voiceActionGeneration: getVoiceActionGeneration(),
+          };
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
     useVoiceStore.getState().setJoinError(null);
     // A user joining anything supersedes a pending legacy-fallback rebuild.
     // The rebuild's own join runs after its intent check, so clearing here is
@@ -3966,6 +4005,14 @@ class VoiceService {
       const callStateToPreserve = this.dmJoiningStateToPreserve(channelId, joinType);
       const ringId = joinType === 'dm' ? this.currentDMRingID(channelId) : undefined;
       await this.leaveActiveChannelBeforeJoin(store, callStateToPreserve);
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
+
+      // A rebuild may have reset the voice store. Apply endpoint privacy intent
+      // before authorization or microphone capture, never after publication.
+      if (opts?.privacyIntent) {
+        store.setMuted(opts.privacyIntent.isMuted);
+        store.setDeafened(opts.privacyIntent.isDeafened);
+      }
 
       store.setConnectionState('connecting');
       connectingStarted = true;
@@ -3980,6 +4027,7 @@ class VoiceService {
       // into synthesizeDMChannel to keep joinChannel's cognitive complexity
       // under the 15-statement bound (was 19 before extraction).
       const channel = await this.resolveAuthorizedJoinChannel(joinData, channelId, joinType);
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
 
       store.setActiveChannel(channel.id, channel.name, channel.server_id);
 
@@ -3999,8 +4047,14 @@ class VoiceService {
         channel.id,
         joinType,
         ringId,
-        joinData
+        joinData,
+        recoveryOwner,
+        cleanupGeneration
       );
+
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
+
+      if (opts?.privacyIntent && this.socket) this.restorePostResumeMuteState(this.socket);
 
       store.setConnectionState('connected');
       notificationSoundService.stopAllLoops();
@@ -4038,10 +4092,19 @@ class VoiceService {
     roomId: string,
     joinType: 'channel' | 'dm',
     ringId: string | undefined,
-    joinData: JoinResponse
+    joinData: JoinResponse,
+    recoveryOwner: VoiceJoinOwner | undefined,
+    cleanupGeneration: number
   ): Promise<void> {
     try {
-      await this.dialAuthorizedMediaSession(store, roomId, joinType, joinData);
+      await this.dialAuthorizedMediaSession(
+        store,
+        roomId,
+        joinType,
+        joinData,
+        recoveryOwner,
+        cleanupGeneration
+      );
     } catch (err) {
       if (!this.isRoomOwnershipRefusal(err)) throw err;
       const refusedSocket = this.socket;
@@ -4051,10 +4114,12 @@ class VoiceService {
 
       // joinInFlight prevents a successor join while cleanup awaits resource teardown.
       await this.cleanup(true);
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
       if (!this.joinInFlight || !this.ownsInitialJoin(roomId) || this.socket) {
         throw new E2EEInitializationSupersededError();
       }
       const refreshedJoinData = await this.authorizeVoiceJoin(authorizationId, joinType, ringId);
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
       if (!this.ownsInitialJoin(roomId) || this.socket) {
         throw new E2EEInitializationSupersededError();
       }
@@ -4063,13 +4128,21 @@ class VoiceService {
         authorizationId,
         joinType
       );
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
       if (!this.ownsInitialJoin(roomId) || this.socket) {
         throw new E2EEInitializationSupersededError();
       }
       store.setActiveChannel(channel.id, channel.name, channel.server_id);
       this.applyJoinMetadata(store, refreshedJoinData, joinType, authorizationId);
       this.resolveQualityTier(store, channel.audio_quality_tier ?? undefined);
-      await this.dialAuthorizedMediaSession(store, channel.id, joinType, refreshedJoinData);
+      await this.dialAuthorizedMediaSession(
+        store,
+        channel.id,
+        joinType,
+        refreshedJoinData,
+        recoveryOwner,
+        cleanupGeneration
+      );
       if (!this.ownsInitialJoin(channel.id) || !this.socket) {
         throw new E2EEInitializationSupersededError();
       }
@@ -4080,8 +4153,11 @@ class VoiceService {
     store: ReturnType<typeof useVoiceStore.getState>,
     channelId: string,
     joinType: 'channel' | 'dm',
-    joinData: JoinResponse
+    joinData: JoinResponse,
+    recoveryOwner: VoiceJoinOwner | undefined,
+    cleanupGeneration: number
   ): Promise<void> {
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
     if (!useAuthStore.getState().accessToken) throw new Error('Not authenticated');
 
     this.socket = io(joinData.media_server_url, {
@@ -4113,9 +4189,10 @@ class VoiceService {
     });
 
     await this.waitForConnect();
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
     this.setupSocketListeners();
     this.registerDocumentVisibilityListener();
-    await this.establishMediaSession(store, channelId, joinData);
+    await this.establishMediaSession(store, channelId, joinData, recoveryOwner, cleanupGeneration);
   }
 
   private ownsInitialJoin(channelId: string, expectedSocket?: Socket): boolean {
@@ -4284,7 +4361,10 @@ class VoiceService {
     // Any user-initiated leave cancels a pending legacy-fallback rebuild —
     // rejoining a call the user explicitly left is never acceptable
     // (CodeRabbit, PR #2866). The rebuild's own leave passes internalRebuild.
-    if (!opts?.internalRebuild) this.legacyRebuildIntent = null;
+    if (!opts?.internalRebuild) {
+      advanceVoiceActionGeneration();
+      this.legacyRebuildIntent = null;
+    }
     const store = useVoiceStore.getState();
     const channelId = store.activeChannelId;
     const isDMCall = store.isDMCall;
@@ -4306,7 +4386,17 @@ class VoiceService {
       store.removeChannelVoiceMember(channelId, localUserId);
     }
 
+    // Internal rebuilds can wait on producer close. Read privacy at the last
+    // possible moment so a mute/deafen during that await survives the reset.
+    const currentPrivacy = useVoiceStore.getState();
+    const rebuildPrivacy = opts?.internalRebuild
+      ? { isMuted: currentPrivacy.isMuted, isDeafened: currentPrivacy.isDeafened }
+      : null;
     store.reset();
+    if (rebuildPrivacy) {
+      store.setMuted(rebuildPrivacy.isMuted);
+      store.setDeafened(rebuildPrivacy.isDeafened);
+    }
   }
 
   /**
@@ -4317,6 +4407,7 @@ class VoiceService {
    * All operations are idempotent — safe to call multiple times.
    */
   emergencyCleanup(): void {
+    this.emergencyCleanupGeneration += 1;
     this.clearAuthRenewalRetry();
     this.mediaHandshake = null;
     this.cleanupMediaAndTransports();
@@ -4401,8 +4492,11 @@ class VoiceService {
   private async establishMediaSession(
     store: ReturnType<typeof useVoiceStore.getState>,
     channelId: string,
-    joinData: JoinResponse
+    joinData: JoinResponse,
+    recoveryOwner: VoiceJoinOwner | undefined,
+    cleanupGeneration: number
   ): Promise<void> {
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
     // Both entry paths funnel through here with a freshly authorized joinData:
     // joinChannel (initial join) and resumeAfterReconnect. Setting it here is
     // what makes the reconnect rebuild use the re-minted credentials (#3104).
@@ -4413,11 +4507,13 @@ class VoiceService {
     console.debug('[ice] servers', describeIceServers(this.iceServers));
 
     const roomJoined = await this.joinMediaRoom(channelId, joinData);
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
 
     // Load device with router capabilities
     this.device = new Device();
     this.routerRtpCapabilities = roomJoined.rtpCapabilities;
     await this.device.load({ routerRtpCapabilities: roomJoined.rtpCapabilities });
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
 
     // Send actual RTP capabilities to server (join-room sent undefined)
     if (!this.socket) throw new Error('Socket disconnected before RTP capabilities update');
@@ -4427,9 +4523,11 @@ class VoiceService {
 
     // Create transports in parallel (no dependency between send/recv)
     await Promise.all([this.createSendTransport(), this.createRecvTransports()]);
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
 
     // Initialize E2EE (all channels are always encrypted)
     await this.setupE2EEForChannel(channelId, roomJoined);
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
 
     // Set participants before consuming producers
     store.setParticipants(this.buildParticipantList(roomJoined));
@@ -4443,6 +4541,7 @@ class VoiceService {
     // publish and handleJoinFailure would tear the whole session down. Skip
     // auto-produce and join with mic off so the stock client can listen.
     if (this.joinPermitsSpeak(joinData)) {
+      this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
       await this.produceAudio();
     } else {
       store.setMuted(true);
@@ -4525,12 +4624,14 @@ class VoiceService {
       return;
     }
     this.resumeInFlight = true;
+    const cleanupGeneration = this.emergencyCleanupGeneration;
     const resumeSocket = this.socket;
     const joinType: 'channel' | 'dm' = store.isDMCall ? 'dm' : 'channel';
     try {
       // Step 1 (as in joinChannel): re-authorize via control plane so
       // enforcement flags and media entitlements are fresh.
       const joinData = await this.authorizeVoiceJoin(channelId, joinType);
+      this.requireJoinOwnership(undefined, cleanupGeneration);
 
       // Quietly discard the dead client-side media/E2EE state. Keeps the
       // socket, the store's call identity, and the visible call UI; local
@@ -4561,7 +4662,7 @@ class VoiceService {
 
       // Steps 3–9 (as in joinChannel): join-room → device → transports →
       // E2EE → participants → mic producer → existing consumers.
-      await this.establishMediaSession(store, channelId, joinData);
+      await this.establishMediaSession(store, channelId, joinData, undefined, cleanupGeneration);
 
       // Stale-context guard: a leaveChannel() racing the awaits above has
       // already torn the call down (socket nulled, store reset) — don't
@@ -4609,20 +4710,29 @@ class VoiceService {
     channelId: string,
     joinType: 'channel' | 'dm'
   ): Promise<void> {
-    const wasMuted = useVoiceStore.getState().isMuted;
-    const wasDeafened = useVoiceStore.getState().isDeafened;
     const intent = Symbol('resume-rebuild');
+    const authGeneration = useAuthStore.getState().authGeneration;
     this.legacyRebuildIntent = intent;
     await this.leaveChannel({ internalRebuild: true });
-    if (this.legacyRebuildIntent !== intent || useVoiceStore.getState().activeChannelId !== null) {
+    if (
+      this.legacyRebuildIntent !== intent ||
+      useAuthStore.getState().authGeneration !== authGeneration ||
+      useVoiceStore.getState().activeChannelId !== null
+    ) {
       return;
     }
-    // leaveChannel resets the store; reapply privacy choices before the new
-    // join creates a mic producer, so an opted-out mic cannot briefly publish.
-    useVoiceStore.getState().setMuted(wasMuted);
-    useVoiceStore.getState().setDeafened(wasDeafened);
+    // leaveChannel preserves the latest privacy choices for internal rebuilds,
+    // including a mute or deafen made while producer cleanup was pending.
+    const privacyIntent = {
+      isMuted: useVoiceStore.getState().isMuted,
+      isDeafened: useVoiceStore.getState().isDeafened,
+    };
     try {
-      await this.joinChannel(channelId, joinType, { internalRebuild: true });
+      await this.joinChannel(channelId, joinType, {
+        internalRebuild: true,
+        privacyIntent,
+        expectedAuthGeneration: authGeneration,
+      });
     } catch {
       // joinChannel owns failure cleanup and the user-visible error state.
       return;
@@ -11642,6 +11752,7 @@ class VoiceService {
     );
     if (!channelId) return;
     const joinType = store.isDMCall ? ('dm' as const) : ('channel' as const);
+    const authGeneration = useAuthStore.getState().authGeneration;
     const intent = Symbol('legacy-rebuild');
     this.legacyRebuildIntent = intent;
     void (async () => {
@@ -11649,15 +11760,30 @@ class VoiceService {
         await this.leaveChannel({ internalRebuild: true });
         // Ownership check: a user-initiated leave or join during the rebuild
         // window clears the intent — the user's action wins, no auto-rejoin.
-        if (this.legacyRebuildIntent !== intent) {
-          console.debug('E2EE: legacy fallback rebuild cancelled — user acted during rebuild');
+        if (
+          this.legacyRebuildIntent !== intent ||
+          useAuthStore.getState().authGeneration !== authGeneration
+        ) {
+          console.debug('E2EE: legacy fallback rebuild cancelled — session ownership changed');
           return;
         }
         if (useVoiceStore.getState().activeChannelId !== null) {
           console.debug('E2EE: legacy fallback rebuild skipped — another call is active');
           return;
         }
-        await this.joinChannel(channelId, joinType, { internalRebuild: true });
+        // leaveChannel carries the latest choice through its reset, including
+        // a mute made while producer cleanup awaited. Capture it here, just
+        // before joinChannel can create a new microphone producer.
+        const postLeave = useVoiceStore.getState();
+        const privacyIntent = {
+          isMuted: postLeave.isMuted,
+          isDeafened: postLeave.isDeafened,
+        };
+        await this.joinChannel(channelId, joinType, {
+          internalRebuild: true,
+          privacyIntent,
+          expectedAuthGeneration: authGeneration,
+        });
       } catch (err) {
         console.error('E2EE: legacy fallback rebuild failed:', errorMessage(err));
       }

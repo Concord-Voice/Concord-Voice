@@ -7,7 +7,8 @@ interface NotifyOptions {
   title: string;
   senderDisplayName: string;
   body: string;
-  targetType: 'channel' | 'dm';
+  /** 'account' (a Wing invite, #2033 PR-5) only focuses the window. */
+  targetType: 'channel' | 'dm' | 'account';
   targetId: string;
   serverId?: string;
   senderId: string;
@@ -91,6 +92,18 @@ class DesktopNotificationService {
       default:
         return false;
     }
+  }
+
+  /**
+   * Whether an account notice (a Wing invite) may show: the master toggle,
+   * DND and quiet hours apply; there is no per-type toggle for it.
+   */
+  shouldNotifyAccount(): boolean {
+    const state = useNotificationStore.getState();
+    if (!state.desktopNotificationsEnabled || state.doNotDisturb) return false;
+    return !(
+      state.quietHoursEnabled && this.isInQuietHours(state.quietHoursStart, state.quietHoursEnd)
+    );
   }
 
   /**
@@ -211,17 +224,23 @@ class DesktopNotificationService {
   /**
    * Handle notification click — focus window and navigate to target.
    */
-  private handleClick(targetType: 'channel' | 'dm', targetId: string, serverId?: string): void {
-    // Import dynamically to avoid circular deps
-    import('../../stores/ui/notificationNavigationStore').then(
-      ({ useNotificationNavigationStore }) => {
-        useNotificationNavigationStore.getState().setPendingNavigation({
-          type: targetType,
-          targetId,
-          serverId,
-        });
-      }
-    );
+  private handleClick(
+    targetType: NotifyOptions['targetType'],
+    targetId: string,
+    serverId?: string
+  ): void {
+    if (targetType !== 'account') {
+      // Import dynamically to avoid circular deps
+      import('../../stores/ui/notificationNavigationStore').then(
+        ({ useNotificationNavigationStore }) => {
+          useNotificationNavigationStore.getState().setPendingNavigation({
+            type: targetType,
+            targetId,
+            serverId,
+          });
+        }
+      );
+    }
 
     // Focus the app window
     globalThis.electron?.focusWindow?.();

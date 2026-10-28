@@ -14,6 +14,7 @@ import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useSubscription } from '@/renderer/hooks/ui/useSubscription';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import type { SubscriptionSource } from '@/renderer/hooks/ui/useSubscription';
 
 const API_BASE = 'http://localhost:8080';
@@ -23,7 +24,7 @@ beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }));
 afterAll(() => server.close());
 afterEach(() => server.resetHandlers());
 
-describe('useSubscription (#1304)', () => {
+describe('useSubscription (#1304, #2033)', () => {
   beforeEach(() => {
     resetAllStores();
     useAuthStore.getState().setAccessToken('mock-token');
@@ -127,5 +128,72 @@ describe('useSubscription (#1304)', () => {
     act(() => result.current.refetch());
     await waitFor(() => expect(result.current.tier).toBe('premium'));
     expect(result.current.source).toBe('code');
+  });
+
+  it('keeps the last good read when a background refresh fails', async () => {
+    let call = 0;
+    server.use(
+      http.get(STATUS_PATH, () => {
+        call += 1;
+        return call === 1
+          ? HttpResponse.json({ tier: 'premium', status: 'active', source: 'code' })
+          : HttpResponse.json({ error: 'boom' }, { status: 503 });
+      })
+    );
+    const { result } = renderHook(() => useSubscription());
+    await waitFor(() => expect(result.current.status).toBe('active'));
+
+    act(() => result.current.refetch());
+    await waitFor(() => expect(call).toBe(2));
+    await act(async () => {});
+    expect(result.current.status).toBe('active');
+    expect(result.current.tier).toBe('premium');
+    expect(result.current.error).toBe(false);
+  });
+
+  it('exposes the billing mode, the live Stripe row and the code row (#2033)', async () => {
+    const stripe = {
+      plan: 'wing',
+      interval: 'year',
+      status: 'past_due',
+      current_period_end: '2027-01-01T00:00:00Z',
+      canceling: false,
+      founders_rate: true,
+    };
+    server.use(
+      http.get(STATUS_PATH, () =>
+        HttpResponse.json({
+          tier: 'premium',
+          status: 'past_due',
+          source: 'stripe',
+          billing: 'available',
+          stripe,
+          code: { current_period_end: null },
+        })
+      )
+    );
+    const { result } = renderHook(() => useSubscription());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.billing).toBe('available');
+    expect(result.current.stripe).toEqual(stripe);
+    expect(result.current.codeExpiry).toBeNull();
+  });
+
+  it('re-reads when a push changes the entitlement tier', async () => {
+    let call = 0;
+    server.use(
+      http.get(STATUS_PATH, () => {
+        call += 1;
+        return HttpResponse.json({ tier: 'free', status: 'none' });
+      })
+    );
+    renderHook(() => useSubscription());
+    await waitFor(() => expect(call).toBe(1));
+    act(() => {
+      useSubscriptionStore.setState({
+        entitlement: { ...useSubscriptionStore.getState().entitlement, tier: 'premium' },
+      });
+    });
+    await waitFor(() => expect(call).toBe(2));
   });
 });

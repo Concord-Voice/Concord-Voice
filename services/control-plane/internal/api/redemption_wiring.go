@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/billing"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/redemption"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -42,11 +43,16 @@ func (n *redemptionTierNotifier) OnTierChange(ctx context.Context, userID uuid.U
 // cosmetic:*). The notifier wires the same entitlements convergence point used
 // by #1297/#1306 so a premium grant live-updates the client. adminToken comes
 // from REDEMPTION_ADMIN_TOKEN (config); empty disables the HTTP generation
-// endpoint (the AdminGate returns 503) — see redemption.NewHandler.
-func buildRedemptionHandler(db *sql.DB, entCache *entitlements.Cache, entNotifier entitlements.SessionNotifier, cfg *config.Config, log *logger.Logger) *redemption.Handler {
+// endpoint (the AdminGate returns 503) — see redemption.NewHandler. billingSvc,
+// when not nil, turns a premium code redeemed on a live Stripe subscription
+// into customer-balance credit (#2033 D1).
+func buildRedemptionHandler(db *sql.DB, entCache *entitlements.Cache, entNotifier entitlements.SessionNotifier, billingSvc *billing.Service, cfg *config.Config, log *logger.Logger) *redemption.Handler {
 	catalog := redemption.NewCatalog()
 	tierNotifier := &redemptionTierNotifier{cache: entCache, notifier: entNotifier}
 	engine := redemption.NewEngine(db, catalog, tierNotifier)
+	if billingSvc != nil { // a nil *Service in the interface would not read as nil
+		engine.SetCrediter(billingSvc)
+	}
 	issuer := redemption.NewIssuer(db, catalog, redemption.NewDBAuditSink())
 	return redemption.NewHandler(engine, issuer, cfg.RedemptionAdminToken, log)
 }

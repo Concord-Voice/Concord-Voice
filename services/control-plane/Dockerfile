@@ -58,9 +58,10 @@ LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
 LABEL org.concord.redis-credential-modes="legacy,managed"
 
 RUN apk --no-cache add ca-certificates \
-    && addgroup -S appuser && adduser -S appuser -G appuser
+    && addgroup -S -g 10006 appuser && adduser -S -u 10006 -G appuser appuser
 
-# Run as non-root user
+# Run as non-root user. UID/GID 10006 is fixed and differs from media-plane
+# (10007) so the managed Redis controller can tell the two apart by peer UID.
 WORKDIR /home/appuser
 
 # Copy binaries from builder

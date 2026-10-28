@@ -810,11 +810,14 @@ func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
 	h.proxyFriendCodeAvatarObject(c, key)
 }
 
-// friendAvatarMaxBytes bounds the in-memory buffer below. It matches the largest
-// MaxAvatarBytes any entitlement tier permits at upload (8 MiB), so it cannot
-// reject an object the service itself accepted; stored avatars are re-encoded to
-// 512x512 and in practice sit far below it.
+// The per-object bound applies to stored bytes, which can grow during GIF
+// processing even when the uploaded source was below its entitlement limit.
 const friendAvatarMaxBytes int64 = 8 * 1024 * 1024
+
+// Keep the public route's whole-object buffers below roughly 64 MiB per
+// process, including slow clients still receiving their response. The route
+// must buffer before sending to preserve its uniform storage-failure fallback.
+var friendAvatarReadSlots = make(chan struct{}, 8)
 
 // proxyFriendCodeAvatarObject is proxyInviteIcon's fail-uniform twin, and exists
 // because the two callers need opposite behaviour on a storage fault.
@@ -838,6 +841,13 @@ func (h *Handler) proxyFriendCodeAvatarObject(c *gin.Context, key string) {
 	}
 	admitted, err := h.profileTier1MediaAdmitted(c.Request.Context(), key)
 	if err != nil || !admitted {
+		serveFriendCodeAvatarFallback(c)
+		return
+	}
+	select {
+	case friendAvatarReadSlots <- struct{}{}:
+		defer func() { <-friendAvatarReadSlots }()
+	default:
 		serveFriendCodeAvatarFallback(c)
 		return
 	}

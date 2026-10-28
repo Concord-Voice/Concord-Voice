@@ -190,6 +190,51 @@ describe('AttachmentDisplay', () => {
     });
   });
 
+  it('clears a transient image error when viewport re-entry reloads it', async () => {
+    mockApiFetch.mockResolvedValueOnce({ ok: false, status: 503 }).mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    let observer: { callback: IntersectionObserverCallback; target: Element | null } | null = null;
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = class {
+      target: Element | null = null;
+      constructor(readonly callback: IntersectionObserverCallback) {
+        observer = this;
+      }
+      observe(target: Element) {
+        this.target = target;
+      }
+      disconnect() {
+        this.target = null;
+      }
+    };
+
+    const view = render(
+      <AttachmentDisplay attachments={[{ ...mockAttachment, id: 'img-retry' }]} channelId="ch-1" />
+    );
+    const intersect = (isIntersecting: boolean) => {
+      act(() => {
+        if (observer?.target) {
+          observer.callback(
+            [{ target: observer.target, isIntersecting } as IntersectionObserverEntry],
+            observer as unknown as IntersectionObserver
+          );
+        }
+      });
+    };
+
+    intersect(true);
+    await waitFor(() => expect(screen.getByText('Failed to load image')).toBeInTheDocument());
+    intersect(false);
+    intersect(true);
+    await waitFor(() =>
+      expect(view.container.querySelector('img.attachment-image')).toBeInTheDocument()
+    );
+    expect(screen.queryByText('Failed to load image')).not.toBeInTheDocument();
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
   // --- Image lightbox + right-click save (#1729) ---
   async function renderLoadedImage(id: string) {
     mockFetchSuccess(new ArrayBuffer(64), 'image/png');
@@ -1014,6 +1059,15 @@ describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    mockDecryptFile.mockImplementation((data: ArrayBuffer) => Promise.resolve(data));
+    mockDecryptAttachmentBlob.mockImplementation(
+      async (bytes: Uint8Array, key: unknown, mime: string) => {
+        const plain = (await mockDecryptFile(bytes.buffer ?? bytes, key)) as ArrayBuffer;
+        const blob = new Blob([], { type: mime });
+        Object.defineProperty(blob, 'size', { value: plain.byteLength });
+        return blob;
+      }
+    );
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);
     revoked = [];
     // The real createObjectURL returns unpredictable urls, which cannot express
@@ -1105,6 +1159,46 @@ describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
 
     unmount();
     expect(revoked).toContain(url);
+  });
+
+  it('shares an uncached huge url across sequential same-file surfaces', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(150 * 1024 * 1024));
+    installImmediateIO();
+
+    const first = render(
+      <AttachmentDisplay
+        attachments={[photoOf('shared-huge', 150 * 1024 * 1024)]}
+        channelId="ch-1"
+      />
+    );
+    const firstUrl = await waitFor(() => {
+      const src = first.container.querySelector('img.attachment-image')?.getAttribute('src');
+      expect(src).toMatch(/^blob:cache-/);
+      return src as string;
+    });
+    const second = render(
+      <AttachmentDisplay
+        attachments={[photoOf('shared-huge', 150 * 1024 * 1024)]}
+        channelId="ch-1"
+      />
+    );
+    await waitFor(() =>
+      expect(second.container.querySelector('img.attachment-image')).toHaveAttribute(
+        'src',
+        firstUrl
+      )
+    );
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+    first.unmount();
+    expect(revoked).not.toContain(firstUrl);
+    second.unmount();
+    expect(revoked).toContain(firstUrl);
   });
 
   it('evicts oldest-first once the byte budget is exceeded and revokes the evicted url', async () => {
@@ -1247,6 +1341,370 @@ describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
     await loadPhotos([104_857_600], 'after-release');
     expect(revoked).toContain(srcs[0]);
   });
+
+  it('reclaims an offscreen image while its message stays mounted, then reloads it on return', async () => {
+    mockDecryptAttachmentBlob.mockImplementation(
+      async (bytes: Uint8Array, key: unknown, mime: string) => {
+        const plain = (await mockDecryptFile(bytes.buffer ?? bytes, key)) as ArrayBuffer;
+        const blob = new Blob([], { type: mime });
+        Object.defineProperty(blob, 'size', { value: plain.byteLength });
+        return blob;
+      }
+    );
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+
+    // Keep only currently observed elements eligible for callbacks. In particular,
+    // disconnecting after the first entry must prevent an artificial exit event.
+    const observers = new Set<ControlledObserver>();
+    class ControlledObserver {
+      readonly targets = new Set<Element>();
+      constructor(readonly callback: IntersectionObserverCallback) {
+        observers.add(this);
+      }
+      observe(target: Element) {
+        this.targets.add(target);
+      }
+      unobserve(target: Element) {
+        this.targets.delete(target);
+      }
+      disconnect() {
+        this.targets.clear();
+      }
+    }
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = ControlledObserver;
+
+    function intersect(target: Element, isIntersecting: boolean) {
+      act(() => {
+        for (const observer of observers) {
+          if (observer.targets.has(target)) {
+            observer.callback(
+              [{ target, isIntersecting } as IntersectionObserverEntry],
+              observer as unknown as IntersectionObserver
+            );
+          }
+        }
+      });
+    }
+
+    async function show(id: string) {
+      const view = render(
+        <AttachmentDisplay attachments={[photoOf(id, 104_857_600)]} channelId="ch-1" />
+      );
+      const target = view.container.querySelector('.attachment-image-container');
+      expect(target).toBeInTheDocument();
+      intersect(target as Element, true);
+      const url = await waitFor(() => {
+        const src = view.container.querySelector('img.attachment-image')?.getAttribute('src');
+        expect(src).toMatch(/^blob:cache-/);
+        return src as string;
+      });
+      return { view, target: target as Element, url };
+    }
+
+    // A message list keeps both rows mounted while scrolling. Only the second
+    // 100 MiB image remains visible when a third enters the viewport.
+    const offscreen = await show('scroll-offscreen');
+    const visible = await show('scroll-visible');
+    intersect(offscreen.target, false);
+    const newcomer = await show('scroll-newcomer');
+
+    expect(
+      offscreen.view.container.querySelector('.attachment-image-container')
+    ).toBeInTheDocument();
+    expect(revoked).toContain(offscreen.url);
+    expect(revoked).not.toContain(visible.url);
+    expect(revoked).not.toContain(newcomer.url);
+    expect(visible.view.container.querySelector('img.attachment-image')).toHaveAttribute(
+      'src',
+      visible.url
+    );
+
+    intersect(offscreen.target, true);
+    const returnedUrl = await waitFor(() => {
+      const src = offscreen.view.container
+        .querySelector('img.attachment-image')
+        ?.getAttribute('src');
+      expect(src).toMatch(/^blob:cache-/);
+      expect(src).not.toBe(offscreen.url);
+      return src as string;
+    });
+    expect(mockApiFetch).toHaveBeenCalledTimes(4);
+    expect(revoked).not.toContain(returnedUrl);
+  });
+
+  it('reclaims an auto-loaded video after it scrolls out of view', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'video/mp4' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+    let observer: {
+      callback: IntersectionObserverCallback;
+      target: Element | null;
+    } | null = null;
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = class {
+      target: Element | null = null;
+      constructor(readonly callback: IntersectionObserverCallback) {
+        observer = this;
+      }
+      observe(target: Element) {
+        this.target = target;
+      }
+      disconnect() {
+        this.target = null;
+      }
+    };
+
+    const video = { ...photoOf('video-offscreen', 104_857_600), file_type: 'video' as const };
+    const view = render(<AttachmentDisplay attachments={[video]} channelId="ch-1" />);
+    const target = view.container.querySelector('.attachment-media-container');
+    expect(target).toBeInTheDocument();
+    const intersect = (isIntersecting: boolean) => {
+      act(() => {
+        if (observer?.target) {
+          observer.callback(
+            [{ target: observer.target, isIntersecting } as IntersectionObserverEntry],
+            observer as unknown as IntersectionObserver
+          );
+        }
+      });
+    };
+
+    intersect(true);
+    const firstUrl = await waitFor(() => {
+      const src = view.container.querySelector('video')?.getAttribute('src');
+      expect(src).toMatch(/^blob:cache-/);
+      return src as string;
+    });
+    intersect(false);
+    await waitFor(() => expect(revoked).toContain(firstUrl));
+    expect(view.container.querySelector('.attachment-media-container')).toBeInTheDocument();
+
+    intersect(true);
+    await waitFor(() => {
+      const src = view.container.querySelector('video')?.getAttribute('src');
+      expect(src).toMatch(/^blob:cache-/);
+      expect(src).not.toBe(firstUrl);
+    });
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a paused picture-in-picture video alive offscreen until picture-in-picture ends', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'video/mp4' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+    let observer: { callback: IntersectionObserverCallback; target: Element | null } | null = null;
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = class {
+      target: Element | null = null;
+      constructor(readonly callback: IntersectionObserverCallback) {
+        observer = this;
+      }
+      observe(target: Element) {
+        this.target = target;
+      }
+      disconnect() {
+        this.target = null;
+      }
+    };
+
+    const previousPiP = Object.getOwnPropertyDescriptor(document, 'pictureInPictureElement');
+    try {
+      const attachment = { ...photoOf('video-pip', 104_857_600), file_type: 'video' as const };
+      const view = render(<AttachmentDisplay attachments={[attachment]} channelId="ch-1" />);
+      const intersect = (isIntersecting: boolean) => {
+        act(() => {
+          if (observer?.target) {
+            observer.callback(
+              [{ target: observer.target, isIntersecting } as IntersectionObserverEntry],
+              observer as unknown as IntersectionObserver
+            );
+          }
+        });
+      };
+      intersect(true);
+      const video = await waitFor(() => {
+        const element = view.container.querySelector('video');
+        expect(element?.getAttribute('src')).toMatch(/^blob:cache-/);
+        return element as HTMLVideoElement;
+      });
+      const url = video.getAttribute('src');
+      Object.defineProperty(document, 'pictureInPictureElement', {
+        configurable: true,
+        value: video,
+      });
+
+      act(() => video.dispatchEvent(new Event('play', { bubbles: true })));
+      intersect(false);
+      act(() => video.dispatchEvent(new Event('pause', { bubbles: true })));
+      expect(view.container.querySelector('video')).toBe(video);
+      expect(video.getAttribute('src')).toBe(url);
+      expect(revoked).not.toContain(url);
+
+      Object.defineProperty(document, 'pictureInPictureElement', {
+        configurable: true,
+        value: null,
+      });
+      act(() => video.dispatchEvent(new Event('leavepictureinpicture')));
+      await waitFor(() => expect(revoked).toContain(url));
+      expect(view.container.querySelector('video')).not.toBeInTheDocument();
+    } finally {
+      if (previousPiP) Object.defineProperty(document, 'pictureInPictureElement', previousPiP);
+      else Reflect.deleteProperty(document, 'pictureInPictureElement');
+    }
+  });
+
+  it('reclaims manually loaded audio after it scrolls away without auto-loading on return', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'audio/mpeg' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(150_000_000));
+    let observer: { callback: IntersectionObserverCallback; target: Element | null } | null = null;
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = class {
+      target: Element | null = null;
+      constructor(readonly callback: IntersectionObserverCallback) {
+        observer = this;
+      }
+      observe(target: Element) {
+        this.target = target;
+      }
+      disconnect() {
+        this.target = null;
+      }
+    };
+
+    const audio: AttachmentSummary = {
+      ...photoOf('audio-offscreen', 150_000_000),
+      file_type: 'audio',
+      mime_type: 'audio/mpeg',
+    };
+    const view = render(<AttachmentDisplay attachments={[audio]} channelId="ch-1" />);
+    const target = view.container.querySelector('.attachment-media-container') as Element;
+    expect(target).toBeInTheDocument();
+    const intersect = (isIntersecting: boolean) => {
+      act(() => {
+        if (observer?.target) {
+          observer.callback(
+            [{ target: observer.target, isIntersecting } as IntersectionObserverEntry],
+            observer as unknown as IntersectionObserver
+          );
+        }
+      });
+    };
+
+    intersect(true);
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    const loadButton = screen.getByText('Load audio').closest('button') as HTMLButtonElement;
+    loadButton.focus();
+    expect(loadButton).toHaveFocus();
+    await userEvent.setup().click(loadButton);
+    const firstUrl = await waitFor(() => {
+      const src = view.container.querySelector('audio')?.getAttribute('src');
+      expect(src).toMatch(/^blob:cache-/);
+      return src as string;
+    });
+    intersect(false);
+    await waitFor(() => expect(revoked).toContain(firstUrl));
+    expect(target).toBeInTheDocument();
+
+    intersect(true);
+    expect(screen.getByText('Load audio')).toBeInTheDocument();
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['image', 'photo', 'image/png', 'img.attachment-image'],
+    ['video', 'video', 'video/mp4', 'video'],
+  ] as const)(
+    'releases a cached %s mounted offscreen on its initial observer result',
+    async (_label, fileType, mimeType, selector) => {
+      mockDecryptAttachmentBlob.mockImplementation(
+        async (bytes: Uint8Array, key: unknown, mime: string) => {
+          const plain = (await mockDecryptFile(bytes.buffer ?? bytes, key)) as ArrayBuffer;
+          const blob = new Blob([], { type: mime });
+          Object.defineProperty(blob, 'size', { value: plain.byteLength });
+          return blob;
+        }
+      );
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+        headers: new Headers({ 'X-File-Mime-Type': mimeType }),
+      });
+      mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+
+      const observers = new Set<ControlledObserver>();
+      class ControlledObserver {
+        readonly targets = new Set<Element>();
+        constructor(readonly callback: IntersectionObserverCallback) {
+          observers.add(this);
+        }
+        observe(target: Element) {
+          this.targets.add(target);
+        }
+        disconnect() {
+          this.targets.clear();
+        }
+      }
+      (globalThis as unknown as Record<string, unknown>).IntersectionObserver = ControlledObserver;
+      const intersect = (target: Element, isIntersecting: boolean) => {
+        const observer = [...observers].find((candidate) => candidate.targets.has(target));
+        expect(observer).toBeDefined();
+        act(() => {
+          observer?.callback(
+            [{ target, isIntersecting } as IntersectionObserverEntry],
+            observer as unknown as IntersectionObserver
+          );
+        });
+      };
+      const attachment: AttachmentSummary = {
+        ...photoOf(`cached-offscreen-${fileType}`, 104_857_600),
+        file_type: fileType,
+        mime_type: mimeType,
+      };
+      const targetSelector =
+        fileType === 'video' ? '.attachment-media-container' : '.attachment-image-container';
+
+      const first = render(<AttachmentDisplay attachments={[attachment]} channelId="ch-1" />);
+      const firstTarget = first.container.querySelector(targetSelector) as Element;
+      expect(firstTarget).toBeInTheDocument();
+      intersect(firstTarget, true);
+      const firstUrl = await waitFor(() => {
+        const src = first.container.querySelector(selector)?.getAttribute('src');
+        expect(src).toMatch(/^blob:cache-/);
+        return src as string;
+      });
+      first.unmount();
+      expect(revoked).not.toContain(firstUrl);
+
+      // Message history remounts every row, including this one outside the
+      // viewport. It starts with the cached URL before the observer's first call.
+      const second = render(<AttachmentDisplay attachments={[attachment]} channelId="ch-1" />);
+      const secondTarget = second.container.querySelector(targetSelector) as Element;
+      expect(second.container.querySelector(selector)).toHaveAttribute('src', firstUrl);
+      intersect(secondTarget, false);
+      await waitFor(() => expect(revoked).toContain(firstUrl));
+      expect(secondTarget).toBeInTheDocument();
+
+      intersect(secondTarget, true);
+      await waitFor(() => {
+        const src = second.container.querySelector(selector)?.getAttribute('src');
+        expect(src).toMatch(/^blob:cache-/);
+        expect(src).not.toBe(firstUrl);
+      });
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    }
+  );
 
   // Review row 1: `a.click()` starts an ASYNCHRONOUS browser download that
   // reads the blob over time. An earlier version reasoned only about the

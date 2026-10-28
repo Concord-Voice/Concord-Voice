@@ -6976,6 +6976,16 @@ paths:
         subscription and pushes `entitlements_changed` so the client updates live.
 
 
+        Code credit (#2033 D1): when the user''s Stripe subscription is live and
+        renewing, a `premium:subscription` code becomes Stripe customer-balance credit
+        spent on the next renewals instead. A code for the subscribed plan is priced
+        at the renewal amount; a code for another plan (`grant_params.plan`) becomes
+        face-value credit only after the user confirms (409 `credit_confirmation_required`,
+        then a retry with `confirm_credit: true`). A subscription set to end takes the
+        ordinary grant, starting where its paid period ends. The credit is queued
+        with the redemption and applied to Stripe after it commits, with retries.
+
+
         No-oracle property: invalid, not-found, expired, exhausted, revoked, and bad-checksum
         all return the SAME generic 400 body — the client can never learn WHICH condition
         failed, only that the code is not valid. The code value and its hash are NEVER
@@ -7004,6 +7014,10 @@ paths:
                   description: The redemption code as shown to the user (prefix + grouped
                     plaintext, e.g. `CV-XXXX-XXXX-XXXX`). Normalized and checksum-validated
                     server-side.
+                confirm_credit:
+                  type: boolean
+                  description: Answers a 409 `credit_confirmation_required`; turns a code
+                    for another plan into face-value credit.
       responses:
         '200':
           description: Code redeemed; the grant has been applied
@@ -7033,14 +7047,58 @@ paths:
         '401':
           description: Missing or invalid Bearer token
         '409':
-          description: The authenticated user has already redeemed this code (idempotent;
-            not an oracle — reflects only this user's own prior redemption).
+          description: 'The authenticated user has already redeemed this code (idempotent;
+            not an oracle — reflects only this user''s own prior redemption), or `error`
+            is `credit_confirmation_required`: the code names another plan than the
+            user''s live subscription and would become face-value credit. Nothing was
+            redeemed; retry with `confirm_credit: true` to accept the quote. Or
+            `error` is `seat_member` (#2470): a premium code was redeemed by a user
+            whose access comes from an active Wing seat and who has no live Stripe
+            subscription of their own. Nothing was redeemed; the code stays usable.'
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                properties:
+                  error:
+                    type: string
+                  credit:
+                    type: object
+                    required:
+                    - amount
+                    - currency
+                    - code_plan
+                    - subscribed_plan
+                    properties:
+                      amount:
+                        type: integer
+                        description: Credit in cents
+                      currency:
+                        type: string
+                        enum:
+                        - usd
+                      code_plan:
+                        type: string
+                        enum:
+                        - supersonic
+                        - wing
+                      subscribed_plan:
+                        type: string
+                        enum:
+                        - supersonic
+                        - wing
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`billing_unavailable`: the code would become credit but billing
+            is not configured or the subscription has no plan to price it by. Nothing
+            was redeemed; the user can retry.'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '429':
-          $ref: '#/components/responses/RateLimited'
         '500':
           description: The code could not be redeemed right now (infrastructure error).
             If a grant landed post-commit it is durable and surfaces on the next entitlements
@@ -7098,7 +7156,8 @@ paths:
                   type: object
                   additionalProperties: true
                   description: 'Effect parameters (e.g. `{"months": 12}` for `premium:subscription`).
-                    Defaults to `{}`.'
+                    A `premium:subscription` code may add `"plan": "supersonic"` (the default) or `"wing"`;
+                    any other plan is rejected with 400. Defaults to `{}`.'
                 count:
                   type: integer
                   minimum: 1
@@ -13407,9 +13466,10 @@ paths:
       description: 'Returns the authenticated user''s live subscription status
         (tier / status / source / expiry) for the Settings subscription page (#1304).
         The entitlement set (`GET /entitlements`) carries only the resolved tier;
-        this read adds the grant''s status, source (`code` | `stripe`), and optional
+        this read adds the grant''s status, source (`code` | `stripe` | `seat`), and optional
         period end. Server-authoritative from the JWT user_id
-        — never client-supplied.
+        — never client-supplied. `seat` and `invites` (#2470) describe the
+        caller''s Wing seat side; they carry user ids only.
 
 
         When the user has no live subscription row the free-default shape is returned
@@ -13697,8 +13757,12 @@ paths:
         The server picks everything else: the active Stripe price for the plan, the
         caller''s Stripe Customer (created on first use, with no email or name), the
         founders discount while founders pricing runs, card as the only payment
-        method, a 35-minute expiry, and fixed return URLs. Any open Checkout of the
-        caller is expired first.
+        method, a 35-minute expiry, and fixed return URLs. A card is collected
+        up front. An account with no historical Stripe subscription gets a
+        30-day trial; at its end the chosen plan is charged unless canceled.
+        Accounts with an earlier canceled or expired Stripe subscription are
+        charged without another trial. Any open Checkout of the caller is
+        expired first.
 
 
         Rate limit: 5 requests per 10 minutes.
@@ -13757,7 +13821,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: '`manage_existing`: the caller already has a live Stripe subscription; manage it in the Portal'
+          description: '`manage_existing`: the caller already has a live Stripe subscription; manage it in the Portal. `seat_member` (#2470): the caller holds an active Wing seat; they leave the Wing before buying their own plan.'
           content:
             application/json:
               schema:
@@ -13772,6 +13836,554 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           description: '`purchase_unavailable`: purchasing is off or the caller is not allowlisted. `billing_unavailable`: Stripe failed, the price for the plan is not active, or the account was erased during the request.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/plan-change:
+    post:
+      tags: [Platform]
+      summary: Change the authenticated subscriber's Stripe plan
+      description: >-
+        Upgrades and monthly-to-yearly changes take effect now with Stripe proration;
+        downgrades and yearly-to-monthly changes wait until the paid period ends.
+        Supersonic yearly to Wing monthly upgrades to Wing yearly now, then books
+        Wing monthly. Wing monthly to Supersonic yearly waits entirely. A booked
+        change must be withdrawn with Keep current plan before another change.
+        Immediate changes require a fresh USD invoice preview amount and
+        proration timestamp. Scheduled changes also require the previewed
+        period end, so confirmation cannot silently move to a later renewal.
+        A payment requiring authentication remains a Stripe pending update
+        until the hosted invoice is paid. Rate limit 5 per 10 minutes.
+      operationId: changeBillingPlan
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan, interval, expected_effective]
+              properties:
+                plan:
+                  type: string
+                  enum: [supersonic, wing]
+                interval:
+                  type: string
+                  enum: [month, year]
+                expected_effective:
+                  type: string
+                  enum: [immediate, scheduled, immediate_then_scheduled]
+                expected_change_at:
+                  type: string
+                  format: date-time
+                  description: Required for a scheduled or immediate_then_scheduled change; change_at from the preview
+                quoted_amount_due:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  description: Required for an immediate change; USD cents from preview
+                proration_date:
+                  type: integer
+                  format: int64
+                  description: Required for an immediate change; timestamp from preview
+      responses:
+        '200':
+          description: Stripe accepted the immediate or booked change
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [effective]
+                properties:
+                  effective:
+                    type: string
+                    enum: [immediate, scheduled, immediate_then_scheduled]
+                  change_at:
+                    type: string
+                    format: date-time
+                  booking_failed:
+                    type: boolean
+                    description: True if the immediate mixed upgrade succeeded but its later interval change could not be booked
+        '202':
+          description: Payment authentication or a new payment method is needed before the change applies
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [effective, payment_status, payment_url]
+                properties:
+                  effective:
+                    type: string
+                    enum: [payment_pending]
+                  payment_status:
+                    type: string
+                    enum: [requires_action, card_declined, processing]
+                  payment_url:
+                    type: string
+                    format: uri
+                    description: Subscriber-only Stripe hosted invoice URL; treat as a bearer link
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid bearer token
+        '402':
+          description: '`card_declined`: payment method was declined'
+        '403':
+          description: Email not verified
+        '404':
+          description: No mapped live subscription
+        '409':
+          description: Same price, stale quote, pending cancellation, unmanaged schedule, `pending_plan_change` (withdraw the booked change first), or `payment_pending` (complete the previous invoice first)
+        '413':
+          description: Request body too large
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Stripe or database failure
+  /billing/plan-change/preview:
+    post:
+      tags: [Platform]
+      summary: Preview the subscriber's proposed plan change
+      operationId: previewBillingPlanChange
+      security:
+      - BearerAuth: []
+      description: Stripe invoice preview supplies the amount due now for an immediate change. Rate limit 10 per 10 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan, interval]
+              properties:
+                plan:
+                  type: string
+                  enum: [supersonic, wing]
+                interval:
+                  type: string
+                  enum: [month, year]
+      responses:
+        '200':
+          description: Proposed timing and amount due now
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [effective, due_now, currency]
+                properties:
+                  effective:
+                    type: string
+                    enum: [immediate, scheduled, immediate_then_scheduled]
+                  due_now:
+                    type: integer
+                    format: int64
+                  currency:
+                    type: string
+                    enum: [usd]
+                  proration_date:
+                    type: integer
+                    format: int64
+                  change_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid bearer token
+        '403':
+          description: Email not verified
+        '404':
+          description: No mapped live subscription
+        '409':
+          description: Same price, pending cancellation, unmanaged schedule, `pending_plan_change` (withdraw the booked change first), or `payment_pending` (complete the previous invoice first)
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Stripe or database failure
+  /billing/plan-change/cancel:
+    post:
+      tags: [Platform]
+      summary: Keep the current plan by withdrawing a booked change
+      operationId: keepCurrentBillingPlan
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: App-owned booking released
+        '401':
+          description: Missing or invalid bearer token
+        '403':
+          description: Email not verified
+        '404':
+          description: No mapped live subscription
+        '409':
+          description: No app-owned active booking
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Stripe or database failure
+  /billing/subscription-cancel:
+    post:
+      tags: [Platform]
+      summary: Confirm period-end cancellation of a booked subscription
+      operationId: cancelBookedSubscription
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: Stripe subscription set to cancel at period end; app-owned booking released
+        '401':
+          description: Missing or invalid bearer token
+        '403':
+          description: Email not verified
+        '404':
+          description: No mapped live subscription
+        '409':
+          description: Subscription already canceling or schedule unmanaged
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Stripe or database failure
+  /billing/seat/invite:
+    post:
+      tags:
+      - Platform
+      summary: Invite a friend to the caller's Wing seat
+      description: 'Invites one accepted friend to the +1 seat of the caller''s live
+        Wing (#2470). The invitee must be an accepted friend with no block either
+        way. A stale pending invite is expired first. `replace: true` revokes the
+        active seat in the same transaction (Change +1). The invite expires after
+        7 days; the invitee gets a `subscription_seat_invite` event.
+
+
+        Cooldown: once a seat has been active, the payer cannot pick a different
+        person for 30 days from the latest activation. A voluntary leave counts;
+        an end because the holder bought their own plan does not.
+
+
+        Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Requires a verified email.
+        Not gated by `BILLING_PURCHASE_MODE`.
+
+
+        Rate limit: 10 requests per hour per route.
+
+        '
+      operationId: inviteBillingSeat
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                replace:
+                  type: boolean
+                  default: false
+      responses:
+        '201':
+          description: Invite sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [seat]
+                properties:
+                  seat:
+                    $ref: '#/components/schemas/SeatDTO'
+        '400':
+          description: '`invalid_request`: the body is not exactly one JSON object with a user id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: '`invitee_not_eligible`: not a friend, blocked, nonexistent or the caller (one body for all)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: '`not_wing_payer`: no live Wing. `seat_occupied`: a seat is open and `replace` is not set. `seat_cooldown` with `available_at`: the 30-day cooldown is running.'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  available_at:
+                    type: string
+                    format: date-time
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`billing_unavailable`: the database failed; nothing changed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/seat:
+    delete:
+      tags:
+      - Platform
+      summary: Remove the caller's +1 or withdraw the pending invite
+      description: 'Ends the open seat of the caller''s live Wing (#2470): revokes an
+        active seat or withdraws a pending invite. The former holder loses premium
+        at once unless another grant covers them. Both sides get
+        `subscription_seat_updated`.
+
+
+        Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Requires a verified email.
+        Not gated by `BILLING_PURCHASE_MODE`.
+
+
+        Rate limit: 10 requests per hour per route.
+
+        '
+      operationId: removeBillingSeat
+      security:
+      - BearerAuth: []
+      responses:
+        '204':
+          description: Seat ended
+        '404':
+          description: '`no_seat`: the caller has no open seat'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`billing_unavailable`: the database failed; nothing changed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/seat/leave:
+    post:
+      tags:
+      - Platform
+      summary: Leave the Wing the caller is a +1 on
+      description: 'Ends the caller''s active seat (#2470). The leave counts toward
+        the payer''s 30-day cooldown. Both sides get `subscription_seat_updated`.
+
+
+        Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Requires a verified email.
+        Not gated by `BILLING_PURCHASE_MODE`.
+
+
+        Rate limit: 10 requests per hour per route.
+
+        '
+      operationId: leaveBillingSeat
+      security:
+      - BearerAuth: []
+      responses:
+        '204':
+          description: Left the Wing
+        '404':
+          description: '`no_seat`: the caller holds no active seat'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`billing_unavailable`: the database failed; nothing changed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/seat-invites/{id}/accept:
+    post:
+      tags:
+      - Platform
+      summary: Accept a Wing invite
+      description: 'Accepts an invite addressed to the caller (#2470). Any open
+        Checkout of the caller is expired first. The caller gets premium through
+        the seat while the Wing is live.
+
+
+        Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Requires a verified email.
+        Not gated by `BILLING_PURCHASE_MODE`.
+
+
+        Rate limit: 10 requests per hour per route.
+
+        '
+      operationId: acceptBillingSeatInvite
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The invite id (`invite_id` in `/subscriptions/me`)
+      responses:
+        '200':
+          description: Invite accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [seat]
+                properties:
+                  seat:
+                    $ref: '#/components/schemas/SeatDTO'
+        '404':
+          description: '`invite_not_found`: no pending invite with this id is addressed to the caller (one body for all)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '410':
+          description: '`invite_expired`: the invite expired, or the Wing is no longer live'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: '`own_subscription_active` with `current_period_end`: the caller pays for their own plan. `already_seat_member`: the caller already holds a seat. `seat_cooldown` with `available_at`: the payer''s cooldown is running.'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  available_at:
+                    type: string
+                    format: date-time
+                  current_period_end:
+                    type: string
+                    format: date-time
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`billing_unavailable`: the database failed; nothing changed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /billing/seat-invites/{id}/decline:
+    post:
+      tags:
+      - Platform
+      summary: Decline a Wing invite
+      description: 'Declines an invite addressed to the caller (#2470).
+
+
+        Registered only when Stripe keys are configured on a non-self-hosted
+        instance; otherwise the route does not exist (404). Requires a verified email.
+        Not gated by `BILLING_PURCHASE_MODE`.
+
+
+        Rate limit: 10 requests per hour per route.
+
+        '
+      operationId: declineBillingSeatInvite
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The invite id (`invite_id` in `/subscriptions/me`)
+      responses:
+        '204':
+          description: Invite declined
+        '404':
+          description: '`invite_not_found`: no pending invite with this id is addressed to the caller'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: '`billing_unavailable`: the database failed; nothing changed'
           content:
             application/json:
               schema:
@@ -20252,6 +20864,7 @@ components:
       - tier
       - status
       - billing
+      - trial_available
       properties:
         tier:
           type: string
@@ -20274,6 +20887,7 @@ components:
           enum:
           - code
           - stripe
+          - seat
           example: code
         current_period_end:
           type: string
@@ -20291,10 +20905,117 @@ components:
           - not_configured
           - available
           example: not_configured
+        trial_available:
+          type: boolean
+          description: Advisory eligibility for the first 30-day trial, based on
+            all historical Stripe subscription rows. Only the Supersonic plan
+            carries the trial; Wing Checkout bills immediately. Checkout
+            rechecks it in Postgres before creating a session.
         stripe:
           $ref: '#/components/schemas/SubscriptionStripe'
         code:
           $ref: '#/components/schemas/SubscriptionCode'
+        seat:
+          $ref: '#/components/schemas/SubscriptionSeat'
+        invites:
+          type: array
+          description: Open Wing invites the caller may answer (#2470). Absent
+            when there are none.
+          items:
+            $ref: '#/components/schemas/SubscriptionSeatInvite'
+    SubscriptionSeat:
+      type: object
+      description: The caller's side of a Wing seat (#2470). For a payer it is
+        present whenever they pay for a live, premium Wing; `seat_id` and
+        `state` are absent when no invite is open. For a member it describes
+        their active seat, including one whose Wing is paused or lapsed
+        (`suspended`), so they can still leave it.
+      required:
+      - role
+      properties:
+        role:
+          type: string
+          enum:
+          - payer
+          - member
+        seat_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          description: The open seat's state. A pending invite past its expiry
+            reads `expired` before anything materializes it.
+          enum:
+          - pending
+          - active
+          - expired
+        counterpart_user_id:
+          type: string
+          format: uuid
+          description: The holder (for a payer) or the payer (for a member).
+        invite_expires_at:
+          type: string
+          format: date-time
+          description: Present while the payer's invite is pending.
+        next_swap_at:
+          type: string
+          format: date-time
+          description: Payer only. While the 30-day cooldown runs, when the
+            payer can pick someone other than the current holder again.
+        suspended:
+          type: boolean
+          description: Member only. True while the parent Wing does not
+            entitle (paused or lapsed); the seat grants nothing until it is
+            live again, and the member may still leave it.
+    SubscriptionSeatInvite:
+      type: object
+      required:
+      - invite_id
+      - payer_user_id
+      - expires_at
+      properties:
+        invite_id:
+          type: string
+          format: uuid
+        payer_user_id:
+          type: string
+          format: uuid
+        expires_at:
+          type: string
+          format: date-time
+        blocked:
+          type: string
+          description: Present when the caller cannot accept yet because their
+            own Stripe subscription is live.
+          enum:
+          - own_subscription_active
+    SeatDTO:
+      type: object
+      description: A Wing seat as the seat endpoints return it (#2470).
+      required:
+      - seat_id
+      - state
+      - payer_user_id
+      - holder_user_id
+      - invite_expires_at
+      properties:
+        seat_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum:
+          - pending
+          - active
+        payer_user_id:
+          type: string
+          format: uuid
+        holder_user_id:
+          type: string
+          format: uuid
+        invite_expires_at:
+          type: string
+          format: date-time
     SubscriptionStripe:
       type: object
       description: The user's first live Stripe-billed row. Present only when the
@@ -20308,6 +21029,7 @@ components:
       - current_period_end
       - canceling
       - founders_rate
+      - schedule_attached
       properties:
         plan:
           type: string
@@ -20346,6 +21068,25 @@ components:
         founders_rate:
           type: boolean
           description: True when the founders-rate coupon applies to the subscription.
+        unit_amount:
+          type: integer
+          format: int64
+          description: Subscriber's USD price in cents after the Founders discount, rounded down. Absent until Stripe has supplied a usable price.
+        schedule_attached:
+          type: boolean
+          description: True while Stripe still links a schedule to the subscription, including after a booked change takes effect. The desktop uses in-app cancellation while true.
+        pending_plan:
+          type: string
+          enum: [supersonic, wing]
+          description: Booked next-period plan, when present.
+        pending_interval:
+          type: string
+          enum: [month, year]
+          description: Booked next-period interval, when present.
+        pending_change_at:
+          type: string
+          format: date-time
+          description: When the booked change takes effect, when present.
     SubscriptionCode:
       type: object
       description: The user's first live code-redeemed row. Present only when the

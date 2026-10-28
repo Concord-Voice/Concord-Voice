@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -209,6 +210,32 @@ func TestNewControllerRejectsReservedBootstrapUsernames(t *testing.T) {
 			})
 			require.ErrorIs(t, err, errController)
 		})
+	}
+}
+
+func TestNewControllerRefusesSharedApplicationUID(t *testing.T) {
+	for _, mediaUID := range []uint32{1002, 1003} {
+		root := t.TempDir()
+		stateDir := filepath.Join(root, "state")
+		require.NoError(t, os.Mkdir(stateDir, 0o700))
+		_, err := NewController(ControllerOptions{
+			Admin:       &fakeRedisAdmin{users: map[string]bool{}},
+			ACLPath:     filepath.Join(root, "users.acl"),
+			JournalPath: filepath.Join(stateDir, "rotation.json"),
+			MarkerPath:  testMarkerPath(t, filepath.Join(stateDir, "rotation.json")),
+			Bootstrap: AdminBootstrap{
+				Version:  1,
+				Scope:    SecretScope{Project: "project-test", Environment: "prod", Path: "/redis", Name: "REDIS_ADMIN_BOOTSTRAP"},
+				Username: "cv_admin", Password: "synthetic-admin-password",
+			},
+			Now:          func() time.Time { return policyTestNow },
+			ExpectedUIDs: map[string]uint32{controlPlaneService: 1002, mediaPlaneService: mediaUID},
+		})
+		if mediaUID == 1002 {
+			require.ErrorIs(t, err, errController)
+		} else {
+			require.NoError(t, err)
+		}
 	}
 }
 
@@ -504,23 +531,243 @@ func TestControllerReconcilePreservesRegisteredAckOnRefresh(t *testing.T) {
 	}))
 }
 
-func TestControllerRejectsLateFinalAckWithoutFreshOverlap(t *testing.T) {
+// The deadlock regression: once the old generation had under 180 s left, the
+// same policy stopped parsing and a late final ACK was refused, so finalize
+// could never run. Both must keep working until the old generation expires.
+func TestControllerAcceptsLateFinalAckAfterOldOverlapLapses(t *testing.T) {
 	now := policyTestNow
-	controller, aclPath := newControllerFixtureWithNow(t, &fakeRedisAdmin{users: map[string]bool{}}, func() time.Time { return now })
+	controller, _ := newControllerFixtureWithNow(t, &fakeRedisAdmin{users: map[string]bool{}}, func() time.Time { return now })
 	prepareController(t, controller)
 	recordControllerAck(t, controller, controlPlaneService, 1002, ack(controlPlaneService, "cp-a"))
 	recordControllerAck(t, controller, controlPlaneService, 1002, ack(controlPlaneService, "cp-b"))
 	bindControllerInstance(t, controller, mediaPlaneService, "mp-a")
 	now = now.Add(time.Minute + time.Second)
 
-	require.ErrorIs(t, controller.RecordAck(context.Background(), mediaPlaneService, 1003, ack(mediaPlaneService, "mp-a")), errController)
+	require.NoError(t, controller.Reconcile(context.Background(), policyTestValue()), "re-reading the in-flight policy must not fail")
+	require.NoError(t, controller.RecordAck(context.Background(), mediaPlaneService, 1003, ack(mediaPlaneService, "mp-a")))
 	state, _, _ := controller.Status()
-	require.Equal(t, "prepared", state)
-	raw, err := readJournalFixture(filepath.Join(filepath.Dir(aclPath), "state", "rotation.json"))
+	require.Equal(t, "promoted", state)
+	require.NoError(t, controller.Finalize(context.Background(), "rotation-12", map[string]string{
+		controlPlaneService: "cv_cp_11", mediaPlaneService: "cv_mp_11",
+	}))
+}
+
+func TestControllerRevokeExpiredRemovesOldUsersWithoutEveryAck(t *testing.T) {
+	now := policyTestNow
+	admin := &fakeRedisAdmin{users: map[string]bool{}}
+	controller, aclPath := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
+	prepareController(t, controller)
+	recordControllerAck(t, controller, controlPlaneService, 1002, ack(controlPlaneService, "cp-a"))
+	admin.clients = []ClientIdentity{{Username: "cv_cp_11"}}
+	oldValidUntil := policyTestValue().Services[controlPlaneService].Generations[0].ValidUntil
+
+	now = oldValidUntil.Add(-time.Nanosecond)
+	require.NoError(t, controller.Reconcile(context.Background(), policyTestValue()))
+	revoked, err := controller.RevokeExpired(context.Background())
 	require.NoError(t, err)
-	var journal rotationJournal
-	require.NoError(t, json.Unmarshal(raw, &journal))
-	require.Len(t, journal.Acks, 2, "late final ACK must not be persisted")
+	require.False(t, revoked, "a still-valid old user stays until its validUntil")
+	require.True(t, admin.users["cv_cp_11"])
+
+	now = oldValidUntil
+	revoked, err = controller.RevokeExpired(context.Background())
+	require.NoError(t, err)
+	require.True(t, revoked, "a withheld ACK must not keep an expired old user enabled")
+	acl, err := readACLFixture(aclPath)
+	require.NoError(t, err)
+	require.NotContains(t, string(acl), "user cv_cp_11 ")
+	require.NotContains(t, string(acl), "user cv_mp_11 ")
+	require.Contains(t, admin.killed, "cv_cp_11")
+	state, _, _ := controller.Status()
+	require.Equal(t, "prepared", state, "finalized is reserved for a rotation every expected host ACKed")
+	require.ErrorIs(t, controller.Reconcile(context.Background(), policyTestValue()), ErrPolicyStale,
+		"the provider must publish the target-only policy next")
+	revoked, err = controller.RevokeExpired(context.Background())
+	require.NoError(t, err)
+	require.False(t, revoked)
+
+	targetOnly := policyTestValue()
+	for service, config := range targetOnly.Services {
+		config.Generations = config.Generations[1:]
+		targetOnly.Services[service] = config
+	}
+	require.NoError(t, controller.Reconcile(context.Background(), targetOnly))
+	recordControllerAck(t, controller, controlPlaneService, 1002, ack(controlPlaneService, "cp-b"))
+	bindControllerInstance(t, controller, mediaPlaneService, "mp-a")
+	require.NoError(t, controller.RecordAck(context.Background(), mediaPlaneService, 1003, ack(mediaPlaneService, "mp-a")))
+	state, _, _ = controller.Status()
+	require.Equal(t, "finalized", state, "the last missing ACK completes the revoked rotation")
+}
+
+func restartControllerFixture(t *testing.T, aclPath string, now func() time.Time) *Controller {
+	t.Helper()
+	journalPath := filepath.Join(filepath.Dir(aclPath), "state", "rotation.json")
+	controller, err := NewController(ControllerOptions{
+		Admin: &fakeRedisAdmin{users: map[string]bool{}}, ACLPath: aclPath, JournalPath: journalPath,
+		MarkerPath: testMarkerPath(t, journalPath),
+		Bootstrap:  AdminBootstrap{Version: 1, Scope: SecretScope{Project: "project-test", Environment: "prod", Path: "/redis", Name: "REDIS_ADMIN_BOOTSTRAP"}, Username: "cv_admin", Password: "synthetic-admin-password"},
+		Now:        now, ExpectedUIDs: map[string]uint32{controlPlaneService: 1002, mediaPlaneService: 1003},
+	})
+	require.NoError(t, err)
+	require.NoError(t, controller.Restore())
+	return controller
+}
+
+// RevokeExpired removes both old users at the first expiry, so a skewed old
+// validUntil would cut the longer-lived one early; the controller refuses it.
+func TestControllerReconcileRefusesUnequalOldExpiry(t *testing.T) {
+	for _, skew := range []time.Duration{0, time.Minute} {
+		controller, _ := newControllerFixture(t, &fakeRedisAdmin{users: map[string]bool{}})
+		policy := policyTestValue()
+		media := policy.Services[mediaPlaneService]
+		media.Generations[0].ValidUntil = media.Generations[0].ValidUntil.Add(skew)
+		policy.Services[mediaPlaneService] = media
+		initial := policy
+		initial.Services = map[string]PolicyService{}
+		for name, service := range policy.Services {
+			service.TargetGeneration, service.Generations = 11, service.Generations[:1]
+			initial.Services[name] = service
+		}
+		require.NoError(t, controller.PrepareInitial(initial))
+		err := controller.Reconcile(context.Background(), policy)
+		if skew == 0 {
+			require.NoError(t, err)
+		} else {
+			require.ErrorIs(t, err, errController)
+		}
+	}
+}
+
+// A failed ACL LOAD while accepting the rotation leaves a reconcile intent that
+// only a provider read clears; it must not keep an expired old user enabled.
+func TestControllerRevokeExpiredRunsThroughAPendingReconcile(t *testing.T) {
+	now := policyTestNow
+	admin := &fakeRedisAdmin{users: map[string]bool{}}
+	controller, aclPath := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
+	require.NoError(t, controller.PrepareInitial(initialSameRotationPolicy()))
+	admin.loadErr = errors.New("synthetic ACL LOAD timeout")
+	require.Error(t, controller.Reconcile(context.Background(), policyTestValue()))
+	admin.loadErr = nil
+	require.True(t, controller.ReconciliationPending())
+
+	now = policyTestValue().Services[controlPlaneService].Generations[0].ValidUntil
+	revoked, err := controller.RevokeExpired(context.Background())
+	require.NoError(t, err)
+	require.True(t, revoked)
+	require.False(t, controller.ReconciliationPending())
+	acl, err := readACLFixture(aclPath)
+	require.NoError(t, err)
+	require.NotContains(t, string(acl), "user cv_cp_11 ")
+	require.NotContains(t, string(acl), "user cv_mp_11 ")
+	require.Contains(t, string(acl), "user cv_cp_12 ")
+}
+
+// A provider read failure is transient: an ACK recorded while it is reported
+// must not persist it and make the restarted controller refuse the policy.
+func TestControllerAckDuringProviderFailureSurvivesRestart(t *testing.T) {
+	for _, code := range []string{"", "provider", "policy", "policy-stale", "reconcile"} {
+		t.Run("code="+code, func(t *testing.T) {
+			controller, aclPath := newControllerFixture(t, &fakeRedisAdmin{users: map[string]bool{}})
+			prepareController(t, controller)
+			bindControllerInstance(t, controller, controlPlaneService, "cp-a")
+			if code != "" {
+				controller.ReportFailure(code)
+			}
+			require.NoError(t, controller.RecordAck(context.Background(), controlPlaneService, 1002, ack(controlPlaneService, "cp-a")))
+			restarted := restartControllerFixture(t, aclPath, func() time.Time { return policyTestNow })
+			require.NoError(t, restarted.ValidateRestoredPolicy(policyTestValue()))
+		})
+	}
+}
+
+// Every RevokeExpired interruption resumes only through the journaled deny
+// intent, the ACL never regains an old user, and the revoked floor holds.
+func TestControllerRevokeExpiredCrashPointsResumeAndFloorHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		inject  func(*fakeRedisAdmin)
+		loseACL bool
+	}{
+		{"load fails", func(a *fakeRedisAdmin) { a.loadErr = errors.New("synthetic") }, false},
+		{"load applies then fails", func(a *fakeRedisAdmin) { a.loadErr, a.applyLoadThenError = errors.New("synthetic"), true }, false},
+		{"finish fails", func(a *fakeRedisAdmin) { a.userExistsErr = errors.New("synthetic") }, false},
+		{"acl file lost", func(a *fakeRedisAdmin) { a.loadErr = errors.New("synthetic") }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := policyTestNow
+			admin := &fakeRedisAdmin{users: map[string]bool{}}
+			controller, aclPath := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
+			prepareController(t, controller)
+			now = policyTestValue().Services[controlPlaneService].Generations[0].ValidUntil
+			tc.inject(admin)
+			revoked, err := controller.RevokeExpired(context.Background())
+			require.True(t, revoked)
+			require.Error(t, err)
+			again, err := controller.RevokeExpired(context.Background())
+			require.NoError(t, err)
+			require.False(t, again, "a parked revoke intent is not retried by later ticks")
+			require.ErrorIs(t, controller.Reconcile(context.Background(), policyTestValue()), errController)
+			if tc.loseACL {
+				require.NoError(t, os.Remove(aclPath))
+			}
+			restarted := restartControllerFixture(t, aclPath, func() time.Time { return now })
+			require.True(t, restarted.RevocationPending())
+			acl, err := readACLFixture(aclPath)
+			require.NoError(t, err)
+			require.NotContains(t, string(acl), "user cv_cp_11 ")
+			require.NoError(t, restarted.ResumeFinalize(context.Background()))
+			require.False(t, restarted.RevocationPending())
+			require.ErrorIs(t, restarted.Reconcile(context.Background(), policyTestValue()), ErrPolicyStale)
+			require.Error(t, restarted.ValidateRestoredPolicy(policyTestValue()))
+		})
+	}
+}
+
+// No path accepts a new two-generation policy whose old generation already expired.
+func TestControllerNeverAcceptsAnExpiredOldGenerationAsNewPolicy(t *testing.T) {
+	expired := policyTestValue()
+	for name, service := range expired.Services {
+		service.Generations[0].ValidUntil = policyTestNow
+		expired.Services[name] = service
+	}
+	fresh, _ := newControllerFixture(t, &fakeRedisAdmin{users: map[string]bool{}})
+	require.Error(t, fresh.PrepareInitial(expired))
+	require.Error(t, fresh.PrepareLostStateRecovery(expired, []byte(`{}`)))
+	controller, _ := newControllerFixture(t, &fakeRedisAdmin{users: map[string]bool{}})
+	require.NoError(t, controller.PrepareInitial(initialSameRotationPolicy()))
+	require.ErrorIs(t, controller.Reconcile(context.Background(), expired), errController)
+	require.Error(t, controller.ValidateRestoredPolicy(expired))
+	next := expired
+	next.RotationID = "rotation-13"
+	require.Error(t, controller.PrepareRecovery(next))
+}
+
+// Finalize and RevokeExpired serialize on the controller lock; exactly one revokes.
+func TestControllerFinalizeAndRevokeExpiredSerialize(t *testing.T) {
+	for i := 0; i < 25; i++ {
+		now := policyTestNow
+		admin := &fakeRedisAdmin{users: map[string]bool{}}
+		controller, aclPath := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
+		prepareController(t, controller)
+		ackAll(t, controller)
+		now = policyTestValue().Services[controlPlaneService].Generations[0].ValidUntil
+		var wg sync.WaitGroup
+		var revoked bool
+		var revokeErr, finalizeErr error
+		wg.Add(2)
+		go func() { defer wg.Done(); revoked, revokeErr = controller.RevokeExpired(context.Background()) }()
+		go func() {
+			defer wg.Done()
+			finalizeErr = controller.Finalize(context.Background(), "rotation-12", map[string]string{controlPlaneService: "cv_cp_11", mediaPlaneService: "cv_mp_11"})
+		}()
+		wg.Wait()
+		require.NoError(t, revokeErr)
+		require.NotEqual(t, revoked, finalizeErr == nil, "exactly one path revokes")
+		state, _, _ := controller.Status()
+		require.Equal(t, "finalized", state)
+		acl, err := readACLFixture(aclPath)
+		require.NoError(t, err)
+		require.NotContains(t, string(acl), "user cv_cp_11 ")
+	}
 }
 
 func TestControllerKeepsTargetValidThroughAckAndFinalization(t *testing.T) {
@@ -661,6 +908,33 @@ func TestControllerFinalizeRejectsExpiredValidationDeadline(t *testing.T) {
 		"control-plane": "cv_cp_11", "media-plane": "cv_mp_11",
 	}), "a stale policy validation must never authorize revocation")
 	require.Empty(t, admin.killed)
+}
+
+func TestControllerSamePolicyPollRenewsFinalizeValidation(t *testing.T) {
+	now := policyTestNow
+	admin := &fakeRedisAdmin{users: map[string]bool{}}
+	controller, _ := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
+	policy, initial := policyTestValue(), initialSameRotationPolicy()
+	for _, service := range []string{controlPlaneService, mediaPlaneService} {
+		for _, p := range []*Policy{&policy, &initial} {
+			entry := p.Services[service]
+			entry.Generations[0].ValidUntil = policyTestNow.Add(30 * time.Minute)
+			p.Services[service] = entry
+		}
+	}
+	require.NoError(t, controller.PrepareInitial(initial))
+	require.NoError(t, controller.Reconcile(context.Background(), policy))
+	registerControllerInstances(t, controller)
+	ackAll(t, controller)
+
+	// The provider re-confirms the unchanged policy on every poll; a finalize
+	// that misses the first window must not stay stuck in promoted forever.
+	now = policyTestNow.Add(4 * time.Minute)
+	require.NoError(t, controller.Reconcile(context.Background(), policy))
+	now = policyTestNow.Add(6 * time.Minute)
+	require.NoError(t, controller.Finalize(context.Background(), "rotation-12", map[string]string{
+		"control-plane": "cv_cp_11", "media-plane": "cv_mp_11",
+	}))
 }
 
 func TestControllerFinalizeRejectsDeadlineCrossedDuringClientDrain(t *testing.T) {
@@ -1308,7 +1582,7 @@ func TestControllerJournalRestorePreservesRevocationAndAckFence(t *testing.T) {
 	require.NotContains(t, string(activeACL), "user cv_mp_11 ")
 }
 
-func TestControllerRestoreAcceptsExpiredOverlapFromIntactACLWithoutLosingAckFence(t *testing.T) {
+func TestControllerRestoreKeepsAckFenceAndRevokesExpiredOldUsers(t *testing.T) {
 	admin := &fakeRedisAdmin{users: map[string]bool{}}
 	now := policyTestNow
 	controller, aclPath := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
@@ -1338,8 +1612,8 @@ func TestControllerRestoreAcceptsExpiredOverlapFromIntactACLWithoutLosingAckFenc
 	}), "the persisted expected host set and partial ACK must still block finalization")
 	recordControllerAck(t, restarted, "control-plane", 1002, ack("control-plane", "cp-b"))
 	bindControllerInstance(t, restarted, mediaPlaneService, "mp-a")
-	require.ErrorIs(t, restarted.RecordAck(context.Background(), mediaPlaneService, 1003, ack(mediaPlaneService, "mp-a")), errController,
-		"restored late ACK must not promote an expired overlap")
+	require.NoError(t, restarted.RecordAck(context.Background(), mediaPlaneService, 1003, ack(mediaPlaneService, "mp-a")),
+		"only the target must stay valid for a late ACK")
 	require.Error(t, restarted.Finalize(context.Background(), "rotation-12", map[string]string{
 		"control-plane": "cv_cp_11", "media-plane": "cv_mp_11",
 	}), "restored ACKs cannot extend the original five-minute validation deadline")
@@ -1348,11 +1622,14 @@ func TestControllerRestoreAcceptsExpiredOverlapFromIntactACLWithoutLosingAckFenc
 	require.NoError(t, err)
 	require.Contains(t, string(retained), "user cv_cp_11 ")
 	require.Contains(t, string(retained), "user cv_mp_11 ")
-	beforeStaleRefresh := string(retained)
-	require.Error(t, restarted.Reconcile(context.Background(), policyTestValue()), "an expired provider overlap cannot be loaded again")
-	afterStaleRefresh, err := readACLFixture(aclPath)
+	require.NoError(t, restarted.Reconcile(context.Background(), policyTestValue()), "a restart after expiry must not refuse the in-flight policy")
+	revoked, err := restarted.RevokeExpired(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, beforeStaleRefresh, string(afterStaleRefresh), "rejected stale policy must not rewrite the ACL")
+	require.True(t, revoked)
+	afterExpiry, err := readACLFixture(aclPath)
+	require.NoError(t, err)
+	require.NotContains(t, string(afterExpiry), "user cv_cp_11 ")
+	require.NotContains(t, string(afterExpiry), "user cv_mp_11 ")
 }
 
 func TestControllerRestoreDoesNotRerenderExpiredOverlapWhenACLIsMissing(t *testing.T) {
@@ -1854,4 +2131,48 @@ func TestControllerAdminProbeFailsClosed(t *testing.T) {
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "wrong-synthetic-password")
 	require.True(t, strings.Contains(err.Error(), "probe") || strings.Contains(err.Error(), "Redis"), "error should retain a bounded operation context")
+}
+
+func TestControllerRevokeExpiredKeepsTheDenyIntentWhenACLLoadFails(t *testing.T) {
+	now := policyTestNow
+	admin := &fakeRedisAdmin{users: map[string]bool{}}
+	controller, _ := newControllerFixtureWithNow(t, admin, func() time.Time { return now })
+	prepareController(t, controller)
+	now = policyTestValue().Services[controlPlaneService].Generations[0].ValidUntil
+	admin.loadErr = errors.New("synthetic ACL load failure")
+
+	revoked, err := controller.RevokeExpired(context.Background())
+	require.True(t, revoked)
+	require.ErrorIs(t, err, errController)
+	require.True(t, controller.RevocationPending(), "a failed load must leave the journaled deny intent for resume")
+}
+
+// A first activation that fails after its marker is promoted (candidate
+// creation, binding or start) must be recoverable with the same policy, but
+// only while nothing has been acknowledged or rotated since.
+func TestControllerPrepareRecoveryResumesAnUntouchedFirstActivation(t *testing.T) {
+	now := func() time.Time { return policyTestNow }
+	controller, aclPath := newControllerFixture(t, &fakeRedisAdmin{users: map[string]bool{}})
+	require.NoError(t, controller.PrepareInitial(initialSingleGenerationPolicy()))
+	bindControllerInstance(t, controller, controlPlaneService, "cp-initial") // the media bind never ran
+
+	restarted := restartControllerFixture(t, aclPath, now)
+	changed := initialSingleGenerationPolicy()
+	changed.Services[controlPlaneService].Generations[0].ValidUntil = policyTestNow.Add(2 * time.Hour)
+	require.Error(t, restarted.PrepareRecovery(changed), "only the exact activated policy resumes")
+	require.NoError(t, restarted.PrepareRecovery(initialSingleGenerationPolicy()))
+	state, rotation, _ := restarted.Status()
+	require.Equal(t, "prepared", state)
+	require.Equal(t, "rotation-11", rotation)
+	require.Equal(t, "cp-initial", restarted.BindingSnapshot()[controlPlaneService].InstanceID, "the partial binding is kept for the resume")
+
+	require.NoError(t, restarted.RegisterExpected(context.Background(), "rotation-11", map[string][]string{
+		controlPlaneService: {"cp-initial"}, mediaPlaneService: {"mp-initial"},
+	}, map[string]uint64{controlPlaneService: 11, mediaPlaneService: 11}))
+	recordControllerAck(t, restarted, controlPlaneService, 1002, AppliedAck{
+		Version: 1, RotationID: "rotation-11", Service: controlPlaneService,
+		InstanceID: "cp-initial", Generation: 11, Username: "cv_cp_11",
+	}) // one ACK keeps the phase prepared
+	acked := restartControllerFixture(t, aclPath, now)
+	require.Error(t, acked.PrepareRecovery(initialSingleGenerationPolicy()), "an acknowledged activation is no longer a failed first activation")
 }

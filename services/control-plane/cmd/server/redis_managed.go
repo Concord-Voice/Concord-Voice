@@ -74,12 +74,20 @@ func pollManagedRedisWith(ctx context.Context, runtime *managedredis.Runtime, cl
 		refreshCancel()
 		if err != nil {
 			reportFailure("refresh")
+			if runtime.Stale(runtime.Now()) {
+				reportFailure("freshness")
+			}
 		} else {
 			ackCtx, ackCancel := context.WithTimeout(ctx, 5*time.Second)
 			if err := acknowledge(ackCtx, runtime, client); err != nil {
 				reportFailure("acknowledgment")
 			}
 			ackCancel()
+		}
+		// select picks at random when both are ready, so a cancel during this
+		// pass could otherwise run one more refresh on a dead context.
+		if ctx.Err() != nil {
+			return
 		}
 		select {
 		case <-ctx.Done():
