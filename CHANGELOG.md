@@ -118,6 +118,7 @@ you verify your email.
 
 ### Added
 
+- **Managed ingress verification groundwork** (internal development reference omitted) — source projection and a bounded offline CLI evaluate supplied ingress evidence. Synthetic tests do not establish production compatibility; host commissioning and deployment enforcement remain pending.
 - **Managed egress support now waits for host commissioning** (internal development reference omitted) — ordinary deployments keep their direct path until the root-owned outbound boundary is fully verified. A partial installation stops before it changes services, and enabling filtering still requires a separate approved host operation.
 - **Managed Redis credential rotation groundwork** (internal development reference omitted) — a default-off runtime path prepares scoped service identities and rotates their credentials. Activation still requires separate host checks and deployment approval.
 - **A separate West staging deployment path is available to operators** (internal development reference omitted) — it remains off until its own secrets, private access and live checks are complete. West is not a production site.
