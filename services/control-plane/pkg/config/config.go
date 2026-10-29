@@ -371,9 +371,13 @@ type Config struct {
 	RequireClientAttestation bool          // Gate authenticated routes on signed-client attestation
 	AttestationTokenTTL      time.Duration // Lifetime of issued attestation tokens; range 30m-24h
 	AttestationPruneInterval time.Duration // Cadence for retention pruning (release_binaries + release_spas); range 1h-24h
-	OIDCIssuer               string        // GitHub Actions OIDC issuer (typically token.actions.githubusercontent.com)
-	OIDCAudience             string        // Expected OIDC audience claim
-	OIDCSubjectPrefix        string        // Required OIDC sub prefix (e.g. "repo:Concord-Voice/Concord-Voice-Alpha:")
+	// iOS App Attest (ADR-0010 D17). Empty AppAttestAppIDs leaves the iOS
+	// path off: platform "ios" is rejected and /attestation/challenge 503s.
+	AppAttestAppIDs           []string // Allowed TEAMID.bundle.id values
+	AppAttestAllowDevelopment bool     // Accept development-environment keys; refused in production
+	OIDCIssuer                string   // GitHub Actions OIDC issuer (typically token.actions.githubusercontent.com)
+	OIDCAudience              string   // Expected OIDC audience claim
+	OIDCSubjectPrefix         string   // Required OIDC sub prefix (e.g. "repo:Concord-Voice/Concord-Voice-Alpha:")
 	// Per-axis OIDC binding (W1, #677 reconciliation). The SPA publish path
 	// and binary publish path are issued from DIFFERENT GitHub Actions
 	// workflows (main-cd.yml vs build-desktop.yml). Each axis is bound to
@@ -571,15 +575,17 @@ func Load() (*Config, error) {
 		// common trailing-newline secret-store artifact (a stray byte would make
 		// the constant-time compare always fail). Empty disables the HTTP gen
 		// endpoint; production guard enforces it when generation is enabled.
-		RedemptionAdminToken:     strings.TrimSpace(getEnv("REDEMPTION_ADMIN_TOKEN", "")), // #nosec G101 -- env var name, not a secret
-		RequireClientAttestation: getEnv("REQUIRE_CLIENT_ATTESTATION", "false") == "true",
-		AttestationTokenTTL:      parseAttestationTokenTTL(getEnv("ATTESTATION_TOKEN_TTL", "2h")),
-		AttestationPruneInterval: parseAttestationPruneInterval(getEnv("ATTESTATION_PRUNE_INTERVAL", "6h")),
-		OIDCIssuer:               getEnv("ATTESTATION_OIDC_ISSUER", "https://token.actions.githubusercontent.com"),
-		OIDCAudience:             getEnv("ATTESTATION_OIDC_AUDIENCE", ""),
-		OIDCSubjectPrefix:        getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:Concord-Voice/Concord-Voice-Alpha:"),
-		OIDCSPAWorkflow:          getEnv("ATTESTATION_OIDC_SPA_WORKFLOW", "main-cd.yml"),
-		OIDCSPARef:               getEnv("ATTESTATION_OIDC_SPA_REF", "refs/heads/main"),
+		RedemptionAdminToken:      strings.TrimSpace(getEnv("REDEMPTION_ADMIN_TOKEN", "")), // #nosec G101 -- env var name, not a secret
+		RequireClientAttestation:  getEnv("REQUIRE_CLIENT_ATTESTATION", "false") == "true",
+		AttestationTokenTTL:       parseAttestationTokenTTL(getEnv("ATTESTATION_TOKEN_TTL", "2h")),
+		AttestationPruneInterval:  parseAttestationPruneInterval(getEnv("ATTESTATION_PRUNE_INTERVAL", "6h")),
+		AppAttestAppIDs:           parseAppAttestAppIDs(getEnv("APP_ATTEST_APP_IDS", "")),
+		AppAttestAllowDevelopment: getEnv("APP_ATTEST_ALLOW_DEVELOPMENT", "false") == "true",
+		OIDCIssuer:                getEnv("ATTESTATION_OIDC_ISSUER", "https://token.actions.githubusercontent.com"),
+		OIDCAudience:              getEnv("ATTESTATION_OIDC_AUDIENCE", ""),
+		OIDCSubjectPrefix:         getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:Concord-Voice/Concord-Voice-Alpha:"),
+		OIDCSPAWorkflow:           getEnv("ATTESTATION_OIDC_SPA_WORKFLOW", "main-cd.yml"),
+		OIDCSPARef:                getEnv("ATTESTATION_OIDC_SPA_REF", "refs/heads/main"),
 		// CAUTION (#2021 B3): the binary axis is dormant — nothing POSTs
 		// /publish/binary — and this default has never been checked against
 		// a REAL minted token. Untested, not known-bad: the original #1492
@@ -1461,6 +1467,9 @@ func (c *Config) validateProduction() error {
 var oidcSubjectPrefixShape = regexp.MustCompile(`^repo:[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*:`)
 
 func (c *Config) validateAttestation() error {
+	if err := c.validateAppAttest(); err != nil {
+		return err
+	}
 	if !c.RequireClientAttestation {
 		return nil
 	}
@@ -1719,6 +1728,36 @@ func parseTrustedProxyCIDRs(raw string) ([]string, error) {
 		cidrs = append(cidrs, trimmed)
 	}
 	return cidrs, nil
+}
+
+// appAttestAppIDShape is Apple's TEAMID.bundle.id: a 10-character team id,
+// then a reverse-DNS bundle id.
+var appAttestAppIDShape = regexp.MustCompile(`^[A-Z0-9]{10}\.[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$`)
+
+// parseAppAttestAppIDs splits APP_ATTEST_APP_IDS on commas, dropping blanks.
+func parseAppAttestAppIDs(raw string) []string {
+	var out []string
+	for _, id := range strings.Split(raw, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// validateAppAttest checks the iOS App Attest settings (ADR-0010 D17). It runs
+// whether or not attestation is required, so a bad value fails at startup
+// instead of at a phone's first verify.
+func (c *Config) validateAppAttest() error {
+	for _, id := range c.AppAttestAppIDs {
+		if !appAttestAppIDShape.MatchString(id) {
+			return fmt.Errorf("APP_ATTEST_APP_IDS entries must look like TEAMID.bundle.id, got %q", id)
+		}
+	}
+	if c.AppAttestAllowDevelopment && c.Environment == "production" {
+		return fmt.Errorf("APP_ATTEST_ALLOW_DEVELOPMENT must be false in production")
+	}
+	return nil
 }
 
 // parseAttestationTokenTTL parses the ATTESTATION_TOKEN_TTL env value and

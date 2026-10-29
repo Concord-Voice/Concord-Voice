@@ -575,3 +575,16 @@ func TestRepository_RevokeBinary_RevokesAllPlatforms(t *testing.T) {
 		require.NotEqual(t, "0.4.2", rb.Version, "revoked rows must not appear in ListActive")
 	}
 }
+
+func TestRepository_AppAttestKeyErrorsWhenQueryFails(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	repo := attestation.NewRepository(db)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // every query fails before reaching Postgres
+
+	require.Error(t, repo.InsertAppAttestKey(ctx, attestation.AppAttestKey{KeyID: []byte("k")}, "h"))
+	_, err := repo.GetAppAttestKey(ctx, []byte("k"))
+	require.Error(t, err)
+	require.Error(t, repo.AdvanceAppAttestCounter(ctx, []byte("k"), 1))
+}

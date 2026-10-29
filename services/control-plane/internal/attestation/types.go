@@ -42,6 +42,9 @@ const (
 	PlatformWindows Platform = "windows"
 	PlatformLinux   Platform = "linux"
 	PlatformWeb     Platform = "web"
+	// PlatformIOS proves itself with Apple App Attest instead of the release
+	// registry (ADR-0010 D17).
+	PlatformIOS Platform = "ios"
 )
 
 // ErrInvalidPlatform is the sentinel error returned by ParsePlatform when the
@@ -70,10 +73,16 @@ func ParsePlatform(s string) (Platform, error) {
 // Valid returns true if p is one of the recognised platforms.
 func (p Platform) Valid() bool {
 	switch p {
-	case PlatformMacOS, PlatformWindows, PlatformLinux, PlatformWeb:
+	case PlatformMacOS, PlatformWindows, PlatformLinux, PlatformWeb, PlatformIOS:
 		return true
 	}
 	return false
+}
+
+// HasReleaseBinary reports whether platform p ships a CI-published desktop
+// binary, i.e. whether it may appear in release_binaries.
+func (p Platform) HasReleaseBinary() bool {
+	return p == PlatformMacOS || p == PlatformWindows || p == PlatformLinux
 }
 
 // RequiresCertHash reports whether platform p requires signal 1 (cert hash).
@@ -89,13 +98,22 @@ func (p Platform) RequiresMachineID() bool {
 }
 
 // VerifyPayload is the body of POST /api/v1/attestation/verify.
+//
+// spa_version and spa_hash are required for every platform except ios, which
+// instead carries the App Attest fields (ADR-0010 D17): key_id, challenge, and
+// exactly one of attestation (first proof per key) or assertion. All four are
+// standard base64.
 type VerifyPayload struct {
-	Version    string   `json:"version"     binding:"required"`
-	Platform   Platform `json:"platform"    binding:"required"`
-	CertHash   string   `json:"cert_hash,omitempty"`
-	MachineID  string   `json:"machine_id,omitempty"`
-	SpaVersion string   `json:"spa_version" binding:"required"`
-	SpaHash    string   `json:"spa_hash"    binding:"required"`
+	Version     string   `json:"version"     binding:"required"`
+	Platform    Platform `json:"platform"    binding:"required"`
+	CertHash    string   `json:"cert_hash,omitempty"`
+	MachineID   string   `json:"machine_id,omitempty"`
+	SpaVersion  string   `json:"spa_version,omitempty"`
+	SpaHash     string   `json:"spa_hash,omitempty"`
+	KeyID       string   `json:"key_id,omitempty"`
+	Challenge   string   `json:"challenge,omitempty"`
+	Attestation string   `json:"attestation,omitempty"`
+	Assertion   string   `json:"assertion,omitempty"`
 }
 
 // VerifyResponse is returned on successful attestation.
@@ -140,6 +158,9 @@ const (
 	ErrUnknownRelease ErrorCode = "ATTESTATION_UNKNOWN_RELEASE"
 	ErrRevoked        ErrorCode = "ATTESTATION_REVOKED"
 	ErrVersionTooOld  ErrorCode = "CLIENT_VERSION_TOO_OLD"
+	// ErrKeyUnknown tells an iOS client its App Attest key is not on record,
+	// so it must generate and attest a new key (ADR-0010 D17).
+	ErrKeyUnknown ErrorCode = "ATTESTATION_KEY_UNKNOWN"
 )
 
 // ErrorResponse is the structured body for 403 rejections.

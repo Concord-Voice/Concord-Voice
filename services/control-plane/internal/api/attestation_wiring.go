@@ -7,6 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation/appattest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -60,14 +61,36 @@ func buildAttestationHandlerWithSecurityEvents(
 	// on the nil receiver). The explicit nil branch hands the constructor a
 	// real interface-nil so PublishSPA/PublishBinary can guard via h.oidc==nil
 	// and refuse cleanly with 503.
+	var handler *attestation.Handler
 	if oidcVerifier == nil {
-		handler := attestation.NewHandler(repo, cache, nil, nc, rdb, log)
-		handler.SetSecurityEvents(events)
-		return handler
+		handler = attestation.NewHandler(repo, cache, nil, nc, rdb, log)
+	} else {
+		handler = attestation.NewHandler(repo, cache, oidcVerifier, nc, rdb, log)
 	}
-	handler := attestation.NewHandler(repo, cache, oidcVerifier, nc, rdb, log)
 	handler.SetSecurityEvents(events)
+	if v := buildAppAttestVerifier(cfg, log); v != nil {
+		handler.SetAppAttest(v)
+	}
 	return handler
+}
+
+// buildAppAttestVerifier enables the iOS path (ADR-0010 D17) when
+// APP_ATTEST_APP_IDS is set. It returns nil, leaving iOS off, otherwise.
+func buildAppAttestVerifier(cfg *config.Config, log *logger.Logger) *appattest.Verifier {
+	if len(cfg.AppAttestAppIDs) == 0 {
+		return nil
+	}
+	v, err := appattest.New(cfg.AppAttestAppIDs, cfg.AppAttestAllowDevelopment)
+	if err != nil {
+		// Only the embedded Apple root failing to parse lands here: a build
+		// defect, so it is fatal whenever attestation is required.
+		if cfg.RequireClientAttestation {
+			log.Fatal("app attest verifier init failed", "error", err)
+		}
+		log.Warn("app attest verifier init failed; ios attestation disabled", "error", err)
+		return nil
+	}
+	return v
 }
 
 // buildOIDCVerifier constructs the per-axis OIDC verifier. On failure,

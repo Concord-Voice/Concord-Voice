@@ -446,3 +446,17 @@ func TestPublishBinary_DegradedMode_503(t *testing.T) {
 		"degraded-mode publish must return 503, not panic: body=%s", w.Body.String())
 	require.Contains(t, w.Body.String(), "OIDC verifier unavailable")
 }
+
+// TestPublishBinaryHandler_NoReleaseBinaryPlatform_400: ios and web are valid
+// verify platforms but never have a signed release binary (ADR-0010 D17).
+func TestPublishBinaryHandler_NoReleaseBinaryPlatform_400(t *testing.T) {
+	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"}
+	h, cleanup := newPublishHandler(t, oidc)
+	defer cleanup()
+
+	for _, platform := range []string{"ios", "web"} {
+		c, w := toGinPublishRequest(t, publishBinaryPath, publishBinaryBody("0.2.7", platform, testHashBinaryFoo), "Bearer valid")
+		h.PublishBinary(c)
+		require.Equal(t, http.StatusBadRequest, w.Code, platform)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -168,6 +169,10 @@ func ensureNotRevoked(
 	version string,
 ) bool {
 	isRevoked, err := rdb.SIsMember(ctx, revokedVersionsKey, version).Result()
+	if err == nil && !isRevoked && strings.HasPrefix(version, "ios-") {
+		// iOS revocations live in a set with no TTL (ADR-0010 D17).
+		isRevoked, err = rdb.SIsMember(ctx, attestation.RevokedIOSVersionsKey, version).Result()
+	}
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 			"error": "attestation registry temporarily unavailable",

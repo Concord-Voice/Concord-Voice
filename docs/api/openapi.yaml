@@ -299,13 +299,17 @@ paths:
       summary: Verify client signals and issue an attestation token
       description: 'Validates client attestation signals (binary cert hash on macOS/Windows, machine ID
 
-        on desktop platforms, SPA hash on all platforms) against the release registry and
+        on desktop platforms, SPA hash on all non-ios platforms) against the release registry and
 
         issues a short-lived attestation token bound to (session, machine). The token TTL
 
-        is server-configured (default 2h). Fails closed (503) when the Redis registry is
+        is server-configured (default 2h). iOS replaces the registry signals with Apple App
 
-        unavailable.
+        Attest: the app redeems a challenge from `/attestation/challenge` with an attestation
+
+        (first time per key) or an assertion (ADR-0010 D17). Fails closed (503) when Redis or
+
+        the key store is unavailable, or when iOS is not configured on this server.
 
         '
       operationId: verifyClientAttestation
@@ -351,6 +355,78 @@ paths:
                 $ref: '#/components/schemas/AttestationError'
         '503':
           description: Attestation registry (Redis) unavailable — fails closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /attestation/challenge:
+    post:
+      tags:
+      - Attestation
+      summary: Issue a single-use App Attest challenge (iOS)
+      description: 'Returns 32 random bytes the iOS app hashes into its App Attest attestation
+
+        or assertion (ADR-0010 D17). The challenge is single use, expires after 5 minutes,
+
+        and can only be redeemed by the same user, X-Session-ID and X-Machine-Id that
+
+        requested it. Outside RequireAttestation so a phone can bootstrap.
+
+        '
+      operationId: issueAppAttestChallenge
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: X-Session-ID
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Session ID the challenge is bound to
+      - name: X-Machine-Id
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Machine ID the challenge is bound to
+      responses:
+        '200':
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - challenge
+                - ttl_seconds
+                properties:
+                  challenge:
+                    type: string
+                    format: byte
+                  ttl_seconds:
+                    type: integer
+                    example: 300
+        '400':
+          description: Missing X-Session-ID or X-Machine-Id header
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: More than 30 challenges per user per minute
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: App Attest not enabled on this server, or Redis unavailable
           content:
             application/json:
               schema:
@@ -24015,14 +24091,18 @@ components:
       - windows
       - linux
       - web
-      description: Client OS family for attestation purposes
+      - ios
+      description: Client OS family for attestation purposes. `ios` proves itself with
+        Apple App Attest (ADR-0010 D17) and is only valid on verify; binary publish
+        accepts macos, windows and linux.
     AttestationVerifyRequest:
       type: object
+      description: spa_version and spa_hash are required on every platform except ios.
+        An ios request instead sends key_id, challenge and exactly one of attestation
+        or assertion.
       required:
       - version
       - platform
-      - spa_version
-      - spa_hash
       properties:
         version:
           type: string
@@ -24042,6 +24122,25 @@ components:
         spa_hash:
           type: string
           description: SPA index.html hash (sha256:<hex>)
+        key_id:
+          type: string
+          format: byte
+          description: ios only. App Attest key identifier (32 bytes)
+        challenge:
+          type: string
+          format: byte
+          description: ios only. Challenge from POST /attestation/challenge; single use
+        attestation:
+          type: string
+          format: byte
+          description: ios only. CBOR attestation object from attestKey, sent once per
+            key. clientDataHash = SHA-256("concord-appattest-v1" || 0x00 || challenge
+            || 0x00 || version), with version exactly as sent in this request
+        assertion:
+          type: string
+          format: byte
+          description: ios only. CBOR assertion from generateAssertion over the same
+            version-bound clientDataHash as attestation, sent on every later verify
     AttestationVerifyResponse:
       type: object
       properties:
@@ -24073,7 +24172,10 @@ components:
           - ATTESTATION_INVALID
           - ATTESTATION_UNKNOWN_RELEASE
           - ATTESTATION_REVOKED
+          - ATTESTATION_KEY_UNKNOWN
           - CLIENT_VERSION_TOO_OLD
+          description: ATTESTATION_KEY_UNKNOWN is returned only to ios assertions whose key
+            is not on record; the client generates and attests a new key.
         updateAvailable:
           type: boolean
           description: Present (true) for ATTESTATION_UNKNOWN_RELEASE and CLIENT_VERSION_TOO_OLD rejections

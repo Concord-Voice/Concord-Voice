@@ -337,6 +337,28 @@ func TestRequireAttestation_RevokedVersion_403Revoked(t *testing.T) {
 	require.Equal(t, attestation.ErrRevoked, resp.Code)
 }
 
+// An iOS version revoked only in the persistent set still blocks live tokens.
+func TestRequireAttestation_RevokedIOSVersion_403Revoked(t *testing.T) {
+	rdb, cleanup := testhelpers.SetupTestRedis(t)
+	defer cleanup()
+
+	writeToken(t, rdb, "attestation:s-ios:m-1", "ios-token", "ios-1.0.0(5)")
+	require.NoError(t, rdb.SAdd(context.Background(), attestation.RevokedIOSVersionsKey, "ios-1.0.0(5)").Err())
+
+	r, called := setupRouter(t, true, rdb)
+	w := doRequest(t, r, map[string]string{
+		"X-Attestation-Token": "ios-token",
+		"X-Session-ID":        "s-ios",
+		"X-Machine-Id":        "m-1",
+	})
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.False(t, *called)
+	var resp attestation.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, attestation.ErrRevoked, resp.Code)
+}
+
 // TestRequireAttestation_RevokedVersion_LogsVersion asserts that the structured
 // rejection log on the ErrRevoked path includes the bound version (finding #24
 // of #1264 review). Without this attribution the hourly counter loses

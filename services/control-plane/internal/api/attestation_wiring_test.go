@@ -284,3 +284,9 @@ func TestHydrateCache_DisabledWarnsOnError(t *testing.T) {
 		hydrateCache(t.Context(), cache, cfg, log)
 	}, "hydrateCache on disabled path must warn-and-continue rather than panic on DB error")
 }
+
+func TestBuildAppAttestVerifier(t *testing.T) {
+	log := logger.New("development")
+	require.Nil(t, buildAppAttestVerifier(&config.Config{}, log))
+	require.NotNil(t, buildAppAttestVerifier(&config.Config{AppAttestAppIDs: []string{"ABCDE12345.com.example.app"}}, log))
+}

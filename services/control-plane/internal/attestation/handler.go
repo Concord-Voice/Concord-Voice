@@ -6,6 +6,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation/appattest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	cpnats "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
@@ -26,14 +27,16 @@ type tokenVerifier interface {
 
 // Handler bundles dependencies for attestation HTTP handlers.
 type Handler struct {
-	repo     *Repository
-	cache    *Cache
-	oidc     tokenVerifier
-	nc       *cpnats.Client
-	rdb      *redis.Client
-	log      *logger.Logger
-	eventsMu sync.RWMutex
-	events   securityevent.Emitter
+	repo  *Repository
+	cache *Cache
+	oidc  tokenVerifier
+	nc    *cpnats.Client
+	rdb   *redis.Client
+	log   *logger.Logger
+	// appAttest is nil unless the iOS path is configured (ADR-0010 D17).
+	appAttest *appattest.Verifier
+	eventsMu  sync.RWMutex
+	events    securityevent.Emitter
 }
 
 // NewHandler wires a Handler against the given dependencies.

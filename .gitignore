@@ -227,6 +227,9 @@ config.production.json
 # AWS
 .aws/
 *.pem
+# Apple's public App Attestation root CA, pinned into the binary (ADR-0010 D17).
+# A certificate, not a key: the verifier embeds it with go:embed.
+!services/control-plane/internal/attestation/appattest/apple_app_attestation_root_ca.pem
 aws-exports.js
 
 # Google Cloud

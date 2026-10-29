@@ -217,7 +217,9 @@ func (h *Handler) PublishBinary(c *gin.Context) {
 	// to Platform (the type's underlying kind is `string`), so trust-boundary
 	// validation must happen here. ParsePlatform combines the cast + Valid()
 	// check into one audited step — see types.go ParsePlatform docs.
-	if _, err := ParsePlatform(string(p.Platform)); err != nil {
+	// Only desktop platforms ship a registry binary; web and ios would otherwise
+	// fall through to the release_binaries CHECK constraint as a 500.
+	if pl, err := ParsePlatform(string(p.Platform)); err != nil || !pl.HasReleaseBinary() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid platform"})
 		return
 	}

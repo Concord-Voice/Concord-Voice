@@ -62,6 +62,7 @@ func TestRouterClientVersionWiring(t *testing.T) {
 	for _, route := range []string{
 		"v1.GET(\"/client/config\"",
 		"v1.POST(\"/attestation/verify\"",
+		"v1.POST(\"/attestation/challenge\"",
 	} {
 		routeIndex := strings.Index(source, route)
 		require.GreaterOrEqual(t, routeIndex, 0, "public route %q is missing", route)

@@ -13,6 +13,9 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
+// errRegistryUnavailable is the client-facing message when Postgres or Redis fails.
+const errRegistryUnavailable = "attestation registry temporarily unavailable"
+
 // Verify validates client signals and issues an attestation token bound to
 // (session, machine). POST /api/v1/attestation/verify
 //
@@ -25,6 +28,7 @@ import (
 // - D2: Fail-closed on Redis errors (matches AuthRequired posture)
 // - D4: Linux skips signal 1 (cert hash)
 // - D8: Web skips signals 1+2; token keyed by attestation:<session>:web
+// - D17: iOS replaces all three signals with Apple App Attest (ios_handler.go)
 //
 // ttl is the configured ATTESTATION_TOKEN_TTL (default 2h, range 30m-24h).
 func (h *Handler) Verify(c *gin.Context, ttl time.Duration) {
@@ -34,7 +38,12 @@ func (h *Handler) Verify(c *gin.Context, ttl time.Duration) {
 	}
 
 	ctx := c.Request.Context()
-	if !h.checkVerifySignals(ctx, c, payload) {
+	if payload.Platform == PlatformIOS {
+		// D17: Apple App Attest replaces the release-registry signals.
+		if !h.checkIOS(ctx, c, sessionID, &payload) {
+			return
+		}
+	} else if !h.checkVerifySignals(ctx, c, payload) {
 		return
 	}
 
@@ -67,6 +76,12 @@ func (h *Handler) parseVerifyRequest(c *gin.Context) (string, VerifyPayload, boo
 	// check into one audited step — see types.go ParsePlatform docs.
 	if _, err := ParsePlatform(string(p.Platform)); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid platform"})
+		return "", VerifyPayload{}, false
+	}
+	// Signal 3 inputs are required everywhere but ios, which proves itself
+	// with App Attest instead (D17).
+	if p.Platform != PlatformIOS && (p.SpaVersion == "" || p.SpaHash == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "spa_version and spa_hash are required"})
 		return "", VerifyPayload{}, false
 	}
 	return sessionID, p, true
@@ -108,7 +123,7 @@ func (h *Handler) checkVerifySignals(ctx context.Context, c *gin.Context, p Veri
 	revoked, err := h.cache.IsRevoked(ctx, p.Version)
 	if err != nil {
 		h.emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
-		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "attestation registry temporarily unavailable"})
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": errRegistryUnavailable})
 		return false
 	}
 	if revoked {
@@ -151,7 +166,7 @@ func (h *Handler) issueToken(ctx context.Context, c *gin.Context, sessionID stri
 	if err := h.rdb.Set(ctx, key, bs, ttl).Err(); err != nil {
 		// Fail-closed per D2.
 		h.emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "attestation registry temporarily unavailable"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errRegistryUnavailable})
 		return
 	}
 

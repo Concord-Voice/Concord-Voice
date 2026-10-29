@@ -1707,6 +1707,14 @@ func NewRouter(
 			middleware.AuthRequired(cfg.JWTSecret, redis, db, credFence),
 			func(c *gin.Context) { attestationHandler.Verify(c, cfg.AttestationTokenTTL) },
 		)
+		// iOS App Attest challenge (ADR-0010 D17). Like verify, it sits outside
+		// RequireAttestation so a phone can bootstrap; each call writes one
+		// short-lived Redis key, hence the per-user cap.
+		v1.POST("/attestation/challenge",
+			middleware.AuthRequired(cfg.JWTSecret, redis, db, credFence),
+			middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+			attestationHandler.Challenge,
+		)
 		// Internal CI publish endpoints (Y1 split — #677 R3 reconciliation).
 		// Two axes, two endpoints, each with its own OIDC-authed shape:
 		//
