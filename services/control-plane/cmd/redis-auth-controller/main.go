@@ -2,9 +2,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
@@ -29,6 +31,21 @@ type controlRequest struct {
 	Args         []string            `json:"args,omitempty"`
 }
 
+// knownControlOperations bounds what a refusal log line can contain.
+var knownControlOperations = map[string]bool{
+	"status": true, "probe": true, "register": true, "bind": true, "replace-ready": true,
+	"finalize": true, "resume": true, "redis": true,
+}
+
+// logRefusal records that a request was refused. It never logs request content:
+// the operation is reduced to a known name, so a peer cannot write into the log.
+func logRefusal(kind, operation string, peerUID uint32) {
+	if !knownControlOperations[operation] {
+		operation = "other"
+	}
+	log.Printf("managed Redis controller refused %s: operation=%s peer_uid=%d", kind, operation, peerUID)
+}
+
 func decodeControlLine(raw []byte, dst any) error {
 	return managedredis.DecodeBoundedJSON(raw, dst)
 }
@@ -37,6 +54,7 @@ func handleAck(ctx context.Context, controller *managedredis.Controller, slot st
 	var ack managedredis.AppliedAck
 	if controller == nil || decodeControlLine(raw, &ack) != nil ||
 		controller.RecordAck(ctx, slot, peerUID, ack) != nil {
+		logRefusal("ack", "", peerUID)
 		return []byte("{\"error\":\"ack-rejected\"}\n")
 	}
 	return []byte("{\"ok\":true}\n")
@@ -79,20 +97,29 @@ func hasUnexpectedControlFields(request controlRequest, allowed controlField) bo
 }
 
 func handleControl(ctx context.Context, controller *managedredis.Controller, peerUID uint32, raw []byte) []byte {
-	if controller == nil {
-		return controlRejected()
-	}
 	var request controlRequest
-	if decodeControlLine(raw, &request) != nil {
-		return controlRejected()
+	reply := controlRejected()
+	if controller != nil && decodeControlLine(raw, &request) == nil &&
+		(peerUID == 0 || (peerUID == controllerUID && request.Operation == "status")) {
+		reply = handleControlOperation(ctx, controller, request)
 	}
-	if peerUID != 0 && (peerUID != controllerUID || request.Operation != "status") {
-		return controlRejected()
+	if isControlRejected(reply) {
+		logRefusal("control request", request.Operation, peerUID)
 	}
-	return handleControlOperation(ctx, controller, request)
+	return reply
 }
 
 func handleRecoveryControl(ctx context.Context, controller *managedredis.Controller, peerUID uint32, raw []byte) []byte {
+	reply := recoveryControl(ctx, controller, peerUID, raw)
+	if isControlRejected(reply) {
+		var request controlRequest
+		_ = decodeControlLine(raw, &request)
+		logRefusal("recovery request", request.Operation, peerUID)
+	}
+	return reply
+}
+
+func recoveryControl(ctx context.Context, controller *managedredis.Controller, peerUID uint32, raw []byte) []byte {
 	var request controlRequest
 	if controller == nil || decodeControlLine(raw, &request) != nil || hasUnexpectedControlFields(request, 0) {
 		return controlRejected()
@@ -137,6 +164,8 @@ func handleControlOperation(ctx context.Context, controller *managedredis.Contro
 }
 
 func controlRejected() []byte { return []byte("{\"error\":\"control-rejected\"}\n") }
+
+func isControlRejected(reply []byte) bool { return bytes.Equal(reply, controlRejected()) }
 
 func controlStatus(controller *managedredis.Controller, request controlRequest) []byte {
 	if hasUnexpectedControlFields(request, 0) {

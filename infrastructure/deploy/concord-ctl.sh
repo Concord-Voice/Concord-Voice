@@ -4170,11 +4170,6 @@ print(json.dumps({"operation":"register","rotationId":s["rotationId"],"instances
   python3 -c 'import json,sys; v=json.load(sys.stdin); raise SystemExit(0 if v.get("state") in ("prepared","promoted","finalized") else 1)' <<<"$response"
 }
 
-# In-place rotation on the single-media profile: register the running, already
-# bound control-plane and media-plane instances as the new rotation's expected
-# set, so their ACKs for the new target count. No container is created, stopped
-# or started. Each instance must be the slot's current binding and must hold an
-# accepted ACK proof from the prior rotation; anything else needs redis-managed-rebuild.
 redis_managed_rollback_locked() {
   local ids
   [[ $# -eq 0 ]] || { echo 'Usage: concord-ctl.sh redis-managed-rollback' >&2; return 2; }
@@ -4195,6 +4190,11 @@ redis_managed_rollback_locked() {
   echo 'Next: set REDIS_CREDENTIAL_MODE=legacy in both canonical writers, then run the approved legacy deploy.'
 }
 
+# In-place rotation on the single-media profile: register the running, already
+# bound control-plane and media-plane instances as the new rotation's expected
+# set, so their ACKs for the new target count. No container is created, stopped
+# or started. Each instance must be the slot's current binding and must hold an
+# accepted ACK proof from the prior rotation; anything else needs redis-managed-rebuild.
 redis_managed_register_running_locked() {
   local status service ids hostname registration response
   local -a cp_hosts=() media_hosts=() cp_ids=() media_ids=()

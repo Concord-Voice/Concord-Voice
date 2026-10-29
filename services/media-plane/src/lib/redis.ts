@@ -294,7 +294,14 @@ export class RedisService {
               error instanceof Error && MANAGED_FAILURE_CODES.has(error.message)
                 ? error.message
                 : 'managed_redis_refresh_failed';
-            logger.error('Managed Redis refresh failed', { code });
+            // A refused ACK leaves the applied generation serving; it is routine
+            // during an in-place rotation until the running apps are registered.
+            // Staleness below is the alert.
+            if (code === 'managed_redis_ack_failed') {
+              logger.warn('Managed Redis refresh failed', { code });
+            } else {
+              logger.error('Managed Redis refresh failed', { code });
+            }
             if (this.managedStale()) {
               logger.error(
                 'Managed Redis credential stale; serving the last validated generation',

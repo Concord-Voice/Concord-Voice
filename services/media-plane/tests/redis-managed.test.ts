@@ -533,6 +533,44 @@ describe('RedisService managed credential lifecycle', () => {
     expect(candidate.ping).toHaveBeenCalledOnce();
   });
 
+  it('logs a refused ACK on a poll as a warning while the new generation serves', async () => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    const active = fakeClient();
+    const candidate = fakeClient();
+    candidate.aclWhoAmI.mockResolvedValue('cv_mp_13');
+    let reads = 0;
+    const service = new RedisService({
+      readExact: vi.fn(async () => ({ value: reads++ === 0 ? first : next })),
+      createManagedClient: vi.fn().mockReturnValueOnce(active).mockReturnValueOnce(candidate),
+      acknowledge: vi
+        .fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValue(new Error('synthetic ack-rejected')),
+      now: () => now,
+    });
+    const refreshLogs = (level: 'warn' | 'error') =>
+      vi
+        .mocked(logger[level])
+        .mock.calls.filter(([message]) => message === 'Managed Redis refresh failed');
+
+    try {
+      await service.connect();
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(service.appliedGeneration).toBe(13);
+      expect(refreshLogs('warn')).toEqual([
+        ['Managed Redis refresh failed', { code: 'managed_redis_ack_failed' }],
+      ]);
+      expect(refreshLogs('error')).toEqual([]);
+      await service.addParticipant('still-serving', 'user-1');
+      expect(candidate.multi).toHaveBeenCalledOnce();
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects a lower generation while keeping the current client active', async () => {
     const initial = fakeClient();
     const active = fakeClient();

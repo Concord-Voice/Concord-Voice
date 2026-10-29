@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -775,4 +777,40 @@ func TestHandleControlRedisRejectsUnknownCommandKeyLuaAndArity(t *testing.T) {
 		})
 	}
 	require.Empty(t, admin.operatorArgs, "rejected operations must not reach Redis")
+}
+
+func TestRefusalsAreLoggedWithoutRequestContent(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	controller := newCLITestController(t)
+	ctx := context.Background()
+
+	handleControl(ctx, controller, 0, []byte(`{"operation":"replace-ready","slot":"control-plane","containerId":"secret-looking-id"}`))
+	handleControl(ctx, controller, 0, []byte(`{"operation":"injected\nline"}`))
+	handleAck(ctx, controller, "media-plane", 1002, []byte(`{"version":1,"rotationId":"secret-looking-rotation"}`))
+	handleRecoveryControl(ctx, controller, 1000, []byte(`{"operation":"resume"}`))
+
+	require.Equal(t, strings.Join([]string{
+		"managed Redis controller refused control request: operation=replace-ready peer_uid=0",
+		"managed Redis controller refused control request: operation=other peer_uid=0",
+		"managed Redis controller refused ack: operation=other peer_uid=1002",
+		"managed Redis controller refused recovery request: operation=resume peer_uid=1000",
+	}, "\n"), stripLogPrefixes(logs.String()))
+
+	logs.Reset()
+	require.Contains(t, string(handleControl(ctx, controller, 0, []byte(`{"operation":"status"}`))), `"state":"prepared"`)
+	require.Empty(t, logs.String(), "an accepted request is not logged")
+}
+
+func stripLogPrefixes(out string) string {
+	split := strings.Split(strings.TrimSpace(out), "\n")
+	lines := make([]string, 0, len(split))
+	for _, line := range split {
+		if i := strings.Index(line, "managed Redis"); i >= 0 {
+			line = line[i:]
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
