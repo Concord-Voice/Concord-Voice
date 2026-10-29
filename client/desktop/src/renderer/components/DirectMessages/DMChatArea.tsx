@@ -463,12 +463,14 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
                 <Timer size={18} aria-hidden="true" />
               </button>
             )}
-            {/* Join voice call (#1219 R5). Shown when this is a group DM with an
-              active voice call the local user is NOT already in — a member who
-              was offline/declined at ring, or who closed and reopened the
-              conversation, can jump in. Routes through voiceService.joinChannel
-              with the 'dm' join type, mirroring acceptIncomingCall. */}
-            {activeConv?.isGroup && activeCall && !isInThisCall && (
+            {/* Join voice call (#1219 R5, 1:1 since #4179). Shown when the DM
+              has an active voice call the local user is NOT already in — a
+              member who was offline/declined at ring, who closed and reopened
+              the conversation, or whose client exited while the peer stayed
+              in the call, can jump back in. Routes through
+              voiceService.joinChannel with the 'dm' join type, mirroring
+              acceptIncomingCall. */}
+            {activeConv && !activeConv.isPersonal && activeCall && !isInThisCall && (
               <button
                 type="button"
                 className="dm-chat-header-join-call-btn"

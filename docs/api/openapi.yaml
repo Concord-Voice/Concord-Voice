@@ -6060,6 +6060,10 @@ paths:
                 properties:
                   error:
                     type: string
+                  existing_call_id:
+                    type: string
+                    format: uuid
+                    description: The call that already owns this conversation. Present when a call row or lease exists; clients may join it through /dm/conversations/{id}/voice/join.
                   existing_ring:
                     type: object
                     properties:

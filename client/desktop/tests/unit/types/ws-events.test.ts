@@ -577,6 +577,41 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(true);
   });
 
+  // #4179: call_id scopes a terminal event to the call it belongs to.
+  it('DMVoiceStateUpdateSchema accepts a UUID call_id and preserves it', () => {
+    const result = DMVoiceStateUpdateSchema.safeParse({
+      type: 'dm_voice_state_update',
+      data: { conversation_id: UUID_A, action: 'room_empty', call_id: UUID_C },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.data.call_id).toBe(UUID_C);
+  });
+
+  it('DMVoiceStateUpdateSchema treats call_id as optional', () => {
+    const result = DMVoiceStateUpdateSchema.safeParse({
+      type: 'dm_voice_state_update',
+      data: { conversation_id: UUID_A, action: 'left', user_id: UUID_B },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.data.call_id).toBeUndefined();
+  });
+
+  it.each([
+    ['a non-UUID string', 'not-a-uuid'],
+    ['an empty string', ''],
+    ['a number', 42],
+    ['null', null],
+  ])('DMVoiceStateUpdateSchema rejects call_id that is %s', (_label, callId) => {
+    const result = DMVoiceStateUpdateSchema.safeParse({
+      type: 'dm_voice_state_update',
+      data: { conversation_id: UUID_A, action: 'room_empty', call_id: callId },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.includes('call_id'))).toBe(true);
+    }
+  });
+
   // ── DM voice call ring (4 events) — #1209 ──────────────────────────
 
   it('DMVoiceCallInvitedSchema accepts a canonical invited envelope', () => {

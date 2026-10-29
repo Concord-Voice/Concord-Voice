@@ -479,3 +479,13 @@ func (s *NATSSubscriber) RenewObservedLeaseForFutureStampedRowsForTest(
 func (s *NATSSubscriber) UseTierViolationQueueForTest(queue string) {
 	s.tierViolationQueue = queue
 }
+
+// BroadcastPrivateVoiceLeft exposes the DM "left" broadcaster (#4179).
+func (s *NATSSubscriber) BroadcastPrivateVoiceLeft(conversationID, senderID, callID uuid.UUID) {
+	s.broadcastPrivateVoiceLeft(conversationID, senderID, callID)
+}
+
+// BroadcastPrivateVoiceRoomEmpty exposes the DM "room_empty" broadcaster (#4179).
+func (s *NATSSubscriber) BroadcastPrivateVoiceRoomEmpty(channelID, callID string, conversationID uuid.UUID) {
+	s.broadcastPrivateVoiceRoomEmpty(voiceRoomEmptyEvent{ChannelID: channelID, CallID: callID}, conversationID)
+}

@@ -2582,6 +2582,199 @@ describe('VoiceService Extended', () => {
       triggerSocketEvent('connect');
       expect(useVoiceStore.getState().connectionState).toBe('connected');
     });
+
+    // ── #4179: camera restore after a network-change resume ──
+
+    function mockResumeRound(sendTransport: ReturnType<typeof makeSendTransport>) {
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      // Mic re-acquire returns audio; a camera request returns a video stream.
+      mockGetUserMedia.mockImplementation(async (constraints: MediaStreamConstraints) =>
+        constraints.video
+          ? createMockMediaStream([{ kind: 'video', id: 'cam-track' }])
+          : createMockMediaStream([{ kind: 'audio', id: 'mic-1' }])
+      );
+      sendTransport.produce.mockImplementation(
+        async (options: { appData?: { source?: string } }) =>
+          options.appData?.source === 'camera'
+            ? createMockProducer('prod-camera', 'camera')
+            : createMockProducer('prod-mic', 'mic')
+      );
+    }
+
+    function cameraCaptureCalls() {
+      return mockGetUserMedia.mock.calls.filter(
+        ([constraints]: [MediaStreamConstraints]) => !!constraints?.video
+      );
+    }
+
+    it('re-produces the camera on the chosen device when it was on before the drop', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: true, videoDeviceId: 'cam-device-42' });
+      useVoiceStore.getState().setConnectionState('reconnecting');
+      mockResumeRound(sendTransport);
+      const produceVideo = vi.spyOn(voiceService, 'produceVideo');
+
+      triggerSocketEvent('connect');
+
+      await vi.waitFor(() => {
+        expect(produceVideo).toHaveBeenCalledWith('cam-device-42');
+      });
+      // Outermost effects: the OS was asked for that exact camera, and a
+      // camera producer was published on the rebuilt send transport.
+      await vi.waitFor(() => {
+        expect(
+          sendTransport.produce.mock.calls.some(
+            ([options]: [{ appData?: { source?: string } }]) => options.appData?.source === 'camera'
+          )
+        ).toBe(true);
+      });
+      const [[cameraConstraints]] = cameraCaptureCalls();
+      expect((cameraConstraints.video as MediaTrackConstraints).deviceId).toEqual({
+        exact: 'cam-device-42',
+      });
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+      expect(useVoiceStore.getState().isVideoOn).toBe(true);
+      produceVideo.mockRestore();
+    });
+
+    it('releases the resume lock before the camera restore finishes', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: true, videoDeviceId: 'cam-device-42' });
+      useVoiceStore.getState().setConnectionState('reconnecting');
+      mockResumeRound(sendTransport);
+      // Camera capture parked on an OS prompt that never answers.
+      const produceVideo = vi
+        .spyOn(voiceService, 'produceVideo')
+        .mockReturnValue(new Promise<void>(() => {}));
+
+      triggerSocketEvent('connect');
+
+      await vi.waitFor(() => {
+        expect(produceVideo).toHaveBeenCalledWith('cam-device-42');
+      });
+      // A second network drop during the restore must be able to resume again.
+      expect((voiceService as unknown as { resumeInFlight: boolean }).resumeInFlight).toBe(false);
+      produceVideo.mockRestore();
+    });
+
+    it('skips the camera restore when the camera was turned back on during the resume', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: true });
+      const produceVideo = vi.spyOn(voiceService, 'produceVideo');
+
+      const svc = voiceService as unknown as {
+        cameraIntentRevision: number;
+        restoreCameraAfterResume(id: string, intent: number): Promise<void>;
+      };
+      await svc.restoreCameraAfterResume('channel-1', svc.cameraIntentRevision);
+
+      expect(produceVideo).not.toHaveBeenCalled();
+      produceVideo.mockRestore();
+    });
+
+    it('does not override a camera stop the user made during the resume', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: false });
+      const produceVideo = vi.spyOn(voiceService, 'produceVideo').mockResolvedValue();
+      const svc = voiceService as unknown as {
+        cameraIntentRevision: number;
+        restoreCameraAfterResume(id: string, intent: number): Promise<void>;
+      };
+      const intentAtDrop = svc.cameraIntentRevision;
+      // The user turned the camera on and then off again while the session rebuilt.
+      await voiceService.toggleVideo();
+      useVoiceStore.setState({ isVideoOn: false });
+      produceVideo.mockClear();
+
+      await svc.restoreCameraAfterResume('channel-1', intentAtDrop);
+      expect(produceVideo).not.toHaveBeenCalled();
+
+      // Control: with no toggle in between, the restore does produce.
+      await svc.restoreCameraAfterResume('channel-1', svc.cameraIntentRevision);
+      expect(produceVideo).toHaveBeenCalledTimes(1);
+      produceVideo.mockRestore();
+    });
+
+    it('does not start the camera after resume when it was off before the drop', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: false, videoDeviceId: 'cam-device-42' });
+      useVoiceStore.getState().setConnectionState('reconnecting');
+      mockResumeRound(sendTransport);
+      const produceVideo = vi.spyOn(voiceService, 'produceVideo');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      triggerSocketEvent('connect');
+
+      await vi.waitFor(() => {
+        expect(warn).toHaveBeenCalledWith('Voice media session resumed after network change');
+      });
+      await Promise.resolve();
+      expect(produceVideo).not.toHaveBeenCalled();
+      expect(cameraCaptureCalls()).toHaveLength(0);
+      expect(useVoiceStore.getState().isVideoOn).toBe(false);
+      produceVideo.mockRestore();
+      warn.mockRestore();
+    });
+
+    it('keeps the resumed call connected when the camera restore fails', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: true, videoDeviceId: 'cam-device-42' });
+      useVoiceStore.getState().setConnectionState('reconnecting');
+      mockResumeRound(sendTransport);
+      const produceVideo = vi
+        .spyOn(voiceService, 'produceVideo')
+        .mockRejectedValueOnce(new Error('camera busy'));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const cleanup = vi.spyOn(voiceService, 'emergencyCleanup');
+
+      triggerSocketEvent('connect');
+
+      await vi.waitFor(() => {
+        expect(warn).toHaveBeenCalledWith(
+          'Camera restore after network change failed:',
+          'camera busy'
+        );
+      });
+      expect(produceVideo).toHaveBeenCalledWith('cam-device-42');
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalledWith(
+        'Voice resume after network change failed:',
+        expect.anything()
+      );
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+      expect(useVoiceStore.getState().activeChannelId).toBe('channel-1');
+      expect(useVoiceStore.getState().isVideoOn).toBe(false);
+      produceVideo.mockRestore();
+      cleanup.mockRestore();
+      warn.mockRestore();
+    });
+
+    it('skips the camera restore when the call was left before the resume finished', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.setState({ isVideoOn: true, videoDeviceId: 'cam-device-42' });
+      useVoiceStore.getState().setConnectionState('reconnecting');
+      mockResumeRound(sendTransport);
+      const produceVideo = vi.spyOn(voiceService, 'produceVideo');
+      const warn = vi.spyOn(console, 'warn').mockImplementation((msg: unknown) => {
+        // The resume logs this just before the restore; the user leaves here.
+        if (msg === 'Voice media session resumed after network change') {
+          useVoiceStore.setState({ activeChannelId: 'other-channel' });
+        }
+      });
+
+      triggerSocketEvent('connect');
+
+      await vi.waitFor(() => {
+        expect(warn).toHaveBeenCalledWith('Voice media session resumed after network change');
+      });
+      await Promise.resolve();
+      expect(produceVideo).not.toHaveBeenCalled();
+      produceVideo.mockRestore();
+      warn.mockRestore();
+    });
   });
 
   describe('socket listener: reconnect_failed', () => {

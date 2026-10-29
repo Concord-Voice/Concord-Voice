@@ -883,18 +883,31 @@ function handleDMCallSounds(
   conversationId: string,
   action: string,
   userId: string | undefined,
-  soundState: DMCallSoundState
+  soundState: DMCallSoundState,
+  callId?: string
 ): void {
   const voiceState = useVoiceStore.getState();
   if (userId === useUserStore.getState().user?.id) return;
 
   const isInThisCall = voiceState.isDMCall && voiceState.dmConversationId === conversationId;
   const callState = voiceState.callState;
-  const isMatchingRingingConversation =
+  const isRingOrJoinForConversation =
     (callState.kind === 'outgoing-ringing' ||
       callState.kind === 'incoming-ringing' ||
       callState.kind === 'joining') &&
     callState.conversationId === conversationId;
+  // #4179: a late terminal event from the previous call must not silence a
+  // successor ring or join. A ring id is the call id. An outgoing ring whose
+  // id is still '' (POST in flight) has no joined peer, so a tagged event is
+  // never about it; a direct join ('joining' with no ring id) targets the
+  // conversation's live call, so a tagged event is about it. Untagged events
+  // (older servers) keep matching.
+  const isTaggedForAnotherCall =
+    callId !== undefined &&
+    isRingOrJoinForConversation &&
+    callState.ringId !== callId &&
+    !(callState.kind === 'joining' && callState.ringId === '');
+  const isMatchingRingingConversation = isRingOrJoinForConversation && !isTaggedForAnotherCall;
   const ownsBackgroundRingtone = soundState.backgroundRingtoneConversationId === conversationId;
   const context: DMCallSoundContext = {
     conversationId,
@@ -902,7 +915,9 @@ function handleDMCallSounds(
     soundState,
     voiceState,
     isInThisCall,
-    isMatchingCall: isInThisCall || isMatchingRingingConversation,
+    // joinChannel sets isDMCall before the state reaches in-call, so the
+    // stale-tag check must also gate isInThisCall during a ring or join.
+    isMatchingCall: !isTaggedForAnotherCall && (isInThisCall || isMatchingRingingConversation),
     ownsBackgroundRingtone,
     ownsAudibleBackgroundRingtone: ownsBackgroundRingtone && callState.kind === 'idle',
   };
@@ -2477,7 +2492,12 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // msg.data narrowed to DMVoiceStateUpdatePayload — conversation_id + action
     // are schema-required (UUID + VoiceActionSchema enum).
     const unsubDMVoiceState = wsService.on('dm_voice_state_update', (msg) => {
-      const { conversation_id: conversationId, action, user_id: userId } = msg.data;
+      const {
+        conversation_id: conversationId,
+        action,
+        user_id: userId,
+        call_id: callId,
+      } = msg.data;
 
       console.debug('[WebSocket] DM voice state update:', action, conversationId, userId);
 
@@ -2512,7 +2532,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // the R9 ringtone-suppression gate reads the PRE-update activeDMCalls
       // roster to distinguish the initial ring (empty roster) from a
       // subsequent group join (#1219 R9).
-      handleDMCallSounds(conversationId, action, userId, dmCallSoundState);
+      handleDMCallSounds(conversationId, action, userId, dmCallSoundState, callId);
 
       // Active DM-call roster reducer (#1219 R4). Feeds the "Join voice call"
       // header affordance (R5) and the "N of M in call" list indicator (R6).

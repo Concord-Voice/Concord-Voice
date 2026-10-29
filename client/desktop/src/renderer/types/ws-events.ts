@@ -988,6 +988,8 @@ export const DMVoiceStateUpdateSchema = z.object({
     user_id: UUID.optional(),
     username: z.string().optional(),
     display_name: z.string().optional(),
+    /** #4179: the call a `left` / `room_empty` belongs to; absent when unknown or from older servers. */
+    call_id: UUID.optional(),
   }),
 });
 

@@ -312,6 +312,83 @@ function settleResolvedRing(
 
 // ── Public caller-side methods (Task E1 implements) ────────────────────
 
+function ownsPendingRing(
+  operation: PendingRingOperation,
+  optimisticState: OutgoingRingingState
+): boolean {
+  return !operation.cancelRequested && useVoiceStore.getState().callState === optimisticState;
+}
+
+export const RING_FAILED_ERROR = 'Could not start the call. Try again.';
+
+function parseExistingCallId(body: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    const id = (parsed as { existing_call_id?: unknown }).existing_call_id;
+    return typeof id === 'string' && id !== '' ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Joins the conversation's live call through the direct DM join path (the
+ * same one the "Join voice call" button uses). joinChannel claims the joining
+ * state itself from idle; the server binds the join to the leased call, and no
+ * ring_id is sent because a direct call has no ring lease to match.
+ */
+async function joinExistingDMCall(conversationId: string): Promise<void> {
+  try {
+    await voiceService.joinChannel(conversationId, 'dm');
+  } catch (err) {
+    console.error('Joining the existing DM voice call failed:', sanitizeErrForLog(err));
+    // joinChannel names only mic and maintenance failures; keep any it set.
+    if (!useVoiceStore.getState().joinError) {
+      useVoiceStore.getState().setJoinError(RING_FAILED_ERROR);
+    }
+    throw err;
+  }
+}
+
+/** Rolls back a failed ring and, when it still spoke for the user, says so. */
+function failPendingRing(
+  conversationId: string,
+  operation: PendingRingOperation,
+  optimisticState: OutgoingRingingState
+): void {
+  const owned = ownsPendingRing(operation, optimisticState);
+  rollbackPendingRing(conversationId, operation, optimisticState);
+  if (owned) useVoiceStore.getState().setJoinError(RING_FAILED_ERROR);
+}
+
+async function handleRingRefusal(
+  conversationId: string,
+  operation: PendingRingOperation,
+  optimisticState: OutgoingRingingState,
+  response: Response
+): Promise<void> {
+  const ownedAtResponse = ownsPendingRing(operation, optimisticState);
+  rollbackPendingRing(conversationId, operation, optimisticState);
+  const revision = callOwnershipRevision;
+  const errBody = await response.text().catch(() => '');
+  // A cancel, ownership timeout or reset, or a new call started while the
+  // body was read, means this response no longer speaks for the user.
+  const stillOwned =
+    ownedAtResponse &&
+    callOwnershipRevision === revision &&
+    useVoiceStore.getState().callState.kind === 'idle';
+  // #4179: a 409 naming the live call means this conversation already has a
+  // call (the peer is still in it, or our own pre-crash session has not been
+  // reaped yet). Join it instead of dropping the ring silently.
+  if (stillOwned && response.status === 409 && parseExistingCallId(errBody)) {
+    await joinExistingDMCall(conversationId);
+    return;
+  }
+  if (stillOwned) useVoiceStore.getState().setJoinError(RING_FAILED_ERROR);
+  throw new Error(`Failed to ring (HTTP ${response.status}): ${errBody}`);
+}
+
 /**
  * initiateDMCall starts an outgoing DM voice call ring per spec §7.2.
  *
@@ -371,21 +448,21 @@ export async function initiateDMCall(conversationId: string): Promise<void> {
       headers: { 'Content-Type': 'application/json' },
     });
   } catch (err) {
-    rollbackPendingRing(conversationId, operation, optimisticState);
+    failPendingRing(conversationId, operation, optimisticState);
     throw err;
   }
 
   if (!response.ok) {
-    rollbackPendingRing(conversationId, operation, optimisticState);
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`Failed to ring (HTTP ${response.status}): ${errBody}`);
+    // Either joins the conversation's live call or throws.
+    await handleRingRefusal(conversationId, operation, optimisticState, response);
+    return;
   }
 
   let data: RingResponsePayload;
   try {
     data = (await response.json()) as typeof data;
   } catch (err) {
-    rollbackPendingRing(conversationId, operation, optimisticState);
+    failPendingRing(conversationId, operation, optimisticState);
     throw err;
   }
 

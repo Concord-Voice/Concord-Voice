@@ -57,6 +57,7 @@ import {
   handleCallCanceled,
   handleCallDeclined,
   handleCallTimedOut,
+  RING_FAILED_ERROR,
 } from '@/renderer/services/voice/voiceService/callStateMachine';
 
 const mockApiFetch = vi.mocked(apiFetch);
@@ -259,6 +260,220 @@ describe('initiateDMCall', () => {
 
     await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow(/HTTP 500/);
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  // ── #4179: ring 409 naming the live call joins it; other failures surface ──
+
+  const EXISTING_CALL_ID = '44444444-4444-4444-4444-444444444444';
+
+  it('joins the existing call from idle when the ring 409 names existing_call_id', async () => {
+    seedConversation();
+    mockApiFetch.mockResolvedValueOnce(
+      errorResponse(
+        409,
+        JSON.stringify({ error: 'call active', existing_call_id: EXISTING_CALL_ID })
+      )
+    );
+    let stateAtJoin: unknown;
+    mockJoinChannel.mockImplementationOnce(async () => {
+      stateAtJoin = useVoiceStore.getState().callState;
+    });
+
+    await expect(initiateDMCall(CONVERSATION_ID)).resolves.toBeUndefined();
+
+    expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
+    // joinChannel's DM ownership claim accepts only an idle state or a ring
+    // with a non-empty id, so the recovery must not pre-claim 'joining'.
+    expect(stateAtJoin).toEqual({ kind: 'idle' });
+    expect(useVoiceStore.getState().joinError).toBeNull();
+    // Ringback stopped by the rollback; nothing is left ringing.
+    expect(mockStopLoop).toHaveBeenCalledWith('call-outgoing');
+  });
+
+  it('does not overwrite a successor call state when the existing-call join resolves late', async () => {
+    seedConversation();
+    const join = deferred<void>();
+    mockApiFetch.mockResolvedValueOnce(
+      errorResponse(409, JSON.stringify({ existing_call_id: EXISTING_CALL_ID }))
+    );
+    mockJoinChannel.mockReturnValueOnce(join.promise as never);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(mockJoinChannel).toHaveBeenCalled());
+    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    join.resolve(undefined);
+    await initiation;
+
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('returns to idle and rejects when joining the existing call fails', async () => {
+    seedConversation();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const joinErr = new Error('join refused');
+    mockApiFetch.mockResolvedValueOnce(
+      errorResponse(409, JSON.stringify({ existing_call_id: EXISTING_CALL_ID }))
+    );
+    mockJoinChannel.mockRejectedValueOnce(joinErr);
+
+    await expect(initiateDMCall(CONVERSATION_ID)).rejects.toBe(joinErr);
+
+    expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+    expect(useVoiceStore.getState().joinError).toBe(RING_FAILED_ERROR);
+    expect(errSpy).toHaveBeenCalledWith(
+      'Joining the existing DM voice call failed:',
+      expect.anything()
+    );
+    errSpy.mockRestore();
+  });
+
+  it('keeps a specific joinError set by joinChannel when the existing-call join fails', async () => {
+    seedConversation();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockApiFetch.mockResolvedValueOnce(
+      errorResponse(409, JSON.stringify({ existing_call_id: EXISTING_CALL_ID }))
+    );
+    mockJoinChannel.mockImplementationOnce(async () => {
+      useVoiceStore.getState().setJoinError('Microphone unavailable');
+      throw new Error('mic');
+    });
+
+    await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow('mic');
+
+    expect(useVoiceStore.getState().joinError).toBe('Microphone unavailable');
+    errSpy.mockRestore();
+  });
+
+  it('does not join or raise an error when a 409 arrives after the ring was abandoned', async () => {
+    seedConversation();
+    const ring = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(ring.promise);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    // A store reset while /ring is pending releases local ownership.
+    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    ring.resolve(errorResponse(409, JSON.stringify({ existing_call_id: EXISTING_CALL_ID })));
+
+    await expect(initiation).rejects.toThrow('HTTP 409');
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().joinError).toBeNull();
+  });
+
+  it('does not join when another call started and ended while the 409 body was read', async () => {
+    seedConversation();
+    const body = deferred<string>();
+    mockApiFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      text: () => body.promise,
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState.kind).toBe('idle'));
+    // Back to idle again, but the ownership revision moved on.
+    useVoiceStore.getState().setCallState({ kind: 'in-call' });
+    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    body.resolve(JSON.stringify({ existing_call_id: EXISTING_CALL_ID }));
+
+    await expect(initiation).rejects.toThrow('HTTP 409');
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().joinError).toBeNull();
+  });
+
+  it('does not raise an error when the ring request fails after it was abandoned', async () => {
+    seedConversation();
+    const ring = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(ring.promise);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    ring.reject(new Error('network'));
+
+    await expect(initiation).rejects.toThrow('network');
+    expect(useVoiceStore.getState().joinError).toBeNull();
+  });
+
+  it('sets joinError when the ring response body is malformed', async () => {
+    seedConversation();
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError('bad json');
+      },
+    } as unknown as Response);
+
+    await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow('bad json');
+    expect(useVoiceStore.getState().joinError).toBe(RING_FAILED_ERROR);
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('does not join when another call starts while the 409 body is read', async () => {
+    seedConversation();
+    const body = deferred<string>();
+    mockApiFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      text: () => body.promise,
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState.kind).toBe('idle'));
+    useVoiceStore.getState().setCallState({ kind: 'in-call' });
+    body.resolve(JSON.stringify({ existing_call_id: EXISTING_CALL_ID }));
+
+    await expect(initiation).rejects.toThrow('HTTP 409');
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+    expect(useVoiceStore.getState().joinError).toBeNull();
+  });
+
+  it.each([
+    ['409 without existing_call_id', 409, JSON.stringify({ error: 'already ringing' })],
+    ['409 with a non-JSON body', 409, 'already ringing'],
+    ['409 with an empty existing_call_id', 409, JSON.stringify({ existing_call_id: '' })],
+    ['409 with a non-string existing_call_id', 409, JSON.stringify({ existing_call_id: 42 })],
+    ['409 with a JSON null body', 409, 'null'],
+    [
+      '500 even when the body names a call',
+      500,
+      JSON.stringify({ existing_call_id: EXISTING_CALL_ID }),
+    ],
+  ])(
+    'sets joinError to RING_FAILED_ERROR and does not join on %s',
+    async (_label, status, body) => {
+      seedConversation();
+      mockApiFetch.mockResolvedValueOnce(errorResponse(status, body));
+
+      await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow(`HTTP ${status}`);
+
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+      expect(useVoiceStore.getState().joinError).toBe(RING_FAILED_ERROR);
+      expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+    }
+  );
+
+  it('sets joinError to RING_FAILED_ERROR when the ring request throws (network error)', async () => {
+    seedConversation();
+    const netErr = new Error('network');
+    mockApiFetch.mockRejectedValueOnce(netErr);
+
+    await expect(initiateDMCall(CONVERSATION_ID)).rejects.toBe(netErr);
+
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().joinError).toBe(RING_FAILED_ERROR);
+  });
+
+  it('leaves joinError untouched on a successful ring', async () => {
+    seedConversation();
+    mockApiFetch.mockResolvedValueOnce(ringResponse());
+
+    await initiateDMCall(CONVERSATION_ID);
+
+    expect(useVoiceStore.getState().joinError).toBeNull();
   });
 });
 

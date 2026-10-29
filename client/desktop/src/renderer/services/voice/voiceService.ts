@@ -919,6 +919,8 @@ class VoiceService {
   private emergencyCleanupGeneration = 0;
   /** Single-flight guard for #1790 network-change media-session resume. */
   private resumeInFlight = false;
+  /** Bumped on every user camera toggle; a post-resume camera restore yields to it (#4179). */
+  private cameraIntentRevision = 0;
   private localCameraStream: MediaStream | null = null;
   private cameraReplacementProducerId: string | null = null;
   private localScreenStream: MediaStream | null = null;
@@ -4627,6 +4629,9 @@ class VoiceService {
     const cleanupGeneration = this.emergencyCleanupGeneration;
     const resumeSocket = this.socket;
     const joinType: 'channel' | 'dm' = store.isDMCall ? 'dm' : 'channel';
+    let restoreCamera = false;
+    let resumed = false;
+    let cameraIntent = 0;
     try {
       // Step 1 (as in joinChannel): re-authorize via control plane so
       // enforcement flags and media entitlements are fresh.
@@ -4647,7 +4652,11 @@ class VoiceService {
       // could never prune these maps).
       store.resetScreenShareConsumption();
       // Local camera/screen producers did not survive the network change;
-      // reflect that honestly instead of showing a dead camera as live.
+      // reflect that honestly instead of showing a dead camera as live. The
+      // camera is re-produced below once the session is rebuilt (#4179);
+      // screen share needs a fresh source pick, so it stays off.
+      restoreCamera = useVoiceStore.getState().isVideoOn;
+      cameraIntent = this.cameraIntentRevision;
       store.setVideoOn(false);
       store.setScreenSharing(false);
 
@@ -4683,6 +4692,7 @@ class VoiceService {
       // PII-safe diagnostic: distinguishes an expected network-transition
       // recovery from a fatal voice disconnect (issue acceptance criterion).
       console.warn('Voice media session resumed after network change');
+      resumed = true;
     } catch (err) {
       if (this.socket !== resumeSocket || useVoiceStore.getState().activeChannelId !== channelId) {
         return;
@@ -4703,6 +4713,28 @@ class VoiceService {
       }
     } finally {
       this.resumeInFlight = false;
+    }
+    // Outside the resume lock: camera capture can wait on an OS prompt, and a
+    // second network drop during it must still be able to start a new resume.
+    if (resumed && restoreCamera) await this.restoreCameraAfterResume(channelId, cameraIntent);
+  }
+
+  /**
+   * #4179: the old camera producer died with the dropped socket and the peer
+   * already saw it closed, so a camera that was on before the drop is produced
+   * again on the rebuilt session. Best effort: a capture failure, or the video
+   * slots filling while we were disconnected, leaves the call up with the
+   * camera off, exactly as before this restore existed.
+   */
+  private async restoreCameraAfterResume(channelId: string, cameraIntent: number): Promise<void> {
+    const store = useVoiceStore.getState();
+    // A camera toggle during the resume is the user's decision; never override it.
+    if (store.activeChannelId !== channelId || store.isVideoOn) return;
+    if (this.cameraIntentRevision !== cameraIntent) return;
+    try {
+      await this.produceVideo(store.videoDeviceId || undefined);
+    } catch (err) {
+      console.warn('Camera restore after network change failed:', errorMessage(err));
     }
   }
 
@@ -6635,6 +6667,7 @@ class VoiceService {
 
   /** Toggle video (start/stop camera) */
   async toggleVideo(): Promise<void> {
+    this.cameraIntentRevision += 1;
     const store = useVoiceStore.getState();
     if (store.isVideoOn) {
       await this.closeProducer('camera');

@@ -2115,8 +2115,47 @@ describe('DMChatArea', () => {
     expect(screen.queryByRole('button', { name: /join voice call/i })).not.toBeInTheDocument();
   });
 
-  it('does not show Join voice call for a 1:1 conversation', () => {
+  // #4179: a 1:1 peer left in the call after this client exited must be
+  // rejoinable from the header, exactly like a group call.
+  it('shows Join voice call for a 1:1 conversation with an active call the user is not in', () => {
     useDMStore.setState({ conversations: [makeConversation()] });
+    useVoiceStore.getState().seedActiveDMCall('conv-1', ['user-2'], 2);
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(screen.getByRole('button', { name: /join voice call/i })).toBeInTheDocument();
+  });
+
+  it('clicking Join voice call in a 1:1 conversation joins the DM channel', () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    useVoiceStore.getState().seedActiveDMCall('conv-1', ['user-2'], 2);
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    fireEvent.click(screen.getByRole('button', { name: /join voice call/i }));
+    expect(mockJoinChannel).toHaveBeenCalledWith('conv-1', 'dm');
+  });
+
+  it('hides Join voice call for a 1:1 conversation with no active call', () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(screen.queryByRole('button', { name: /join voice call/i })).not.toBeInTheDocument();
+  });
+
+  it('hides Join voice call for a 1:1 conversation when the user is already in that call', () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    useVoiceStore.getState().seedActiveDMCall('conv-1', ['user-1', 'user-2'], 2);
+    useVoiceStore.getState().setDMCall(true, 'conv-1');
+    useVoiceStore.getState().setCallState({ kind: 'in-call' });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(screen.queryByRole('button', { name: /join voice call/i })).not.toBeInTheDocument();
+  });
+
+  it('never shows Join voice call for personal notes, even with a call roster', () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          isPersonal: true,
+          participants: [{ userId: 'user-1', username: 'me' }],
+        }),
+      ],
+    });
     useVoiceStore.getState().seedActiveDMCall('conv-1', ['user-2'], 2);
     render(<DMChatArea selectedThreadId="conv-1" />);
     expect(screen.queryByRole('button', { name: /join voice call/i })).not.toBeInTheDocument();
