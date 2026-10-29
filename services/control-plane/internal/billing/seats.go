@@ -118,6 +118,7 @@ const (
 	// eligibleInviteeSQL: an accepted friendship in either direction, no
 	// blocked friendship in either direction, and no DM-block reconciliation
 	// pending for the pair (dm_block_reconciliations stores user_a < user_b).
+	// Read at invite and again at accept, both under the seat locks.
 	eligibleInviteeSQL = `SELECT
 		EXISTS (SELECT 1 FROM friendships WHERE status = 'accepted'
 		        AND ((requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)))

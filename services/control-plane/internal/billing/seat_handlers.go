@@ -72,7 +72,9 @@ func (s *Service) SeatInvite(c *gin.Context) {
 	}
 	out, err := s.runSeatTx(ctx, stripeSubID, users,
 		func(tx *sql.Tx, present map[uuid.UUID]bool) (seatOutcome, error) {
-			return s.inviteLocked(ctx, tx, present, subRowID, caller, invitee, displaced, req.Replace)
+			return s.inviteLocked(ctx, tx, present, seatInviteOp{
+				subRowID: subRowID, payer: caller, invitee: invitee, displaced: displaced, replace: req.Replace,
+			})
 		})
 	if err != nil {
 		s.seatFailed(c, "invite", err)
@@ -88,13 +90,19 @@ func (s *Service) SeatInvite(c *gin.Context) {
 	}})
 }
 
-// inviteLocked is the invite under the advisory key and the users' locks;
-// displaced is the open seat's holder as read before locking (uuid.Nil when
-// there was none). The cooldown is checked before replace revokes anything,
-// so a refused swap leaves the old seat intact.
-func (s *Service) inviteLocked(ctx context.Context, tx *sql.Tx, present map[uuid.UUID]bool,
-	subRowID, payer, invitee, displaced uuid.UUID, replace bool,
+// seatInviteOp is one invite as the handler read it before locking. displaced
+// is the open seat's holder at that read (uuid.Nil when there was none).
+type seatInviteOp struct {
+	subRowID, payer, invitee, displaced uuid.UUID
+	replace                             bool
+}
+
+// inviteLocked is the invite under the advisory key and the users' locks. The
+// cooldown is checked before replace revokes anything, so a refused swap
+// leaves the old seat intact.
+func (s *Service) inviteLocked(ctx context.Context, tx *sql.Tx, present map[uuid.UUID]bool, op seatInviteOp,
 ) (seatOutcome, error) {
+	subRowID, payer, invitee, displaced, replace := op.subRowID, op.payer, op.invitee, op.displaced, op.replace
 	if !present[payer] {
 		return seatOutcome{}, refuse(http.StatusConflict, seatErrNotPayer)
 	}
@@ -160,14 +168,17 @@ func (s *Service) replaceOpenSeat(ctx context.Context, tx *sql.Tx, out *seatOutc
 	if state == SeatStateActive {
 		reason = seatEndPayerSwapped
 	}
-	return s.endWithTier(ctx, tx, out, seatID, payer, holder, state, SeatStateRevoked, reason)
+	seat := seatChange{seatID: seatID, payer: payer, holder: holder}
+	return s.endWithTier(ctx, tx, out, seat, state, SeatStateRevoked, reason)
 }
 
-// endWithTier ends one open seat and records the change, plus the holder's
-// tier on both sides when the seat was active.
+// endWithTier ends one open seat (seat names it; its state is ignored) and
+// records the change, plus the holder's tier on both sides when the seat was
+// active.
 func (s *Service) endWithTier(ctx context.Context, tx *sql.Tx, out *seatOutcome,
-	seatID, payer, holder uuid.UUID, fromState, toState, reason string,
+	seat seatChange, fromState, toState, reason string,
 ) error {
+	seatID, payer, holder := seat.seatID, seat.payer, seat.holder
 	var before string
 	var err error
 	if fromState == SeatStateActive {
@@ -280,7 +291,8 @@ func (s *Service) endOpenSeatLocked(ctx context.Context, tx *sql.Tx, seatID, pay
 		return seatOutcome{}, refuse(http.StatusNotFound, seatErrNoSeat)
 	}
 	var out seatOutcome
-	if err := s.endWithTier(ctx, tx, &out, seatID, payer, holder, state, toState, reason); err != nil {
+	seat := seatChange{seatID: seatID, payer: payer, holder: holder}
+	if err := s.endWithTier(ctx, tx, &out, seat, state, toState, reason); err != nil {
 		return seatOutcome{}, err
 	}
 	return out, nil
@@ -320,8 +332,9 @@ func (s *Service) SeatAccept(c *gin.Context) {
 }
 
 // acceptLocked is accept under its locks, in the spec's order: the
-// caller-scoped re-read, expiry and the parent (410), the caller's own live
-// Stripe row (409), the cooldown, then the active-holder index.
+// caller-scoped re-read, eligibility again (404), expiry and the parent (410),
+// the caller's own live Stripe row (409), the cooldown, then the active-holder
+// index.
 func (s *Service) acceptLocked(ctx context.Context, tx *sql.Tx, present map[uuid.UUID]bool,
 	seatID, payer, holder uuid.UUID,
 ) (seatOutcome, error) {
@@ -336,6 +349,21 @@ func (s *Service) acceptLocked(ctx context.Context, tx *sql.Tx, present map[uuid
 	}
 	if err != nil {
 		return seatOutcome{}, withStage(stageSeatRead, err)
+	}
+	// Eligibility was last read when the invite was created; an unfriend or a
+	// block since then must not leave a seat the payer pays for. It is read
+	// again here under the locks the activation holds, so a block in flight is
+	// either committed (and seen) or waits behind this accept. The refusal is
+	// the one an unknown, declined or withdrawn invite gets, so the invitee
+	// cannot tell a block from the payer taking the invite back, and it comes
+	// before every refusal that carries a detail (the own-plan end, the
+	// cooldown date), which a blocked invitee must not learn.
+	var eligible bool
+	if err := tx.QueryRowContext(ctx, eligibleInviteeSQL, payer, holder).Scan(&eligible); err != nil {
+		return seatOutcome{}, withStage(stageSeatRead, err)
+	}
+	if !eligible {
+		return seatOutcome{}, refuse(http.StatusNotFound, seatErrInviteNotFound)
 	}
 	live, err := parentLive(ctx, tx, subRowID, payer)
 	if err != nil {

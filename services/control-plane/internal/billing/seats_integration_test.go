@@ -324,7 +324,9 @@ func TestSeat_SwapLocksTheDisplacedHolder(t *testing.T) {
 	ctx := context.Background()
 	_, err = env.Svc.runSeatTx(ctx, subID, []uuid.UUID{payer, other, first},
 		func(tx *sql.Tx, present map[uuid.UUID]bool) (seatOutcome, error) {
-			return env.Svc.inviteLocked(ctx, tx, present, subRowID, payer, other, first, true)
+			return env.Svc.inviteLocked(ctx, tx, present, seatInviteOp{
+				subRowID: subRowID, payer: payer, invitee: other, displaced: first, replace: true,
+			})
 		})
 	var refused *errSeatRefused
 	require.ErrorAs(t, err, &refused)

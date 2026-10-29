@@ -26,7 +26,8 @@ relay and the media server share one public address.
 
 A Wing subscription can now share Supersonic with one friend. Invite a friend
 from Settings ▸ Subscription; they get Supersonic once they accept, for as long
-as your Wing is active. You can change your +1 once every 30 days.
+as your Wing is active. You can change your +1 once every 30 days. If you
+unfriend or block someone after inviting them, they can no longer accept.
 
 Opening the web address in a browser now shows a link to download the desktop
 app, instead of an "Update Required" prompt that could not be completed.
