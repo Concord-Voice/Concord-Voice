@@ -28,6 +28,23 @@ npm run ios                                         # or: npm run android
 
 `bundle install` needs Ruby 3.2 or newer, so install one with Homebrew or rbenv first; macOS's system Ruby 2.6 is too old.
 
+To verify a Jest upgrade, check discovery and execute the suites without a cached
+transform:
+
+```sh
+npm test -- --listTests --maxWorkers=2
+npm test -- --runInBand --no-cache
+npm ls jest babel-jest jest-environment-node @react-native/jest-preset
+```
+
+The Jest 30 runner resolves its Babel transformer to `babel-jest` 30 while using
+the React Native 0.87.1 preset's native environment, which extends
+`jest-environment-node` 29. The installed dependency tree also contains Babel
+transformer 29 through the preset. Check `npm test -- --showConfig` when changing
+these dependencies; the App, core and ConcordCrypto suites exercise rendering,
+timers and native-module mocks together. Native crypto execution still requires
+the iOS test target.
+
 The repository refuses keystore files, so Android debug builds need a local one:
 
 ```sh

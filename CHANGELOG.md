@@ -43,6 +43,7 @@ gate can learn from your voice.
 
 ### Changed
 
+- **Voice:** The desktop call library handles mixed audio and video RTP header extensions with mediasoup-client 3.25.3.
 - **Accessibility:** The desktop app follows the system's reduced-motion setting, hides decorative icons from screen readers, and shows text while bundled fonts load.
 - **Plans:** Every account can create any number of servers, search as far back as a subscriber, and customize theme colors. One account can create up to 10 servers in 24 hours.
 - **Web:** Opening the web address in a browser shows a link to download the desktop app, not an "Update Required" prompt.
