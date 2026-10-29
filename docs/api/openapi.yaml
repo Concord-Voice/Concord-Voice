@@ -1074,13 +1074,13 @@ paths:
     post:
       tags:
       - Auth
-      summary: Create a social recovery request
-      description: 'Create a Shamir-secret-sharing recovery request (24-hour expiry) for the user''s recovery
-        circle. Requires a valid recovery token.
-
-        Rate limit: 3 requests per 15 minutes (IP-based).
-
-        '
+      summary: Social recovery request creation is temporarily paused
+      description: >-
+        After the unchanged AuthBanCheck parent gate, always returns the exact Recovery Circle pause
+        response without reading the body or recovery token. Does not create a request or access
+        recovery data. Runs before the route-specific limiter, whose counter is not advanced.
+        AuthBanCheck can still access Redis and return 429 with Retry-After. The pause itself sets no
+        Retry-After. Request definitions remain for dormant compatibility; no success response is reachable.
       operationId: createSocialRecoveryRequest
       security: []
       requestBody:
@@ -1090,50 +1090,21 @@ paths:
             schema:
               $ref: '#/components/schemas/RecoveryRequestCreate'
       responses:
-        '200':
-          description: Social recovery request created
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  request_id:
-                    type: string
-                    format: uuid
-                  threshold_k:
-                    type: integer
-                    description: Guardian shares required to complete recovery
-        '400':
-          description: Invalid body, no recovery circle configured, or malformed base64 ephemeral key
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Invalid or expired recovery token
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
-          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/RecoveryCirclePaused'
   /auth/recovery/social-request/{id}:
     get:
       tags:
       - Auth
-      summary: Poll a social recovery request
-      description: 'Poll request status and guardian share progress. Recovery token via `Authorization:
-        Bearer` header or `recovery_token` query parameter.
-
-        Rate limit: 10 requests per 15 minutes (IP-based).
-
-        '
+      summary: Social recovery polling is temporarily paused
+      description: >-
+        After the unchanged AuthBanCheck parent gate, always returns the exact Recovery Circle pause
+        response, regardless of request existence, status or recovery token. No shares are returned,
+        including for complete requests. Runs before the route-specific limiter, whose counter is not
+        advanced. AuthBanCheck can still access Redis and return 429 with Retry-After. The pause itself
+        sets no Retry-After. Stored requests remain unchanged; no success response is reachable.
       operationId: pollSocialRecoveryRequest
       security: []
       parameters:
@@ -1151,58 +1122,10 @@ paths:
           type: string
         description: Recovery token (alternative to the Authorization Bearer header)
       responses:
-        '200':
-          description: Current status (`pending`, `complete`, or `expired`); guardian responses included
-            when complete
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                  shares_received:
-                    type: integer
-                  threshold_k:
-                    type: integer
-                  responses:
-                    type: array
-                    description: Present when status is complete
-                    items:
-                      type: object
-                      properties:
-                        contact_id:
-                          type: string
-                          format: uuid
-                        encrypted_share:
-                          type: string
-                          format: byte
-        '400':
-          description: Recovery token missing
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Invalid or expired recovery token
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Social recovery request not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
-          description: Recovery policy unavailable; token remains unconsumed and no authentication failure is recorded
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/RecoveryCirclePaused'
   /auth/recovery/verify-code:
     post:
       tags:
@@ -11211,26 +11134,27 @@ paths:
     get:
       tags:
       - MFA
-      summary: List recovery shares held for others
-      description: 'Returns the encrypted Shamir shares this user holds as a contact in
-
-        other users'' recovery circles.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      summary: Recovery Circle share release is temporarily paused
+      description: >-
+        After the unchanged authentication, client-version, attestation and verified-email gates,
+        returns the exact Recovery Circle pause response without releasing any held shares.
+        Service-hop middleware remains unchanged; Circle routes are outside its voice-route allowlist.
+        Runs before the route-specific limiter without advancing its counter or accessing recovery data.
+        Parent gates retain their existing refusals; the pause sets no Retry-After.
       operationId: mfaGetMyRecoveryShares
       security:
       - BearerAuth: []
       responses:
-        '200':
-          description: Held recovery shares
+        '401':
+          description: Unchanged parent authentication refusal
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/RecoveryCircleShare'
+                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/RecoveryCircleParentForbidden'
+        '503':
+          $ref: '#/components/responses/RecoveryCirclePausedOrParentUnavailable'
   /mfa/recovery-hardened:
     put:
       tags:
@@ -11633,43 +11557,40 @@ paths:
     get:
       tags:
       - MFA
-      summary: List pending social recovery requests
-      description: 'Returns pending, unexpired social recovery requests where the
-
-        authenticated user is a circle contact.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
+      summary: Social recovery request listing is temporarily paused
+      description: >-
+        After the unchanged authentication, client-version, attestation and verified-email gates,
+        returns the exact Recovery Circle pause response without listing requests or inviting approval.
+        Service-hop middleware remains unchanged; Circle routes are outside its voice-route allowlist.
+        Runs before the route-specific limiter without advancing its counter or accessing recovery data.
+        Stored requests remain unchanged. Parent gates retain their existing refusals; the pause sets no Retry-After.
       operationId: mfaListSocialRecoveryRequests
       security:
       - BearerAuth: []
       responses:
-        '200':
-          description: Pending social recovery requests
+        '401':
+          description: Unchanged parent authentication refusal
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  requests:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/SocialRecoveryRequestSummary'
+                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/RecoveryCircleParentForbidden'
+        '503':
+          $ref: '#/components/responses/RecoveryCirclePausedOrParentUnavailable'
   /mfa/recovery-requests/social/{id}/respond:
     post:
       tags:
       - MFA
-      summary: Submit a share for a social recovery request
-      description: 'As a circle contact, submits the re-encrypted Shamir share for a pending
-
-        social recovery request. The request completes when the share threshold
-
-        is met.
-
-        Rate limit: 5 requests per minute (user-based).
-
-        '
+      summary: Social recovery share submission is temporarily paused
+      description: >-
+        After the unchanged authentication, client-version, attestation and verified-email gates,
+        returns the exact Recovery Circle pause response without reading the body, submitting a share
+        or advancing a request. The refusal is independent of request existence and status.
+        Service-hop middleware remains unchanged; Circle routes are outside its voice-route allowlist.
+        Runs before the route-specific limiter without advancing its counter or accessing recovery data.
+        Parent gates retain their existing refusals; the pause sets no Retry-After. Request definitions
+        remain for dormant compatibility; no success response is reachable.
       operationId: mfaRespondToSocialRecovery
       security:
       - BearerAuth: []
@@ -11694,37 +11615,16 @@ paths:
                   type: string
                   description: Base64 — share re-encrypted to the requester's ephemeral public key
       responses:
-        '200':
-          description: Share submitted
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                  shares_received:
-                    type: integer
-                  threshold_met:
-                    type: boolean
-        '400':
-          description: Missing/invalid base64 share, request no longer pending, or request expired
+        '401':
+          description: Unchanged parent authentication refusal
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '404':
-          description: Recovery request not found or you are not a contact
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409':
-          description: You have already responded to this request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/RecoveryCircleParentForbidden'
+        '503':
+          $ref: '#/components/responses/RecoveryCirclePausedOrParentUnavailable'
   /mfa/recovery-requests/{id}/respond:
     post:
       tags:
@@ -19240,6 +19140,51 @@ components:
         pattern: ^[a-zA-Z0-9-]{1,100}$
       description: KLIPY GIF slug (1-100 characters of [a-zA-Z0-9-])
   responses:
+    RecoveryCirclePaused:
+      description: >-
+        Recovery Circle recovery is temporarily paused. After the existing parent gates, the terminal
+        middleware always returns this exact two-field body. It reads no body or identifiers, performs
+        no dependency work, changes no stored recovery data, and aborts before route-specific limiters
+        and handlers. No Retry-After header is set and no reopening date is promised.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RecoveryCirclePausedError'
+          example:
+            error: Recovery Circle recovery is temporarily paused. Use another recovery method.
+            error_code: recovery_circle_paused
+    RecoveryCirclePausedOrParentUnavailable:
+      description: >-
+        After the existing parent gates, the terminal pause returns exactly the recovery_circle_paused
+        body, with no Retry-After header and no body parsing, dependency work, stored-data changes or
+        route-specific limiter execution. Before the pause, authentication or attestation dependencies
+        may instead return their unchanged unavailable response. No success response is reachable.
+      content:
+        application/json:
+          schema:
+            anyOf:
+            - $ref: '#/components/schemas/RecoveryCirclePausedError'
+            - $ref: '#/components/schemas/Error'
+          examples:
+            paused:
+              value:
+                error: Recovery Circle recovery is temporarily paused. Use another recovery method.
+                error_code: recovery_circle_paused
+            authenticationUnavailable:
+              value:
+                error: Authentication temporarily unavailable
+            attestationUnavailable:
+              value:
+                error: attestation registry temporarily unavailable
+    RecoveryCircleParentForbidden:
+      description: Unchanged parent refusal for disabled account, unverified email, client version or attestation
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/AccountDisabledError'
+            - $ref: '#/components/schemas/EmailVerificationError'
+            - $ref: '#/components/schemas/AttestationError'
     VoiceCommandQueueFull:
       description: Enforcement queue capacity is exhausted. The mutation rolls back; retry after the stated delay.
       headers:
@@ -20423,6 +20368,18 @@ components:
       - usernameChangeIntervalSeconds
       - maxServersCreated
       - messageHistorySearchDays
+    RecoveryCirclePausedError:
+      type: object
+      additionalProperties: false
+      required: [error, error_code]
+      properties:
+        error:
+          type: string
+          enum:
+          - Recovery Circle recovery is temporarily paused. Use another recovery method.
+        error_code:
+          type: string
+          enum: [recovery_circle_paused]
     Error:
       type: object
       properties:

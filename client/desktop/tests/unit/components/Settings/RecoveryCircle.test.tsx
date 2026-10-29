@@ -171,9 +171,13 @@ describe('RecoveryCircle', () => {
     expect(screen.getByText('Set Up Recovery Circle')).toBeInTheDocument();
   });
 
-  it('renders explanatory text about Shamir Secret Sharing', () => {
+  it('#3676 explains that saving a configuration does not activate recovery', () => {
     render(<RecoveryCircle onComplete={onComplete} onCancel={onCancel} />);
-    expect(screen.getByText(/Shamir/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'You can save a Recovery Circle configuration, but Recovery Circle recovery is temporarily paused.'
+      )
+    ).toBeInTheDocument();
   });
 
   it('renders friend list with checkboxes', () => {
@@ -310,7 +314,7 @@ describe('RecoveryCircle', () => {
     fireEvent.click(screen.getByText('Continue'));
   };
 
-  const primary = () => screen.getByRole('button', { name: 'Create Recovery Circle' });
+  const primary = () => screen.getByRole('button', { name: 'Save Recovery Circle' });
   const typePassword = (value = FIXTURE_PW) =>
     fireEvent.change(screen.getByLabelText('Password'), { target: { value } });
   /** Resolves once the primary can act: the read landed and the shares are prepared. */
@@ -322,17 +326,21 @@ describe('RecoveryCircle', () => {
     openConfirm(3);
 
     expect(screen.getByText('Confirm Recovery Circle')).toBeInTheDocument();
-    expect(screen.getByText(/3 of 3/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Save this configuration for 3 of 3 contacts. Recovery is temporarily paused. Verify your identity to save the configuration.'
+      )
+    ).toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
   });
 
-  it('shows Create Recovery Circle button on confirm step', () => {
+  it('shows Save Recovery Circle button on confirm step', () => {
     render(<RecoveryCircle onComplete={onComplete} onCancel={onCancel} />);
     openConfirm(3);
     expect(primary()).toBeInTheDocument();
   });
 
-  it('keeps Create Recovery Circle aria-disabled, not natively disabled, with no password', async () => {
+  it('keeps Save Recovery Circle aria-disabled, not natively disabled, with no password', async () => {
     render(<RecoveryCircle onComplete={onComplete} onCancel={onCancel} />);
     openConfirm(3);
     await waitFor(() => expect(publicKeyCalls()).toHaveLength(3));
@@ -368,7 +376,7 @@ describe('RecoveryCircle', () => {
       expect(screen.queryByLabelText('Backup code')).not.toBeInTheDocument();
       fireEvent.click(primary());
 
-      await screen.findByText('Recovery Circle Configured');
+      await screen.findByText('Recovery Circle saved — recovery paused');
       expect(putCalls()).toHaveLength(1);
       expect(putCalls()[0].body).not.toHaveProperty('mfa_code');
       expect(putCalls()[0].body).toMatchObject({ password: FIXTURE_PW });
@@ -403,7 +411,7 @@ describe('RecoveryCircle', () => {
       await untilActionable();
       fireEvent.click(primary());
 
-      await screen.findByText('Recovery Circle Configured');
+      await screen.findByText('Recovery Circle saved — recovery paused');
       expect(putCalls()[0].body).toMatchObject({ password: FIXTURE_PW, mfa_code: FIXTURE_OTP });
     });
 
@@ -427,7 +435,7 @@ describe('RecoveryCircle', () => {
       await untilActionable();
       fireEvent.click(primary());
 
-      await screen.findByText('Recovery Circle Configured');
+      await screen.findByText('Recovery Circle saved — recovery paused');
       expect(putCalls()[0].body).toMatchObject({ mfa_code: 'EXCI3G5F' });
     });
 
@@ -464,7 +472,7 @@ describe('RecoveryCircle', () => {
       await untilActionable();
       expect(putCalls()).toHaveLength(0);
       fireEvent.click(primary());
-      await screen.findByText('Recovery Circle Configured');
+      await screen.findByText('Recovery Circle saved — recovery paused');
     });
 
     // Mutant: `submit` awaits preparation itself. Nothing would be fetched when
@@ -494,7 +502,7 @@ describe('RecoveryCircle', () => {
       expect(putCalls()).toHaveLength(0);
 
       fireEvent.click(primary());
-      await screen.findByText('Recovery Circle Configured');
+      await screen.findByText('Recovery Circle saved — recovery paused');
 
       // The activation fetched nothing more, and the PUT came after every fetch.
       expect(publicKeyCalls()).toHaveLength(2);
@@ -512,7 +520,7 @@ describe('RecoveryCircle', () => {
       typePassword();
       await untilActionable();
       fireEvent.click(primary());
-      await screen.findByText('Recovery Circle Configured');
+      await screen.findByText('Recovery Circle saved — recovery paused');
 
       const [put] = putCalls();
       expect(put.context).toBeDefined();
@@ -533,7 +541,7 @@ describe('RecoveryCircle', () => {
 
       await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Sign in again'));
       expect(putCalls()).toHaveLength(0);
-      expect(screen.queryByText('Recovery Circle Configured')).not.toBeInTheDocument();
+      expect(screen.queryByText('Recovery Circle saved — recovery paused')).not.toBeInTheDocument();
     });
 
     it('returns to the select step with the reason when the keys cannot be unlocked', async () => {
@@ -578,9 +586,35 @@ describe('RecoveryCircle', () => {
     fireEvent.click(primary());
 
     await waitFor(() => {
-      expect(screen.getByText('Setting up...')).toBeInTheDocument();
+      expect(screen.getByText('Saving…')).toBeInTheDocument();
     });
     expect(screen.getByRole('button', { name: 'Back' })).toBeDisabled();
+  });
+
+  it('#3676 preserves the ceremony waiting label before saving a configuration', async () => {
+    const webauthn = await import('@/renderer/services/system/webauthnInlineStepUp');
+    const begin = deferred<PublicKeyCredentialRequestOptions>();
+    const beginSpy = vi
+      .spyOn(webauthn, 'beginWebAuthnInlineVerification')
+      .mockImplementation(() => begin.promise);
+    serve({ read: () => readOffers(['webauthn']) });
+    try {
+      render(<RecoveryCircle onComplete={onComplete} onCancel={onCancel} />);
+      openConfirm();
+      typePassword();
+      await untilActionable();
+      fireEvent.click(primary());
+      expect(await screen.findByRole('button', { name: 'Waiting…' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
+      expect(putCalls()).toHaveLength(0);
+      await act(async () => begin.reject(new DOMException('Cancelled', 'NotAllowedError')));
+      await screen.findByRole('button', { name: 'Save Recovery Circle' });
+      expect(putCalls()).toHaveLength(0);
+    } finally {
+      beginSpy.mockRestore();
+    }
   });
 
   it('shows done step after successful setup', async () => {
@@ -591,9 +625,16 @@ describe('RecoveryCircle', () => {
     fireEvent.click(primary());
 
     await waitFor(() => {
-      expect(screen.getByText('Recovery Circle Configured')).toBeInTheDocument();
-      expect(screen.getByText('Recovery Circle Active')).toBeInTheDocument();
+      expect(screen.getByText('Recovery Circle saved — recovery paused')).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          'Your configuration is saved. Recovery Circle recovery is temporarily paused.'
+        )
+      ).toBeInTheDocument();
     });
+    expect(
+      screen.getByRole('heading', { name: 'Recovery Circle saved — recovery paused', level: 3 })
+    ).toHaveStyle({ color: 'var(--text-primary)' });
     expect(putCalls()[0].body).toMatchObject({
       threshold_k: 2,
       total_shares_n: 2,
@@ -640,7 +681,7 @@ describe('RecoveryCircle', () => {
       await save();
 
       expect(await screen.findByText('Password incorrect')).toBeInTheDocument();
-      expect(screen.queryByText('Recovery Circle Configured')).not.toBeInTheDocument();
+      expect(screen.queryByText('Recovery Circle saved — recovery paused')).not.toBeInTheDocument();
     });
 
     it('says so when the server cannot be reached', async () => {
@@ -950,8 +991,10 @@ describe('RecoveryCircle', () => {
       await untilActionable();
       fireEvent.click(primary());
 
-      await screen.findByText('Recovery Circle Active');
-      expect(heading('Recovery Circle Configured')).toHaveFocus();
+      await screen.findByText(
+        'Your configuration is saved. Recovery Circle recovery is temporarily paused.'
+      );
+      expect(heading('Recovery Circle saved — recovery paused')).toHaveFocus();
     });
   });
 });

@@ -724,7 +724,7 @@ func TestCreateSocialRecoveryRequestNoCircle(t *testing.T) {
 
 	recoveryToken := seedAndVerifyRecovery(t, ts, user)
 
-	w := ts.DoRequest("POST", "/api/v1/auth/recovery/social-request", map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", "/api/v1/auth/recovery/social-request", map[string]interface{}{
 		"recovery_token": recoveryToken,
 	}, nil)
 
@@ -735,7 +735,7 @@ func TestCreateSocialRecoveryRequestNoCircle(t *testing.T) {
 func TestPollSocialRecoveryRequestNotFound(t *testing.T) {
 	ts := setupTS(t)
 
-	w := ts.DoRequest("GET", "/api/v1/auth/recovery/social-request/00000000-0000-0000-0000-000000000000", nil, nil)
+	w := doDormantSocialRequest(t, ts, "GET", "/api/v1/auth/recovery/social-request/00000000-0000-0000-0000-000000000000", nil, nil)
 	assert.Contains(t, []int{http.StatusNotFound, http.StatusBadRequest}, w.Code)
 }
 

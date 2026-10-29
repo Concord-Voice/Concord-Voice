@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -724,7 +725,7 @@ func TestPollSocialRecoveryWithBearerHeader(t *testing.T) {
 	headers.Set("Authorization", bearerPrefix+recoveryToken)
 	headers.Set(ctHeader, ctJSON)
 
-	w := ts.DoRequest("GET", pathSocialReqPoll+uuid.New().String(), nil, headers)
+	w := doDormantSocialRequest(t, ts, "GET", pathSocialReqPoll+uuid.New().String(), nil, headers)
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
@@ -733,7 +734,7 @@ func TestPollSocialRecoveryWithQueryParam(t *testing.T) {
 	user := ts.CreateTestUser(t, "pollsocquery")
 	recoveryToken := getRecoveryToken2(t, ts, user)
 
-	w := ts.DoRequest("GET", pathSocialReqPoll+uuid.New().String()+"?recovery_token="+recoveryToken, nil, nil)
+	w := doDormantSocialRequest(t, ts, "GET", pathSocialReqPoll+uuid.New().String()+"?recovery_token="+recoveryToken, nil, nil)
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
@@ -789,7 +790,7 @@ func TestCreateSocialRecoveryRequestWithCircle(t *testing.T) {
 	require.NoError(t, err)
 
 	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathSocialReqCreate, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialReqCreate, map[string]interface{}{
 		"recovery_token":       recoveryToken,
 		"ephemeral_public_key": ephKey,
 	}, nil)
@@ -806,7 +807,7 @@ func TestCreateSocialRecoveryRequestMissingEphemeralKey(t *testing.T) {
 	user := ts.CreateTestUser(t, "socialnokey")
 	recoveryToken := getRecoveryToken2(t, ts, user)
 
-	w := ts.DoRequest("POST", pathSocialReqCreate, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialReqCreate, map[string]interface{}{
 		"recovery_token": recoveryToken,
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -873,7 +874,7 @@ func TestPollSocialRecoveryPendingStatus(t *testing.T) {
 
 	// Create a social recovery request
 	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathSocialReqCreate, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialReqCreate, map[string]interface{}{
 		"recovery_token":       recoveryToken,
 		"ephemeral_public_key": ephKey,
 	}, nil)
@@ -888,7 +889,7 @@ func TestPollSocialRecoveryPendingStatus(t *testing.T) {
 	headers.Set("Authorization", bearerPrefix+recoveryToken)
 	headers.Set(ctHeader, ctJSON)
 
-	w = ts.DoRequest("GET", pathSocialReqPoll+requestID, nil, headers)
+	w = doDormantSocialRequest(t, ts, "GET", pathSocialReqPoll+requestID, nil, headers)
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	var pollBody map[string]interface{}
@@ -916,7 +917,7 @@ func TestPollSocialRecoveryCompleteWithResponses(t *testing.T) {
 
 	// Create a social recovery request
 	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathSocialReqCreate, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialReqCreate, map[string]interface{}{
 		"recovery_token":       recoveryToken,
 		"ephemeral_public_key": ephKey,
 	}, nil)
@@ -946,7 +947,7 @@ func TestPollSocialRecoveryCompleteWithResponses(t *testing.T) {
 	headers.Set("Authorization", bearerPrefix+recoveryToken)
 	headers.Set(ctHeader, ctJSON)
 
-	w = ts.DoRequest("GET", pathSocialReqPoll+requestID, nil, headers)
+	w = doDormantSocialRequest(t, ts, "GET", pathSocialReqPoll+requestID, nil, headers)
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	var pollBody map[string]interface{}
@@ -1021,7 +1022,7 @@ func TestPollSocialRecoveryExpired(t *testing.T) {
 	require.NoError(t, err)
 
 	ephKey := base64.StdEncoding.EncodeToString([]byte(fakeEphemeralKey))
-	w := ts.DoRequest("POST", pathSocialReqCreate, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialReqCreate, map[string]interface{}{
 		"recovery_token":       recoveryToken,
 		"ephemeral_public_key": ephKey,
 	}, nil)
@@ -1042,7 +1043,7 @@ func TestPollSocialRecoveryExpired(t *testing.T) {
 	headers.Set("Authorization", bearerPrefix+recoveryToken)
 	headers.Set(ctHeader, ctJSON)
 
-	w = ts.DoRequest("GET", pathSocialReqPoll+requestID, nil, headers)
+	w = doDormantSocialRequest(t, ts, "GET", pathSocialReqPoll+requestID, nil, headers)
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	var pollBody map[string]interface{}
@@ -1967,4 +1968,33 @@ func TestWSTicketDoubleUse(t *testing.T) {
 	// Validate again — should fail (single-use)
 	_, _, _, _, err = auth.ValidateTicket(context.Background(), ts.Redis, ticket)
 	assert.Error(t, err)
+}
+
+// doRecoveryConsumerRequest exercises retained social-handler policy while public
+// social routes are paused. Other recovery consumers keep their production router.
+func doRecoveryConsumerRequest(t *testing.T, ts *testhelpers.TestServer, method, path string, body interface{}, headers http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	if strings.HasPrefix(path, pathSocialReqCreate) {
+		return doDormantSocialRequest(t, ts, method, path, body, headers)
+	}
+	return ts.DoRequest(method, path, body, headers)
+}
+
+func doDormantSocialRequest(t *testing.T, ts *testhelpers.TestServer, method, path string, body interface{}, headers http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	h := auth.NewHandler(ts.DB, ts.Redis, logger.NewWithWriter(io.Discard), testhelpers.TestJWTSecret, nil)
+	h.SetMFAChecker(newRaceMFA(ts))
+	router := gin.New()
+	router.POST(pathSocialReqCreate, h.CreateSocialRecoveryRequest)
+	router.GET(pathSocialReqCreate+"/:id", h.PollSocialRecoveryRequest)
+	encoded, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequest(method, path, strings.NewReader(string(encoded)))
+	if headers != nil {
+		req.Header = headers.Clone()
+	}
+	req.Header.Set(ctHeader, ctJSON)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
 }

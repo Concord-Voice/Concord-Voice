@@ -417,7 +417,7 @@ fi
 readonly EGRESS_RECEIPT=/etc/concord/egress-commissioned.json
 readonly EGRESS_ENGINE=/usr/local/sbin/nightwatch-egress
 readonly EGRESS_COMPANION=/usr/local/sbin/concord-egress
-readonly EGRESS_BUILD_IMAGE='moby/buildkit:v0.32.2-rootless@sha256:504731e577c20559c00f968f33219f30115e70be29ab96728d1d06e963fc494b'
+readonly EGRESS_BUILD_IMAGE='moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89'
 
 managed_egress_role() {
   case "$COMPOSE_OVERRIDE" in

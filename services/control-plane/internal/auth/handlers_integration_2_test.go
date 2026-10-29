@@ -1394,14 +1394,14 @@ func TestPollDeviceRecoveryRequestInvalidToken(t *testing.T) {
 func TestCreateSocialRecoveryRequestMissingBody(t *testing.T) {
 	ts := setupTS(t)
 
-	w := ts.DoRequest("POST", pathSocialRequest, map[string]interface{}{}, nil)
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialRequest, map[string]interface{}{}, nil)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestCreateSocialRecoveryRequestInvalidToken(t *testing.T) {
 	ts := setupTS(t)
 
-	w := ts.DoRequest("POST", pathSocialRequest, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialRequest, map[string]interface{}{
 		"recovery_token":       invalidToken,
 		"ephemeral_public_key": base64.StdEncoding.EncodeToString([]byte("test-ephemeral-key")),
 	}, nil)
@@ -1414,7 +1414,7 @@ func TestCreateSocialRecoveryRequestInvalidBase64EphemeralKey(t *testing.T) {
 
 	recoveryToken := getRecoveryToken(t, ts, user)
 
-	w := ts.DoRequest("POST", pathSocialRequest, map[string]interface{}{
+	w := doDormantSocialRequest(t, ts, "POST", pathSocialRequest, map[string]interface{}{
 		"recovery_token":       recoveryToken,
 		"ephemeral_public_key": invalidBase64,
 	}, nil)
@@ -1426,7 +1426,7 @@ func TestCreateSocialRecoveryRequestInvalidBase64EphemeralKey(t *testing.T) {
 func TestPollSocialRecoveryRequestMissingToken(t *testing.T) {
 	ts := setupTS(t)
 
-	w := ts.DoRequest("GET", pathSocialRequest+pollSuffix, nil, nil)
+	w := doDormantSocialRequest(t, ts, "GET", pathSocialRequest+pollSuffix, nil, nil)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -1435,7 +1435,7 @@ func TestPollSocialRecoveryRequestInvalidToken(t *testing.T) {
 
 	headers := http.Header{}
 	headers.Set("Authorization", bearerPfx+invalidToken)
-	w := ts.DoRequest("GET", pathSocialRequest+pollSuffix, nil, headers)
+	w := doDormantSocialRequest(t, ts, "GET", pathSocialRequest+pollSuffix, nil, headers)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 

@@ -122,12 +122,12 @@ func TestRecoveryPolicyLegacyAndIncompleteTokensCannotReachRecoveryConsumers(t *
 		require.NoError(t, err)
 		for _, path := range []string{pathRecoveryResetPwd, pathRecoveryResetAcct, "/api/v1/auth/recovery/social-request"} {
 			body := map[string]interface{}{"recovery_token": token, "new_password": testNewPassword, "wrapped_private_key": "dGVzdA==", "key_derivation_salt": "dGVzdA==", "key_derivation_alg": "argon2id", "public_key": "dGVzdA==", "acknowledge_data_loss": true, "ephemeral_public_key": "dGVzdA=="}
-			w := ts.DoRequest(http.MethodPost, path, body, nil)
+			w := doRecoveryConsumerRequest(t, ts, http.MethodPost, path, body, nil)
 			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 		}
 		w := ts.DoRequest(http.MethodGet, "/api/v1/auth/recovery/device-request/00000000-0000-4000-8000-000000000001", nil, testhelpers.AuthHeaders(token))
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
-		w = ts.DoRequest(http.MethodGet, "/api/v1/auth/recovery/social-request/00000000-0000-4000-8000-000000000001", nil, testhelpers.AuthHeaders(token))
+		w = doDormantSocialRequest(t, ts, http.MethodGet, "/api/v1/auth/recovery/social-request/00000000-0000-4000-8000-000000000001", nil, testhelpers.AuthHeaders(token))
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 	}
 }

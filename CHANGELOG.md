@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Recovery Circle recovery is temporarily paused. Your saved contacts remain in
+Settings, where you can still change the configuration. Use another recovery
+method to regain access to your account.
+
 Supported Pilot desktop builds can connect alongside Stable builds without being
 blocked solely because their version includes a Pilot suffix.
 

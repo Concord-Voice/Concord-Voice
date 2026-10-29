@@ -1322,9 +1322,15 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
           <h4 style={{ color: 'var(--text-primary)', margin: '0 0 8px' }}>Recovery Circle</h4>
           <p style={{ color: 'var(--text-secondary)', fontSize: 14, margin: '0 0 12px' }}>
             {circleConfig?.has_circle
-              ? `${circleConfig.threshold_k}-of-${circleConfig.total_shares_n} contacts can recover your account.`
-              : "Distribute your recovery among trusted contacts using Shamir's Secret Sharing."}
+              ? 'Recovery is temporarily paused. Your saved contacts are retained. You can still change your Recovery Circle.'
+              : 'You can save a Recovery Circle configuration, but Recovery Circle recovery is temporarily paused.'}
           </p>
+          {circleConfig?.has_circle && (
+            <p style={{ color: 'var(--text-secondary)', fontSize: 14, margin: '0 0 12px' }}>
+              Saved configuration: {circleConfig.threshold_k} of {circleConfig.total_shares_n}{' '}
+              contacts.
+            </p>
+          )}
           {circleConfig?.has_circle && circleConfig.contacts && (
             <div style={{ marginBottom: 12 }}>
               {circleConfig.contacts.map((c) => (

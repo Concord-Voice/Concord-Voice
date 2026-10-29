@@ -129,7 +129,7 @@ func TestRecoveryPolicyRace_ConsumersRecheckAfterPolicyWriter(t *testing.T) {
 		token := recoveryTokenFor(t, ts, user)
 		circleID := insertRecoveryCircle(t, ts, user.ID)
 		w := raceRecoveryPolicyWriter(t, ts, user.ID, func() *httptest.ResponseRecorder {
-			return ts.DoRequest(http.MethodPost, pathSocialReqCreate, map[string]string{"recovery_token": token, "ephemeral_public_key": "dGVzdA=="}, nil)
+			return doDormantSocialRequest(t, ts, http.MethodPost, pathSocialReqCreate, map[string]string{"recovery_token": token, "ephemeral_public_key": "dGVzdA=="}, nil)
 		})
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 		var count int
@@ -144,7 +144,7 @@ func TestRecoveryPolicyRace_ConsumersRecheckAfterPolicyWriter(t *testing.T) {
 		requestID := completedSocialRecoveryRequest(t, ts, user.ID, token)
 		headers := http.Header{"Authorization": []string{"Bearer " + token}}
 		w := raceRecoveryPolicyWriter(t, ts, user.ID, func() *httptest.ResponseRecorder {
-			return ts.DoRequest(http.MethodGet, pathSocialReqPoll+requestID, nil, headers)
+			return doDormantSocialRequest(t, ts, http.MethodGet, pathSocialReqPoll+requestID, nil, headers)
 		})
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 		assert.NotContains(t, w.Body.String(), "encrypted_share")

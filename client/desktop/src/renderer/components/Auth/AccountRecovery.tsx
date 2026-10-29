@@ -11,11 +11,6 @@ import {
   exportPublicKey,
   rewrapRecoveryAccountKey,
   deriveKeyArgon2id,
-  generateECDHKeyPair,
-  exportECDHPublicKey,
-  importECDHPublicKey,
-  deriveSharedSecret,
-  decryptWithSharedSecret,
 } from '../../utils/crypto/crypto';
 import {
   apiUrl,
@@ -34,19 +29,12 @@ import {
 import { useAuthStore } from '../../stores/auth/authStore';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import DeviceRecoveryFingerprint from './DeviceRecoveryFingerprint';
-import { assertValidUUID, isValidUUID } from '../../utils/runtime/uuid';
 import LoadingSpinner from './LoadingSpinner';
 import './Login.css';
 import ConcordWordmark from './ConcordWordmark';
 
 type RecoveryStep =
-  | 'email'
-  | 'verify'
-  | 'recovery-key'
-  | 'device-waiting'
-  | 'social-waiting'
-  | 'reset-warning'
-  | 'new-password';
+  'email' | 'verify' | 'recovery-key' | 'device-waiting' | 'reset-warning' | 'new-password';
 
 interface AccountRecoveryProps {
   onBack: () => void;
@@ -84,10 +72,6 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
   const [hasRecoveryKey, setHasRecoveryKey] = useState(false);
   const [hasTrustedDevices, setHasTrustedDevices] = useState(false);
   const [hasRecoveryCircle, setHasRecoveryCircle] = useState(false);
-  const [socialRequestId, setSocialRequestId] = useState('');
-  const [socialThreshold, setSocialThreshold] = useState(0);
-  const [socialSharesReceived, setSocialSharesReceived] = useState(0);
-  const [ecdhKeyPair, setEcdhKeyPair] = useState<CryptoKeyPair | null>(null);
   const deviceAttemptRef = useRef<RequesterDeviceRecoveryAttempt | null>(null);
   const deviceStartingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -151,10 +135,6 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       setHasRecoveryKey(false);
       setHasTrustedDevices(false);
       setHasRecoveryCircle(false);
-      setSocialRequestId('');
-      setSocialThreshold(0);
-      setSocialSharesReceived(0);
-      setEcdhKeyPair(null);
       setRecoveryKeyInput('');
       setNewPassword('');
       setConfirmPassword('');
@@ -376,121 +356,6 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     finishLoading(loadingAttempt);
   };
 
-  // Step 3c: Initiate social recovery
-  const handleSocialRecovery = async () => {
-    const issued = issuanceRef.current;
-    if (!recoveryIsCurrent(issued)) return;
-    const loadingAttempt = startLoading();
-    setError('');
-    setSocialThreshold(0);
-    setSocialSharesReceived(0);
-    try {
-      const keyPair = await generateECDHKeyPair();
-      if (!recoveryIsCurrent(issued)) return;
-      setEcdhKeyPair(keyPair);
-      const pubKeyBase64 = await exportECDHPublicKey(keyPair.publicKey);
-
-      if (!recoveryIsCurrent(issued)) return;
-      const res = await fetch(apiUrl('/api/v1/auth/recovery/social-request'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recovery_token: recoveryToken,
-          ephemeral_public_key: pubKeyBase64,
-        }),
-      });
-      const data = await res.json();
-      if (!recoveryIsCurrent(issued)) return;
-      if (!res.ok) throw new Error(data.error || 'Failed');
-
-      // Upfront validation mirroring handleDeviceRecovery — see that comment
-      // for the full rationale (prevents silent infinite-poll trap for
-      // malformed server request_ids).
-      if (!isValidUUID(data.request_id)) {
-        throw new Error('Server returned an invalid recovery request ID. Please try again.');
-      }
-
-      setSocialRequestId(data.request_id);
-      setSocialThreshold(data.threshold_k);
-      setStep('social-waiting');
-    } catch (err) {
-      if (recoveryIsCurrent(issued)) setError(err instanceof Error ? err.message : 'Failed');
-    } finally {
-      finishLoading(loadingAttempt);
-    }
-  };
-
-  // Poll for social recovery shares (handler defined inside useEffect to capture current closure values)
-  useEffect(() => {
-    if (step !== 'social-waiting' || !socialRequestId) return;
-
-    const issued = issuanceRef.current;
-    let active = true;
-    const recoverSocialShares = async (responses: Array<{ encrypted_share: string }>) => {
-      const { combine } = await import('../../utils/crypto/shamir');
-      if (!active || !recoveryIsCurrent(issued)) return;
-      const shares: Array<{ index: number; data: Uint8Array }> = [];
-      try {
-        for (const resp of responses) {
-          // Each response contains a JSON payload with ephemeral_public_key, encrypted_data, share_index
-          const payloadStr = atob(resp.encrypted_share);
-          const payload = JSON.parse(payloadStr);
-
-          // Derive shared secret with responder's ECDH key
-          if (!ecdhKeyPair) {
-            throw new Error('social recovery: ECDH key pair was not generated before polling');
-          }
-          const responderKey = await importECDHPublicKey(payload.ephemeral_public_key);
-          if (!active || !recoveryIsCurrent(issued)) return;
-          const sharedKey = await deriveSharedSecret(ecdhKeyPair.privateKey, responderKey);
-          if (!active || !recoveryIsCurrent(issued)) return;
-          const shareBytes = await decryptWithSharedSecret(sharedKey, payload.encrypted_data);
-
-          // share_index is embedded in the encrypted payload by the contact
-          const shareIndex: number = payload.share_index;
-          shares.push({ index: shareIndex, data: new Uint8Array(shareBytes) });
-        }
-
-        // Reconstruct PKCS8
-        if (!active || !recoveryIsCurrent(issued)) return;
-        const reconstructed = combine(shares);
-        retainRecoveredPkcs8(reconstructed.buffer as ArrayBuffer);
-        setStep('new-password');
-      } finally {
-        for (const share of shares) share.data.fill(0);
-      }
-    };
-    const pollSocial = async () => {
-      try {
-        if (!active || !recoveryIsCurrent(issued)) return;
-        const safeId = encodeURIComponent(assertValidUUID(socialRequestId, 'socialRequestId'));
-        const res = await fetch(apiUrl(`/api/v1/auth/recovery/social-request/${safeId}`), {
-          headers: { Authorization: `Bearer ${recoveryToken}` },
-        });
-        const data = await res.json();
-        if (!active || !recoveryIsCurrent(issued) || !res.ok) return;
-
-        setSocialSharesReceived(data.shares_received || 0);
-
-        if (data.status === 'complete' && data.responses) {
-          await recoverSocialShares(data.responses);
-        }
-      } catch {
-        // Ignore poll errors silently — the next poll tick retries (mirrors
-        // pollDevice above). Malformed request_ids are caught upstream at
-        // handleSocialRecovery before setSocialRequestId is ever called.
-        // The ECDH-invariant throw inside the loop is already gated by
-        // state-machine preconditions.
-      }
-    };
-
-    const interval = setInterval(pollSocial, 5000); // Poll every 5 seconds
-    return () => {
-      active = false;
-      clearInterval(interval);
-    };
-  }, [step, socialRequestId, recoveryToken, ecdhKeyPair, recoveryIsCurrent, retainRecoveredPkcs8]);
-
   // Step 4: Set new password
   const handleSetPassword = async () => {
     const issued = issuanceRef.current;
@@ -625,7 +490,6 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
             {step === 'verify' && 'Enter the 6-digit code sent to your email'}
             {step === 'recovery-key' && 'Enter your recovery key to restore your encrypted data'}
             {step === 'device-waiting' && 'Waiting for trusted device approval'}
-            {step === 'social-waiting' && 'Waiting for Recovery Circle approval'}
             {step === 'reset-warning' && 'No recovery key found'}
             {step === 'new-password' && 'Set your new password'}
           </p>
@@ -774,15 +638,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 </button>
               )}
               {hasRecoveryCircle && (
-                <button
-                  type="button"
-                  className="mfa-choose-another"
-                  onClick={handleSocialRecovery}
-                  disabled={loading}
-                  style={{ marginTop: 4 }}
-                >
-                  Recover via Recovery Circle
-                </button>
+                <p>Recovery Circle recovery is temporarily paused. Use another recovery method.</p>
               )}
             </>
           )}
@@ -833,40 +689,6 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
             </div>
           )}
 
-          {step === 'social-waiting' && (
-            <>
-              <div style={{ textAlign: 'center', padding: '20px 0' }}>
-                <LoadingSpinner size="small" inline />
-                <p style={{ color: 'var(--text-secondary)', marginTop: 12 }}>
-                  Waiting for your Recovery Circle to respond...
-                </p>
-                <p style={{ color: 'var(--text-primary)', fontSize: 18, fontWeight: 600 }}>
-                  {socialSharesReceived} / {socialThreshold} shares received
-                </p>
-                <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
-                  Your contacts need to open Concord and approve your recovery request. This may
-                  take up to 24 hours.
-                </p>
-              </div>
-              {error && (
-                <div className="form-error-banner">
-                  <span>{error}</span>
-                </div>
-              )}
-              <button
-                type="button"
-                className="mfa-choose-another"
-                onClick={() => {
-                  if (!recoveryIsCurrent()) return;
-                  setStep(hasRecoveryKey ? 'recovery-key' : 'reset-warning');
-                  setError('');
-                }}
-              >
-                Try a different recovery method
-              </button>
-            </>
-          )}
-
           {step === 'reset-warning' && (
             <>
               <div
@@ -874,6 +696,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 style={{
                   background: 'rgba(220, 38, 38, 0.15)',
                   border: '1px solid #dc2626',
+                  color: 'var(--text-primary)',
                   marginBottom: 16,
                 }}
               >
@@ -930,15 +753,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 </button>
               )}
               {hasRecoveryCircle && (
-                <button
-                  type="button"
-                  className="mfa-choose-another"
-                  onClick={handleSocialRecovery}
-                  disabled={loading}
-                  style={{ marginTop: 4 }}
-                >
-                  Recover via Recovery Circle
-                </button>
+                <p>Recovery Circle recovery is temporarily paused. Use another recovery method.</p>
               )}
             </>
           )}

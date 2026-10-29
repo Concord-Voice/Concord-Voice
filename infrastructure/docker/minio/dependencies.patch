@@ -1,5 +1,5 @@
 diff --git a/go.mod b/go.mod
-index a957085..4d4b97d 100644
+index a957085..3e847ce 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -1,8 +1,8 @@
@@ -9,7 +9,7 @@ index a957085..4d4b97d 100644
 +go 1.26.0
 
 -toolchain go1.24.8
-+toolchain go1.26.8
++toolchain go1.26.10
 
  // Install tools using 'go install tool'.
  tool (

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +18,9 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -798,7 +801,7 @@ func TestGetMyRecoverySharesEmpty(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "recshares")
 
-	w := ts.DoRequest("GET", urlRecoveryCircleShares, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w := doDormantCircleRequest(t, ts, "GET", urlRecoveryCircleShares, nil, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	var shares []interface{}
@@ -812,7 +815,7 @@ func TestListSocialRecoveryRequestsEmpty(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "socialreq")
 
-	w := ts.DoRequest("GET", urlSocialRecoveryReqs, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w := doDormantCircleRequest(t, ts, "GET", urlSocialRecoveryReqs, nil, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
@@ -826,7 +829,7 @@ func TestRespondToSocialRecoveryNotFound(t *testing.T) {
 	user := ts.CreateTestUser(t, "socialresp")
 
 	encShare := base64.StdEncoding.EncodeToString([]byte("re-encrypted-share"))
-	w := ts.DoRequest("POST", urlSocialRecoveryReqs+"/nonexistent/respond", map[string]interface{}{
+	w := doDormantCircleRequest(t, ts, "POST", urlSocialRecoveryReqs+"/nonexistent/respond", map[string]interface{}{
 		"encrypted_share": encShare,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
@@ -1715,7 +1718,7 @@ func TestGetMyRecoverySharesAsContact(t *testing.T) {
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 
 	// Contact should see their share
-	w := ts.DoRequest("GET", urlRecoveryCircleShares, nil, testhelpers.AuthHeaders(contact.AccessToken))
+	w := doDormantCircleRequest(t, ts, "GET", urlRecoveryCircleShares, nil, testhelpers.AuthHeaders(contact.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 	var shares []interface{}
 	testhelpers.ParseJSON(t, w, &shares)
@@ -3623,7 +3626,7 @@ func TestRespondToSocialRecoveryNotContact(t *testing.T) {
 
 	// Try to respond to a non-existent request
 	encShare := base64.StdEncoding.EncodeToString([]byte("share"))
-	w := ts.DoRequest("POST", urlSocialRecoveryReqs+"/00000000-0000-0000-0000-000000000099/respond", map[string]interface{}{
+	w := doDormantCircleRequest(t, ts, "POST", urlSocialRecoveryReqs+"/00000000-0000-0000-0000-000000000099/respond", map[string]interface{}{
 		"encrypted_share": encShare,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
@@ -3636,7 +3639,7 @@ func TestRespondToSocialRecoveryBadBase64(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "socialbadb64")
 
-	w := ts.DoRequest("POST", urlSocialRecoveryReqs+someIDRespond, map[string]interface{}{
+	w := doDormantCircleRequest(t, ts, "POST", urlSocialRecoveryReqs+someIDRespond, map[string]interface{}{
 		"encrypted_share": invalidBase64,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
@@ -3649,7 +3652,7 @@ func TestRespondToSocialRecoveryMissingShare(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "socialmissing")
 
-	w := ts.DoRequest("POST", urlSocialRecoveryReqs+someIDRespond, map[string]interface{}{},
+	w := doDormantCircleRequest(t, ts, "POST", urlSocialRecoveryReqs+someIDRespond, map[string]interface{}{},
 		testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -4648,4 +4651,27 @@ func (h *beforeScriptHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook
 
 func (*beforeScriptHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
+}
+
+// doDormantCircleRequest keeps handler-specific share and approval assertions
+// effective behind the public pause, with real authenticated identity/epoch state.
+func doDormantCircleRequest(t *testing.T, ts *testhelpers.TestServer, method, path string, body interface{}, headers http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	log := logger.NewWithWriter(io.Discard)
+	h := mfa.NewHandler(ts.DB, ts.Redis, log, nil, testhelpers.TestJWTSecret, nil, "test")
+	router := gin.New()
+	router.Use(middleware.AuthRequired(testhelpers.TestJWTSecret, ts.Redis, ts.DB, credepoch.New(ts.DB, ts.Redis, log)))
+	router.GET(urlRecoveryCircleShares, h.GetMyRecoveryShares)
+	router.GET(urlSocialRecoveryReqs, h.ListSocialRecoveryRequests)
+	router.POST(urlSocialRecoveryReqs+"/:id/respond", h.RespondToSocialRecovery)
+	encoded, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequest(method, path, strings.NewReader(string(encoded)))
+	if headers != nil {
+		req.Header = headers.Clone()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
 }

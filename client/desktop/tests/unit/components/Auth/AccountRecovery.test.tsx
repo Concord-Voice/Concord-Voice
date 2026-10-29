@@ -216,43 +216,6 @@ describe('AccountRecovery', () => {
     }
   );
 
-  it('releases a stale social request without clearing a newer code-send spinner', async () => {
-    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
-    await advanceToRecoveryKeyStep();
-    const socialStarted = deferred<void>();
-    const socialReply = deferred<void>();
-    const beginStarted = deferred<void>();
-    const beginReply = deferred<void>();
-    server.use(
-      http.post(apiUrl('/api/v1/auth/recovery/social-request'), async () => {
-        socialStarted.resolve();
-        await socialReply.promise;
-        return HttpResponse.json({
-          request_id: '22222222-2222-2222-2222-222222222222',
-          threshold_k: 3,
-        });
-      }),
-      http.post(apiUrl('/api/v1/auth/recovery/begin'), async () => {
-        beginStarted.resolve();
-        await beginReply.promise;
-        return HttpResponse.json({});
-      })
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Recover via Recovery Circle' }));
-    await socialStarted.promise;
-    act(() =>
-      useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
-    );
-    expect(screen.getByRole('button', { name: 'Send Recovery Code' })).toBeEnabled();
-    fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
-    await beginStarted.promise;
-    expect(screen.getByText('Sending...')).toBeInTheDocument();
-    await act(async () => socialReply.resolve());
-    expect(screen.getByText('Sending...')).toBeInTheDocument();
-    await act(async () => beginReply.resolve());
-    await screen.findByLabelText('Verification Code');
-  });
-
   it('restarts after a reserved factor returns incomplete recovery data', async () => {
     server.use(
       http.post(apiUrl('/api/v1/auth/recovery/begin'), () => HttpResponse.json({})),
@@ -459,23 +422,22 @@ describe('AccountRecovery', () => {
     }
   );
 
-  it.each([
-    'Recover Account',
-    'Recover from trusted device instead',
-    'Recover via Recovery Circle',
-  ])('refuses stale issued recovery before %s', async (action) => {
-    const crypto = await import('@/renderer/utils/crypto/crypto');
-    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
-    await advanceToRecoveryKeyStep();
-    fireEvent.change(screen.getByLabelText('Recovery Key'), { target: { value: 'key' } });
-    useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 });
-    fireEvent.click(screen.getByText(action));
-    await screen.findByText('Recovery context changed. Start again.');
-    expect(crypto.unwrapWithRecoveryKey).not.toHaveBeenCalled();
-    expect(crypto.generateECDHKeyPair).not.toHaveBeenCalled();
-    expect(mockApiResponse).toHaveBeenCalledTimes(2);
-    expect(screen.getByText('Send Recovery Code')).toBeEnabled();
-  });
+  it.each(['Recover Account', 'Recover from trusted device instead'])(
+    'refuses stale issued recovery before %s',
+    async (action) => {
+      const crypto = await import('@/renderer/utils/crypto/crypto');
+      const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+      await advanceToRecoveryKeyStep();
+      fireEvent.change(screen.getByLabelText('Recovery Key'), { target: { value: 'key' } });
+      useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 });
+      fireEvent.click(screen.getByText(action));
+      await screen.findByText('Recovery context changed. Start again.');
+      expect(crypto.unwrapWithRecoveryKey).not.toHaveBeenCalled();
+      expect(crypto.generateECDHKeyPair).not.toHaveBeenCalled();
+      expect(mockApiResponse).toHaveBeenCalledTimes(2);
+      expect(screen.getByText('Send Recovery Code')).toBeEnabled();
+    }
+  );
 
   it('clears issued material after a server change and refuses a pending unwrap result', async () => {
     const crypto = await import('@/renderer/utils/crypto/crypto');
@@ -646,7 +608,7 @@ describe('AccountRecovery', () => {
 
   // --- Step 3a: Recovery Key ---
 
-  async function advanceToRecoveryKeyStep() {
+  async function advanceToRecoveryKeyStep(hasCircle = true) {
     // Step 1 -> Step 2
     mockApiResponse.mockResolvedValueOnce({
       ok: true,
@@ -668,7 +630,7 @@ describe('AccountRecovery', () => {
         recovery_token: 'mock-token',
         has_recovery_key: true,
         has_trusted_devices: true,
-        has_recovery_circle: true,
+        has_recovery_circle: hasCircle,
         recovery_wrapped_private_key: 'mock-wrapped',
         recovery_key_salt: 'mock-salt',
       }),
@@ -726,10 +688,86 @@ describe('AccountRecovery', () => {
     expect(screen.getByText('Recover from trusted device instead')).toBeInTheDocument();
   });
 
-  it('shows recovery circle option when available', async () => {
-    await advanceToRecoveryKeyStep();
-    expect(screen.getByText('Recover via Recovery Circle')).toBeInTheDocument();
-  });
+  // Regression for #3676: an older server's circle hint cannot enable paused recovery.
+  it.each(['recovery-key', 'reset-warning'] as const)(
+    '#3676 shows a pause notice and sends no social requests from %s',
+    async (choice) => {
+      const socialRequest = vi.fn(() =>
+        HttpResponse.json({ error: 'forbidden social request' }, { status: 500 })
+      );
+      server.use(
+        http.post(apiUrl('/api/v1/auth/recovery/social-request'), socialRequest),
+        http.get(apiUrl('/api/v1/auth/recovery/social-request/:id'), socialRequest)
+      );
+      // Observe the real caller synchronously; MSW dispatch can lag behind fake timers.
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      try {
+        await advanceToRecoveryKeyStep();
+        if (choice === 'reset-warning')
+          fireEvent.click(screen.getByText("I don't have my recovery key"));
+        // Positive controls prove the real choice screen and its other recovery methods survived.
+        if (choice === 'recovery-key') {
+          expect(screen.getByLabelText('Recovery Key')).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: 'Recover Account' })).toBeDisabled();
+        } else {
+          expect(screen.getByText('No recovery key found')).toBeInTheDocument();
+          expect(
+            screen.getByRole('checkbox', {
+              name: 'I understand that all encrypted message history will be permanently lost',
+            })
+          ).not.toBeChecked();
+          expect(
+            screen.getByRole('button', { name: 'Continue with Account Reset' })
+          ).toBeDisabled();
+        }
+        expect(
+          screen.getByRole('button', { name: 'Recover from trusted device instead' })
+        ).toBeEnabled();
+        vi.useFakeTimers();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10001);
+        });
+        const socialCalls = fetchSpy.mock.calls.filter(([input]) => {
+          const url =
+            typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          return new URL(url).pathname.startsWith('/api/v1/auth/recovery/social-request');
+        });
+        expect(socialCalls).toHaveLength(0);
+        expect(socialRequest).not.toHaveBeenCalled();
+        expect(
+          screen.queryByRole('button', { name: 'Recover via Recovery Circle' })
+        ).not.toBeInTheDocument();
+        expect(
+          screen.getByText(
+            'Recovery Circle recovery is temporarily paused. Use another recovery method.'
+          )
+        ).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+        fetchSpy.mockRestore();
+      }
+    }
+  );
+
+  it.each(['recovery-key', 'reset-warning'] as const)(
+    '#3676 omits the pause notice without a saved circle on %s',
+    async (choice) => {
+      await advanceToRecoveryKeyStep(false);
+      if (choice === 'reset-warning')
+        fireEvent.click(screen.getByText("I don't have my recovery key"));
+      expect(
+        screen.getByRole('button', { name: 'Recover from trusted device instead' })
+      ).toBeEnabled();
+      expect(
+        screen.queryByText(
+          'Recovery Circle recovery is temporarily paused. Use another recovery method.'
+        )
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: 'Recover via Recovery Circle' })
+      ).not.toBeInTheDocument();
+    }
+  );
 
   it('shows error for invalid recovery key', async () => {
     const { unwrapWithRecoveryKey } = await import('@/renderer/utils/crypto/crypto');
@@ -1156,158 +1194,6 @@ describe('AccountRecovery', () => {
 
   // --- Device Waiting Step ---
 
-  it('shows social waiting step subtitle', async () => {
-    await advanceToRecoveryKeyStep();
-
-    mockApiResponse.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 3 }),
-    });
-
-    fireEvent.click(screen.getByText('Recover via Recovery Circle'));
-
-    await waitFor(() => {
-      expect(screen.getByText('Waiting for Recovery Circle approval')).toBeInTheDocument();
-      expect(
-        screen.getByText('Waiting for your Recovery Circle to respond...')
-      ).toBeInTheDocument();
-    });
-  });
-
-  it('shows share progress in social waiting step', async () => {
-    await advanceToRecoveryKeyStep();
-
-    mockApiResponse.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 3 }),
-    });
-
-    fireEvent.click(screen.getByText('Recover via Recovery Circle'));
-
-    await waitFor(() => {
-      expect(screen.getByText('0 / 3 shares received')).toBeInTheDocument();
-    });
-  });
-
-  it('starts a new social ceremony at zero after the account lifecycle changes', async () => {
-    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
-    const interval = vi.spyOn(globalThis, 'setInterval');
-    try {
-      await advanceToRecoveryKeyStep();
-      mockApiResponse.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 3 }),
-      });
-      fireEvent.click(screen.getByText('Recover via Recovery Circle'));
-      await screen.findByText('0 / 3 shares received');
-      mockApiResponse.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ status: 'pending', shares_received: 2 }),
-      });
-      // findByText gates on the DOM; the poll is registered by a passive effect that can land later.
-      const pollHandler = () => interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
-      await waitFor(() => expect(pollHandler()).toBeTypeOf('function'));
-      const poll = pollHandler();
-      if (typeof poll !== 'function') throw new Error('Social recovery poll was not started');
-      await act(async () => {
-        await poll();
-      });
-      expect(screen.getByText('2 / 3 shares received')).toBeInTheDocument();
-      act(() =>
-        useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
-      );
-      mockApiResponse.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
-      fireEvent.click(screen.getByRole('button', { name: 'Send Recovery Code' }));
-      await screen.findByLabelText('Verification Code');
-      mockApiResponse.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          recovery_token: 'new-ceremony-token',
-          has_recovery_key: true,
-          has_trusted_devices: false,
-          has_recovery_circle: true,
-          recovery_wrapped_private_key: 'mock-wrapped',
-          recovery_key_salt: 'mock-salt',
-        }),
-      });
-      fireEvent.change(screen.getByLabelText('Verification Code'), { target: { value: '654321' } });
-      fireEvent.click(screen.getByRole('button', { name: 'Verify Code' }));
-      await screen.findByText('Enter your recovery key to restore your encrypted data');
-      mockApiResponse.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ request_id: '33333333-3333-3333-3333-333333333333', threshold_k: 4 }),
-      });
-      fireEvent.click(screen.getByText('Recover via Recovery Circle'));
-      await screen.findByText('0 / 4 shares received');
-    } finally {
-      interval.mockRestore();
-    }
-  });
-
-  it('wipes decrypted social shares when auth changes during the final decrypt', async () => {
-    const crypto = await import('@/renderer/utils/crypto/crypto');
-    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
-    const firstShare = new Uint8Array([1, 2, 3]);
-    const secondShare = new Uint8Array([4, 5, 6]);
-    const secondStarted = deferred();
-    const secondDecrypt = deferred<ArrayBuffer>();
-    vi.mocked(crypto.decryptWithSharedSecret)
-      .mockResolvedValueOnce(firstShare.buffer)
-      .mockImplementationOnce(() => {
-        secondStarted.resolve();
-        return secondDecrypt.promise;
-      });
-    const encryptedShare = (index: number) =>
-      btoa(
-        JSON.stringify({ ephemeral_public_key: 'mock', encrypted_data: 'mock', share_index: index })
-      );
-    const interval = vi.spyOn(globalThis, 'setInterval');
-    try {
-      await advanceToRecoveryKeyStep();
-      mockApiResponse.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ request_id: '22222222-2222-2222-2222-222222222222', threshold_k: 2 }),
-      });
-      mockApiResponse.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          status: 'complete',
-          shares_received: 2,
-          responses: [
-            { encrypted_share: encryptedShare(1) },
-            { encrypted_share: encryptedShare(2) },
-          ],
-        }),
-      });
-      fireEvent.click(screen.getByText('Recover via Recovery Circle'));
-      await screen.findByText('Waiting for Recovery Circle approval');
-      // findByText gates on the DOM; the poll is registered by a passive effect that can land later.
-      const pollHandler = () => interval.mock.calls.find(([, delay]) => delay === 5000)?.[0];
-      await waitFor(() => expect(pollHandler()).toBeTypeOf('function'));
-      const poll = pollHandler();
-      if (typeof poll !== 'function') throw new Error('Social recovery poll was not started');
-      let pollPromise: Promise<void> | undefined;
-      await act(async () => {
-        pollPromise = poll() as Promise<void>;
-        await secondStarted.promise;
-      });
-      expect(firstShare).toEqual(new Uint8Array([1, 2, 3]));
-      act(() =>
-        useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 })
-      );
-      await act(async () => {
-        secondDecrypt.resolve(secondShare.buffer);
-        await pollPromise;
-      });
-      expect(firstShare).toEqual(new Uint8Array(3));
-      expect(secondShare).toEqual(new Uint8Array(3));
-      expect(screen.queryByLabelText('New Password')).not.toBeInTheDocument();
-      expect(screen.getByText('Send Recovery Code')).toBeEnabled();
-    } finally {
-      interval.mockRestore();
-    }
-  });
-
   // --- Back to Login always visible ---
 
   it('shows Back to login button on every step', async () => {
@@ -1324,33 +1210,5 @@ describe('AccountRecovery', () => {
     // real Chromium by tests/e2e/auth-wordmark.spec.ts). Two here, rather than "at least
     // one", is what catches a regression back to a bare white-only image.
     expect(screen.getAllByAltText('Concord Voice')).toHaveLength(2);
-  });
-
-  // --- Upfront request_id validation ---
-  //
-  // These tests verify the upfront validation at setDeviceRequestId /
-  // setSocialRequestId call sites — catching a malformed server response
-  // immediately, before the "Waiting..." screen ever renders. This is
-  // strictly better UX than the poll-catch fallback above (which stays in
-  // place as defense-in-depth).
-
-  it('rejects social recovery initiation immediately when server returns malformed request_id', async () => {
-    await advanceToRecoveryKeyStep();
-
-    mockApiResponse.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ request_id: 'also-not-a-uuid', threshold_k: 3 }),
-    });
-    fireEvent.click(screen.getByText('Recover via Recovery Circle'));
-
-    await waitFor(() => {
-      expect(
-        screen.getByText('Server returned an invalid recovery request ID. Please try again.')
-      ).toBeInTheDocument();
-    });
-    expect(
-      screen.getByText('Enter your recovery key to restore your encrypted data')
-    ).toBeInTheDocument();
-    expect(screen.queryByText('Waiting for Recovery Circle approval')).not.toBeInTheDocument();
   });
 });

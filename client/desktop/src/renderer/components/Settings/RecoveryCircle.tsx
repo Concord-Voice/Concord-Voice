@@ -156,9 +156,9 @@ async function prepareShares(
 
 /** The primary's label by phase. */
 const PRIMARY_LABEL: Record<StepUpPhase, string> = {
-  idle: 'Create Recovery Circle',
+  idle: 'Save Recovery Circle',
   ceremony: 'Waiting…',
-  submitting: 'Setting up...',
+  submitting: 'Saving…',
 };
 
 interface RecoveryCircleConfirmProps {
@@ -254,11 +254,8 @@ const RecoveryCircleConfirm: React.FC<RecoveryCircleConfirmProps> = ({
       </h3>
       <div className="mfa-setup-step">
         <p>
-          <strong>
-            {threshold} of {contactIds.length}
-          </strong>{' '}
-          contacts will be needed to recover your account. Verify your identity to create the
-          recovery circle.
+          Save this configuration for {threshold} of {contactIds.length} contacts. Recovery is
+          temporarily paused. Verify your identity to save the configuration.
         </p>
         <StepUpCredentials
           factor={factor}
@@ -341,15 +338,11 @@ const RecoveryCircle: React.FC<RecoveryCircleProps> = ({ onComplete, onCancel })
   if (step === 'done') {
     return (
       <div className="mfa-setup-wizard">
-        <h3 tabIndex={-1} ref={headingRef}>
-          Recovery Circle Configured
+        <h3 tabIndex={-1} ref={headingRef} style={{ color: 'var(--text-primary)' }}>
+          Recovery Circle saved — recovery paused
         </h3>
         <div className="mfa-setup-step mfa-setup-success">
-          <h4>Recovery Circle Active</h4>
-          <p>
-            {threshold} of {selectedContacts.length} trusted contacts can help you recover your
-            account. No single contact can access your data.
-          </p>
+          <p>Your configuration is saved. Recovery Circle recovery is temporarily paused.</p>
           <button className="btn btn-primary" onClick={onComplete}>
             Done
           </button>
@@ -377,8 +370,8 @@ const RecoveryCircle: React.FC<RecoveryCircleProps> = ({ onComplete, onCancel })
       </h3>
       <div className="mfa-setup-step">
         <p>
-          Select trusted contacts who can help you recover your account. Your private key will be
-          split using Shamir&apos;s Secret Sharing — no single contact can access your data.
+          You can save a Recovery Circle configuration, but Recovery Circle recovery is temporarily
+          paused.
         </p>
 
         <div style={{ marginBottom: 16 }}>

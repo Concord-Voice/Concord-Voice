@@ -1540,10 +1540,12 @@ func NewRouter(
 
 			// Social recovery (unauthenticated — uses recovery token)
 			authRoutes.POST("/recovery/social-request",
+				middleware.RecoveryCirclePaused,
 				middleware.RateLimitByIP(redis, 3, 15*time.Minute),
 				authHandler.CreateSocialRecoveryRequest,
 			)
 			authRoutes.GET("/recovery/social-request/:id",
+				middleware.RecoveryCirclePaused,
 				middleware.RateLimitByIP(redis, 10, 15*time.Minute),
 				authHandler.PollSocialRecoveryRequest,
 			)
@@ -2117,16 +2119,19 @@ func NewRouter(
 					mfaHandler.DeleteRecoveryCircle,
 				)
 				mfaRoutes.GET("/recovery-circle/shares",
+					middleware.RecoveryCirclePaused,
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					mfaHandler.GetMyRecoveryShares,
 				)
 
 				// Social recovery requests (contacts respond)
 				mfaRoutes.GET("/recovery-requests/social",
+					middleware.RecoveryCirclePaused,
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					mfaHandler.ListSocialRecoveryRequests,
 				)
 				mfaRoutes.POST("/recovery-requests/social/:id/respond",
+					middleware.RecoveryCirclePaused,
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
 					mfaHandler.RespondToSocialRecovery,
 				)

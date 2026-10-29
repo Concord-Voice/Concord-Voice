@@ -440,6 +440,45 @@ describe('MFATierSelector', () => {
     await vi.waitFor(() => expect(screen.getByText('Set Up Recovery Circle')).toBeInTheDocument());
   });
 
+  it('#3676 describes a saved circle truthfully while retaining management', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path) =>
+      path === '/api/v1/mfa/recovery-circle'
+        ? json({
+            has_circle: true,
+            threshold_k: 2,
+            total_shares_n: 3,
+            contacts: [{ username: 'alice' }, { username: 'bob' }, { username: 'charlie' }],
+          })
+        : json({})
+    );
+    render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+    await screen.findByRole('button', { name: 'Reconfigure' });
+    expect(screen.getByText('@alice')).toBeInTheDocument();
+    expect(screen.getByText('@bob')).toBeInTheDocument();
+    expect(screen.getByText('@charlie')).toBeInTheDocument();
+    expect(screen.getByText('Saved configuration: 2 of 3 contacts.')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Recovery is temporarily paused. Your saved contacts are retained. You can still change your Recovery Circle.'
+      )
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Reconfigure' }));
+    expect(screen.getByTestId('recovery-circle')).toBeInTheDocument();
+  });
+
+  it('#3676 permits saving an unconfigured circle while explaining paused recovery', async () => {
+    vi.mocked(apiFetch).mockResolvedValue(json({ has_circle: false }));
+    render(<MFATierSelector {...defaultProps} activeMethods={['totp']} />);
+    await screen.findByRole('button', { name: 'Set Up Recovery Circle' });
+    expect(
+      screen.getByText(
+        'You can save a Recovery Circle configuration, but Recovery Circle recovery is temporarily paused.'
+      )
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Set Up Recovery Circle' }));
+    expect(screen.getByTestId('recovery-circle')).toBeInTheDocument();
+  });
+
   // ── Sole MFA protection ──────────────────────────────────────────────────
 
   it('disables Reset button when TOTP is sole MFA and Email/SMS is active', () => {

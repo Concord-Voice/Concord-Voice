@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG DERIVATIVE_COMMIT
@@ -8,7 +8,7 @@ WORKDIR /src
 COPY . .
 ENV SOURCE_DATE_EPOCH=1760549395
 RUN : "${DERIVATIVE_COMMIT:?}" "${DERIVATIVE_TAG:?}" "${UPSTREAM_COMMIT:?}" && \
-    test "$(go env GOVERSION)" = "go1.26.8" && \
+    test "$(go env GOVERSION)" = "go1.26.10" && \
     mkdir -p /out && \
     LDFLAGS="-s -w -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z -X github.com/minio/minio/cmd.CopyrightYear=2025 -X github.com/minio/minio/cmd.ReleaseTag=$DERIVATIVE_TAG -X github.com/minio/minio/cmd.CommitID=$DERIVATIVE_COMMIT -X github.com/minio/minio/cmd.ShortCommitID=$(printf '%.12s' "$DERIVATIVE_COMMIT") -X github.com/minio/minio/cmd.GOPATH=/go -X github.com/minio/minio/cmd.GOROOT=/usr/local/go" && \
     GOTOOLCHAIN=local CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -mod=readonly -buildvcs=false -tags=kqueue -trimpath -ldflags "$LDFLAGS" -o /out/minio .
