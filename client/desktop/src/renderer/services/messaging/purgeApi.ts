@@ -493,6 +493,42 @@ async function purgeStepUpFields(
   return { fields };
 }
 
+/** A non-negative safe integer count, as the server must send it. */
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * The success outcome from a 2xx body. A malformed body leaves the deletion
+ * outcome unknown, so it is treated as partial and the caller invalidates the
+ * scope conservatively.
+ */
+async function parsePurgeSuccess(res: Response, args: PurgeArgs): Promise<PurgeResult> {
+  const body: unknown = await res.json().catch(() => null);
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return { kind: 'partial' };
+  }
+  const data = body as Partial<{
+    deleted_count: number;
+    hidden_count: number;
+    affected_channel_ids: string[];
+  }>;
+  const deletedCount = data.deleted_count;
+  const hiddenCount = data.hidden_count;
+  if (!isCount(deletedCount) || !isCount(hiddenCount)) return { kind: 'partial' };
+  const affectedChannelIds =
+    args.context === 'server'
+      ? affectedServerChannels(data.affected_channel_ids, args.scopeId)
+      : undefined;
+  // deleted_count 0 is a legal success — an authorized purge of an empty scope.
+  return {
+    kind: 'success',
+    deletedCount,
+    hiddenCount,
+    ...(affectedChannelIds === undefined ? {} : { affectedChannelIds }),
+  };
+}
+
 /**
  * `context` is the operation the purge belongs to (`captureApiRequestContext`).
  * The DM/group step-up passes the capture its factor was proven under, so a
@@ -533,42 +569,7 @@ export async function purgeMessages(
   );
   if (res === null) return { kind: 'unavailable' };
 
-  if (res.ok) {
-    // A malformed success body leaves the deletion outcome unknown. Treat it
-    // as partial so the caller invalidates the scope conservatively.
-    const body: unknown = await res.json().catch(() => null);
-    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-      return { kind: 'partial' };
-    }
-    const data = body as Partial<{
-      deleted_count: number;
-      hidden_count: number;
-      affected_channel_ids: string[];
-    }>;
-    const deletedCount = data.deleted_count;
-    const hiddenCount = data.hidden_count;
-    if (
-      typeof deletedCount !== 'number' ||
-      !Number.isSafeInteger(deletedCount) ||
-      deletedCount < 0 ||
-      typeof hiddenCount !== 'number' ||
-      !Number.isSafeInteger(hiddenCount) ||
-      hiddenCount < 0
-    ) {
-      return { kind: 'partial' };
-    }
-    const affectedChannelIds =
-      args.context === 'server'
-        ? affectedServerChannels(data.affected_channel_ids, args.scopeId)
-        : undefined;
-    // deleted_count 0 is a legal success — an authorized purge of an empty scope.
-    return {
-      kind: 'success',
-      deletedCount,
-      hiddenCount,
-      ...(affectedChannelIds === undefined ? {} : { affectedChannelIds }),
-    };
-  }
+  if (res.ok) return parsePurgeSuccess(res, args);
 
   if (res.status === 429) return mapTooManyRequests(res);
 

@@ -16,6 +16,15 @@ import (
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
+// erasureClearWiring is the #2447 erasure capture and cross-replica clear
+// publisher: the graph-presence capture, the NATS client, and the secret the
+// clear envelope key derives from.
+type erasureClearWiring struct {
+	capture presencecapture.GraphPresenceCapture
+	nats    *natsclient.Client
+	secret  string
+}
+
 // buildPrivacyHandler constructs the privacy handler wired to the
 // account-deletion service. Telemetry-related wiring was removed in #758 (sub-epic G);
 // the handler now exposes only POST /api/v1/privacy/erase-account.
@@ -30,18 +39,16 @@ func buildPrivacyHandler(
 	log *logger.Logger,
 	activityCleanup *users.Handler,
 	hub *websocket.Hub,
-	graphPresence presencecapture.GraphPresenceCapture,
-	natsClient *natsclient.Client,
-	controlPlaneSecret string,
+	erasure erasureClearWiring,
 ) (*privacy.Handler, *users.AccountService) {
 	account := users.NewAccountService(db, log)
 	account.SetActivitySettingsCleanupHandler(activityCleanup)
 	// #2447: the erasure capture and the cross-replica clear publisher. Returned
 	// alongside the handler so the router's boot guard can interrogate the
 	// service itself rather than trusting that this line still exists.
-	account.SetGraphPresenceCapture(graphPresence)
-	account.SetNATS(natsClient)
-	account.SetErasureClearKey(erasureclear.DeriveKey(controlPlaneSecret))
+	account.SetGraphPresenceCapture(erasure.capture)
+	account.SetNATS(erasure.nats)
+	account.SetErasureClearKey(erasureclear.DeriveKey(erasure.secret))
 	// #2992: the erasure transaction brackets the presence-audience fence, so an
 	// audience computed against the pre-erasure graph cannot be delivered. Returned
 	// alongside the handler so the router's boot guard can interrogate the service

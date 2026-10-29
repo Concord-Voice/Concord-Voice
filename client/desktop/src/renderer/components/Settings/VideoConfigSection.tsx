@@ -742,11 +742,34 @@ function deriveBitrateSlider(
 
 // ─── Video Configuration Section ────────────────────────────────────────────
 
+// Camera preview is unavailable while one of these holds the camera.
+const VOICE_CALL_STATES: ReadonlySet<string> = new Set(['connected', 'connecting', 'reconnecting']);
+
+const CameraTestRow: React.FC<{
+  isTesting: boolean;
+  inVoiceCall: boolean;
+  error: string | null;
+  onToggle: () => void;
+}> = ({ isTesting, inVoiceCall, error, onToggle }) => (
+  <div className="settings-camera-test-row">
+    <button
+      className={`settings-camera-test-btn${isTesting ? ' testing' : ''}`}
+      onClick={onToggle}
+      disabled={inVoiceCall}
+      title={inVoiceCall ? 'Unavailable during a voice call' : undefined}
+    >
+      {isTesting ? 'Stop Preview' : 'Test'}
+    </button>
+    {error && <span className="settings-camera-test-error">{error}</span>}
+  </div>
+);
+
 const VideoConfigSection: React.FC = () => {
   const activeCameraCodec = useVoiceStore((s) => s.activeCameraCodec);
   const activeScreenCodec = useVoiceStore((s) => s.activeScreenCodec);
   const codecFloor = useVoiceStore((s) => s.codecFloor);
   const connectionState = useVoiceStore((s) => s.connectionState);
+  const inVoiceCall = VOICE_CALL_STATES.has(connectionState);
   const {
     isTesting,
     error: cameraTestError,
@@ -1089,27 +1112,12 @@ const VideoConfigSection: React.FC = () => {
       <div className="settings-device-row">
         <DeviceSelector kind="videoinput" />
       </div>
-      <div className="settings-camera-test-row">
-        <button
-          className={`settings-camera-test-btn${isTesting ? ' testing' : ''}`}
-          onClick={toggleTest}
-          disabled={
-            connectionState === 'connected' ||
-            connectionState === 'connecting' ||
-            connectionState === 'reconnecting'
-          }
-          title={
-            connectionState === 'connected' ||
-            connectionState === 'connecting' ||
-            connectionState === 'reconnecting'
-              ? 'Unavailable during a voice call'
-              : undefined
-          }
-        >
-          {isTesting ? 'Stop Preview' : 'Test'}
-        </button>
-        {cameraTestError && <span className="settings-camera-test-error">{cameraTestError}</span>}
-      </div>
+      <CameraTestRow
+        isTesting={isTesting}
+        inVoiceCall={inVoiceCall}
+        error={cameraTestError}
+        onToggle={toggleTest}
+      />
       {isTesting && (
         <div className="settings-camera-preview">
           <video

@@ -89,6 +89,24 @@ func (h *Handler) SetMinimumClientVersion(minimum string) {
 	h.minimumClientVersion = minimum
 }
 
+// liveWebSocketDeadline is the authenticated credential's expiry, when it is
+// set and still in the future.
+func liveWebSocketDeadline(c *gin.Context) (time.Time, bool) {
+	expiresAt, ok := c.Get(wsDeadlineContextKey)
+	deadline, valid := expiresAt.(time.Time)
+	return deadline, ok && valid && time.Now().Before(deadline)
+}
+
+// lookupWebSocketProfile reads the username, display name, and avatar for a
+// connecting user. A failed read keeps the socket and names the user "Unknown".
+func (h *Handler) lookupWebSocketProfile(userID uuid.UUID) (username string, displayName, avatarURL *string) {
+	if err := h.db.QueryRow("SELECT username, display_name, avatar_url FROM users WHERE id = $1", userID).Scan(&username, &displayName, &avatarURL); err != nil {
+		log.Printf("Failed to look up username for user %s: %v", sanitizeLogValue(userID.String()), err)
+		return "Unknown", nil, nil
+	}
+	return username, displayName, avatarURL
+}
+
 // HandleWebSocket upgrades HTTP connections to WebSocket
 func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// Authenticate: prefer ticket-based auth, fall back to JWT for backward compat
@@ -111,21 +129,13 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		}
 	}()
 	activityRichPresenceCapable := requestSupportsActivityRichPresence(c.Request)
-	expiresAt, ok := c.Get(wsDeadlineContextKey)
-	deadline, valid := expiresAt.(time.Time)
-	if !ok || !valid || !time.Now().Before(deadline) {
+	deadline, ok := liveWebSocketDeadline(c)
+	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	// Look up username, display name, and avatar for this user
-	var username string
-	var displayName *string
-	var avatarURL *string
-	if err := h.db.QueryRow("SELECT username, display_name, avatar_url FROM users WHERE id = $1", userID).Scan(&username, &displayName, &avatarURL); err != nil {
-		log.Printf("Failed to look up username for user %s: %v", sanitizeLogValue(userID.String()), err)
-		username = "Unknown"
-	}
+	username, displayName, avatarURL := h.lookupWebSocketProfile(userID)
 	if !time.Now().Before(deadline) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return

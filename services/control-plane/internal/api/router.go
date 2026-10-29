@@ -1306,7 +1306,8 @@ func NewRouter(
 		dangerousActionGateGap(channelsHandler, membersHandler, rbacHandler, mediaHandler) == "")
 	updatesHandler := updates.NewHandler(cfg, log)
 	privacyHandler, accountService := buildPrivacyHandler(
-		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient, cfg.MFAEncryptionKey)
+		db, redis, log, usersHandler, hub,
+		erasureClearWiring{capture: graphPresenceCapture, nats: natsClient, secret: cfg.MFAEncryptionKey})
 
 	// The erasure drain (#2448). Wired here rather than beside the DM rail for
 	// the same reason the guard below runs here: accountService does not exist
@@ -1368,7 +1369,7 @@ func NewRouter(
 	// billing route and runs no billing worker. The workers live as long as
 	// the router's lifecycle context. Built before redemption, which uses it
 	// for code credit (D1).
-	billingSvc := wireBilling(lifecycleCtx, cfg, db, entCache, redemptionEntNotifier, redemptionEntNotifier, opsCounters, log)
+	billingSvc := wireBilling(cfg, db, entCache, redemptionEntNotifier, redemptionEntNotifier, opsCounters, log)
 	startBillingWorkers(lifecycleCtx, billingSvc)
 	if billingSvc != nil {
 		accountService.SetErasedSeatNotifier(erasedSeatNotifier(billingSvc))

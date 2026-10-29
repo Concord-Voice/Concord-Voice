@@ -213,6 +213,33 @@ function isChallenge(outcome: PurgeOutcome): boolean {
  * configure → softlock → result; one refused by the dangerous-action gate of an
  * MFA-enforcing server (#3456) goes configure → mfa → result.
  */
+// Whether the purge outcome may have removed messages, so open views refresh.
+function outcomeChangedMessages(outcome: PurgeOutcome): boolean {
+  if (outcome.kind === 'success') return outcome.deletedCount > 0 || outcome.hiddenCount > 0;
+  return outcome.kind === 'partial' || outcome.kind === 'networkError';
+}
+
+// The actor may not be subscribed to a changed channel. The server's successful
+// response names exactly the channels with committed deletes, so clearing
+// locally must use that list as well. Uncertain outcomes and older servers lack
+// it and retain the conservative server refresh.
+function dispatchMessagesPurged(outcome: PurgeOutcome, context: PurgeContext, scopeId: string) {
+  const affected = outcome.kind === 'success' ? outcome.affectedChannelIds : undefined;
+  if (context === 'server' && affected?.length) {
+    for (const channelId of affected) {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: channelId } })
+      );
+    }
+    return;
+  }
+  globalThis.dispatchEvent(
+    new CustomEvent('messages-purged', {
+      detail: context === 'server' ? { scopeId: null, serverId: scopeId } : { scopeId },
+    })
+  );
+}
+
 type Stage = 'configure' | 'stepup' | 'softlock' | 'mfa' | 'result';
 
 /** The stages that ask for credentials: focus lands on their heading on entry. */
@@ -780,33 +807,7 @@ const PurgeMessagesModal: React.FC<PurgeMessagesModalProps> = ({
       showStepUpChallenge(outcome, requestContext);
       return;
     }
-    if (
-      (outcome.kind === 'success' && (outcome.deletedCount > 0 || outcome.hiddenCount > 0)) ||
-      outcome.kind === 'partial' ||
-      outcome.kind === 'networkError'
-    ) {
-      // The actor may not be subscribed to a changed channel. The server's
-      // successful response names exactly the channels with committed deletes,
-      // so clearing locally must use that list as well. Uncertain outcomes and
-      // older servers lack it and retain the conservative server refresh.
-      if (
-        context === 'server' &&
-        outcome.kind === 'success' &&
-        outcome.affectedChannelIds?.length
-      ) {
-        for (const channelId of outcome.affectedChannelIds) {
-          globalThis.dispatchEvent(
-            new CustomEvent('messages-purged', { detail: { scopeId: channelId } })
-          );
-        }
-      } else {
-        globalThis.dispatchEvent(
-          new CustomEvent('messages-purged', {
-            detail: context === 'server' ? { scopeId: null, serverId: scopeId } : { scopeId },
-          })
-        );
-      }
-    }
+    if (outcomeChangedMessages(outcome)) dispatchMessagesPurged(outcome, context, scopeId);
     // Nothing beyond this point needs the credentials; drop them before the
     // result stage renders.
     setPassword('');

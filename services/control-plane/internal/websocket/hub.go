@@ -5099,58 +5099,80 @@ func (h *Hub) BroadcastServerPurgeViewAuthorizedRecovering(
 	if len(events) == 0 {
 		return
 	}
-	go func() {
-		backoff := time.Second
-		pending := events
-		for len(pending) > 0 {
-			jobs := make(chan ServerPurgeChannelEvent, len(pending))
-			for _, event := range pending {
-				jobs <- event
-			}
-			close(jobs)
-			failed := make([]ServerPurgeChannelEvent, 0, len(pending))
-			var mu sync.Mutex
-			var workers sync.WaitGroup
-			for range min(len(pending), cap(h.purgeDeliverySlots)) {
-				workers.Add(1)
-				go func() {
-					defer workers.Done()
-					for event := range jobs {
-						receipt := make(chan ServerVoiceTerminalDeliveryOutcome, 1)
-						if !h.broadcastToServerChannelViewAuthorizedContext(context.Background(), serverID, event.ChannelID, receipt, event.Message) {
-							return // the hub has stopped; its clients are disconnected
-						}
-						select {
-						case outcome := <-receipt:
-							if outcome == ServerVoiceTerminalDeliveryApplied {
-								continue
-							}
-						case <-h.done:
-							return
-						}
-						mu.Lock()
-						failed = append(failed, event)
-						mu.Unlock()
-					}
-				}()
-			}
-			workers.Wait()
-			if len(failed) == 0 {
-				return
-			}
-			pending = failed
-			timer := time.NewTimer(backoff)
-			select {
-			case <-timer.C:
-			case <-h.done:
-				timer.Stop()
-				return
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
+	go h.retryServerPurgeInvalidations(serverID, events)
+}
+
+// retryServerPurgeInvalidations delivers rounds until every event applies or
+// the hub stops, backing off between rounds.
+func (h *Hub) retryServerPurgeInvalidations(serverID uuid.UUID, pending []ServerPurgeChannelEvent) {
+	backoff := time.Second
+	for len(pending) > 0 {
+		pending = h.deliverServerPurgeRound(serverID, pending)
+		if len(pending) == 0 || !h.sleepUnlessStopped(backoff) {
+			return
 		}
-	}()
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// deliverServerPurgeRound fans one round out to at most cap(purgeDeliverySlots)
+// workers and returns the events that did not apply.
+func (h *Hub) deliverServerPurgeRound(serverID uuid.UUID, pending []ServerPurgeChannelEvent) []ServerPurgeChannelEvent {
+	jobs := make(chan ServerPurgeChannelEvent, len(pending))
+	for _, event := range pending {
+		jobs <- event
+	}
+	close(jobs)
+	failed := make([]ServerPurgeChannelEvent, 0, len(pending))
+	var mu sync.Mutex
+	var workers sync.WaitGroup
+	for range min(len(pending), cap(h.purgeDeliverySlots)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for event := range jobs {
+				applied, stopped := h.deliverServerPurgeEvent(serverID, event)
+				if stopped {
+					return // the hub has stopped; its clients are disconnected
+				}
+				if !applied {
+					mu.Lock()
+					failed = append(failed, event)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	return failed
+}
+
+// deliverServerPurgeEvent sends one invalidation and waits for its receipt.
+func (h *Hub) deliverServerPurgeEvent(serverID uuid.UUID, event ServerPurgeChannelEvent) (applied, stopped bool) {
+	receipt := make(chan ServerVoiceTerminalDeliveryOutcome, 1)
+	if !h.broadcastToServerChannelViewAuthorizedContext(context.Background(), serverID, event.ChannelID, receipt, event.Message) {
+		return false, true
+	}
+	select {
+	case outcome := <-receipt:
+		return outcome == ServerVoiceTerminalDeliveryApplied, false
+	case <-h.done:
+		return false, true
+	}
+}
+
+// sleepUnlessStopped waits d, or reports false as soon as the hub stops.
+func (h *Hub) sleepUnlessStopped(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	select {
+	case <-timer.C:
+		return true
+	case <-h.done:
+		timer.Stop()
+		return false
+	}
 }
 
 func (h *Hub) broadcastToServerChannelViewAuthorizedContext(

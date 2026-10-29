@@ -935,6 +935,28 @@ func (h *Handler) ProxyDMIcon(c *gin.Context) {
 	c.Data(http.StatusOK, image.contentType, image.body)
 }
 
+// feedbackScreenshotBackend looks up the live screenshot row's storage backend.
+// It writes the 404 or 503 itself and reports false when the request is done.
+func (h *Handler) feedbackScreenshotBackend(c *gin.Context, storageKey string) (*string, bool) {
+	var backend sql.NullString
+	err := h.db.QueryRowContext(c.Request.Context(), `SELECT storage_backend FROM media_files
+		WHERE storage_key=$1 AND media_tier=1 AND mime_type IN ('image/jpeg','image/png')
+		  AND deleted_at IS NULL`, storageKey).Scan(&backend)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+		return nil, false
+	}
+	if err != nil {
+		h.log.Error("Failed to resolve feedback screenshot metadata", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		return nil, false
+	}
+	if !backend.Valid {
+		return nil, true
+	}
+	return &backend.String, true
+}
+
 // ProxyFeedbackScreenshot serves a bug-report screenshot through the control plane.
 // GET /api/v1/media/feedback-screenshots/:id
 // PUBLIC: the unguessable UUID is the only identifier. Registered without auth so
@@ -959,17 +981,8 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 	}
 
 	storageKey := fmt.Sprintf("feedback-screenshots/%s", id)
-	var backend sql.NullString
-	err = h.db.QueryRowContext(c.Request.Context(), `SELECT storage_backend FROM media_files
-		WHERE storage_key=$1 AND media_tier=1 AND mime_type IN ('image/jpeg','image/png')
-		  AND deleted_at IS NULL`, storageKey).Scan(&backend)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
-		} else {
-			h.log.Error("Failed to resolve feedback screenshot metadata", "error", err)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
-		}
+	backendID, ok := h.feedbackScreenshotBackend(c, storageKey)
+	if !ok {
 		return
 	}
 	data, contentType, remote, allowed, err := feedbackscreenshots.New(h.db).Read(c.Request.Context(), storageKey)
@@ -985,10 +998,6 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 	if !remote {
 		c.Data(http.StatusOK, contentType, data)
 		return
-	}
-	var backendID *string
-	if backend.Valid {
-		backendID = &backend.String
 	}
 	store, ok := h.requireObjectStoreForRow(c, backendID)
 	if !ok {
@@ -1014,6 +1023,27 @@ func (h *Handler) ProxyFeedbackScreenshot(c *gin.Context) {
 	if _, err := io.Copy(c.Writer, obj); err != nil {
 		h.log.Warn("Failed to stream feedback screenshot")
 	}
+}
+
+// lockMediaConversation takes a key-share lock on the DM conversation a file
+// belongs to, in the order DM retirement uses. A channel file has none to lock.
+// sql.ErrNoRows means the conversation is gone.
+func lockMediaConversation(ctx context.Context, tx *sql.Tx, conversationID sql.NullString) error {
+	if !conversationID.Valid {
+		return nil
+	}
+	var locked int
+	return tx.QueryRowContext(ctx, `SELECT 1 FROM dm_conversations WHERE id = $1 FOR KEY SHARE`, conversationID.String).Scan(&locked)
+}
+
+// lockMediaMembership key-share locks the uploader's membership of the file's
+// server (through its channel) or DM. sql.ErrNoRows means they are no longer a member.
+func lockMediaMembership(ctx context.Context, tx *sql.Tx, channelID, conversationID sql.NullString, userID string) error {
+	var member int
+	if channelID.Valid {
+		return tx.QueryRowContext(ctx, `SELECT 1 FROM channels ch JOIN server_members sm ON sm.server_id = ch.server_id AND sm.user_id = $2 WHERE ch.id = $1 FOR KEY SHARE OF sm`, channelID.String, userID).Scan(&member)
+	}
+	return tx.QueryRowContext(ctx, `SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR KEY SHARE`, conversationID.String, userID).Scan(&member)
 }
 
 // DeleteMedia soft-deletes a media file and removes it from object storage.
@@ -1069,18 +1099,15 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
 		return
 	}
-	if expectedConversationID.Valid {
-		var lockedConversation int
-		err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM dm_conversations WHERE id = $1 FOR KEY SHARE`, expectedConversationID.String).Scan(&lockedConversation)
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
-			return
-		}
-		if err != nil {
-			h.log.Error("Failed to lock media conversation", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
-			return
-		}
+	err = lockMediaConversation(c.Request.Context(), tx, expectedConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to lock media conversation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return
 	}
 
 	// Verify ownership, tier 2 only, and get the storage key AND its placement.
@@ -1109,12 +1136,7 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		return
 	}
 
-	var member int
-	if channelID.Valid {
-		err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM channels ch JOIN server_members sm ON sm.server_id = ch.server_id AND sm.user_id = $2 WHERE ch.id = $1 FOR KEY SHARE OF sm`, channelID.String, userID).Scan(&member)
-	} else {
-		err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR KEY SHARE`, conversationID.String, userID).Scan(&member)
-	}
+	err = lockMediaMembership(c.Request.Context(), tx, channelID, conversationID, userID)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
 		return

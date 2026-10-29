@@ -388,6 +388,11 @@ async function seatRequest(
   }
 }
 
+/** A 409 that says a plan change is already booked. */
+async function isPendingPlanChangeConflict(res: Response): Promise<boolean> {
+  return res.status === 409 && (await readErrorCode(res)) === 'pending_plan_change';
+}
+
 export const useBillingStore = createStore<BillingState>()((set, get) => {
   const enterConfirming = (): void => {
     clearStallTimer();
@@ -492,6 +497,58 @@ export const useBillingStore = createStore<BillingState>()((set, get) => {
     return result;
   };
 
+  // A booked change that needs a payment step: open Stripe's payment page.
+  const applyPlanChangePayment = async (res: Response, current: () => boolean): Promise<void> => {
+    const payment = PendingPlanPaymentSchema.parse(await safeJson<unknown>(res));
+    if (!current()) return;
+    previewTicket += 1;
+    set({ preview: null, previewing: false });
+    if (!isStripePaymentUrl(payment.payment_url)) {
+      set({ notice: 'plan_change_payment_unavailable' });
+      return;
+    }
+    const opened = await globalThis.electron?.openExternal?.(payment.payment_url);
+    if (!current()) return;
+    let notice: BillingNotice = 'plan_change_payment_unavailable';
+    if (opened?.ok) {
+      notice =
+        payment.payment_status === 'card_declined'
+          ? 'card_declined'
+          : 'plan_change_payment_pending';
+    }
+    set({ notice });
+  };
+
+  const applyPlanChangeResult = async (res: Response, current: () => boolean): Promise<void> => {
+    const result = PlanChangeResultSchema.parse(await safeJson<unknown>(res));
+    if (!current()) return;
+    previewTicket += 1;
+    set({
+      notice: result.booking_failed ? 'plan_change_partial' : 'plan_change_saved',
+      preview: null,
+      previewing: false,
+    });
+    await get().fetchMe();
+    if (current()) await useSubscriptionStore.getState().hydrate();
+  };
+
+  const applyPlanChangeRefusal = async (
+    res: Response,
+    current: () => boolean,
+    plan: PlanId,
+    interval: PlanInterval
+  ): Promise<void> => {
+    const code = await readErrorCode(res);
+    if (!current()) return;
+    set({ notice: PLAN_CHANGE_ERROR_NOTICES.get(code ?? '') ?? 'plan_change_failed' });
+    if (code === 'card_declined' || code === 'payment_pending') {
+      previewTicket += 1;
+      set({ preview: null, previewing: false, previewError: true });
+    }
+    if (code === 'plan_change_conflict') void get().previewPlanChange(plan, interval);
+    if (code === 'pending_plan_change') void get().fetchMe();
+  };
+
   return {
     ...INITIAL,
 
@@ -569,7 +626,7 @@ export const useBillingStore = createStore<BillingState>()((set, get) => {
         });
         if (!current()) return;
         if (!res.ok) {
-          if (res.status === 409 && (await readErrorCode(res)) === 'pending_plan_change') {
+          if (await isPendingPlanChangeConflict(res)) {
             if (current()) {
               set({ notice: 'pending_plan_change' });
               void get().fetchMe();
@@ -617,47 +674,9 @@ export const useBillingStore = createStore<BillingState>()((set, get) => {
           }),
         });
         if (!current()) return;
-        if (res.status === 202) {
-          const payment = PendingPlanPaymentSchema.parse(await safeJson<unknown>(res));
-          if (!current()) return;
-          previewTicket += 1;
-          set({ preview: null, previewing: false });
-          if (!isStripePaymentUrl(payment.payment_url)) {
-            set({ notice: 'plan_change_payment_unavailable' });
-            return;
-          }
-          const opened = await globalThis.electron?.openExternal?.(payment.payment_url);
-          if (!current()) return;
-          let notice: BillingNotice = 'plan_change_payment_unavailable';
-          if (opened?.ok) {
-            notice =
-              payment.payment_status === 'card_declined'
-                ? 'card_declined'
-                : 'plan_change_payment_pending';
-          }
-          set({ notice });
-        } else if (res.ok) {
-          const result = PlanChangeResultSchema.parse(await safeJson<unknown>(res));
-          if (!current()) return;
-          previewTicket += 1;
-          set({
-            notice: result.booking_failed ? 'plan_change_partial' : 'plan_change_saved',
-            preview: null,
-            previewing: false,
-          });
-          await get().fetchMe();
-          if (current()) await useSubscriptionStore.getState().hydrate();
-        } else {
-          const code = await readErrorCode(res);
-          if (!current()) return;
-          set({ notice: PLAN_CHANGE_ERROR_NOTICES.get(code ?? '') ?? 'plan_change_failed' });
-          if (code === 'card_declined' || code === 'payment_pending') {
-            previewTicket += 1;
-            set({ preview: null, previewing: false, previewError: true });
-          }
-          if (code === 'plan_change_conflict') void get().previewPlanChange(plan, interval);
-          if (code === 'pending_plan_change') void get().fetchMe();
-        }
+        if (res.status === 202) await applyPlanChangePayment(res, current);
+        else if (res.ok) await applyPlanChangeResult(res, current);
+        else await applyPlanChangeRefusal(res, current, plan, interval);
       } catch {
         if (current()) set({ notice: 'plan_change_failed' });
       } finally {

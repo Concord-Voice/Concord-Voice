@@ -37,6 +37,24 @@ interface WingSeatPanelProps {
 
 type Confirm = 'remove' | 'withdraw' | null;
 
+/** Copy for the remove / withdraw confirmation dialog. */
+function confirmCopy(confirm: Confirm, name: string, nextSwap: string | undefined) {
+  if (confirm === 'withdraw') {
+    return {
+      title: SEAT_COPY.withdraw,
+      message: `Withdraw your invite to ${name}?`,
+      confirmLabel: SEAT_COPY.withdraw,
+      cancelLabel: undefined,
+    };
+  }
+  return {
+    title: SEAT_COPY.remove,
+    message: seatRemoveConfirm(name, nextSwap),
+    confirmLabel: SEAT_COPY.remove,
+    cancelLabel: confirm === 'remove' ? `Keep ${name}` : undefined,
+  };
+}
+
 const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
   const removeSeat = useBillingStore((s) => s.removeSeat);
   const fetchMe = useBillingStore((s) => s.fetchMe);
@@ -64,6 +82,7 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
   }, [swapAt, now, fetchMe]);
 
   const nextSwap = swapAt > now ? formatExpiry(seat.next_swap_at) : undefined;
+  const describedBy = nextSwap ? cooldownId : undefined;
   const cooldown = nextSwap ? (
     <p id={cooldownId} className="subscription-plan-hint">
       {seatCooldownLine(nextSwap)}
@@ -87,7 +106,7 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
             type="button"
             className="subscription-button"
             aria-disabled={nextSwap !== undefined}
-            aria-describedby={nextSwap ? cooldownId : undefined}
+            aria-describedby={describedBy}
             onClick={() => {
               if (!nextSwap) setPicker('change');
             }}
@@ -132,7 +151,7 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
           <button
             type="button"
             className="subscription-button"
-            aria-describedby={nextSwap ? cooldownId : undefined}
+            aria-describedby={describedBy}
             onClick={() => setPicker('invite')}
           >
             {seat.state === 'expired' ? SEAT_COPY.inviteSomeoneElse : SEAT_COPY.inviteFriend}
@@ -158,15 +177,8 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
       <ConfirmActionModal
         isOpen={confirm !== null}
         onClose={() => setConfirm(null)}
-        title={confirm === 'withdraw' ? SEAT_COPY.withdraw : SEAT_COPY.remove}
-        message={
-          confirm === 'withdraw'
-            ? `Withdraw your invite to ${name}?`
-            : seatRemoveConfirm(name, nextSwap)
-        }
-        confirmLabel={confirm === 'withdraw' ? SEAT_COPY.withdraw : SEAT_COPY.remove}
+        {...confirmCopy(confirm, name, nextSwap)}
         loadingLabel="Updating…"
-        cancelLabel={confirm === 'remove' ? `Keep ${name}` : undefined}
         onConfirm={runRemove}
       />
     </section>

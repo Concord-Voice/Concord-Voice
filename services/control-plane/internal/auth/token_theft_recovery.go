@@ -594,25 +594,9 @@ func insertCurrentTokenTheftFallback(ctx context.Context, db *sql.DB, redisClien
 	if !userExists {
 		return false, errors.New("token theft fallback user deleted")
 	}
-	if operationID != nil {
-		current, getErr := redisClient.HGet(ctx, tokenTheftFallbackHashKey, userID).Result()
-		if errors.Is(getErr, redis.Nil) {
-			return false, nil
-		}
-		if getErr != nil {
-			return false, fmt.Errorf("recheck token theft fallback: %w", getErr)
-		}
-		if current != *operationID {
-			return false, nil
-		}
-	} else {
-		current, checkErr := redisClient.SIsMember(ctx, tokenTheftLegacyFallbackSetKey, userID).Result()
-		if checkErr != nil {
-			return false, fmt.Errorf("recheck legacy token theft fallback: %w", checkErr)
-		}
-		if !current {
-			return false, nil
-		}
+	stillCurrent, err := tokenTheftFallbackStillCurrent(ctx, redisClient, userID, operationID)
+	if err != nil || !stillCurrent {
+		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO token_theft_pending_revocations (user_id, operation_id)
 		VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING`, userID, operationID); err != nil {
@@ -622,6 +606,26 @@ func insertCurrentTokenTheftFallback(ctx context.Context, db *sql.DB, redisClien
 		return false, fmt.Errorf("commit token theft fallback promotion: %w", err)
 	}
 	return true, nil
+}
+
+// tokenTheftFallbackStillCurrent reports whether the fallback this scan read is
+// still the one in Redis: the same operation, or a legacy set entry.
+func tokenTheftFallbackStillCurrent(ctx context.Context, redisClient *redis.Client, userID string, operationID *string) (bool, error) {
+	if operationID == nil {
+		current, err := redisClient.SIsMember(ctx, tokenTheftLegacyFallbackSetKey, userID).Result()
+		if err != nil {
+			return false, fmt.Errorf("recheck legacy token theft fallback: %w", err)
+		}
+		return current, nil
+	}
+	current, err := redisClient.HGet(ctx, tokenTheftFallbackHashKey, userID).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("recheck token theft fallback: %w", err)
+	}
+	return current == *operationID, nil
 }
 
 func recoverPendingTokenTheftRevocations(ctx context.Context, db *sql.DB, redisClient *redis.Client, log *logger.Logger, userIDs []string, recoveryClient ...func(context.Context) (*redis.Client, error)) []error {

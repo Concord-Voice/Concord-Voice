@@ -360,7 +360,7 @@ func (s *Service) writeSubscription(ctx context.Context, conn *sql.Conn, in reco
 	if out.before, err = resolveTier(ctx, tx, payer, stageTierBefore); err != nil {
 		return reconcileOutcome{}, err
 	}
-	holder, holderBefore, err := seatHolderBefore(ctx, tx, in.subID)
+	holder, err := seatHolderBefore(ctx, tx, in.subID)
 	if err != nil {
 		return reconcileOutcome{}, err
 	}
@@ -377,7 +377,7 @@ func (s *Service) writeSubscription(ctx context.Context, conn *sql.Conn, in reco
 	if out.changed, out.statusBefore, err = s.upsertRow(ctx, tx, payer, in, old, found); err != nil {
 		return reconcileOutcome{}, err
 	}
-	if out.seats, err = s.reconcileSeats(ctx, tx, in, payer, locked, holder, holderBefore, out.changed); err != nil {
+	if out.seats, err = s.reconcileSeats(ctx, tx, in, payer, locked, holder, out.changed); err != nil {
 		return reconcileOutcome{}, err
 	}
 	if err := s.finishWrite(ctx, tx, in, &out); err != nil {

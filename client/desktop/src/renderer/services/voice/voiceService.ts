@@ -26,6 +26,7 @@ import {
   useVoiceStore,
   AUDIO_QUALITY_TIERS,
   MAX_TUNED_SCREEN_SHARES,
+  type ActiveScreenShare,
   type AudioQualityTier,
   type MediaPolicyInterrupt,
   type VoiceParticipant,
@@ -742,6 +743,45 @@ interface VideoCodecSwapOptions {
   preserveActiveCodec?: boolean;
   selectedCodec?: mediasoupTypes.RtpCodecCapability;
   requireRoomFloorMatch?: boolean;
+}
+
+/** Recovery options for a dead camera track: re-publish the swap's codecs when both are known. */
+function cameraRecoveryCodec(
+  activeCodec: mediasoupTypes.RtpCodecCapability | undefined,
+  selectedCodec: mediasoupTypes.RtpCodecCapability | undefined,
+  requireRoomFloorMatch: boolean | undefined
+): CameraRecoveryCodecOptions | undefined {
+  if (!activeCodec || !selectedCodec) return undefined;
+  return { selectedCodec, activeCodec, requireRoomFloorMatch };
+}
+
+interface AuthorizedJoinTarget {
+  /** The id the join was authorized for (a channel, or a DM conversation). */
+  authorizationId: string;
+  /** The media room the authorization resolved to. */
+  roomId: string;
+  joinType: 'channel' | 'dm';
+  ringId: string | undefined;
+}
+
+type CodecSettings = Pick<
+  ReturnType<typeof useVideoSettingsStore.getState>,
+  'preferredVideoCodec' | 'hdrEncoding' | 'prioritizeHdrCodecs'
+>;
+
+/** Whether two snapshots select the same send codec. */
+function sameCodecSettings(a: CodecSettings, b: CodecSettings): boolean {
+  return (
+    a.preferredVideoCodec === b.preferredVideoCodec &&
+    a.hdrEncoding === b.hdrEncoding &&
+    a.prioritizeHdrCodecs === b.prioritizeHdrCodecs
+  );
+}
+
+interface CameraReplacement {
+  codec: mediasoupTypes.RtpCodecCapability;
+  newProducer: mediasoupTypes.Producer;
+  publishedBitrate: number;
 }
 
 interface CameraRecoveryCodecOptions {
@@ -2857,6 +2897,172 @@ class VoiceService {
     return floor !== null && isCodecKeyInFloor(this.codecKeyFromParameters(codec), floor);
   }
 
+  /** The active codec and the override a swap publishes; null when a needed active codec is missing. */
+  private videoSwapCodecs(
+    source: VideoReproduceSource,
+    opts: VideoCodecSwapOptions
+  ): {
+    activeCodec: mediasoupTypes.RtpCodecCapability | undefined;
+    codecOverride: mediasoupTypes.RtpCodecCapability | undefined;
+  } | null {
+    const needsActive = Boolean(opts.preserveActiveCodec || opts.requireRoomFloorMatch);
+    const activeCodec = needsActive ? this.currentVideoSendCodec(source) : undefined;
+    if (needsActive && !activeCodec) return null;
+    return {
+      activeCodec,
+      codecOverride: opts.preserveActiveCodec ? activeCodec : opts.selectedCodec,
+    };
+  }
+
+  /** The override, or the active codec when the room floor no longer shares it. */
+  private floorSafeOverride(
+    opts: VideoCodecSwapOptions,
+    codecOverride: mediasoupTypes.RtpCodecCapability | undefined,
+    activeCodec: mediasoupTypes.RtpCodecCapability | undefined
+  ): mediasoupTypes.RtpCodecCapability | undefined {
+    if (
+      opts.requireRoomFloorMatch &&
+      codecOverride &&
+      !this.roomFloorIncludesCodec(codecOverride)
+    ) {
+      return activeCodec;
+    }
+    return codecOverride;
+  }
+
+  /** Whether a floor change during produce() left the new codec unshared. */
+  private replacementLeftFloor(
+    opts: VideoCodecSwapOptions,
+    activeCodec: mediasoupTypes.RtpCodecCapability | undefined,
+    codec: mediasoupTypes.RtpCodecCapability
+  ): boolean {
+    if (!opts.requireRoomFloorMatch || !activeCodec) return false;
+    const unchanged = this.codecKeysEquivalent(
+      this.codecKeyFromParameters(codec),
+      this.codecKeyFromParameters(activeCodec)
+    );
+    return !unchanged && !this.roomFloorIncludesCodec(codec);
+  }
+
+  /** Whether the swap lost its transport or stream, or another producer won. */
+  private videoSwapStale(
+    source: 'camera' | 'screen',
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    stream: MediaStream
+  ): boolean {
+    const local = source === 'camera' ? this.localCameraStream : this.localScreenStream;
+    return (
+      !this.isCurrentVideoReproduce(token, transport) ||
+      local !== stream ||
+      this.producers.has(source)
+    );
+  }
+
+  private async publishCameraReplacement(
+    transport: mediasoupTypes.Transport,
+    track: MediaStreamTrack,
+    override?: mediasoupTypes.RtpCodecCapability
+  ): Promise<CameraReplacement> {
+    const selection = this.pickCameraCodec(override);
+    const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+    const publishedBitrate = selection.encodings.reduce(
+      (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
+      0
+    );
+    const cameraBitrate = this.cameraStartBitrate(selection.encodings);
+    const newProducer = await this.produceEncrypted(transport, {
+      track,
+      encodings: selection.encodings,
+      codec,
+      codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
+      // The track is owned by localCameraStream and reused across codec/layer
+      // re-produces (fastReproduceCamera). stopTracks:false keeps producer.close()
+      // from stopping it; every teardown path stops localCameraStream explicitly.
+      stopTracks: false,
+      appData: videoPublishAppData('camera'),
+    });
+    return { codec, newProducer, publishedBitrate };
+  }
+
+  private finishCameraReplacement(
+    replacement: CameraReplacement,
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    stream: MediaStream,
+    socket: Socket | null
+  ): void {
+    if (this.videoSwapStale('camera', token, transport, stream)) {
+      this.discardProducedProducer(replacement.newProducer, socket);
+      return;
+    }
+    if (replacement.publishedBitrate > this.cameraBitrateBudget()) {
+      this.discardProducedProducer(replacement.newProducer, socket);
+      this.cleanupCameraState();
+      return;
+    }
+    const committed = this.commitCameraProducer(
+      replacement.newProducer,
+      stream,
+      token,
+      transport,
+      socket,
+      replacement.codec
+    );
+    if (!committed) return;
+    const selectedCodecKey = this.codecKeyFromParameters(replacement.codec);
+    const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
+    console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
+  }
+
+  /** Move the local share's tune-in, owner row and dominance to its new producer. */
+  private carryScreenShareState(
+    pre: {
+      wasTunedIn: boolean;
+      wasDominant: boolean;
+      oldShareMeta: ActiveScreenShare | undefined;
+    },
+    oldProducerId: string,
+    newProducerId: string
+  ): void {
+    const { wasTunedIn, wasDominant, oldShareMeta } = pre;
+    // Update tuned-in mapping since producer ID changed. Keyed off the
+    // pre-swap snapshot — the producer-closed self-echo may already have
+    // pruned the old entries during the awaits above (#2088).
+    const store = useVoiceStore.getState();
+    if (wasTunedIn) {
+      store.tuneOut(oldProducerId); // no-op if the echo already pruned it
+      store.tuneIn(newProducerId, LOCAL_SCREEN_CONSUMER_ID);
+    }
+    // Carry the owner metadata to the new producerId (#2088) — re-register
+    // unconditionally from the snapshot/local identity so an echo-pruned
+    // entry cannot leave the live share without its ShareTunePill/StreamBar row.
+    store.unregisterActiveScreenShare(oldProducerId);
+    const localUserId = useUserStore.getState().user?.id;
+    const shareOwnerId = oldShareMeta?.userId ?? localUserId;
+    if (shareOwnerId) {
+      const localParticipant = store.participants[shareOwnerId];
+      store.registerActiveScreenShare({
+        producerId: newProducerId,
+        userId: shareOwnerId,
+        username: oldShareMeta?.username ?? localParticipant?.username ?? 'You',
+        displayName: oldShareMeta?.displayName ?? localParticipant?.displayName,
+        isLocal: true,
+      });
+    }
+    // The self-echo may also have cleared the local participant's screen
+    // state mid-swap; re-assert it while the capture stream is live.
+    if (localUserId && this.localScreenStream) {
+      store.updateParticipant(localUserId, {
+        screenStream: this.localScreenStream,
+        isScreenSharing: true,
+      });
+    }
+    if (wasDominant || (wasTunedIn && useVoiceStore.getState().dominantScreenShareId === null)) {
+      store.setDominantScreenShare(newProducerId);
+    }
+  }
+
   /**
    * Fast re-produce camera: close producer and re-produce with best floor-compatible
    * codec, reusing the existing video track for a subsecond switch.
@@ -2882,24 +3088,16 @@ class VoiceService {
     // Gate events change the encoding plan, not the codec. Resolve the active
     // codec before closing its producer so a disjoint room floor cannot turn a
     // layering change into an unsafe codec switch.
-    const activeCodec =
-      opts.preserveActiveCodec || opts.requireRoomFloorMatch
-        ? this.currentVideoSendCodec('camera')
-        : undefined;
-    if ((opts.preserveActiveCodec || opts.requireRoomFloorMatch) && !activeCodec) return;
-    let codecOverride = opts.preserveActiveCodec ? activeCodec : opts.selectedCodec;
+    const codecs = this.videoSwapCodecs('camera', opts);
+    if (!codecs) return;
+    const { activeCodec } = codecs;
+    let { codecOverride } = codecs;
 
     const track = stream.getVideoTracks()[0];
     if (track?.readyState !== 'live') {
       await this.liveReproduceCameraQueued(
         token,
-        activeCodec && codecOverride
-          ? {
-              selectedCodec: codecOverride,
-              activeCodec,
-              requireRoomFloorMatch: opts.requireRoomFloorMatch,
-            }
-          : undefined
+        cameraRecoveryCodec(activeCodec, codecOverride, opts.requireRoomFloorMatch)
       );
       return;
     }
@@ -2925,98 +3123,31 @@ class VoiceService {
 
       // The floor may have changed while the transport queue drained. If the
       // checked replacement is no longer shared, re-publish the old codec.
-      if (opts.requireRoomFloorMatch && codecOverride) {
-        if (!this.roomFloorIncludesCodec(codecOverride)) {
-          codecOverride = activeCodec;
-        }
-      }
+      codecOverride = this.floorSafeOverride(opts, codecOverride, activeCodec);
 
-      const publish = async (override?: mediasoupTypes.RtpCodecCapability) => {
-        const selection = this.pickCameraCodec(override);
-        const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
-        const publishedBitrate = selection.encodings.reduce(
-          (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
-          0
-        );
-        const cameraBitrate = this.cameraStartBitrate(selection.encodings);
-        const newProducer = await this.produceEncrypted(transport, {
-          track,
-          encodings: selection.encodings,
-          codec,
-          codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
-          stopTracks: false,
-          appData: videoPublishAppData('camera'),
-        });
-        return { codec, newProducer, publishedBitrate };
-      };
       let replacement;
       try {
-        replacement = await publish(codecOverride);
+        replacement = await this.publishCameraReplacement(transport, track, codecOverride);
         // transport.produce itself awaits the media plane. A second floor
         // change during that await must not commit the now-unsafe codec.
         if (
-          opts.requireRoomFloorMatch &&
-          activeCodec &&
-          this.isCurrentVideoReproduce(token, transport) &&
-          this.localCameraStream === stream &&
-          !this.producers.has('camera') &&
-          !this.codecKeysEquivalent(
-            this.codecKeyFromParameters(replacement.codec),
-            this.codecKeyFromParameters(activeCodec)
-          ) &&
-          !this.roomFloorIncludesCodec(replacement.codec)
+          !this.videoSwapStale('camera', token, transport, stream) &&
+          this.replacementLeftFloor(opts, activeCodec, replacement.codec)
         ) {
           this.discardProducedProducer(replacement.newProducer, socket);
           await this.drainSendTransportQueue(transport);
-          if (
-            !this.isCurrentVideoReproduce(token, transport) ||
-            this.localCameraStream !== stream ||
-            this.producers.has('camera')
-          ) {
-            return;
-          }
-          replacement = await publish(activeCodec);
+          if (this.videoSwapStale('camera', token, transport, stream)) return;
+          replacement = await this.publishCameraReplacement(transport, track, activeCodec);
         }
       } catch (err) {
-        if (
-          this.isCurrentVideoReproduce(token, transport) &&
-          this.localCameraStream === stream &&
-          !this.producers.has('camera')
-        ) {
+        if (!this.videoSwapStale('camera', token, transport, stream)) {
           this.cleanupCameraState();
           this.setVideoReproduceError('camera');
         }
         throw err;
       }
 
-      if (
-        !this.isCurrentVideoReproduce(token, transport) ||
-        this.localCameraStream !== stream ||
-        this.producers.has('camera')
-      ) {
-        this.discardProducedProducer(replacement.newProducer, socket);
-        return;
-      }
-
-      if (replacement.publishedBitrate > this.cameraBitrateBudget()) {
-        this.discardProducedProducer(replacement.newProducer, socket);
-        this.cleanupCameraState();
-        return;
-      }
-      if (
-        !this.commitCameraProducer(
-          replacement.newProducer,
-          stream,
-          token,
-          transport,
-          socket,
-          replacement.codec
-        )
-      )
-        return;
-      const selectedCodecKey = this.codecKeyFromParameters(replacement.codec);
-      const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
-      console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
+      this.finishCameraReplacement(replacement, token, transport, stream, socket);
     } finally {
       if (this.cameraReplacementProducerId === producer.id) {
         this.cameraReplacementProducerId = null;
@@ -3046,12 +3177,10 @@ class VoiceService {
     const socket = this.socket;
     if (!oldProducer || !transport || !stream) return;
 
-    const activeCodec =
-      opts.preserveActiveCodec || opts.requireRoomFloorMatch
-        ? this.currentVideoSendCodec('screen')
-        : undefined;
-    if ((opts.preserveActiveCodec || opts.requireRoomFloorMatch) && !activeCodec) return;
-    let codecOverride = opts.preserveActiveCodec ? activeCodec : opts.selectedCodec;
+    const codecs = this.videoSwapCodecs('screen', opts);
+    if (!codecs) return;
+    const { activeCodec } = codecs;
+    let { codecOverride } = codecs;
 
     const track = stream.getVideoTracks()[0];
     if (track?.readyState !== 'live') {
@@ -3088,11 +3217,7 @@ class VoiceService {
     this.producers.delete('screen');
     this.socket?.emit('close-producer', { producerId: oldProducerId });
 
-    if (opts.requireRoomFloorMatch && codecOverride) {
-      if (!this.roomFloorIncludesCodec(codecOverride)) {
-        codecOverride = activeCodec;
-      }
-    }
+    codecOverride = this.floorSafeOverride(opts, codecOverride, activeCodec);
 
     let replacement = await this.produceScreenReplacement(
       token,
@@ -3103,24 +3228,10 @@ class VoiceService {
       codecOverride
     );
     if (!replacement) return;
-    if (
-      opts.requireRoomFloorMatch &&
-      activeCodec &&
-      !this.codecKeysEquivalent(
-        this.codecKeyFromParameters(replacement.codec),
-        this.codecKeyFromParameters(activeCodec)
-      ) &&
-      !this.roomFloorIncludesCodec(replacement.codec)
-    ) {
+    if (this.replacementLeftFloor(opts, activeCodec, replacement.codec)) {
       this.discardProducedProducer(replacement.producer, socket);
       await this.drainSendTransportQueue(transport);
-      if (
-        !this.isCurrentVideoReproduce(token, transport) ||
-        this.localScreenStream !== stream ||
-        this.producers.has('screen')
-      ) {
-        return;
-      }
+      if (this.videoSwapStale('screen', token, transport, stream)) return;
       replacement = await this.produceScreenReplacement(
         token,
         transport,
@@ -3150,41 +3261,11 @@ class VoiceService {
       );
     };
 
-    // Update tuned-in mapping since producer ID changed. Keyed off the
-    // pre-swap snapshot — the producer-closed self-echo may already have
-    // pruned the old entries during the awaits above (#2088).
-    const store = useVoiceStore.getState();
-    if (wasTunedIn) {
-      store.tuneOut(oldProducerId); // no-op if the echo already pruned it
-      store.tuneIn(newProducer.id, LOCAL_SCREEN_CONSUMER_ID);
-    }
-    // Carry the owner metadata to the new producerId (#2088) — re-register
-    // unconditionally from the snapshot/local identity so an echo-pruned
-    // entry cannot leave the live share without its ShareTunePill/StreamBar row.
-    store.unregisterActiveScreenShare(oldProducerId);
-    const localUserId = useUserStore.getState().user?.id;
-    const shareOwnerId = oldShareMeta?.userId ?? localUserId;
-    if (shareOwnerId) {
-      const localParticipant = store.participants[shareOwnerId];
-      store.registerActiveScreenShare({
-        producerId: newProducer.id,
-        userId: shareOwnerId,
-        username: oldShareMeta?.username ?? localParticipant?.username ?? 'You',
-        displayName: oldShareMeta?.displayName ?? localParticipant?.displayName,
-        isLocal: true,
-      });
-    }
-    // The self-echo may also have cleared the local participant's screen
-    // state mid-swap; re-assert it while the capture stream is live.
-    if (localUserId && this.localScreenStream) {
-      store.updateParticipant(localUserId, {
-        screenStream: this.localScreenStream,
-        isScreenSharing: true,
-      });
-    }
-    if (wasDominant || (wasTunedIn && useVoiceStore.getState().dominantScreenShareId === null)) {
-      store.setDominantScreenShare(newProducer.id);
-    }
+    this.carryScreenShareState(
+      { wasTunedIn, wasDominant, oldShareMeta },
+      oldProducerId,
+      newProducer.id
+    );
 
     newProducer.on('transportclose', () => {
       if (this.producers.get('screen') !== newProducer) return;
@@ -3497,6 +3578,36 @@ class VoiceService {
     );
   }
 
+  /** Whether the room floor or hardware policy keeps the current producer. */
+  private reproduceGateRefuses(
+    source: VideoReproduceSource,
+    bestMime: string,
+    currentMime: string,
+    opts?: { requireHwImprovement?: boolean; requireRoomFloorMatch?: boolean }
+  ): boolean {
+    // A null or unsatisfiable floor says nothing about which codec existing
+    // viewers can consume. Keep a working producer instead of switching to a
+    // preferred codec solely because another participant changed its claim.
+    if (opts?.requireRoomFloorMatch) {
+      const floor = useVoiceStore.getState().codecFloor;
+      if (!floor || !isCodecKeyInFloor(bestMime, floor)) return true;
+    }
+
+    // #2187 item 2: a B=false-driven re-selection only switches toward a genuinely
+    // HW-accelerated codec — prevents SW→SW churn/oscillation.
+    if (opts?.requireHwImprovement && !this.isHwAccelerated(bestMime)) return true;
+
+    // Never switch to a HW codec if hardware acceleration is disabled
+    const hwAccel = useVideoSettingsStore.getState().hardwareAcceleration;
+    if (!hwAccel && this.isHwAccelerated(bestMime) && !this.isHwAccelerated(currentMime)) {
+      console.debug(
+        `[codec-floor] Skipping ${source} switch to ${bestMime} (HW) — hardware accel is off`
+      );
+      return true;
+    }
+    return false;
+  }
+
   private async reProduceIfBetterCodecQueued(
     source: VideoReproduceSource,
     token: VideoReproduceToken,
@@ -3521,26 +3632,7 @@ class VoiceService {
     const bestMime = this.codecKeyFromParameters(bestPick.codec);
     if (this.codecKeysEquivalent(bestMime, currentMime) && !opts?.forceReproduce) return;
 
-    // A null or unsatisfiable floor says nothing about which codec existing
-    // viewers can consume. Keep a working producer instead of switching to a
-    // preferred codec solely because another participant changed its claim.
-    if (opts?.requireRoomFloorMatch) {
-      const floor = useVoiceStore.getState().codecFloor;
-      if (!floor || !isCodecKeyInFloor(bestMime, floor)) return;
-    }
-
-    // #2187 item 2: a B=false-driven re-selection only switches toward a genuinely
-    // HW-accelerated codec — prevents SW→SW churn/oscillation.
-    if (opts?.requireHwImprovement && !this.isHwAccelerated(bestMime)) return;
-
-    // Never switch to a HW codec if hardware acceleration is disabled
-    const hwAccel = useVideoSettingsStore.getState().hardwareAcceleration;
-    if (!hwAccel && this.isHwAccelerated(bestMime) && !this.isHwAccelerated(currentMime)) {
-      console.debug(
-        `[codec-floor] Skipping ${source} switch to ${bestMime} (HW) — hardware accel is off`
-      );
-      return;
-    }
+    if (this.reproduceGateRefuses(source, bestMime, currentMime, opts)) return;
 
     const hwLabel = this.isHwAccelerated(bestMime) ? 'HW' : 'SW';
     console.debug(
@@ -4045,10 +4137,7 @@ class VoiceService {
 
       await this.connectAuthorizedJoinSession(
         store,
-        channelId,
-        channel.id,
-        joinType,
-        ringId,
+        { authorizationId: channelId, roomId: channel.id, joinType, ringId },
         joinData,
         recoveryOwner,
         cleanupGeneration
@@ -4056,15 +4145,7 @@ class VoiceService {
 
       this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
 
-      if (opts?.privacyIntent && this.socket) this.restorePostResumeMuteState(this.socket);
-
-      store.setConnectionState('connected');
-      notificationSoundService.stopAllLoops();
-      if (!opts?.internalRebuild)
-        notificationSoundService.play(joinType === 'dm' ? 'call-connected' : 'voice-join');
-      if (directDMJoiningState && useVoiceStore.getState().callState === directDMJoiningState) {
-        store.setCallState({ kind: 'in-call' });
-      }
+      this.finishJoinConnected(store, joinType, opts, directDMJoiningState);
 
       // Step 10: Start decoder budget profiling (IGNIS insight)
       // Profiles decode performance and adjusts SVC layers to avoid queue buildup
@@ -4088,16 +4169,32 @@ class VoiceService {
     }
   }
 
+  /** Mark a join connected: restore privacy intent, sounds and the DM call state. */
+  private finishJoinConnected(
+    store: ReturnType<typeof useVoiceStore.getState>,
+    joinType: 'channel' | 'dm',
+    opts: { internalRebuild?: boolean; privacyIntent?: unknown } | undefined,
+    directDMJoiningState: Extract<CallState, { kind: 'joining' }> | undefined
+  ): void {
+    if (opts?.privacyIntent && this.socket) this.restorePostResumeMuteState(this.socket);
+
+    store.setConnectionState('connected');
+    notificationSoundService.stopAllLoops();
+    if (!opts?.internalRebuild)
+      notificationSoundService.play(joinType === 'dm' ? 'call-connected' : 'voice-join');
+    if (directDMJoiningState && useVoiceStore.getState().callState === directDMJoiningState) {
+      store.setCallState({ kind: 'in-call' });
+    }
+  }
+
   private async connectAuthorizedJoinSession(
     store: ReturnType<typeof useVoiceStore.getState>,
-    authorizationId: string,
-    roomId: string,
-    joinType: 'channel' | 'dm',
-    ringId: string | undefined,
+    target: AuthorizedJoinTarget,
     joinData: JoinResponse,
     recoveryOwner: VoiceJoinOwner | undefined,
     cleanupGeneration: number
   ): Promise<void> {
+    const { authorizationId, roomId, joinType, ringId } = target;
     try {
       await this.dialAuthorizedMediaSession(
         store,
@@ -5326,98 +5423,24 @@ class VoiceService {
       }
       this.localCameraStream = acquiredStream;
       const track = acquiredStream.getVideoTracks()[0];
-      const publish = async (override?: mediasoupTypes.RtpCodecCapability) => {
-        const selection = this.pickCameraCodec(override);
-        const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
-        const { encodings } = selection;
-        const publishedBitrate = encodings.reduce(
-          (sum, encoding) => sum + (encoding.maxBitrate ?? 0),
-          0
-        );
-        const cameraBitrate = this.cameraStartBitrate(encodings);
-        const producer = await this.produceEncrypted(transport, {
-          track,
-          encodings,
-          codec,
-          codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
-          // The track is owned by localCameraStream and reused across codec/layer
-          // re-produces (fastReproduceCamera). stopTracks:false keeps producer.close()
-          // from stopping it; every teardown path stops localCameraStream explicitly.
-          stopTracks: false,
-          appData: videoPublishAppData('camera'),
-        });
-        return { codec, producer, publishedBitrate };
-      };
       const currentCodecSettings = useVideoSettingsStore.getState();
       // Explicit settings saved during capture supersede the old recovery plan.
-      const recovery =
-        currentCodecSettings.preferredVideoCodec ===
-          codecSettingsBeforeCapture.preferredVideoCodec &&
-        currentCodecSettings.hdrEncoding === codecSettingsBeforeCapture.hdrEncoding &&
-        currentCodecSettings.prioritizeHdrCodecs === codecSettingsBeforeCapture.prioritizeHdrCodecs
-          ? recoveryCodec
-          : undefined;
-      const selectedCodec =
-        recovery?.requireRoomFloorMatch && !this.roomFloorIncludesCodec(recovery.selectedCodec)
-          ? recovery.activeCodec
-          : recovery?.selectedCodec;
-      let replacement = await publish(selectedCodec);
-      if (
-        recovery?.requireRoomFloorMatch &&
-        this.isCurrentVideoReproduce(token, transport) &&
-        this.localCameraStream === acquiredStream &&
-        !this.producers.has('camera') &&
-        !this.codecKeysEquivalent(
-          this.codecKeyFromParameters(replacement.codec),
-          this.codecKeyFromParameters(recovery.activeCodec)
-        ) &&
-        !this.roomFloorIncludesCodec(replacement.codec)
-      ) {
-        this.discardProducedProducer(replacement.producer, socket);
-        await this.drainSendTransportQueue(transport);
-        if (
-          !this.isCurrentVideoReproduce(token, transport) ||
-          this.localCameraStream !== acquiredStream ||
-          this.producers.has('camera')
-        ) {
-          this.stopMediaStream(acquiredStream);
-          if (this.localCameraStream === acquiredStream) this.localCameraStream = null;
-          return;
-        }
-        replacement = await publish(recovery.activeCodec);
-      }
-      let publishedSettings = currentCodecSettings;
-      while (
-        this.isCurrentVideoReproduce(token, transport) &&
-        this.localCameraStream === acquiredStream &&
-        !this.producers.has('camera')
-      ) {
-        const latestSettings = useVideoSettingsStore.getState();
-        if (
-          latestSettings.preferredVideoCodec === publishedSettings.preferredVideoCodec &&
-          latestSettings.hdrEncoding === publishedSettings.hdrEncoding &&
-          latestSettings.prioritizeHdrCodecs === publishedSettings.prioritizeHdrCodecs
-        ) {
-          break;
-        }
-        // No mapped producer can receive settings saves while publication awaits.
-        this.discardProducedProducer(replacement.producer, socket);
-        await this.drainSendTransportQueue(transport);
-        if (
-          !this.isCurrentVideoReproduce(token, transport) ||
-          this.localCameraStream !== acquiredStream ||
-          this.producers.has('camera')
-        ) {
-          this.stopMediaStream(acquiredStream);
-          if (this.localCameraStream === acquiredStream) this.localCameraStream = null;
-          return;
-        }
-        publishedSettings = useVideoSettingsStore.getState();
-        replacement = await publish();
-      }
+      const recovery = sameCodecSettings(currentCodecSettings, codecSettingsBeforeCapture)
+        ? recoveryCodec
+        : undefined;
+      const replacement = await this.publishCapturedCamera(
+        token,
+        transport,
+        acquiredStream,
+        track,
+        socket,
+        recovery,
+        currentCodecSettings
+      );
+      if (!replacement) return;
       if (
         !this.commitCameraProducer(
-          replacement.producer,
+          replacement.newProducer,
           acquiredStream,
           token,
           transport,
@@ -5429,19 +5452,114 @@ class VoiceService {
         return;
       }
     } catch (err) {
-      if (!this.isCurrentVideoReproduce(token, transport)) {
-        this.stopMediaStream(acquiredStream);
-        return;
-      }
-      console.error('Failed to start camera:', errorMessage(err));
-      this.stopMediaStream(acquiredStream);
-      if (this.localCameraStream === acquiredStream) {
-        this.localCameraStream = null;
-      }
-      useVoiceStore
-        .getState()
-        .setVideoSlotError(VoiceService.mapCameraError(err, acquiredStream !== null));
+      this.failCameraStart(err, token, transport, acquiredStream);
     }
+  }
+
+  private failCameraStart(
+    err: unknown,
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    acquiredStream: MediaStream | null
+  ): void {
+    this.stopMediaStream(acquiredStream);
+    // A superseded start reports nothing: its successor owns the camera state.
+    if (!this.isCurrentVideoReproduce(token, transport)) return;
+    console.error('Failed to start camera:', errorMessage(err));
+    if (this.localCameraStream === acquiredStream) {
+      this.localCameraStream = null;
+    }
+    useVoiceStore
+      .getState()
+      .setVideoSlotError(VoiceService.mapCameraError(err, acquiredStream !== null));
+  }
+
+  /** The codec a dead-track recovery publishes, falling back when the floor moved. */
+  private recoveryPublishCodec(
+    recovery: CameraRecoveryCodecOptions | undefined
+  ): mediasoupTypes.RtpCodecCapability | undefined {
+    if (!recovery) return undefined;
+    if (recovery.requireRoomFloorMatch && !this.roomFloorIncludesCodec(recovery.selectedCodec)) {
+      return recovery.activeCodec;
+    }
+    return recovery.selectedCodec;
+  }
+
+  /**
+   * Publish a freshly captured camera track. A floor change during produce()
+   * re-publishes the active codec, and a codec settings save while publication
+   * awaited re-publishes with the new settings. Null when the capture was
+   * abandoned.
+   */
+  private async publishCapturedCamera(
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    stream: MediaStream,
+    track: MediaStreamTrack,
+    socket: Socket | null,
+    recovery: CameraRecoveryCodecOptions | undefined,
+    settings: CodecSettings
+  ): Promise<CameraReplacement | null> {
+    let replacement: CameraReplacement | null = await this.publishCameraReplacement(
+      transport,
+      track,
+      this.recoveryPublishCodec(recovery)
+    );
+    if (
+      !this.videoSwapStale('camera', token, transport, stream) &&
+      this.replacementLeftFloor(
+        { requireRoomFloorMatch: recovery?.requireRoomFloorMatch },
+        recovery?.activeCodec,
+        replacement.codec
+      )
+    ) {
+      replacement = await this.republishCapturedCamera(
+        replacement,
+        token,
+        transport,
+        stream,
+        socket,
+        () => this.publishCameraReplacement(transport, track, recovery?.activeCodec)
+      );
+      if (!replacement) return null;
+    }
+    let publishedSettings = settings;
+    while (!this.videoSwapStale('camera', token, transport, stream)) {
+      if (sameCodecSettings(useVideoSettingsStore.getState(), publishedSettings)) break;
+      // No mapped producer can receive settings saves while publication awaits.
+      replacement = await this.republishCapturedCamera(
+        replacement,
+        token,
+        transport,
+        stream,
+        socket,
+        () => {
+          publishedSettings = useVideoSettingsStore.getState();
+          return this.publishCameraReplacement(transport, track);
+        }
+      );
+      if (!replacement) return null;
+    }
+    return replacement;
+  }
+
+  /** Discard a published producer and publish again, unless the capture went stale. */
+  private async republishCapturedCamera(
+    replacement: CameraReplacement,
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    stream: MediaStream,
+    socket: Socket | null,
+    publish: () => Promise<CameraReplacement>
+  ): Promise<CameraReplacement | null> {
+    this.discardProducedProducer(replacement.newProducer, socket);
+    await this.drainSendTransportQueue(transport);
+    if (this.videoSwapStale('camera', token, transport, stream)) {
+      this.stopMediaStream(stream);
+      if (this.localCameraStream === stream) this.localCameraStream = null;
+      return null;
+    }
+    return publish();
   }
 
   private commitCameraProducer(

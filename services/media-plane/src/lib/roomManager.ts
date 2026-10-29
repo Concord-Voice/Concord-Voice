@@ -1564,6 +1564,15 @@ interface ExactUserModerationCapture {
   readonly target: ExactVoiceCommandTarget;
 }
 
+/** Whether a camera producer sends one SVC layer stack (AV1 or VP9, one encoding). */
+function isSingleLayerSvcProducer(parameters: RtpParameters | undefined): boolean {
+  if (parameters?.encodings?.length !== 1) return false;
+  const primaryMime = parameters.codecs
+    ?.find((codec) => codec.mimeType.toLowerCase() !== 'video/rtx')
+    ?.mimeType.toLowerCase();
+  return primaryMime === 'video/av1' || primaryMime === 'video/vp9';
+}
+
 export class RoomManager {
   private readonly pendingNativeClose = new Map<string, NativeCloseRecord>();
   private readonly nativeTransportCreations = new WeakMap<Participant, Set<Promise<void>>>();
@@ -6306,39 +6315,40 @@ export class RoomManager {
     room.screenLayeringGateBySharer.delete(sharerUserId);
   }
 
-  private cameraLayeringCodecKind(room: Room): LayeredCodecKind {
-    let hasCameraProducer = false;
+  /**
+   * The layering kind the room's working camera producers already use, or null
+   * when there is none. Any non-SVC camera forces simulcast.
+   */
+  private cameraProducerLayeringKind(room: Room): LayeredCodecKind | null {
+    let kind: LayeredCodecKind | null = null;
     for (const [, participant] of room.participants) {
       for (const [, entry] of participant.producers) {
         if (entry.source !== 'camera') continue;
-        hasCameraProducer = true;
-        const parameters = entry.producer.rtpParameters;
-        const primaryMime = parameters?.codecs
-          ?.find((codec) => codec.mimeType.toLowerCase() !== 'video/rtx')
-          ?.mimeType.toLowerCase();
-        if (
-          parameters?.encodings?.length !== 1 ||
-          (primaryMime !== 'video/av1' && primaryMime !== 'video/vp9')
-        ) {
-          return 'simulcast';
-        }
+        if (!isSingleLayerSvcProducer(entry.producer.rtpParameters)) return 'simulcast';
+        kind = 'svc';
       }
     }
+    return kind;
+  }
+
+  private countCapabilityClaims(room: Room): number {
+    let count = 0;
+    for (const [, participant] of room.participants) {
+      if (participant.rtpCapabilities) count++;
+    }
+    return count;
+  }
+
+  private cameraLayeringCodecKind(room: Room): LayeredCodecKind {
     // Receive claims cannot override the codec of a working camera producer.
-    if (hasCameraProducer) return 'svc';
+    const producerKind = this.cameraProducerLayeringKind(room);
+    if (producerKind) return producerKind;
 
     const floor = this.computeCodecFloor(room.id);
     if (!floor) {
       // Null also covers empty or disjoint claims. Keep the former conservative
       // simulcast gate once two participants have submitted capabilities.
-      let capabilityCount = 0;
-      for (const [, participant] of room.participants) {
-        if (participant.rtpCapabilities) {
-          capabilityCount++;
-          if (capabilityCount >= 2) return 'simulcast';
-        }
-      }
-      return 'svc';
+      return this.countCapabilityClaims(room) >= 2 ? 'simulcast' : 'svc';
     }
     if (
       floor.some(

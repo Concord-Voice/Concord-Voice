@@ -195,39 +195,55 @@ func (c *Controller) PrepareInitial(policy Policy) error {
 			return errController
 		}
 	}
-	marker, err := c.markerState()
-	if err != nil || marker == "activated" {
-		return errController
-	}
-	journalExists, err := checkedJournalFile(c.journalPath)
+	marker, journalExists, err := c.initialPrepareFilesLocked()
 	if err != nil {
-		return errController
-	}
-	aclExists, err := c.checkedACLFile()
-	if err != nil || marker == "" && (journalExists || aclExists) || marker == "initializing" && aclExists && !journalExists {
-		return errController
+		return err
 	}
 	if marker == "" {
 		if err := c.createMarker(initializingMarkerContents); err != nil {
 			return err
 		}
 	}
-	if journalExists {
-		if err := c.restoreInitialJournalLocked(policy); err != nil {
-			return err
-		}
-	} else {
-		j := c.snapshotJournalLocked()
-		j.Effective, j.Phase, j.Intent, j.ValidatedAt = policy, "prepared", "", c.now()
-		if err := c.persistJournal(j); err != nil {
-			return err
-		}
-		c.applyJournalLocked(j)
+	if err := c.seedInitialJournalLocked(policy, journalExists); err != nil {
+		return err
 	}
 	if err := c.writePolicy(policy); err != nil {
 		return err
 	}
 	return c.promoteInitializingMarker()
+}
+
+// initialPrepareFilesLocked reads the marker and the journal and ACL files, and
+// refuses any combination a first preparation cannot resume from.
+func (c *Controller) initialPrepareFilesLocked() (marker string, journalExists bool, err error) {
+	marker, err = c.markerState()
+	if err != nil || marker == "activated" {
+		return "", false, errController
+	}
+	journalExists, err = checkedJournalFile(c.journalPath)
+	if err != nil {
+		return "", false, errController
+	}
+	aclExists, err := c.checkedACLFile()
+	if err != nil || marker == "" && (journalExists || aclExists) || marker == "initializing" && aclExists && !journalExists {
+		return "", false, errController
+	}
+	return marker, journalExists, nil
+}
+
+// seedInitialJournalLocked resumes a saved first-preparation journal, or writes
+// a fresh prepared one.
+func (c *Controller) seedInitialJournalLocked(policy Policy, journalExists bool) error {
+	if journalExists {
+		return c.restoreInitialJournalLocked(policy)
+	}
+	j := c.snapshotJournalLocked()
+	j.Effective, j.Phase, j.Intent, j.ValidatedAt = policy, "prepared", "", c.now()
+	if err := c.persistJournal(j); err != nil {
+		return err
+	}
+	c.applyJournalLocked(j)
+	return nil
 }
 
 func (c *Controller) restoreInitialJournalLocked(policy Policy) error {
@@ -307,29 +323,16 @@ func (c *Controller) PrepareLostStateRecovery(policy Policy, rawProof []byte) er
 	if resumed, err := c.resumePersistedRecoveryIntentLocked(policy); resumed || err != nil {
 		return err
 	}
-	if c.validatePolicy(policy) != nil || !singleGenerationPolicy(policy) {
-		return errController
-	}
-	if exists, err := checkedJournalFile(c.journalPath); err != nil || exists {
-		return errController
-	}
-	if _, err := os.Lstat(c.aclPath); err == nil || !errors.Is(err, os.ErrNotExist) {
-		return errController
-	}
-	var proof lostStateProof
-	if DecodeBoundedJSON(rawProof, &proof) != nil || !c.validLostStateProof(policy, proof) {
-		return errController
+	proof, err := c.lostStateProofLocked(policy, rawProof)
+	if err != nil {
+		return err
 	}
 	j := c.snapshotJournalLocked()
 	if err := c.applyLostStateInventory(&j, policy, proof); err != nil {
 		return err
 	}
-	if exists, err := c.activationMarker(); err != nil {
-		return errController
-	} else if !exists {
-		if err := c.createActivationMarker(); err != nil {
-			return err
-		}
+	if err := c.ensureActivationMarkerLocked(); err != nil {
+		return err
 	}
 	j.Effective, j.Phase, j.Intent, j.ValidatedAt = policy, "prepared", "recovery", c.now()
 	j.FailureCode, j.RecoveryAt = "reconcile", c.now()
@@ -338,6 +341,37 @@ func (c *Controller) PrepareLostStateRecovery(policy Policy, rawProof []byte) er
 	}
 	c.applyJournalLocked(j)
 	return c.completeRecoveryIntentLocked(&j)
+}
+
+// lostStateProofLocked checks that both state files are really gone and
+// decodes the reviewed proof for this single-generation policy.
+func (c *Controller) lostStateProofLocked(policy Policy, rawProof []byte) (lostStateProof, error) {
+	var proof lostStateProof
+	if c.validatePolicy(policy) != nil || !singleGenerationPolicy(policy) {
+		return proof, errController
+	}
+	if exists, err := checkedJournalFile(c.journalPath); err != nil || exists {
+		return proof, errController
+	}
+	if _, err := os.Lstat(c.aclPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return proof, errController
+	}
+	if DecodeBoundedJSON(rawProof, &proof) != nil || !c.validLostStateProof(policy, proof) {
+		return proof, errController
+	}
+	return proof, nil
+}
+
+// ensureActivationMarkerLocked creates the activation marker unless it exists.
+func (c *Controller) ensureActivationMarkerLocked() error {
+	exists, err := c.activationMarker()
+	if err != nil {
+		return errController
+	}
+	if exists {
+		return nil
+	}
+	return c.createActivationMarker()
 }
 
 // PrepareRecovery replaces a stopped cohort with fresh single-generation users.
@@ -354,8 +388,7 @@ func (c *Controller) PrepareRecovery(policy Policy) error {
 	if c.policy.Version == 0 || !rotationID.MatchString(policy.RotationID) {
 		return errController
 	}
-	if samePolicy(c.policy, policy) && !c.recoveryAt.IsZero() && c.state == "prepared" && c.failureCode == "" &&
-		len(c.expected) == 0 && len(c.acks) == 0 {
+	if c.recoveryAlreadyPreparedLocked(policy) {
 		return nil
 	}
 	// A first activation that failed after its marker was promoted leaves the
@@ -373,10 +406,8 @@ func (c *Controller) PrepareRecovery(policy Policy) error {
 	if err := c.validatePolicy(policy); err != nil {
 		return err
 	}
-	for _, service := range []string{controlPlaneService, mediaPlaneService} {
-		if len(policy.Services[service].Generations) != 1 || policy.Services[service].TargetGeneration <= c.policy.Services[service].TargetGeneration {
-			return errController
-		}
+	if !c.recoveryAdvancesGenerationsLocked(policy) {
+		return errController
 	}
 	j := c.snapshotJournalLocked()
 	c.advanceRecoveryFloors(&j)
@@ -389,6 +420,25 @@ func (c *Controller) PrepareRecovery(policy Policy) error {
 	}
 	c.applyJournalLocked(j)
 	return c.completeRecoveryIntentLocked(&j)
+}
+
+// recoveryAlreadyPreparedLocked reports whether this same recovery policy is
+// already prepared with nothing awaiting acknowledgement.
+func (c *Controller) recoveryAlreadyPreparedLocked(policy Policy) bool {
+	return samePolicy(c.policy, policy) && !c.recoveryAt.IsZero() && c.state == "prepared" &&
+		c.failureCode == "" && len(c.expected) == 0 && len(c.acks) == 0
+}
+
+// recoveryAdvancesGenerationsLocked reports whether the recovery policy gives
+// every service exactly one generation, newer than the current target.
+func (c *Controller) recoveryAdvancesGenerationsLocked(policy Policy) bool {
+	for _, service := range []string{controlPlaneService, mediaPlaneService} {
+		next := policy.Services[service]
+		if len(next.Generations) != 1 || next.TargetGeneration <= c.policy.Services[service].TargetGeneration {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Controller) untouchedFirstActivationLocked() bool {
@@ -1421,37 +1471,49 @@ func (c *Controller) ResumeFinalize(ctx context.Context) error {
 	return c.finishRevocationLocked(ctx)
 }
 
-func (c *Controller) finishRevocationLocked(ctx context.Context) error {
+// revokedUsersSettledLocked reports whether every old user is gone and every
+// target user exists.
+func (c *Controller) revokedUsersSettledLocked(ctx context.Context) bool {
 	for _, service := range []string{controlPlaneService, mediaPlaneService} {
 		present, err := c.admin.UserExists(ctx, c.oldUsernames[service])
 		if err != nil || present {
-			c.failureCode = "reconcile"
-			return errController
+			return false
 		}
 		target := c.policy.Services[service].Generations[0].Username
 		present, err = c.admin.UserExists(ctx, target)
 		if err != nil || !present {
-			c.failureCode = "reconcile"
-			return errController
+			return false
 		}
 	}
+	return true
+}
+
+// killOldClientsLocked kills the connections of each old user still listed.
+func (c *Controller) killOldClientsLocked(ctx context.Context) error {
 	clients, err := c.admin.ListClients(ctx)
 	if err != nil {
-		c.failureCode = "reconcile"
-		return errController
+		return err
 	}
 	for _, service := range []string{controlPlaneService, mediaPlaneService} {
+		old := c.oldUsernames[service]
 		for _, client := range clients {
-			if client.Username == c.oldUsernames[service] {
-				if err := c.admin.KillUser(ctx, c.oldUsernames[service]); err != nil {
-					c.failureCode = "reconcile"
-					return errController
+			if client.Username == old {
+				if err := c.admin.KillUser(ctx, old); err != nil {
+					return err
 				}
 				break
 			}
 		}
 	}
-	clients, err = c.admin.ListClients(ctx)
+	return nil
+}
+
+func (c *Controller) finishRevocationLocked(ctx context.Context) error {
+	if !c.revokedUsersSettledLocked(ctx) || c.killOldClientsLocked(ctx) != nil {
+		c.failureCode = "reconcile"
+		return errController
+	}
+	clients, err := c.admin.ListClients(ctx)
 	if err != nil {
 		c.failureCode = "reconcile"
 		return errController

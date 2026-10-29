@@ -36,7 +36,6 @@ func billingState(cfg *config.Config) string {
 // so constructing a Service never spawns a goroutine against a database it
 // was not given.
 func wireBilling(
-	_ context.Context,
 	cfg *config.Config,
 	db *sql.DB,
 	cache *entitlements.Cache,

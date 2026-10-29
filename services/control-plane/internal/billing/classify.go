@@ -73,15 +73,22 @@ func classify(sub *stripe.Subscription) (rowFields, error) {
 	out.Tier = entitlements.TierFree
 	if out.Malformed == "" {
 		out.Tier = entitlements.TierPremium
-		if first.Price != nil && first.Price.Currency == stripe.CurrencyUSD && first.Price.UnitAmount >= 0 {
-			amount := first.Price.UnitAmount
-			if out.FoundersRate {
-				amount = foundersUnitAmount(amount)
-			}
-			out.UnitAmount = sql.NullInt64{Int64: amount, Valid: true}
-		}
+		out.UnitAmount = chargedUnitAmount(first.Price, out.FoundersRate)
 	}
 	return out, nil
+}
+
+// chargedUnitAmount is the USD amount the item charges per period, after the
+// founders discount, or NULL when the price is not a known USD amount.
+func chargedUnitAmount(price *stripe.Price, founders bool) sql.NullInt64 {
+	if price == nil || price.Currency != stripe.CurrencyUSD || price.UnitAmount < 0 {
+		return sql.NullInt64{}
+	}
+	amount := price.UnitAmount
+	if founders {
+		amount = foundersUnitAmount(amount)
+	}
+	return sql.NullInt64{Int64: amount, Valid: true}
 }
 
 // itemFields reads plan and interval from the item's price and reports why the

@@ -108,23 +108,30 @@ func lockPayerAndSeatParties(ctx context.Context, tx *sql.Tx, subID string, paye
 
 // seatHolderBefore returns the active holder of subID's seat and their tier
 // before the upsert, or uuid.Nil when the seat has no active holder.
-func seatHolderBefore(ctx context.Context, tx *sql.Tx, subID string) (uuid.UUID, string, error) {
+func seatHolderBefore(ctx context.Context, tx *sql.Tx, subID string) (seatHolder, error) {
 	var holder uuid.UUID
 	err := tx.QueryRowContext(ctx, activeHolderSQL, subID).Scan(&holder)
 	if errors.Is(err, sql.ErrNoRows) {
-		return uuid.Nil, "", nil
+		return seatHolder{}, nil
 	}
 	if err != nil {
-		return uuid.Nil, "", withStage(stageSeatReconc, fmt.Errorf("billing: reconcile: read seat: %w", err))
+		return seatHolder{}, withStage(stageSeatReconc, fmt.Errorf("billing: reconcile: read seat: %w", err))
 	}
 	before, err := seatTier(ctx, tx, holder)
-	return holder, before, err
+	return seatHolder{user: holder, before: before}, err
+}
+
+// seatHolder is a seat's active holder (uuid.Nil for none) and their tier
+// before the upsert.
+type seatHolder struct {
+	user   uuid.UUID
+	before string
 }
 
 // reconcileSeats is step 7, after the upsert and inside its transaction.
-// holder and holderBefore are seatHolderBefore's answer.
+// holder is seatHolderBefore's answer.
 func (s *Service) reconcileSeats(ctx context.Context, tx *sql.Tx, in reconcileInput, payer uuid.UUID,
-	locked map[uuid.UUID]bool, holder uuid.UUID, holderBefore string, rowChanged bool,
+	locked map[uuid.UUID]bool, holder seatHolder, rowChanged bool,
 ) (seatOutcome, error) {
 	parties, err := seatParties(ctx, tx, in.subID, payer)
 	if err != nil {
@@ -144,14 +151,14 @@ func (s *Service) reconcileSeats(ctx context.Context, tx *sql.Tx, in reconcileIn
 	if err := s.endHeldSeatIfSubscribed(ctx, tx, &out, payer); err != nil {
 		return seatOutcome{}, err
 	}
-	if holder != uuid.Nil {
-		after, err := seatTier(ctx, tx, holder)
+	if holder.user != uuid.Nil {
+		after, err := seatTier(ctx, tx, holder.user)
 		if err != nil {
 			return seatOutcome{}, err
 		}
 		// Pushed by the payer's rule: whenever the parent row changed, not
 		// only when the tier moved.
-		out.tiers = append(out.tiers, tierMove{user: holder, before: holderBefore, after: after, force: rowChanged})
+		out.tiers = append(out.tiers, tierMove{user: holder.user, before: holder.before, after: after, force: rowChanged})
 	}
 	return out, nil
 }
