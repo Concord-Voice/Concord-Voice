@@ -96,6 +96,7 @@ import { gateForAudioSettings } from '@/renderer/services/voice/micProcessor';
 // Build a comprehensive mock audio pipeline
 const mockTrackStop = vi.fn();
 const mockGetUserMedia = vi.fn();
+let mockCaptureTrack: EventTarget & { stop: typeof mockTrackStop };
 let mockAudioContext: ReturnType<typeof createMockAudioPipeline>;
 let nextModuleGate: Promise<void> | null = null;
 let nextNodeConstructionFailure = false;
@@ -156,12 +157,13 @@ class MockAudioWorkletNode {
 
 function createMockAudioPipeline() {
   const contextState = nextAudioContextState;
+  const contextEvents = new EventTarget();
   const resumeAudioContext = nextAudioContextResume;
   const connections: Array<{ from: Record<string, unknown>; to: Record<string, unknown> }> = [];
   const gainNodes: Record<string, unknown>[] = [];
   // Each node needs its own connect mock that returns itself (for chaining)
   const createNode = (extras: Record<string, unknown> = {}) => {
-    const node: Record<string, unknown> = { ...extras };
+    const node: Record<string, unknown> = { disconnect: vi.fn(), ...extras };
     node.connect = vi.fn((to: Record<string, unknown>) => {
       connections.push({ from: node, to });
       return to;
@@ -175,6 +177,10 @@ function createMockAudioPipeline() {
 
   const mockCtx = {
     state: contextState,
+    destination: createNode(),
+    addEventListener: vi.fn(contextEvents.addEventListener.bind(contextEvents)),
+    removeEventListener: vi.fn(contextEvents.removeEventListener.bind(contextEvents)),
+    dispatchEvent: contextEvents.dispatchEvent.bind(contextEvents),
     currentTime: 0,
     sampleRate: 48000,
     audioWorklet: {
@@ -213,6 +219,10 @@ function createMockAudioPipeline() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Restore the canonical listener registration after tests override this vi.fn.
+  vi.mocked(useVoiceStore.subscribe).mockReset();
+  mockGetUserMedia.mockReset();
+  vi.mocked(ensureOsPermission).mockReset();
   nextModuleGate = null;
   nextNodeConstructionFailure = false;
   nextAudioContextState = 'running';
@@ -244,8 +254,10 @@ beforeEach(() => {
   (globalThis as any).AudioWorkletNode = MockAudioWorkletNode;
 
   // Mock getUserMedia
+  mockCaptureTrack = Object.assign(new EventTarget(), { stop: mockTrackStop });
   mockGetUserMedia.mockResolvedValue({
-    getTracks: () => [{ stop: mockTrackStop }],
+    getTracks: () => [mockCaptureTrack],
+    getAudioTracks: () => [mockCaptureTrack],
   });
   Object.defineProperty(navigator, 'mediaDevices', {
     value: { getUserMedia: mockGetUserMedia },
@@ -1391,5 +1403,435 @@ describe('useMicTest', () => {
       // for the noise gate pipeline
       expect(result.current.isTesting).toBe(true);
     });
+  });
+});
+
+describe('useMicTest silent calibration ownership', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+  const callbacks = () => ({ onEvent: vi.fn(), onInvalidated: vi.fn() });
+  type Session = NonNullable<
+    Awaited<ReturnType<ReturnType<typeof useMicTest>['startCalibration']>>
+  >;
+  beforeEach(() => {
+    useAudioSettingsStore.setState({ autoGainControl: false, inputVolume: 75 });
+  });
+  async function startCalibration() {
+    const hook = renderHook(() => useMicTest());
+    const observer = callbacks();
+    let session: Session | null = null;
+    await act(async () => {
+      session = await hook.result.current.startCalibration(observer);
+    });
+    expect(session).not.toBeNull();
+    return { ...hook, observer, session: session as unknown as Session };
+  }
+
+  it('connects processed input through a zero-gain destination without loopback playback', async () => {
+    useVoiceStore.setState({
+      audioInputDeviceId: 'calibration-input',
+      audioOutputDeviceId: 'headphones',
+    });
+    const { result, session } = await startCalibration();
+    expect(mockGetUserMedia).toHaveBeenCalledExactlyOnceWith({
+      audio: expect.objectContaining({
+        autoGainControl: false,
+        deviceId: { exact: 'calibration-input' },
+      }),
+    });
+    expect(result.current.isPending).toBe(false);
+    expect(session.sampleRate).toBe(48000);
+    expect(mockLoopbackAudioElement).toBeNull();
+    expect(mockLoopbackSetSinkId).not.toHaveBeenCalled();
+    expect(mockAudioContext.createMediaStreamDestination).not.toHaveBeenCalled();
+    const processor = mockProcessorNodes.at(-1)!.instance;
+    const sink = mockAudioContext._connections.find(
+      ({ from }) => from === (processor as unknown)
+    )?.to;
+    expect(sink).toBeDefined();
+    expect(sink?.gain).toMatchObject({ value: 0 });
+    expect(mockAudioContext._connections).toContainEqual({
+      from: sink,
+      to: mockAudioContext.destination,
+    });
+    const level = mockAudioContext._connections.find(
+      ({ from }) => from === mockAudioContext._sourceNode
+    )?.to;
+    expect(level?.gain).toMatchObject({ value: 0.75 });
+    expect(mockAudioContext._connections).toContainEqual({ from: level, to: processor });
+    act(() => result.current.stopTest());
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    expect(sink?.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards acknowledged phases and windows and silences queued callbacks after stop', async () => {
+    const { result, session, observer } = await startCalibration();
+    const processor = mockProcessorNodes.at(-1)!.instance;
+    act(() => session.setPhase(1, 'quiet'));
+    expect(processor.port.postMessage).toHaveBeenCalledWith({
+      type: 'setCalibrationPhase',
+      epoch: 1,
+      phase: 'quiet',
+    });
+    const ack = { type: 'calibrationAck', epoch: 1, phase: 'quiet' };
+    const window = {
+      type: 'calibrationWindow',
+      epoch: 1,
+      phase: 'quiet',
+      peak: 0.01,
+      frames: 960,
+      valid: true,
+      overloaded: false,
+    };
+    const deliver = processor.port.onmessage;
+    act(() => {
+      deliver?.(new MessageEvent('message', { data: ack }));
+      deliver?.(new MessageEvent('message', { data: window }));
+    });
+    expect(observer.onEvent.mock.calls).toEqual([[ack], [window]]);
+    act(() => result.current.stopTest());
+    act(() => deliver?.(new MessageEvent('message', { data: window })));
+    expect(observer.onEvent).toHaveBeenCalledTimes(2);
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('cancelled');
+  });
+
+  it('cancels pending OS permission immediately and ignores its late grant', async () => {
+    const permission = deferred<'granted'>();
+    vi.mocked(ensureOsPermission).mockReturnValue(permission.promise);
+    const { result } = renderHook(() => useMicTest());
+    const observer = callbacks();
+    let starting!: Promise<Session | null>;
+    act(() => {
+      starting = result.current.startCalibration(observer);
+    });
+    expect(result.current.isPending).toBe(true);
+    act(() => result.current.stopTest());
+    expect(result.current.isPending).toBe(false);
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('cancelled');
+    await act(async () => {
+      permission.resolve('granted');
+      expect(await starting).toBeNull();
+    });
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+  });
+
+  it.each(['Cancel', 'device change'] as const)(
+    'stops a late capture after pending %s without replacement capture',
+    async (reason) => {
+      vi.useFakeTimers();
+      const capture = deferred<MediaStream>();
+      mockGetUserMedia.mockReturnValue(capture.promise);
+      const { result } = renderHook(() => useMicTest());
+      const observer = callbacks();
+      let starting!: Promise<Session | null>;
+      await act(async () => {
+        starting = result.current.startCalibration(observer);
+      });
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
+      expect(result.current.isPending).toBe(true);
+      act(() => {
+        if (reason === 'Cancel') result.current.stopTest();
+        else useVoiceStore.setState({ audioInputDeviceId: 'replacement' });
+      });
+      expect(result.current.isPending).toBe(false);
+      expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith(
+        reason === 'Cancel' ? 'cancelled' : 'configuration'
+      );
+      await act(async () => {
+        capture.resolve({ getTracks: () => [mockCaptureTrack] } as unknown as MediaStream);
+        expect(await starting).toBeNull();
+        await vi.runAllTimersAsync();
+      });
+      expect(mockTrackStop).toHaveBeenCalledTimes(1);
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
+      expect(mockProcessorNodes).toHaveLength(0);
+      expect(mockLoopbackAudioElement).toBeNull();
+    }
+  );
+
+  it('retires a processor whose module finishes loading after Cancel', async () => {
+    const module = deferred<void>();
+    nextModuleGate = module.promise;
+    const { result } = renderHook(() => useMicTest());
+    const observer = callbacks();
+    let starting!: Promise<Session | null>;
+    await act(async () => {
+      starting = result.current.startCalibration(observer);
+    });
+    expect(mockAudioContext.audioWorklet.addModule).toHaveBeenCalledTimes(1);
+    act(() => result.current.stopTest());
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      module.resolve();
+      expect(await starting).toBeNull();
+    });
+    for (const { instance } of mockProcessorNodes)
+      expect(instance.port.close).toHaveBeenCalledTimes(1);
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('cancelled');
+    expect(mockLoopbackAudioElement).toBeNull();
+  });
+
+  it.each(['OS permission', 'browser permission'] as const)(
+    'clears pending state after denied %s',
+    async (boundary) => {
+      if (boundary === 'OS permission') vi.mocked(ensureOsPermission).mockResolvedValue('denied');
+      else mockGetUserMedia.mockRejectedValue(new DOMException('Denied', 'NotAllowedError'));
+      const { result } = renderHook(() => useMicTest());
+      await act(async () => {
+        expect(await result.current.startCalibration(callbacks())).toBeNull();
+      });
+      expect(result.current.isPending).toBe(false);
+      expect(result.current.isTesting).toBe(false);
+      expect(result.current.error).toMatch(/denied/i);
+      expect(mockProcessorNodes).toHaveLength(0);
+      expect(mockLoopbackAudioElement).toBeNull();
+    }
+  );
+
+  it.each([
+    ['input device', () => useVoiceStore.setState({ audioInputDeviceId: 'replacement' })],
+    ['output device', () => useVoiceStore.setState({ audioOutputDeviceId: 'replacement' })],
+    ['AGC', () => useAudioSettingsStore.setState({ autoGainControl: true })],
+    ['input level', () => useAudioSettingsStore.setState({ inputVolume: 40 })],
+    ['noise suppression', () => useAudioSettingsStore.setState({ noiseCancellation: false })],
+  ] as const)(
+    'invalidates active calibration on %s changes without restarting capture',
+    async (_name, change) => {
+      vi.useFakeTimers();
+      const { result, observer } = await startCalibration();
+      act(change);
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+      expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('configuration');
+      expect(mockTrackStop).toHaveBeenCalledTimes(1);
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
+      expect(result.current.isPending).toBe(false);
+      expect(result.current.isTesting).toBe(false);
+    }
+  );
+
+  it('replaces calibration with ordinary listening Test and invalidates exactly once', async () => {
+    const { result, observer } = await startCalibration();
+    const version = result.current.getActivityVersion();
+    await act(async () => {
+      await result.current.startTest();
+    });
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('competing-test');
+    expect(result.current.getActivityVersion()).toBeGreaterThan(version);
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockGetUserMedia).toHaveBeenCalledTimes(2);
+    expect(mockLoopbackAudioElement?.play).toHaveBeenCalledTimes(1);
+    expect(result.current.isTesting).toBe(true);
+  });
+
+  it('finishes capture without invalidating review and returns its synchronous activity version', async () => {
+    const { result, session, observer } = await startCalibration();
+    const before = result.current.getActivityVersion();
+    let finished = -1;
+    act(() => {
+      finished = session.finish();
+      expect(result.current.getActivityVersion()).toBe(finished);
+    });
+    expect(finished).toBeGreaterThan(before);
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    expect(result.current.isPending).toBe(false);
+    expect(result.current.isTesting).toBe(false);
+    expect(observer.onInvalidated).not.toHaveBeenCalled();
+    act(() => result.current.stopTest());
+    expect(result.current.getActivityVersion()).toBeGreaterThan(finished);
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['ended', 'mute'] as const)(
+    'releases capture after track %s and ignores subsequent events',
+    async (event) => {
+      const { result, observer } = await startCalibration();
+      act(() => mockCaptureTrack.dispatchEvent(new Event(event)));
+      expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('capture-lost');
+      expect(mockTrackStop).toHaveBeenCalledTimes(1);
+      expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+      expect(result.current.isTesting).toBe(false);
+      act(() => mockCaptureTrack.dispatchEvent(new Event(event)));
+      expect(observer.onInvalidated).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each(['suspended', 'closed'] as const)(
+    'invalidates calibration when its context becomes %s',
+    async (state) => {
+      const { observer } = await startCalibration();
+      act(() => {
+        mockAudioContext.state = state;
+        mockAudioContext.dispatchEvent(new Event('statechange'));
+      });
+      expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('capture-lost');
+      expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('reports processor failure and releases all microphone resources', async () => {
+    const { result, observer } = await startCalibration();
+    act(() => mockProcessorNodes.at(-1)!.instance.fail());
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('processor-error');
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    expect(result.current.error).toMatch(/processing failed/i);
+  });
+
+  it('balances call suspension on duplicate Stop without waiting for track ended', async () => {
+    useVoiceStore.setState({ connectionState: 'connected' });
+    const { result, observer } = await startCalibration();
+    expect(voiceService.beginTestSuspension).toHaveBeenCalledTimes(1);
+    act(() => {
+      result.current.stopTest();
+      result.current.stopTest();
+    });
+    expect(voiceService.endTestSuspension).toHaveBeenCalledTimes(1);
+    expect(voiceService.setLocalTestingStatus).toHaveBeenLastCalledWith(false);
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('cancelled');
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('unmount releases capture and ignores later track/context events', async () => {
+    const { unmount, observer } = await startCalibration();
+    unmount();
+    expect(observer.onInvalidated).toHaveBeenCalledExactlyOnceWith('cancelled');
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    mockCaptureTrack.dispatchEvent(new Event('ended'));
+    mockAudioContext.state = 'suspended';
+    mockAudioContext.dispatchEvent(new Event('statechange'));
+    expect(observer.onInvalidated).toHaveBeenCalledTimes(1);
+  });
+  it('a stale finished session cannot stop a replacement listening Test', async () => {
+    const { result, session } = await startCalibration();
+    act(() => {
+      session.finish();
+    });
+    await act(async () => {
+      await result.current.startTest();
+    });
+    const version = result.current.getActivityVersion();
+    const processor = mockProcessorNodes.at(-1)!.instance;
+    const posted = processor.port.postMessage.mock.calls.length;
+    act(() => {
+      session.setPhase(9, 'speech');
+      session.finish();
+    });
+    expect(result.current.isTesting).toBe(true);
+    expect(result.current.getActivityVersion()).toBe(version);
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(processor.port.close).not.toHaveBeenCalled();
+    expect(processor.port.postMessage).toHaveBeenCalledTimes(posted);
+  });
+
+  it('refuses a competing in-call audio test before requesting microphone access', async () => {
+    useVoiceStore.setState({ connectionState: 'connected', localIsTesting: true });
+    const { result } = renderHook(() => useMicTest());
+    await act(async () => {
+      expect(await result.current.startCalibration(callbacks())).toBeNull();
+    });
+    expect(result.current.error).toMatch(/another audio test/i);
+    expect(result.current.isPending).toBe(false);
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+    expect(voiceService.beginTestSuspension).not.toHaveBeenCalled();
+  });
+
+  it('notifies activity subscribers synchronously after advancing the version on start and Stop', async () => {
+    const { result } = renderHook(() => useMicTest());
+    const versions: number[] = [];
+    expect(result.current.subscribeActivity).toBeTypeOf('function');
+    const unsubscribe = result.current.subscribeActivity!(() => {
+      versions.push(result.current.getActivityVersion());
+    });
+    const before = result.current.getActivityVersion();
+    let starting!: Promise<void>;
+    act(() => {
+      starting = result.current.startTest();
+      expect(versions.length).toBeGreaterThan(0);
+      expect(versions.at(-1)).toBe(result.current.getActivityVersion());
+      expect(versions.at(-1)).toBeGreaterThan(before);
+    });
+    await act(async () => {
+      await starting;
+    });
+    const started = result.current.getActivityVersion();
+    const notifications = versions.length;
+    act(() => {
+      result.current.stopTest();
+      expect(versions.length).toBeGreaterThan(notifications);
+      expect(versions.at(-1)).toBe(result.current.getActivityVersion());
+      expect(versions.at(-1)).toBeGreaterThan(started);
+    });
+    for (let i = 1; i < versions.length; i++) expect(versions[i]).toBeGreaterThan(versions[i - 1]);
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    unsubscribe();
+  });
+
+  it('notifies on successful finish and every later external Stop even when React state stays idle', async () => {
+    const { result, session, observer } = await startCalibration();
+    const versions: number[] = [];
+    expect(result.current.subscribeActivity).toBeTypeOf('function');
+    const unsubscribe = result.current.subscribeActivity!(() => {
+      versions.push(result.current.getActivityVersion());
+    });
+    const before = result.current.getActivityVersion();
+    act(() => {
+      const finished = session.finish();
+      expect(versions.at(-1)).toBe(finished);
+      expect(finished).toBeGreaterThan(before);
+    });
+    expect(observer.onInvalidated).not.toHaveBeenCalled();
+    expect(result.current.isTesting).toBe(false);
+    expect(result.current.isPending).toBe(false);
+    for (let i = 0; i < 2; i++) {
+      const previousVersion = result.current.getActivityVersion();
+      const notifications = versions.length;
+      act(() => {
+        result.current.stopTest();
+        expect(versions.length).toBeGreaterThan(notifications);
+        expect(versions.at(-1)).toBe(result.current.getActivityVersion());
+        expect(versions.at(-1)).toBeGreaterThan(previousVersion);
+      });
+      expect(result.current.isTesting).toBe(false);
+      expect(result.current.isPending).toBe(false);
+    }
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    unsubscribe();
+  });
+
+  it('unsubscribe silences only that observer while activity and resource cleanup continue', async () => {
+    const { result } = renderHook(() => useMicTest());
+    const removed = vi.fn();
+    const remaining = vi.fn();
+    expect(result.current.subscribeActivity).toBeTypeOf('function');
+    const unsubscribe = result.current.subscribeActivity!(removed);
+    const unsubscribeRemaining = result.current.subscribeActivity!(remaining);
+    await act(async () => {
+      await result.current.startCalibration(callbacks());
+    });
+    expect(removed).toHaveBeenCalled();
+    expect(remaining).toHaveBeenCalled();
+    unsubscribe();
+    removed.mockClear();
+    remaining.mockClear();
+    const before = result.current.getActivityVersion();
+    act(() => result.current.stopTest());
+    expect(result.current.getActivityVersion()).toBeGreaterThan(before);
+    expect(removed).not.toHaveBeenCalled();
+    expect(remaining).toHaveBeenCalled();
+    expect(mockTrackStop).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.close).toHaveBeenCalledTimes(1);
+    unsubscribeRemaining();
   });
 });

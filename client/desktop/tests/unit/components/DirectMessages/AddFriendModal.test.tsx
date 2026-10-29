@@ -290,6 +290,40 @@ describe('AddFriendModal', () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('COPYCODE');
   });
 
+  it('cleans up copy feedback timers and ignores clipboard completion after unmount', async () => {
+    vi.useFakeTimers();
+    const clipboard = vi.mocked(navigator.clipboard.writeText);
+    clipboard.mockResolvedValue(undefined);
+    const { unmount } = render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
+    try {
+      await act(async () => fireEvent.click(screen.getByText('Generate Code')));
+      await act(async () => fireEvent.click(screen.getByText('Copy')));
+      expect(screen.getByText('Copied!')).toBeInTheDocument();
+      await act(async () => vi.advanceTimersByTime(2000));
+      expect(screen.getByText('Copy')).toBeInTheDocument();
+      await act(async () => fireEvent.click(screen.getByText('Copy')));
+      expect(screen.getByText('Copied!')).toBeInTheDocument();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      let finishCopy: () => void = () => {};
+      clipboard.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishCopy = resolve;
+          })
+      );
+      fireEvent.click(screen.getByText('Copied!'));
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+      await act(async () => finishCopy());
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+      clipboard.mockResolvedValue(undefined);
+    }
+  });
+
   it('renders expiry dropdown', () => {
     render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
     expect(screen.getByText('Expires after')).toBeInTheDocument();

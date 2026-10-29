@@ -20,6 +20,8 @@ import { useGateActivation } from '../../hooks/ui/useGateActivation';
 import PremiumChip from '../common/PremiumChip';
 import DeviceSelector from '../Voice/DeviceSelector';
 import { useMicTest } from '../../hooks/device/useMicTest';
+import { useGateCalibration } from '../../hooks/device/useGateCalibration';
+import { NoiseGateCalibration } from './NoiseGateCalibration';
 import { useOutputTest } from '../../hooks/device/useOutputTest';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
@@ -91,7 +93,7 @@ function noiseGateHint(mode: NoiseGateMode): string {
     case 'manualCalibrate':
       return 'Manual Calibrate uses the fixed dBFS threshold below to decide when the gate opens.';
     case 'autoCalibrate':
-      return 'Off leaves the gate open.';
+      return 'Auto Calibrate measures room and voice levels to suggest a fixed threshold for review.';
     case 'off':
       return 'Off leaves the gate open.';
   }
@@ -152,6 +154,8 @@ interface AudioDeviceSettingsProps {
   micTest: ReturnType<typeof useMicTest>;
   outputTest: ReturnType<typeof useOutputTest>;
   outputVolume: number;
+  calibrationActive: boolean;
+  calibrationCapturing: boolean;
 }
 
 const AudioDeviceSettings: React.FC<AudioDeviceSettingsProps> = ({
@@ -159,6 +163,8 @@ const AudioDeviceSettings: React.FC<AudioDeviceSettingsProps> = ({
   micTest,
   outputTest,
   outputVolume,
+  calibrationActive,
+  calibrationCapturing,
 }) => (
   <div className="settings-audio-devices">
     <div className="settings-audio-device-group">
@@ -181,7 +187,7 @@ const AudioDeviceSettings: React.FC<AudioDeviceSettingsProps> = ({
         Microphone Test uses applied settings until you select Apply. Its meter shows sample peaks
         before the noise gate, so it still responds while the gate is closed.
       </p>
-      {micTest.isTesting && (
+      {micTest.isTesting && !calibrationActive && (
         <div className="settings-mic-meter-container">
           <div className="settings-mic-meter-track">
             <div
@@ -241,9 +247,15 @@ const AudioDeviceSettings: React.FC<AudioDeviceSettingsProps> = ({
         <button
           className={`settings-output-test-btn${outputTest.isTesting ? ' testing' : ''}`}
           onClick={outputTest.playTestTone}
-          disabled={outputTest.isTesting || (localIsTesting && !outputTest.isTesting)}
+          disabled={
+            calibrationCapturing ||
+            outputTest.isTesting ||
+            (localIsTesting && !outputTest.isTesting)
+          }
           title={
-            localIsTesting && !outputTest.isTesting ? 'Another audio test is running' : undefined
+            calibrationCapturing || (localIsTesting && !outputTest.isTesting)
+              ? 'Another audio test is running'
+              : undefined
           }
         >
           {outputTest.isTesting ? 'Playing...' : 'Test'}
@@ -260,7 +272,6 @@ interface NoiseGateSettingsProps {
   appliedMusicMode: boolean;
   autoGainControl: boolean;
   noiseGateMode: NoiseGateMode;
-  noiseGateLevel: number;
   musicMode: boolean;
   isTesting: boolean;
   activeGateStatus: ReturnType<typeof useVoiceStore.getState>['dynamicGateStatus'];
@@ -273,7 +284,6 @@ const NoiseGateSettings: React.FC<NoiseGateSettingsProps> = ({
   appliedMusicMode,
   autoGainControl,
   noiseGateMode,
-  noiseGateLevel,
   musicMode,
   isTesting,
   activeGateStatus,
@@ -312,7 +322,12 @@ const NoiseGateSettings: React.FC<NoiseGateSettingsProps> = ({
           }
         >
           <option value="dynamic">Dynamic</option>
-          {!effectiveAgc && <option value="manualCalibrate">Manual Calibrate</option>}
+          {!effectiveAgc && (
+            <>
+              <option value="autoCalibrate">Auto Calibrate</option>
+              <option value="manualCalibrate">Manual Calibrate</option>
+            </>
+          )}
           <option value="off">Off</option>
         </select>
       </div>
@@ -325,7 +340,9 @@ const NoiseGateSettings: React.FC<NoiseGateSettingsProps> = ({
         </p>
       )}
 
-      {appliedDynamic && (isTesting || activeGateStatus || gateError) ? (
+      {appliedDynamic &&
+      noiseGateMode === 'dynamic' &&
+      (isTesting || activeGateStatus || gateError) ? (
         <div className="settings-row-hint">
           <span role="status" aria-live="polite">
             {dynamicGateStatusMessage(gateError, activeGateStatus)}
@@ -342,31 +359,6 @@ const NoiseGateSettings: React.FC<NoiseGateSettingsProps> = ({
         noiseGateMode === 'dynamic' && (
           <p className="settings-row-hint">The gate learns during a call or microphone Test</p>
         )
-      )}
-
-      {noiseGateMode === 'manualCalibrate' && (
-        <div className="settings-row settings-row-child">
-          <div className="settings-row-info">
-            <label className="settings-row-label" htmlFor="settings-noise-gate-threshold">
-              Gate Threshold
-            </label>
-            <span className="settings-row-hint">Set the threshold yourself.</span>
-          </div>
-          <div className="settings-slider-wrapper">
-            <span className="settings-slider-value">{noiseGateLevel} dBFS</span>
-            <input
-              id="settings-noise-gate-threshold"
-              type="range"
-              className="settings-slider"
-              min={-80}
-              max={-20}
-              value={noiseGateLevel}
-              onChange={(event) =>
-                setDraftAudioSetting('noiseGateLevel', Number(event.currentTarget.value))
-              }
-            />
-          </div>
-        </div>
       )}
     </>
   );
@@ -514,6 +506,7 @@ const AudioConfigSection: React.FC = () => {
 
   const advancedMode = useAudioSettingsStore((s) => s.advancedMode);
   const appliedGateMode = useAudioSettingsStore((s) => s.noiseGateMode);
+  const appliedThreshold = useAudioSettingsStore((s) => s.noiseGateLevel);
   const appliedAgc = useAudioSettingsStore((s) => s.autoGainControl);
   const appliedMusicMode = useAudioSettingsStore((s) => s.musicMode);
   const liveGateStatus = useVoiceStore((s) => s.dynamicGateStatus);
@@ -537,11 +530,28 @@ const AudioConfigSection: React.FC = () => {
   const outputVolume = useDraftAudioSetting('outputVolume');
   const localIsTesting = useVoiceStore((s) => s.localIsTesting);
   const micTest = useMicTest();
+  const calibration = useGateCalibration(micTest);
+  const fixedGate = noiseGateMode === 'autoCalibrate' || noiseGateMode === 'manualCalibrate';
   const outputTest = useOutputTest();
+  const calibrationCapturing = ['acquiring', 'quiet', 'readyToRead', 'speech'].includes(
+    calibration.state.phase
+  );
+  const { stopTest: stopOutputTest, playTestTone } = outputTest;
+  const { start: beginCalibration, cancel: cancelCalibration } = calibration;
+  const startCalibration = useCallback(async () => {
+    // Stop even a pending tone before the microphone owner begins silent sampling.
+    stopOutputTest();
+    await beginCalibration();
+  }, [stopOutputTest, beginCalibration]);
+  const startOutputTest = useCallback(async () => {
+    cancelCalibration();
+    await playTestTone();
+  }, [cancelCalibration, playTestTone]);
   const testGateError = micTest.error
     ? `${micTest.error}. Check your microphone and try again.`
     : null;
-  const gateError = !micTest.isTesting && liveGateError ? liveGateError : testGateError;
+  let gateError = testGateError;
+  if (!micTest.isTesting && (liveGateStatus || liveGateError)) gateError = liveGateError;
   const handleAdvancedToggle = useCallback(
     (enabled: boolean) => {
       useAudioSettingsStore.getState().setAdvancedMode(enabled); // immediate — UI toggle
@@ -555,6 +565,7 @@ const AudioConfigSection: React.FC = () => {
       id="section-audio-config"
       title="Audio Configuration"
       onCollapse={() => {
+        calibration.cancel();
         micTest.stopTest();
         outputTest.stopTest();
       }}
@@ -562,8 +573,10 @@ const AudioConfigSection: React.FC = () => {
       <AudioDeviceSettings
         localIsTesting={localIsTesting}
         micTest={micTest}
-        outputTest={outputTest}
+        outputTest={{ ...outputTest, playTestTone: startOutputTest }}
         outputVolume={outputVolume}
+        calibrationActive={fixedGate}
+        calibrationCapturing={calibrationCapturing}
       />
       <p className="settings-section-description">
         Device selections apply immediately. Processing changes apply when you select Apply.
@@ -708,12 +721,22 @@ const AudioConfigSection: React.FC = () => {
         appliedMusicMode={appliedMusicMode}
         autoGainControl={autoGainControl}
         noiseGateMode={noiseGateMode}
-        noiseGateLevel={noiseGateLevel}
         musicMode={musicMode}
         isTesting={micTest.isTesting}
         activeGateStatus={micTest.isTesting ? micTest.dynamicGateStatus : liveGateStatus}
         gateError={gateError}
       />
+
+      {fixedGate && (
+        <NoiseGateCalibration
+          controller={{ ...calibration, start: startCalibration }}
+          micTest={micTest}
+          mode={noiseGateMode}
+          threshold={noiseGateLevel}
+          appliedThreshold={appliedThreshold}
+          onThresholdChange={(value) => setDraftAudioSetting('noiseGateLevel', value)}
+        />
+      )}
 
       <div className="settings-row">
         <div className="settings-row-info">

@@ -8,6 +8,9 @@ const mockSetAdvancedMode = vi.fn();
 const mockStashAndSwap = vi.fn();
 const mockStartMicTest = vi.fn();
 const mockStopMicTest = vi.fn();
+const mockStartCalibration = vi.fn(async () => null);
+const mockGetMicActivityVersion = vi.fn(() => 0);
+const mockSubscribeMicActivity = vi.fn(() => () => {});
 const mockPlayTestTone = vi.fn();
 const mockStopOutputTest = vi.fn();
 let mockLocalIsTesting = false;
@@ -115,6 +118,7 @@ vi.mock('@/renderer/stores/audio/audioSettingsStore', async (importOriginal) => 
     await importOriginal<typeof import('@/renderer/stores/audio/audioSettingsStore')>();
   return {
     effectiveNoiseGateMode: actual.effectiveNoiseGateMode,
+    effectiveMicLevelPercent: actual.effectiveMicLevelPercent,
     useAudioSettingsStore: Object.assign(
       vi.fn((s) =>
         s({
@@ -149,7 +153,15 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
 }));
 
 vi.mock('@/renderer/hooks/device/useMicTest', () => ({
-  useMicTest: () => ({ ...micTestState, startTest: mockStartMicTest, stopTest: mockStopMicTest }),
+  useMicTest: () => ({
+    ...micTestState,
+    isPending: false,
+    startTest: mockStartMicTest,
+    stopTest: mockStopMicTest,
+    startCalibration: mockStartCalibration,
+    getActivityVersion: mockGetMicActivityVersion,
+    subscribeActivity: mockSubscribeMicActivity,
+  }),
 }));
 vi.mock('@/renderer/hooks/device/useOutputTest', () => ({
   useOutputTest: () => ({
@@ -955,6 +967,28 @@ describe('AudioConfigSection', () => {
     expect(screen.getByRole('status')).toHaveTextContent(/Microphone processing stopped/i);
     expect(screen.getByRole('status')).not.toHaveTextContent(/Earlier Test failure/i);
   });
+
+  // Regression for #3636: a stopped Test does not own a healthy call's gate status.
+  it.each([null, 'Earlier Test failure'])(
+    'shows healthy live Dynamic status with stopped Test error %s',
+    async (testError) => {
+      const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
+      micTestState = { ...micTestState, isTesting: false, error: testError };
+      useVoiceStore.setState({
+        joinError: null,
+        dynamicGateStatus: { state: 'adjusted', thresholdDbfs: -42 },
+      });
+      mockCallState = { kind: 'in-call' };
+
+      render(<AudioConfigSection />);
+
+      expect(screen.getByRole('status')).toHaveTextContent('Adjusted');
+      expect(screen.getByRole('status')).not.toHaveTextContent('Earlier Test failure');
+      expect(screen.getByText(/Current threshold: −42 dBFS/)).toBeInTheDocument();
+      // The old error remains available alongside Test, rather than disappearing altogether.
+      if (testError) expect(screen.getByText(testError)).toBeInTheDocument();
+    }
+  );
 
   it('keeps status changes in one polite announcement region', () => {
     micTestState = {

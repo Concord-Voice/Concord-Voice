@@ -94,7 +94,10 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease;
   text-align: left;
 }
 
@@ -500,13 +503,9 @@
   border-radius: 50%;
   border: none;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: box-shadow 0.2s ease;
   padding: 0;
   background-origin: border-box;
-}
-
-.color-scheme-circle:hover {
-  transform: scale(1.1);
 }
 
 .color-scheme-circle.selected {
@@ -528,7 +527,10 @@
   border: 2px dashed var(--border-color);
   background: var(--bg-tertiary);
   color: var(--text-secondary);
-  transition: all 0.2s ease;
+  transition:
+    box-shadow 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
 }
 
 .color-scheme-circle.custom-add:hover {
@@ -633,7 +635,10 @@
   border: 2px solid var(--border-color);
   border-radius: 10px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease,
+    background-color 0.2s ease;
   color: var(--text-secondary);
 }
 
@@ -690,7 +695,9 @@
   border: 2px solid var(--border-color);
   border-radius: 8px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease;
   color: var(--text-secondary);
   font-family: inherit;
   text-align: center;
@@ -768,7 +775,10 @@
   font-family: inherit;
   font-size: calc(12px * var(--font-scale, 1));
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    opacity 0.15s ease;
 }
 
 .ui-scale-reset-btn:hover:not(:disabled) {
@@ -817,7 +827,9 @@
   border: 1px solid var(--border-color);
   border-radius: 12px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
 }
 
 .settings-toggle input:checked + .settings-toggle-track {
@@ -937,7 +949,11 @@
   font-size: calc(13px * var(--font-scale, 1));
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease,
+    opacity 0.15s ease;
 }
 
 .session-revoke-btn:hover:not(:disabled) {
@@ -971,7 +987,9 @@
   font-size: calc(13px * var(--font-scale, 1));
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
 }
 
 .session-cancel-btn:hover {
@@ -1040,7 +1058,9 @@
   font-size: calc(12px * var(--font-scale, 1));
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
 }
 
 .revocation-mode-btn:hover:not(.active) {
@@ -1122,7 +1142,9 @@
   font-size: calc(13px * var(--font-scale, 1));
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
 }
 
 .revoke-all-modal-cancel-btn:hover {
@@ -1140,7 +1162,7 @@
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: opacity 0.15s ease;
 }
 
 .revoke-all-modal-confirm-btn:hover:not(:disabled):not([aria-disabled='true']) {
@@ -1165,7 +1187,9 @@
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease;
 }
 
 .sessions-revoke-all-btn:hover:not(:disabled) {
@@ -1583,7 +1607,10 @@
   font-weight: 600;
   color: var(--text-secondary);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
   user-select: none;
 }
 
@@ -2018,6 +2045,138 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Guided fixed-threshold calibration shares the existing microphone Test owner. */
+.settings-calibration {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin-block: 12px 20px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  overflow-wrap: anywhere;
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.settings-calibration-preparation,
+.settings-calibration-reading,
+.settings-calibration-meter {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-calibration-meter-track {
+  position: relative;
+  height: 10px;
+  margin-block: 12px;
+  margin-inline: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+}
+
+.settings-calibration-marker {
+  position: absolute;
+  transform: translateX(-50%);
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.settings-calibration-marker-current {
+  bottom: 100%;
+}
+
+.settings-calibration-marker-suggested {
+  top: 100%;
+}
+
+.settings-calibration-meter-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: calc(10px * var(--font-scale, 1));
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-calibration-summary {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settings-calibration-summary dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.settings-calibration-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-calibration-actions button {
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.settings-calibration-actions button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.settings-calibration-actions button:disabled {
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+
+.settings-calibration-actions button:focus-visible,
+.settings-calibration input:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 3px;
+}
+
+.settings-calibration-threshold {
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-left: 0;
+}
+
+.settings-calibration-threshold .settings-slider-wrapper {
+  flex: 1 1 160px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.settings-calibration-threshold input {
+  width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 640px) {
+  .settings-calibration-threshold {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-calibration-threshold .settings-slider-wrapper {
+    flex: none;
+    width: 100%;
+  }
+}
+
 /* ─── Tree Navigation ─────────────────────────────────────────────────────── */
 
 .settings-nav-group {
@@ -2129,7 +2288,9 @@
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
 }
 
 .settings-btn-secondary:hover {
@@ -2158,7 +2319,6 @@
   border: 1px solid var(--border-color);
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  animation: blobSlideIn 0.3s ease-out;
 }
 
 @keyframes blobSlideIn {
@@ -2218,7 +2378,7 @@
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: border-color 0.15s ease;
 }
 
 .settings-pending-blob-revert:hover {
@@ -2228,7 +2388,6 @@
 /* ─── Blob bounce animation (triggered on back button hover) ─────────────── */
 
 .settings-pending-blob--bouncing {
-  animation: blobBounce 1.5s ease-in-out infinite;
   box-shadow:
     0 4px 16px rgba(0, 0, 0, 0.25),
     0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
@@ -2264,7 +2423,6 @@
   box-shadow:
     0 4px 16px rgba(0, 0, 0, 0.25),
     0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
-  animation: blobGlowFade 3s ease-out forwards;
 }
 
 @keyframes blobGlowFade {
@@ -2408,4 +2566,52 @@
   .settings-bitrate-ghost-zone {
     transition: none;
   }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .color-scheme-circle {
+    transition:
+      transform 0.2s ease,
+      box-shadow 0.2s ease;
+  }
+  .color-scheme-circle.custom-add {
+    transition:
+      transform 0.2s ease,
+      box-shadow 0.2s ease,
+      border-color 0.2s ease,
+      color 0.2s ease;
+  }
+  .color-scheme-circle:hover {
+    transform: scale(1.1);
+  }
+
+  .settings-pending-blob {
+    animation: blobSlideIn 0.3s ease-out;
+  }
+  .settings-pending-blob--bouncing {
+    animation: blobBounce 1.5s ease-in-out infinite;
+  }
+  .settings-pending-blob--fading {
+    animation: blobGlowFade 3s ease-out forwards;
+  }
+}
+
+.settings-calibration-meter-native {
+  display: block;
+  appearance: none;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--bg-tertiary);
+}
+.settings-calibration-meter-native::-webkit-meter-bar {
+  background: var(--bg-tertiary);
+  border: 0;
+  border-radius: 0;
+}
+.settings-calibration-meter-native::-webkit-meter-optimum-value {
+  background: var(--text-secondary);
+}
+.settings-calibration-meter-native::-moz-meter-bar {
+  background: var(--text-secondary);
 }

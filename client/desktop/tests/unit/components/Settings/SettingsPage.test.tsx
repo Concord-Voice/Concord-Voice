@@ -8,6 +8,9 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 
 const mockStopMicTest = vi.fn();
+const mockStartMicCalibration = vi.fn(async () => null);
+const mockGetMicActivityVersion = vi.fn(() => 0);
+const mockSubscribeMicActivity = vi.fn((_listener: () => void) => () => {});
 const mockStopOutputTest = vi.fn();
 const mockStopCameraTest = vi.fn();
 let mockMicTestActive = false;
@@ -26,10 +29,16 @@ vi.mock('@/renderer/hooks/device/useMicTest', async () => {
       );
       return {
         isTesting: mockMicTestActive,
+        isPending: false,
         dbfsLevel: -40,
+        inputOverloaded: false,
+        dynamicGateStatus: null,
         error: null,
         startTest: vi.fn(),
         stopTest: mockStopMicTest,
+        startCalibration: mockStartMicCalibration,
+        getActivityVersion: mockGetMicActivityVersion,
+        subscribeActivity: mockSubscribeMicActivity,
       };
     }),
   };

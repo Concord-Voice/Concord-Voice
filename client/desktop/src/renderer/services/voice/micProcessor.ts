@@ -17,7 +17,8 @@ export function gateForAudioSettings(
   >
 ): GateRuntime {
   const mode = effectiveNoiseGateMode(settings);
-  if (mode === 'manualCalibrate') return { kind: 'fixed', thresholdDbfs: settings.noiseGateLevel };
+  if (mode === 'manualCalibrate' || mode === 'autoCalibrate')
+    return { kind: 'fixed', thresholdDbfs: settings.noiseGateLevel };
   return mode === 'off' ? { kind: 'off' } : { kind: 'dynamic' };
 }
 
@@ -28,6 +29,12 @@ export type PeakWindow = {
   overloaded: boolean;
 };
 
+export type CalibrationPhase = 'quiet' | 'speech' | 'idle';
+export type CalibrationEvent =
+  | { type: 'calibrationAck'; epoch: number; phase: CalibrationPhase }
+  | ({ type: 'calibrationWindow'; epoch: number; phase: 'quiet' | 'speech' } & PeakWindow)
+  | { type: 'calibrationComplete'; epoch: number; phase: 'quiet' | 'speech'; frames: number };
+
 export type MicProcessorInitial = {
   protectAgcPeaks: boolean;
   gate: GateRuntime;
@@ -37,6 +44,7 @@ export type MicProcessorHandle = {
   node: AudioWorkletNode;
   setGate(gate: GateRuntime): void;
   setWindowReporting(enabled: boolean): void;
+  setCalibrationPhase(epoch: number, phase: CalibrationPhase): void;
   close(): void;
 };
 
@@ -45,19 +53,42 @@ export async function createMicProcessor(
   initial: MicProcessorInitial,
   onWindow: (window: PeakWindow) => void,
   onProcessorError: () => void,
-  onGateStatus?: (status: DynamicGateStatus) => void
+  onGateStatus?: (status: DynamicGateStatus) => void,
+  onCalibrationEvent?: (event: CalibrationEvent) => void
 ): Promise<MicProcessorHandle> {
   validateInitial(initial);
   if (!Number.isFinite(context.sampleRate) || context.sampleRate <= 0) {
     throw new TypeError('Invalid microphone processor configuration');
   }
   const reportFrames = Math.max(1, Math.round(context.sampleRate * 0.02));
+  const quietLimit = Math.ceil((context.sampleRate * 10) / reportFrames);
+  const speechLimit = Math.floor((context.sampleRate * 20) / reportFrames);
+  const calibrationSupported =
+    Number.isSafeInteger(reportFrames) &&
+    Number.isSafeInteger(quietLimit) &&
+    quietLimit >= 1 &&
+    quietLimit <= 501 &&
+    Number.isSafeInteger(speechLimit) &&
+    speechLimit >= 1 &&
+    speechLimit <= 1000 &&
+    Number.isSafeInteger(reportFrames * quietLimit) &&
+    Number.isSafeInteger(reportFrames * speechLimit) &&
+    Math.round(context.sampleRate * 0.02) >= 1;
+  let calibration:
+    | {
+        epoch: number;
+        phase: CalibrationPhase;
+        acknowledged: boolean;
+        windows: number;
+        complete: boolean;
+      }
+    | undefined;
   let node: AudioWorkletNode | undefined;
   let closed = false;
   let failed = false;
 
   const notifyError = () => {
-    if (failed) return;
+    if (closed || failed) return;
     failed = true;
     try {
       onProcessorError();
@@ -87,6 +118,25 @@ export async function createMicProcessor(
     }
   };
 
+  const acceptCalibrationEvent = (data: CalibrationEvent): boolean => {
+    if (!calibration) return false;
+    if (data.type === 'calibrationAck') {
+      if (calibration.acknowledged) return false;
+      calibration.acknowledged = true;
+      return true;
+    }
+    if (!calibration.acknowledged || calibration.complete) return false;
+    const limit = data.phase === 'quiet' ? quietLimit : speechLimit;
+    if (data.type === 'calibrationWindow') {
+      if (calibration.windows >= limit) return false;
+      calibration.windows++;
+      return true;
+    }
+    if (calibration.windows !== limit || data.frames !== limit * reportFrames) return false;
+    calibration.complete = true;
+    return true;
+  };
+
   try {
     await context.audioWorklet.addModule(processorUrl);
     const createdNode = new AudioWorkletNode(context, 'concord-mic-processor', {
@@ -102,6 +152,15 @@ export async function createMicProcessor(
       if (closed || failed) return;
       if (isPeakWindow(data, reportFrames)) onWindow(data);
       else if (isDynamicGateStatus(data)) onGateStatus?.(data);
+      else if (
+        calibration &&
+        isCalibrationEvent(data, reportFrames) &&
+        data.epoch === calibration.epoch &&
+        data.phase === calibration.phase
+      ) {
+        if (!acceptCalibrationEvent(data)) return;
+        onCalibrationEvent?.(data);
+      }
     };
     node.addEventListener('processorerror', () => {
       notifyError();
@@ -123,6 +182,17 @@ export async function createMicProcessor(
     setWindowReporting(enabled) {
       if (typeof enabled !== 'boolean') throw new TypeError('Invalid window reporting setting');
       if (!closed && !failed) node?.port.postMessage({ type: 'setWindowReporting', enabled });
+    },
+    setCalibrationPhase(epoch, phase) {
+      if (!isCalibrationEpoch(epoch) || !isCalibrationPhase(phase)) {
+        throw new TypeError('Invalid calibration phase');
+      }
+      if (closed || failed) return;
+      if (!calibrationSupported) throw new TypeError('Unsupported calibration sample rate');
+      if (calibration && epoch <= calibration.epoch) return;
+      // Fence queued old-phase messages as soon as a newer boundary is requested.
+      calibration = { epoch, phase, acknowledged: false, windows: 0, complete: false };
+      node?.port.postMessage({ type: 'setCalibrationPhase', epoch, phase });
     },
     close,
   };
@@ -191,6 +261,40 @@ function isPeakWindow(value: unknown, expectedFrames: number): value is PeakWind
     return false;
   }
   return (
+    typeof value.peak === 'number' &&
+    Number.isFinite(value.peak) &&
+    value.peak >= 0 &&
+    value.frames === expectedFrames &&
+    typeof value.valid === 'boolean' &&
+    typeof value.overloaded === 'boolean'
+  );
+}
+
+function isCalibrationEpoch(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isCalibrationPhase(value: unknown): value is CalibrationPhase {
+  return value === 'quiet' || value === 'speech' || value === 'idle';
+}
+
+function isCalibrationEvent(value: unknown, expectedFrames: number): value is CalibrationEvent {
+  if (!isRecord(value) || !isCalibrationEpoch(value.epoch) || !isCalibrationPhase(value.phase)) {
+    return false;
+  }
+  if (value.type === 'calibrationAck') return hasExactKeys(value, ['type', 'epoch', 'phase']);
+  if (value.phase === 'idle') return false;
+  if (value.type === 'calibrationComplete') {
+    return (
+      hasExactKeys(value, ['type', 'epoch', 'phase', 'frames']) &&
+      typeof value.frames === 'number' &&
+      Number.isSafeInteger(value.frames) &&
+      value.frames > 0
+    );
+  }
+  return (
+    value.type === 'calibrationWindow' &&
+    hasExactKeys(value, ['type', 'epoch', 'phase', 'peak', 'frames', 'valid', 'overloaded']) &&
     typeof value.peak === 'number' &&
     Number.isFinite(value.peak) &&
     value.peak >= 0 &&

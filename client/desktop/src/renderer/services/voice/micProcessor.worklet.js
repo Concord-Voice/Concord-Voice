@@ -4,7 +4,7 @@ const DYNAMIC_HOLD_SECONDS = 0.12;
 const DYNAMIC_STABLE_TOLERANCE_DB = 3;
 const DYNAMIC_MIN_ELEVATED_WINDOWS = 25;
 const DYNAMIC_LONG_ELEVATED_WINDOWS = 100;
-const DYNAMIC_STALE_ELEVATED_WINDOWS = 150;
+const DYNAMIC_STALE_REGIME_WINDOWS = 150; // Three seconds without either learned regime.
 
 function hasExactKeys(value, keys) {
   return (
@@ -31,6 +31,15 @@ function cappedSample(sample) {
   return Number.isFinite(sample) ? Math.fround(Math.max(-PEAK_CAP, Math.min(PEAK_CAP, sample))) : 0;
 }
 
+function validCalibrationCommand(data) {
+  return (
+    hasExactKeys(data, ['type', 'epoch', 'phase']) &&
+    Number.isSafeInteger(data.epoch) &&
+    data.epoch >= 0 &&
+    (data.phase === 'quiet' || data.phase === 'speech' || data.phase === 'idle')
+  );
+}
+
 class ConcordMicProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -51,6 +60,25 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
     this.dynamicHoldFrames = Math.round(sampleRate * DYNAMIC_HOLD_SECONDS);
     this.release = Math.exp(-1 / (sampleRate * 0.1));
     this.windowFrames = Math.max(1, Math.round(sampleRate * 0.02));
+    this.quietCalibrationLimit = Math.ceil((sampleRate * 10) / this.windowFrames);
+    this.speechCalibrationLimit = Math.floor((sampleRate * 20) / this.windowFrames);
+    this.calibrationSupported =
+      Number.isFinite(sampleRate) &&
+      sampleRate > 0 &&
+      Math.round(sampleRate * 0.02) >= 1 &&
+      Number.isSafeInteger(this.windowFrames) &&
+      Number.isSafeInteger(this.quietCalibrationLimit) &&
+      this.quietCalibrationLimit >= 1 &&
+      this.quietCalibrationLimit <= 501 &&
+      Number.isSafeInteger(this.speechCalibrationLimit) &&
+      this.speechCalibrationLimit >= 1 &&
+      this.speechCalibrationLimit <= 1000 &&
+      Number.isSafeInteger(this.windowFrames * this.quietCalibrationLimit) &&
+      Number.isSafeInteger(this.windowFrames * this.speechCalibrationLimit);
+    this.calibrationEpoch = -1;
+    this.calibrationPhase = 'idle';
+    this.calibrationWindows = 0;
+    this.resetCalibrationWindow();
     this.delay = Math.max(1, Math.ceil(sampleRate * 0.004));
     this.delayed = [new Float32Array(this.delay), new Float32Array(this.delay)];
     this.delayedValid = new Uint8Array(this.delay);
@@ -69,22 +97,24 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
     this.closed = false;
 
     this.port.onmessage = ({ data }) => {
+      if (this.closed) return;
       if (data?.type === 'close' && hasExactKeys(data, ['type'])) {
         this.closed = true;
+      } else if (data?.type === 'setCalibrationPhase' && validCalibrationCommand(data)) {
+        if (!this.calibrationSupported) throw new Error('Unsupported calibration sample rate');
+        if (data.epoch <= this.calibrationEpoch) return;
+        this.calibrationEpoch = data.epoch;
+        this.calibrationPhase = data.phase;
+        this.calibrationWindows = 0;
+        // The calibration boundary must not disturb the gate's ordinary observation timeline.
+        this.resetCalibrationWindow();
+        this.port.postMessage({ type: 'calibrationAck', epoch: data.epoch, phase: data.phase });
       } else if (
         data?.type === 'setGate' &&
         hasExactKeys(data, ['type', 'gate']) &&
         validGate(data.gate)
       ) {
-        const wasFixed = this.gate.kind === 'fixed';
-        this.gate = data.gate;
-        this.gateThreshold = this.gate.kind === 'fixed' ? 10 ** (this.gate.thresholdDbfs / 20) : 0;
-        if (this.gate.kind === 'off') this.gateGain = 1;
-        else if (this.gate.kind === 'dynamic') {
-          this.gateGain = 1;
-          this.resetDynamic();
-          this.resetWindow();
-        } else if (!wasFixed) this.gateGain = 0;
+        this.updateGate(data.gate);
       } else if (
         data?.type === 'setWindowReporting' &&
         hasExactKeys(data, ['type', 'enabled']) &&
@@ -96,6 +126,18 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
         throw new Error('Invalid microphone processor message');
       }
     };
+  }
+
+  updateGate(gate) {
+    const wasFixed = this.gate.kind === 'fixed';
+    this.gate = gate;
+    this.gateThreshold = this.gate.kind === 'fixed' ? 10 ** (this.gate.thresholdDbfs / 20) : 0;
+    if (this.gate.kind === 'off') this.gateGain = 1;
+    else if (this.gate.kind === 'dynamic') {
+      this.gateGain = 1;
+      this.resetDynamic();
+      this.resetWindow();
+    } else if (!wasFixed) this.gateGain = 0;
   }
 
   resetLookahead() {
@@ -115,6 +157,43 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
     this.reportPeak = 0;
     this.reportValid = true;
     this.reportOverloaded = false;
+  }
+
+  resetCalibrationWindow() {
+    this.calibrationFrames = 0;
+    this.calibrationPeak = 0;
+    this.calibrationValid = true;
+    this.calibrationOverloaded = false;
+  }
+
+  observeCalibration(peak, valid, overloaded) {
+    if (this.calibrationPhase === 'idle') return;
+    const limit =
+      this.calibrationPhase === 'quiet' ? this.quietCalibrationLimit : this.speechCalibrationLimit;
+    if (this.calibrationWindows >= limit) return;
+    this.calibrationPeak = Math.max(this.calibrationPeak, peak);
+    this.calibrationValid &&= valid;
+    this.calibrationOverloaded ||= overloaded;
+    if (++this.calibrationFrames !== this.windowFrames) return;
+    this.port.postMessage({
+      type: 'calibrationWindow',
+      epoch: this.calibrationEpoch,
+      phase: this.calibrationPhase,
+      peak: this.calibrationPeak,
+      frames: this.calibrationFrames,
+      valid: this.calibrationValid,
+      overloaded: this.calibrationOverloaded,
+    });
+    this.calibrationWindows++;
+    this.resetCalibrationWindow();
+    if (this.calibrationWindows === limit) {
+      this.port.postMessage({
+        type: 'calibrationComplete',
+        epoch: this.calibrationEpoch,
+        phase: this.calibrationPhase,
+        frames: this.calibrationWindows * this.windowFrames,
+      });
+    }
   }
 
   resetDynamic() {
@@ -140,6 +219,8 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
     this.dynamicElevatedWindows = 0;
     this.dynamicObservedHighBin = -1;
     this.dynamicLastElevatedWindow = 0;
+    this.dynamicLastLowerWindow = 0;
+    this.dynamicSilentWindows = 0;
     this.dynamicSawOnset = false;
     this.dynamicOnsetCount = 0;
     this.dynamicAmbiguous = false;
@@ -150,15 +231,7 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
   trackDynamicShift(bin) {
     if (this.dynamicThresholdDbfs === null) return false;
     if (bin >= this.dynamicHighBin - 5) this.dynamicLastElevatedWindow = this.dynamicWindows;
-    // ponytail: level alone cannot distinguish ambient from equally quiet speech;
-    // expire confidence after a short quiet stretch until guided calibration can help.
-    else if (
-      this.dynamicWindows - this.dynamicLastElevatedWindow >=
-      DYNAMIC_STALE_ELEVATED_WINDOWS
-    ) {
-      this.resetDynamic();
-      return true;
-    }
+    if (bin <= this.dynamicLowBin + 6) this.dynamicLastLowerWindow = this.dynamicWindows;
     if (
       bin < this.dynamicLowBin - 6 ||
       (bin > this.dynamicLowBin + 6 && bin < this.dynamicHighBin - 5)
@@ -228,19 +301,47 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
     this.dynamicLastValidWindow = this.dynamicWindows;
   }
 
+  observeDynamicSilence() {
+    this.dynamicSilentWindows++;
+    // Zero is a valid pause, but not a finite noise-envelope measurement. Only
+    // finish an onset whose elevated portion was already observed and stable.
+    if (this.dynamicSilentWindows === 5 && this.dynamicHighStable) {
+      if (this.dynamicElevatedWindows >= DYNAMIC_MIN_ELEVATED_WINDOWS) this.acceptDynamicOnset();
+      this.dynamicOnsetBin = -1;
+      this.dynamicHighStable = false;
+      this.dynamicElevatedWindows = 0;
+    }
+    this.dynamicRunBin = -1;
+    this.dynamicRunLength = 0;
+    if (this.dynamicSilentWindows >= DYNAMIC_STALE_REGIME_WINDOWS) this.resetDynamic();
+  }
+
   observeDynamicWindow(peak, valid, overloaded) {
     this.dynamicWindows++;
-    if (valid && !overloaded && peak > 0 && peak < 1) {
+    if (!valid || overloaded || peak >= 1) {
+      this.resetDynamic();
+      return;
+    }
+    // Silence advances captured time without refreshing either learned regime.
+    // Expire before a returning sample can revive an already stale threshold.
+    if (
+      this.dynamicThresholdDbfs !== null &&
+      (this.dynamicWindows - this.dynamicLastElevatedWindow >= DYNAMIC_STALE_REGIME_WINDOWS ||
+        this.dynamicWindows - this.dynamicLastLowerWindow >= DYNAMIC_STALE_REGIME_WINDOWS)
+    ) {
+      this.resetDynamic();
+      return;
+    }
+    if (peak > 0) {
+      this.dynamicSilentWindows = 0;
       const bin = Math.max(0, Math.min(80, Math.floor(20 * Math.log10(peak)) + 80));
       if (this.trackDynamicShift(bin)) return;
       this.trackDynamicOnset(bin);
       this.recordDynamicBin(bin);
     } else {
-      this.dynamicRunBin = -1;
-      this.dynamicRunLength = 0;
-      this.dynamicOnsetBin = -1;
-      this.dynamicHighStable = false;
+      this.observeDynamicSilence();
     }
+    this.dynamicLastValidWindow = this.dynamicWindows;
     this.updateDynamicModelIfDue();
   }
 
@@ -270,7 +371,10 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
         : this.dynamicThresholdDbfs +
           Math.max(-1, Math.min(1, candidate - this.dynamicThresholdDbfs));
     this.dynamicThreshold = 10 ** (this.dynamicThresholdDbfs / 20);
-    if (this.dynamicConfidentWindows === 0) this.dynamicLastElevatedWindow = this.dynamicWindows;
+    if (this.dynamicConfidentWindows === 0) {
+      this.dynamicLastElevatedWindow = this.dynamicWindows;
+      this.dynamicLastLowerWindow = this.dynamicWindows;
+    }
     this.dynamicConfidentWindows += interval;
   }
 
@@ -379,7 +483,10 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
     this.resetLookahead();
     this.resetDynamic();
     this.resetWindow();
-    for (let frame = 0; frame < frames; frame++) this.observe(0, false, false);
+    for (let frame = 0; frame < frames; frame++) {
+      this.observe(0, false, false);
+      this.observeCalibration(0, false, false);
+    }
   }
 
   advancePeakQueue(inputPeak) {
@@ -437,6 +544,7 @@ class ConcordMicProcessor extends AudioWorkletProcessor {
   writeFrame(output, frame, channels) {
     const peak = Math.max(Math.abs(this.frameSample0), Math.abs(this.frameSample1));
     this.observe(peak, this.frameValid, this.frameOverloaded);
+    this.observeCalibration(peak, this.frameValid, this.frameOverloaded);
     if (this.gate.kind === 'fixed') {
       this.gateGain = peak >= this.gateThreshold ? 1 : this.gateGain * this.gateRelease;
     } else if (this.gate.kind === 'dynamic') {

@@ -62,6 +62,15 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose, initia
   const [generatedCode, setGeneratedCode] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyRequestRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      copyRequestRef.current += 1;
+      if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   const friendCodes = useFriendStore((s) => s.friendCodes);
   const previewFriendCode = useFriendStore((s) => s.previewFriendCode);
@@ -219,10 +228,16 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose, initia
     async (code?: string) => {
       const text = code || generatedCode;
       if (!text) return;
+      const request = ++copyRequestRef.current;
       try {
         await navigator.clipboard.writeText(text);
+        if (request !== copyRequestRef.current) return;
+        if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
         setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
+        copyTimerRef.current = setTimeout(() => {
+          copyTimerRef.current = null;
+          setCopied(false);
+        }, 2000);
       } catch {
         // Clipboard unavailable — user can select the code manually
       }

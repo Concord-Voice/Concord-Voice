@@ -1,3 +1,4 @@
+import { resetAllStores } from '../../helpers/store-helpers';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/renderer/services/voice/micProcessor.worklet.js?url&no-inline', () => ({
@@ -329,4 +330,197 @@ describe('createMicProcessor', () => {
     });
     expect(() => setGate({ kind: 'fixed', thresholdDbfs: Infinity })).toThrow();
   });
+});
+
+describe('calibration host protocol', () => {
+  const ack = (epoch = 1, phase = 'quiet') => ({ type: 'calibrationAck', epoch, phase });
+  const window = (epoch = 1, phase = 'quiet') => ({
+    type: 'calibrationWindow',
+    epoch,
+    phase,
+    peak: 0.01,
+    frames: 960,
+    valid: true,
+    overloaded: false,
+  });
+
+  it('delivers only acknowledged current-epoch observations separately from ordinary windows', async () => {
+    const onEvent = vi.fn();
+    const onWindow = vi.fn();
+    const handle = await createMicProcessor(
+      context,
+      initial,
+      onWindow,
+      vi.fn(),
+      undefined,
+      onEvent
+    );
+    handle.setCalibrationPhase(1, 'quiet');
+    expect(constructed[0].port.postMessage).toHaveBeenCalledWith({
+      type: 'setCalibrationPhase',
+      epoch: 1,
+      phase: 'quiet',
+    });
+    constructed[0].emit(window());
+    expect(onEvent).not.toHaveBeenCalled();
+    constructed[0].emit(ack());
+    constructed[0].emit(window());
+    handle.setCalibrationPhase(2, 'speech');
+    constructed[0].emit(window());
+    constructed[0].emit(ack(2, 'speech'));
+    constructed[0].emit(window());
+    constructed[0].emit(window(2, 'speech'));
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([
+      ack(),
+      window(),
+      ack(2, 'speech'),
+      window(2, 'speech'),
+    ]);
+    expect(onWindow).not.toHaveBeenCalled();
+  });
+
+  it('delivers invalid and overload evidence instead of silently dropping it', async () => {
+    const onEvent = vi.fn();
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, onEvent);
+    handle.setCalibrationPhase(1, 'quiet');
+    constructed[0].emit(ack());
+    const invalid = { ...window(), valid: false };
+    const overload = { ...window(), peak: 1.5, overloaded: true };
+    constructed[0].emit(invalid);
+    constructed[0].emit(overload);
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([ack(), invalid, overload]);
+  });
+
+  it.each([
+    { peak: NaN },
+    { peak: -1 },
+    { frames: 959 },
+    { valid: 1 },
+    { overloaded: null },
+    { pcm: [0.1] },
+    { epoch: 1.5 },
+    { phase: 'idle' },
+  ])('rejects malformed event %o', async (bad) => {
+    const onEvent = vi.fn();
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, onEvent);
+    handle.setCalibrationPhase(1, 'quiet');
+    constructed[0].emit(ack());
+    onEvent.mockClear();
+    constructed[0].emit({ ...window(), ...bad });
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed acknowledgements and premature completion', async () => {
+    const onEvent = vi.fn();
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, onEvent);
+    handle.setCalibrationPhase(1, 'quiet');
+    constructed[0].emit({ ...ack(), extra: true });
+    constructed[0].emit(ack(1, 'speech'));
+    constructed[0].emit({ type: 'calibrationComplete', epoch: 1, phase: 'quiet', frames: 480_000 });
+    expect(onEvent).not.toHaveBeenCalled();
+    constructed[0].emit(ack());
+    constructed[0].emit({ type: 'calibrationComplete', epoch: 1, phase: 'quiet', frames: 960 });
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([ack()]);
+  });
+
+  it.each([
+    ['quiet', 500],
+    ['speech', 1000],
+  ] as const)('bounds %s callbacks even when the worklet over-reports', async (phase, limit) => {
+    const onEvent = vi.fn();
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, onEvent);
+    handle.setCalibrationPhase(1, phase);
+    constructed[0].emit(ack(1, phase));
+    for (let index = 0; index < limit + 2; index++) constructed[0].emit(window(1, phase));
+    const complete = { type: 'calibrationComplete', epoch: 1, phase, frames: limit * 960 };
+    constructed[0].emit(complete);
+    constructed[0].emit(complete);
+    expect(onEvent.mock.calls.filter(([event]) => event.type === 'calibrationWindow')).toHaveLength(
+      limit
+    );
+    expect(
+      onEvent.mock.calls.filter(([event]) => event.type === 'calibrationComplete')
+    ).toHaveLength(1);
+  });
+
+  it.each([44_100, 96_000])('validates calibration frames against %i Hz', async (rate) => {
+    context = { sampleRate: rate, audioWorklet: { addModule } } as unknown as AudioContext;
+    const onEvent = vi.fn();
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, onEvent);
+    handle.setCalibrationPhase(1, 'quiet');
+    constructed[0].emit(ack());
+    constructed[0].emit(window());
+    const correct = { ...window(), frames: rate * 0.02 };
+    constructed[0].emit(correct);
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([ack(), correct]);
+  });
+
+  it('rejects invalid commands without sending them and ignores stale epochs', async () => {
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, vi.fn());
+    for (const epoch of [-1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => handle.setCalibrationPhase(epoch, 'quiet')).toThrow();
+    }
+    expect(() => handle.setCalibrationPhase(1, 'other' as 'quiet')).toThrow();
+    expect(constructed[0].port.postMessage).not.toHaveBeenCalled();
+    handle.setCalibrationPhase(2, 'speech');
+    handle.setCalibrationPhase(1, 'quiet');
+    handle.setCalibrationPhase(2, 'quiet');
+    expect(constructed[0].port.postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['close', 'error'])('fences queued callbacks and commands after %s', async (ending) => {
+    const onEvent = vi.fn();
+    const handle = await createMicProcessor(context, initial, vi.fn(), vi.fn(), undefined, onEvent);
+    handle.setCalibrationPhase(1, 'quiet');
+    constructed[0].emit(ack());
+    onEvent.mockClear();
+    if (ending === 'close') handle.close();
+    else constructed[0].fail();
+    const sends = constructed[0].port.postMessage.mock.calls.length;
+    handle.setCalibrationPhase(2, 'speech');
+    constructed[0].emit(window());
+    constructed[0].emit(ack(2, 'speech'));
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(constructed[0].port.postMessage).toHaveBeenCalledTimes(sends);
+  });
+});
+
+beforeEach(() => resetAllStores());
+
+describe('calibrated Auto runtime policy', () => {
+  it.each([
+    [false, false, -47, { kind: 'fixed', thresholdDbfs: -47 }],
+    [true, true, -53, { kind: 'fixed', thresholdDbfs: -53 }],
+    [false, true, -47, { kind: 'dynamic' }],
+  ] as const)(
+    'resolves Auto with Music Mode %s and saved AGC %s at threshold %s',
+    (musicMode, autoGainControl, noiseGateLevel, expected) => {
+      expect(
+        gateForAudioSettings({
+          musicMode,
+          autoGainControl,
+          noiseGateMode: 'autoCalibrate',
+          noiseGateLevel,
+        })
+      ).toEqual(expected);
+    }
+  );
+
+  it.each([
+    [false, false],
+    [false, true],
+    [true, true],
+  ])(
+    'keeps explicit Off open with Music Mode %s and saved AGC %s',
+    (musicMode, autoGainControl) => {
+      expect(
+        gateForAudioSettings({
+          musicMode,
+          autoGainControl,
+          noiseGateMode: 'off',
+          noiseGateLevel: -47,
+        })
+      ).toEqual({ kind: 'off' });
+    }
+  );
 });

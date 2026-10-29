@@ -265,10 +265,35 @@ describe('audioSettingsStore', () => {
       }
     );
 
+    // Regression for #3636: corrupt preferences must not become maximally suppressive gates.
+    it.each([
+      [999, -50],
+      [-999, -50],
+      [-19, -50],
+      [-81, -50],
+      [-80, -80],
+      [-20, -20],
+      [-61, -61],
+    ])('hydrates fixed threshold %s as %s', async (noiseGateLevel, expected) => {
+      localStorage.setItem(
+        'concord:audio-advanced',
+        JSON.stringify({
+          state: { noiseGateMode: 'manualCalibrate', autoGainControl: false, noiseGateLevel },
+          version: 3,
+        })
+      );
+      await useAudioSettingsStore.persist.rehydrate();
+
+      expect(useAudioSettingsStore.getState().noiseGateMode).toBe('manualCalibrate');
+      expect(
+        useAudioSettingsStore.getState().noiseGateLevel,
+        'Unsupported persisted thresholds must recover the safe default; valid thresholds must survive'
+      ).toBe(expected);
+    });
+
     it.each([
       ['invalid mode', { noiseGateMode: 'auto' }],
       ['null mode', { noiseGateMode: null }],
-      ['unavailable auto calibration', { noiseGateMode: 'autoCalibrate' }],
       ['invalid threshold', { noiseGateLevel: Number.POSITIVE_INFINITY }],
       ['invalid AGC boolean', { autoGainControl: 'yes' }],
       ['invalid Music Mode boolean', { musicMode: 1 }],
@@ -287,6 +312,18 @@ describe('audioSettingsStore', () => {
   it('sets noise gate level', () => {
     useAudioSettingsStore.getState().setNoiseGateLevel(-30);
     expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-30);
+  });
+
+  it.each([999, -999])('recovers the default when setting an unsupported threshold %s', (level) => {
+    useAudioSettingsStore.getState().setNoiseGateLevel(-61);
+    expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-61);
+
+    useAudioSettingsStore.getState().setNoiseGateLevel(level);
+
+    expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-50);
+    expect(
+      JSON.parse(localStorage.getItem('concord:audio-advanced') ?? '{}').state.noiseGateLevel
+    ).toBe(-50);
   });
 
   it('sets music mode', () => {
@@ -403,6 +440,81 @@ describe('audioSettingsStore', () => {
       useAudioSettingsStore.getState().setScreenShareVolume('user-1', 75);
       useAudioSettingsStore.getState().clearScreenShareVolume('user-nonexistent');
       expect(useAudioSettingsStore.getState().perScreenShareVolume).toEqual({ 'user-1': 75 });
+    });
+  });
+});
+
+describe('functional Auto calibration policy', () => {
+  it.each([
+    [false, false, 'autoCalibrate'],
+    [false, true, 'dynamic'],
+    [true, true, 'autoCalibrate'],
+  ] as const)(
+    'resolves Auto with Music Mode=%s and AGC=%s to %s',
+    (musicMode, autoGainControl, expected) => {
+      expect(
+        effectiveNoiseGateMode({ musicMode, autoGainControl, noiseGateMode: 'autoCalibrate' })
+      ).toBe(expected);
+    }
+  );
+
+  it('keeps Auto and its saved threshold when selected with AGC off', () => {
+    useAudioSettingsStore.getState().setNoiseGateLevel(-47);
+    useAudioSettingsStore.getState().setNoiseGateMode('autoCalibrate');
+    expect(useAudioSettingsStore.getState()).toMatchObject({
+      noiseGateMode: 'autoCalibrate',
+      noiseGateLevel: -47,
+    });
+    expect(JSON.parse(localStorage.getItem('concord:audio-advanced') ?? '{}').state).toMatchObject({
+      noiseGateMode: 'autoCalibrate',
+      noiseGateLevel: -47,
+    });
+  });
+
+  it('hydrates functional Auto without changing saved threshold or manual input level', async () => {
+    localStorage.setItem(
+      'concord:audio-advanced',
+      JSON.stringify({
+        version: 3,
+        state: {
+          noiseGateMode: 'autoCalibrate',
+          noiseGateLevel: -47,
+          autoGainControl: false,
+          musicMode: false,
+          inputVolume: 135,
+        },
+      })
+    );
+    await useAudioSettingsStore.persist.rehydrate();
+    expect(useAudioSettingsStore.getState()).toMatchObject({
+      noiseGateMode: 'autoCalibrate',
+      noiseGateLevel: -47,
+      inputVolume: 135,
+    });
+  });
+
+  it('atomically changes Auto to Dynamic when AGC becomes effective and preserves threshold', () => {
+    useAudioSettingsStore.setState({ noiseGateMode: 'autoCalibrate', noiseGateLevel: -47 });
+    const listener = vi.fn();
+    const unsubscribe = useAudioSettingsStore.subscribe(listener);
+    useAudioSettingsStore.getState().setAutoGainControl(true);
+    unsubscribe();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener.mock.calls[0][0]).toMatchObject({
+      autoGainControl: true,
+      noiseGateMode: 'dynamic',
+      noiseGateLevel: -47,
+    });
+  });
+
+  it('retains Auto in Music Mode and normalizes it when leaving Music Mode with saved AGC on', () => {
+    useAudioSettingsStore.setState({ autoGainControl: true, musicMode: true, noiseGateLevel: -47 });
+    useAudioSettingsStore.getState().setNoiseGateMode('autoCalibrate');
+    expect(useAudioSettingsStore.getState().noiseGateMode).toBe('autoCalibrate');
+    useAudioSettingsStore.getState().setMusicMode(false);
+    expect(useAudioSettingsStore.getState()).toMatchObject({
+      noiseGateMode: 'dynamic',
+      noiseGateLevel: -47,
     });
   });
 });

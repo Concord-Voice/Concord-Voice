@@ -6,13 +6,22 @@ import React from 'react';
 const mockSetQualityTier = vi.fn();
 const mockSetAdvancedMode = vi.fn();
 const mockStashAndSwap = vi.fn();
+const mockStartMicTest = vi.fn();
+const mockStopMicTest = vi.fn();
+const mockStartCalibration = vi.fn(async () => null);
+const mockGetActivityVersion = vi.fn(() => 0);
+const mockSubscribeActivity = vi.fn((_listener: () => void) => () => {});
 
 let currentTier = 'standard';
 
 vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(
     vi.fn((selector) => selector({ qualityTier: currentTier, setQualityTier: mockSetQualityTier })),
-    { getState: () => ({ reset: vi.fn() }), setState: vi.fn() }
+    {
+      getState: () => ({ reset: vi.fn() }),
+      setState: vi.fn(),
+      subscribe: vi.fn(() => () => {}),
+    }
   ),
   AUDIO_QUALITY_TIERS: {
     minimum: { label: 'Minimum', maxBitrate: 16000, opusDtx: true, opusFec: true, premium: false },
@@ -37,13 +46,21 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
-  effectiveNoiseGateMode: vi.fn(() => 'dynamic'),
-  useAudioSettingsStore: Object.assign(
-    vi.fn((s) => s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
-    { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })) }
-  ),
-}));
+vi.mock('@/renderer/stores/audio/audioSettingsStore', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@/renderer/stores/audio/audioSettingsStore')>();
+  return {
+    effectiveNoiseGateMode: actual.effectiveNoiseGateMode,
+    effectiveMicLevelPercent: actual.effectiveMicLevelPercent,
+    useAudioSettingsStore: Object.assign(
+      vi.fn((s) => s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
+      {
+        getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
+        subscribe: vi.fn(() => () => {}),
+      }
+    ),
+  };
+});
 
 vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn(() => false),
@@ -54,10 +71,16 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
 vi.mock('@/renderer/hooks/device/useMicTest', () => ({
   useMicTest: () => ({
     isTesting: false,
+    isPending: false,
     dbfsLevel: -Infinity,
+    inputOverloaded: false,
+    dynamicGateStatus: null,
     error: null,
-    startTest: vi.fn(),
-    stopTest: vi.fn(),
+    startTest: mockStartMicTest,
+    stopTest: mockStopMicTest,
+    startCalibration: mockStartCalibration,
+    getActivityVersion: mockGetActivityVersion,
+    subscribeActivity: mockSubscribeActivity,
   }),
 }));
 vi.mock('@/renderer/hooks/device/useOutputTest', () => ({

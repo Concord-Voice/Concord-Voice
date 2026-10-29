@@ -1,4 +1,5 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { resetAllStores } from '../../helpers/store-helpers';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type TestProcessor = {
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean;
@@ -115,6 +116,53 @@ describe('microphone peak worklet', () => {
     expect(Math.max(...render(processor, [Array(960).fill(0.08)])[0])).toBeCloseTo(0.08, 5);
   });
 
+  // Regression for #3636: valid digital silence must not erase a completed short phrase.
+  it.each([0.003, 0])('learns recurring phrases separated by a %s pause', (pausePeak) => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const feed = (peak: number, windows: number) => {
+      for (let window = 0; window < windows; window++) {
+        render(processor, [Array(960).fill(peak)]);
+      }
+    };
+    feed(0.003, 200);
+    feed(0.08, 40);
+    feed(pausePeak, 50);
+    feed(0.003, 50);
+    feed(0.08, 40);
+    feed(0.003, 80);
+
+    expect(
+      processor.port.postMessage.mock.calls.map(([message]) => message),
+      'Recurring separated phrases should establish confidence even when a pause is digital silence'
+    ).toContainEqual(expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' }));
+    expect(Math.max(...render(processor, [Array(960).fill(0.08)])[0])).toBeCloseTo(0.08, 5);
+  });
+
+  it.each([
+    ['invalid samples', Number.NaN, 1],
+    ['clipped samples', 1.1, 1],
+    ['three seconds of silence', 0, 150],
+  ] as const)('discards prior phrase evidence after %s', (_label, pausePeak, pauseWindows) => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const feed = (peak: number, windows: number) => {
+      for (let window = 0; window < windows; window++) {
+        render(processor, [Array(960).fill(peak)]);
+      }
+    };
+    feed(0.003, 200);
+    feed(0.08, 40);
+    feed(pausePeak, pauseWindows);
+    feed(0.003, 50);
+    feed(0.08, 40);
+    feed(0.003, 80);
+
+    expect(
+      processor.port.postMessage.mock.calls.map(([message]) => message),
+      'A single phrase after unusable or expired history must not establish suppression confidence'
+    ).not.toContainEqual(expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' }));
+    expect(Math.max(...render(processor, [Array(960).fill(0.002)])[0])).toBeCloseTo(0.002, 5);
+  });
+
   it('does not mistake a brief elevated transient for a spoken phrase', () => {
     const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
     for (let window = 0; window < 200; window++) render(processor, [Array(960).fill(0.003)]);
@@ -167,6 +215,71 @@ describe('microphone peak worklet', () => {
     const quietWord = render(processor, [Array(960).fill(0.002)])[0];
     expect(quietWord[0]).toBeGreaterThan(0.002 * 0.24);
   });
+
+  // Regression for #3636: losing the lower regime also invalidates old separation evidence.
+  it('releases a stale threshold within three seconds of sustained high-level input', () => {
+    const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+    const ambient = Array(960).fill(0.003);
+    const voice = Array(960).fill(0.08);
+    for (let window = 0; window < 120; window++) render(processor, [ambient]);
+    for (let window = 0; window < 120; window++) render(processor, [voice]);
+    for (let window = 0; window < 65; window++) render(processor, [ambient]);
+    for (let window = 0; window < 1800; window++) {
+      render(processor, [window % 2 === 0 ? ambient : voice]);
+    }
+    const latestStatus = () =>
+      processor.port.postMessage.mock.calls
+        .map(([message]) => message)
+        .filter((message) => message?.type === 'dynamicGateStatus')
+        .at(-1);
+    // Positive control: the observation history really established a threshold.
+    expect(latestStatus()?.state).toBe('adjusted');
+
+    for (let window = 0; window < 150; window++) render(processor, [voice]);
+
+    // Observe the whole 200 ms word: the old gate's short hold passes only its onset.
+    for (let window = 0; window < 10; window++) {
+      const softWord = render(processor, [Array(960).fill(0.002)])[0];
+      expect(
+        Math.min(...softWord),
+        'A quiet word after three seconds without separation must pass unattenuated'
+      ).toBeCloseTo(0.002, 5);
+    }
+    // Status is bounded to 1 Hz; audio release must not wait for its next report.
+    for (let window = 0; window < 50; window++) render(processor, [voice]);
+    expect(
+      latestStatus()?.thresholdDbfs,
+      'The next status report must reflect the expired separation evidence'
+    ).toBeNull();
+  });
+
+  it.each([0.08, 0.003])(
+    'expires learned regimes across %s input followed by digital silence',
+    (precedingPeak) => {
+      const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+      const feed = (peak: number, windows: number) => {
+        for (let window = 0; window < windows; window++) {
+          render(processor, [Array(960).fill(peak)]);
+        }
+      };
+      feed(0.003, 120);
+      feed(0.08, 120);
+      feed(0.003, 65);
+      const latestStatus = () =>
+        processor.port.postMessage.mock.calls
+          .map(([message]) => message)
+          .filter((message) => message?.type === 'dynamicGateStatus')
+          .at(-1);
+      expect(latestStatus()?.state).toBe('adjusted');
+      feed(precedingPeak, 100);
+      feed(0, 100);
+      for (let window = 0; window < 10; window++) {
+        const word = render(processor, [Array(960).fill(0.002)])[0];
+        expect(Math.min(...word)).toBeCloseTo(0.002, 5);
+      }
+      expect(latestStatus()?.thresholdDbfs).toBeNull();
+    }
+  );
 
   it('releases a stale threshold within three seconds of sustained low-level input', () => {
     const processor = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
@@ -572,4 +685,208 @@ describe('microphone peak worklet', () => {
     expect(output.every(Number.isFinite)).toBe(true);
     expect(Math.max(...output.map(Math.abs))).toBeLessThanOrEqual(10 ** (-6 / 20));
   });
+});
+
+function calibrationMessages(processor: TestProcessor) {
+  return processor.port.postMessage.mock.calls
+    .map(([message]) => message)
+    .filter((message) => message?.type?.startsWith('calibration'));
+}
+function phase(processor: TestProcessor, epoch: number, name: string) {
+  expect(() =>
+    processor.port.onmessage?.({ data: { type: 'setCalibrationPhase', epoch, phase: name } })
+  ).not.toThrow();
+}
+
+describe('actual worklet calibration phases', () => {
+  afterEach(() => vi.stubGlobal('sampleRate', 48_000));
+
+  it('acknowledges before reports and excludes the old partial window', () => {
+    const processor = createProcessor({ protectAgcPeaks: false });
+    phase(processor, 1, 'quiet');
+    render(processor, [Array(480).fill(0.3)]);
+    phase(processor, 2, 'speech');
+    render(processor, [Array(480).fill(0.01)]);
+    expect(calibrationMessages(processor)).toEqual([
+      { type: 'calibrationAck', epoch: 1, phase: 'quiet' },
+      { type: 'calibrationAck', epoch: 2, phase: 'speech' },
+    ]);
+    render(processor, [Array(480).fill(0.01)]);
+    expect(calibrationMessages(processor).at(-1)).toEqual({
+      type: 'calibrationWindow',
+      epoch: 2,
+      phase: 'speech',
+      peak: expect.closeTo(0.01, 6),
+      frames: 960,
+      valid: true,
+      overloaded: false,
+    });
+  });
+
+  it('observes input before fixed gate attenuation even without ordinary reporting', () => {
+    const processor = createProcessor({
+      protectAgcPeaks: false,
+      gate: { kind: 'fixed', thresholdDbfs: -20 },
+    });
+    phase(processor, 1, 'quiet');
+    expect(render(processor, [Array(960).fill(0.01)])[0].every((sample) => sample === 0)).toBe(
+      true
+    );
+    expect(calibrationMessages(processor)).toContainEqual({
+      type: 'calibrationWindow',
+      epoch: 1,
+      phase: 'quiet',
+      peak: expect.closeTo(0.01, 6),
+      frames: 960,
+      valid: true,
+      overloaded: false,
+    });
+  });
+
+  it('reports post-protection peaks while preserving overload evidence', () => {
+    const processor = createProcessor();
+    phase(processor, 1, 'speech');
+    render(processor, [Array(960).fill(2)]);
+    const report = calibrationMessages(processor).find(
+      (message) => message.type === 'calibrationWindow'
+    );
+    expect(report).toMatchObject({ valid: true, overloaded: true });
+    expect(report.peak).toBeGreaterThan(0);
+    expect(report.peak).toBeLessThanOrEqual(10 ** (-6 / 20));
+  });
+
+  it.each([44_100, 48_000, 96_000, 22_051])(
+    'bounds complete quiet and speech windows at %i Hz',
+    (rate) => {
+      vi.stubGlobal('sampleRate', rate);
+      const frames = Math.round(rate * 0.02);
+      for (const [name, limit] of [
+        ['quiet', Math.ceil((rate * 10) / frames)],
+        ['speech', Math.floor((rate * 20) / frames)],
+      ] as const) {
+        const processor = createProcessor({ protectAgcPeaks: false });
+        phase(processor, 1, name);
+        for (let index = 0; index < limit + 3; index++)
+          render(processor, [Array(frames).fill(0.01)]);
+        const events = calibrationMessages(processor);
+        expect(events.filter((event) => event.type === 'calibrationWindow')).toHaveLength(limit);
+        expect(events.filter((event) => event.type === 'calibrationComplete')).toEqual([
+          { type: 'calibrationComplete', epoch: 1, phase: name, frames: limit * frames },
+        ]);
+        phase(processor, 1, name);
+        render(processor, [Array(frames).fill(0.01)]);
+        expect(calibrationMessages(processor)).toEqual(events);
+      }
+    }
+  );
+
+  it('aggregates stereo peaks over actual unequal processing block sizes', () => {
+    const processor = createProcessor({ protectAgcPeaks: false });
+    phase(processor, 1, 'speech');
+    for (const frames of [64, 128, 256, 512])
+      render(processor, [Array(frames).fill(0.01), Array(frames).fill(-0.2)]);
+    expect(calibrationMessages(processor).at(-1)).toMatchObject({
+      type: 'calibrationWindow',
+      peak: expect.closeTo(0.2, 6),
+      frames: 960,
+      valid: true,
+    });
+  });
+
+  it.each(['missing', 'nonfinite'])('reports %s input as invalid evidence', (kind) => {
+    const processor = createProcessor({ protectAgcPeaks: false });
+    phase(processor, 1, 'quiet');
+    if (kind === 'missing') processor.process([], [[new Float32Array(960)]]);
+    else render(processor, [[NaN, ...Array(959).fill(0.01)]]);
+    expect(calibrationMessages(processor)).toContainEqual(
+      expect.objectContaining({
+        type: 'calibrationWindow',
+        epoch: 1,
+        phase: 'quiet',
+        valid: false,
+      })
+    );
+  });
+
+  it('does not let old or repeated epochs discard a current partial window', () => {
+    const processor = createProcessor({ protectAgcPeaks: false });
+    phase(processor, 2, 'speech');
+    render(processor, [Array(480).fill(0.2)]);
+    phase(processor, 1, 'quiet');
+    phase(processor, 2, 'quiet');
+    render(processor, [Array(480).fill(0.01)]);
+    expect(calibrationMessages(processor)).toEqual([
+      { type: 'calibrationAck', epoch: 2, phase: 'speech' },
+      {
+        type: 'calibrationWindow',
+        epoch: 2,
+        phase: 'speech',
+        peak: expect.closeTo(0.2, 6),
+        frames: 960,
+        valid: true,
+        overloaded: false,
+      },
+    ]);
+  });
+
+  it('idle discards partial evidence while ordinary windows continue unreset', () => {
+    const processor = createProcessor({ protectAgcPeaks: false });
+    processor.port.onmessage?.({ data: { type: 'setWindowReporting', enabled: true } });
+    phase(processor, 1, 'quiet');
+    render(processor, [Array(480).fill(0.2)]);
+    phase(processor, 2, 'idle');
+    render(processor, [Array(480).fill(0.01)]);
+    expect(calibrationMessages(processor)).toEqual([
+      { type: 'calibrationAck', epoch: 1, phase: 'quiet' },
+      { type: 'calibrationAck', epoch: 2, phase: 'idle' },
+    ]);
+    expect(processor.port.postMessage).toHaveBeenCalledWith({
+      peak: expect.closeTo(0.2, 6),
+      frames: 960,
+      valid: true,
+      overloaded: false,
+    });
+  });
+
+  it.each([
+    { epoch: -1, phase: 'quiet' },
+    { epoch: 1.5, phase: 'quiet' },
+    { epoch: Number.MAX_SAFE_INTEGER + 1, phase: 'quiet' },
+    { epoch: 1, phase: 'other' },
+    { epoch: 1, phase: 'quiet', frames: 1 },
+  ])('rejects malformed phase command %o without starting capture', (command) => {
+    const processor = createProcessor({ protectAgcPeaks: false });
+    try {
+      processor.port.onmessage?.({ data: { type: 'setCalibrationPhase', ...command } });
+    } catch {
+      /* Rejection may be terminal in the real worklet. */
+    }
+    render(processor, [Array(960).fill(0.01)]);
+    expect(calibrationMessages(processor)).toEqual([]);
+  });
+});
+
+beforeEach(() => resetAllStores());
+
+it('calibration boundaries preserve the actual Dynamic output and ordinary observation timeline', () => {
+  const reference = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+  const observed = createProcessor({ protectAgcPeaks: false, gate: { kind: 'dynamic' } });
+  for (const processor of [reference, observed]) {
+    processor.port.onmessage?.({ data: { type: 'setWindowReporting', enabled: true } });
+  }
+  for (let index = 0; index < 340; index++) {
+    if (index === 121) phase(observed, 1, 'quiet');
+    if (index === 241) phase(observed, 2, 'speech');
+    if (index === 300) phase(observed, 3, 'idle');
+    const samples = Array(960).fill(index < 120 || index >= 240 ? 0.003 : 0.08);
+    expect(render(observed, [samples])).toEqual(render(reference, [samples]));
+  }
+  const nonCalibration = (processor: TestProcessor) =>
+    processor.port.postMessage.mock.calls
+      .map(([event]) => event)
+      .filter((event) => !event.type?.startsWith('calibration'));
+  expect(nonCalibration(observed)).toEqual(nonCalibration(reference));
+  expect(nonCalibration(reference)).toContainEqual(
+    expect.objectContaining({ type: 'dynamicGateStatus', state: 'adjusted' })
+  );
 });

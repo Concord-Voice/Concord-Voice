@@ -19,7 +19,7 @@ export interface AudioSettings {
   echoCancellation: boolean;
   autoGainControl: boolean;
   noiseGateMode: NoiseGateMode;
-  noiseGateLevel: number; // dBFS, range -80 to -20 (used in Manual Calibrate)
+  noiseGateLevel: number; // dBFS, range -80 to -20 (used by both fixed calibration modes)
 
   // Opus advanced
   musicMode: boolean; // Disables audio processing (echo cancel, noise suppression, AGC) for music fidelity
@@ -79,8 +79,8 @@ type CaptureGateSettings = Pick<
 >;
 
 function normalizeNoiseGateLevel(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value)
-    ? Math.max(-80, Math.min(-20, value))
+  return typeof value === 'number' && Number.isFinite(value) && value >= -80 && value <= -20
+    ? value
     : DEFAULT_NOISE_GATE_LEVEL;
 }
 
@@ -88,16 +88,17 @@ function normalizeNoiseGateMode(
   value: unknown,
   autoGainControl: boolean,
   musicMode: boolean
-): Exclude<NoiseGateMode, 'autoCalibrate'> {
-  if (value === 'off' || value === 'autoCalibrate') return 'off';
+): NoiseGateMode {
+  if (value === 'off') return 'off';
   if (value === 'dynamic') return 'dynamic';
-  if (value === 'manualCalibrate') return !musicMode && autoGainControl ? 'dynamic' : value;
+  if (value === 'manualCalibrate' || value === 'autoCalibrate')
+    return !musicMode && autoGainControl ? 'dynamic' : value;
   return 'off';
 }
 
 export function effectiveNoiseGateMode(
   settings: Pick<AudioSettings, 'musicMode' | 'autoGainControl' | 'noiseGateMode'>
-): 'off' | 'dynamic' | 'manualCalibrate' {
+): NoiseGateMode {
   return normalizeNoiseGateMode(
     settings.noiseGateMode,
     settings.autoGainControl === true,

@@ -31,17 +31,17 @@ beforeEach(() => {
 });
 
 describe('audioSettingsStore — extended coverage', () => {
-  // --- Clamping behavior ---
+  // --- Range validation ---
 
-  describe('noiseGateLevel clamping', () => {
-    it('clamps values below -80 to -80', () => {
+  describe('noiseGateLevel validation', () => {
+    it('recovers the safe default for values below -80', () => {
       useAudioSettingsStore.getState().setNoiseGateLevel(-100);
-      expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-80);
+      expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-50);
     });
 
-    it('clamps values above -20 to -20', () => {
+    it('recovers the safe default for values above -20', () => {
       useAudioSettingsStore.getState().setNoiseGateLevel(0);
-      expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-20);
+      expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-50);
     });
 
     it('accepts values within range', () => {

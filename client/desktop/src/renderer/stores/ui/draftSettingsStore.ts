@@ -485,6 +485,13 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
         }
       }
 
+      const nextMode = effectiveNoiseGateMode({ ...state.snapshot.audio, ...newDrafts });
+      if (nextMode === state.snapshot.audio.noiseGateMode) {
+        delete newDrafts.noiseGateMode;
+      } else {
+        newDrafts.noiseGateMode = nextMode;
+      }
+
       return { drafts: { ...state.drafts, audio: newDrafts } };
     }),
 

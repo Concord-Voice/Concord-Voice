@@ -421,11 +421,23 @@ describe('draftSettingsStore', () => {
       expect(useAudioSettingsStore.getState().noiseGateLevel).toBe(-47);
     });
 
-    it('normalizes unavailable Auto Calibrate to Off', () => {
-      useDraftSettingsStore.getState().initialize();
-      useDraftSettingsStore.getState().setAudioDraft('noiseGateMode', 'autoCalibrate');
-      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('off');
-    });
+    it.each([
+      [false, 'autoCalibrate'],
+      [true, 'dynamic'],
+    ] as const)(
+      'normalizes Auto Calibrate with effective AGC=%s to %s',
+      (autoGainControl, expected) => {
+        useAudioSettingsStore.setState({
+          autoGainControl,
+          musicMode: false,
+          noiseGateMode: 'off',
+        });
+        useDraftSettingsStore.getState().initialize();
+        useDraftSettingsStore.getState().setAudioDraft('noiseGateMode', 'autoCalibrate');
+        expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe(expected);
+        expect(useAudioSettingsStore.getState().noiseGateMode).toBe('off');
+      }
+    );
   });
 
   describe('setVideoDraft', () => {
@@ -914,4 +926,98 @@ describe('autoTuneInScreenShares draft flow (#2088)', () => {
     expect(useVideoSettingsStore.getState().autoTuneInScreenShares).toBe(false);
     expect(useDraftSettingsStore.getState().drafts.video.autoTuneInScreenShares).toBeUndefined();
   });
+});
+
+describe('Auto calibration draft policy', () => {
+  beforeEach(() => {
+    useAudioSettingsStore.setState({
+      musicMode: false,
+      autoGainControl: false,
+      noiseGateMode: 'manualCalibrate',
+      noiseGateLevel: -50,
+      inputVolume: 135,
+    });
+    useDraftSettingsStore.getState().initialize();
+  });
+
+  it.each(['single', 'batch'] as const)(
+    'retains Auto and proposed threshold through %s drafting and Apply',
+    async (method) => {
+      if (method === 'single') {
+        useDraftSettingsStore.getState().setAudioDraft('noiseGateMode', 'autoCalibrate');
+        useDraftSettingsStore.getState().setAudioDraft('noiseGateLevel', -47);
+      } else {
+        useDraftSettingsStore
+          .getState()
+          .batchSetAudioDrafts({ noiseGateMode: 'autoCalibrate', noiseGateLevel: -47 });
+      }
+      expect(useDraftSettingsStore.getState().drafts.audio).toMatchObject({
+        noiseGateMode: 'autoCalibrate',
+        noiseGateLevel: -47,
+      });
+      expect(useAudioSettingsStore.getState()).toMatchObject({
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -50,
+      });
+      await useDraftSettingsStore.getState().apply();
+      expect(useAudioSettingsStore.getState()).toMatchObject({
+        noiseGateMode: 'autoCalibrate',
+        noiseGateLevel: -47,
+        inputVolume: 135,
+      });
+    }
+  );
+
+  it.each(['single', 'batch'] as const)(
+    'normalizes a %s Auto draft atomically when AGC is enabled',
+    (method) => {
+      useDraftSettingsStore.getState().setAudioDraft('noiseGateMode', 'autoCalibrate');
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('autoCalibrate');
+      const listener = vi.fn();
+      const unsubscribe = useDraftSettingsStore.subscribe(listener);
+      if (method === 'single')
+        useDraftSettingsStore.getState().setAudioDraft('autoGainControl', true);
+      else
+        useDraftSettingsStore
+          .getState()
+          .batchSetAudioDrafts({ autoGainControl: true, noiseGateMode: 'autoCalibrate' });
+      unsubscribe();
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0].drafts.audio).toMatchObject({
+        autoGainControl: true,
+        noiseGateMode: 'dynamic',
+      });
+      expect(useAudioSettingsStore.getState().autoGainControl).toBe(false);
+    }
+  );
+
+  it('permits Auto with stored AGC on in a Music Mode batch', () => {
+    useDraftSettingsStore.getState().batchSetAudioDrafts({
+      musicMode: true,
+      autoGainControl: true,
+      noiseGateMode: 'autoCalibrate',
+    });
+    expect(useDraftSettingsStore.getState().drafts.audio).toMatchObject({
+      musicMode: true,
+      autoGainControl: true,
+      noiseGateMode: 'autoCalibrate',
+    });
+  });
+
+  it.each(['revert', 'teardown'] as const)(
+    '%s discards the proposed threshold and Auto selection without persisting them',
+    (action) => {
+      useDraftSettingsStore
+        .getState()
+        .batchSetAudioDrafts({ noiseGateMode: 'autoCalibrate', noiseGateLevel: -47 });
+      expect(useDraftSettingsStore.getState().drafts.audio.noiseGateMode).toBe('autoCalibrate');
+      useDraftSettingsStore.getState()[action]();
+      expect(useDraftSettingsStore.getState().drafts.audio).toEqual({});
+      expect(useAudioSettingsStore.getState()).toMatchObject({
+        noiseGateMode: 'manualCalibrate',
+        noiseGateLevel: -50,
+        inputVolume: 135,
+      });
+    }
+  );
 });

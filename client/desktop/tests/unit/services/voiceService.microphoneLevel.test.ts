@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
@@ -179,6 +179,39 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   },
   ensureOsPermission: vi.fn(async () => 'granted'),
 }));
+
+type ActualProcessor = {
+  process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean;
+  port: {
+    onmessage: ((event: { data: unknown }) => void) | null;
+    postMessage: ReturnType<typeof vi.fn>;
+  };
+};
+let ActualMicProcessor: new (options: { processorOptions: unknown }) => ActualProcessor;
+const workletGlobals = ['sampleRate', 'AudioWorkletProcessor', 'registerProcessor'] as const;
+const originalWorkletGlobals = workletGlobals.map((name) =>
+  Object.getOwnPropertyDescriptor(globalThis, name)
+);
+beforeAll(async () => {
+  vi.stubGlobal('sampleRate', 48_000);
+  vi.stubGlobal(
+    'AudioWorkletProcessor',
+    class {
+      port = { onmessage: null, postMessage: vi.fn() };
+    }
+  );
+  vi.stubGlobal('registerProcessor', (_name: string, ctor: typeof ActualMicProcessor) => {
+    ActualMicProcessor = ctor;
+  });
+  await import('@/renderer/services/voice/micProcessor.worklet.js');
+});
+afterAll(() => {
+  workletGlobals.forEach((name, index) => {
+    const descriptor = originalWorkletGlobals[index];
+    if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+    else Reflect.deleteProperty(globalThis, name);
+  });
+});
 
 describe('voiceService microphone processing graph (#3635)', () => {
   const resumePaths = [
@@ -469,6 +502,61 @@ describe('voiceService microphone processing graph (#3635)', () => {
       expect(producedTracks[0]).toBe(graphs[0].outputTrack);
     }
   );
+
+  it.each([
+    { name: 'Auto without AGC', music: false, agc: false, volume: 200 },
+    { name: 'Auto in Music Mode with saved AGC', music: true, agc: true, volume: 200 },
+    { name: 'Auto with explicit zero manual level', music: false, agc: false, volume: 0 },
+  ])('consumes fixed Auto in the actual outgoing graph: $name', async ({ music, agc, volume }) => {
+    useAudioSettingsStore.getState().setCaptureGateSettings({
+      autoGainControl: agc,
+      musicMode: music,
+      noiseGateMode: 'autoCalibrate',
+      noiseGateLevel: -37,
+    });
+    useAudioSettingsStore.getState().setInputVolume(volume);
+    await service.produceAudio();
+    const graph = graphs[0];
+    const node = AudioWorkletNodeMock.created[0];
+    expect(producedTracks[0]).toBe(graph.outputTrack);
+    expect(graph.edges.map(({ from, to }) => [from.kind, to.kind])).toEqual([
+      ['source', 'gain'],
+      ['gain', 'processor'],
+      ['processor', 'destination'],
+    ]);
+    expect(graph.gains).toHaveLength(1);
+    expect(graph.gains[0].gain?.value).toBe(volume / 100);
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audio: expect.objectContaining({ autoGainControl: false }),
+      })
+    );
+
+    // Execute the real worklet using the configuration selected by produceAudio,
+    // feeding samples through the gain that the live graph actually constructed.
+    const processor = new ActualMicProcessor({ processorOptions: node.options.processorOptions });
+    processor.port.onmessage?.({ data: { type: 'setWindowReporting', enabled: true } });
+    const render = (rawPeak: number) => {
+      const input = new Float32Array(960).fill(rawPeak * graph.gains[0].gain!.value);
+      const output = new Float32Array(960);
+      processor.process([[input]], [[output]]);
+      return [...output];
+    };
+    expect(render(0.001).every((sample) => sample === 0)).toBe(true);
+    expect(processor.port.postMessage).toHaveBeenCalledWith({
+      peak: expect.closeTo(volume === 0 ? 0 : 0.002, 6),
+      frames: 960,
+      valid: true,
+      overloaded: false,
+    });
+    const voice = render(0.04);
+    if (volume === 0) expect(voice.every((sample) => sample === 0)).toBe(true);
+    else expect(Math.max(...voice)).toBeCloseTo(0.08, 6);
+    expect(node.options.processorOptions).toMatchObject({
+      gate: { kind: 'fixed', thresholdDbfs: -37 },
+      protectAgcPeaks: false,
+    });
+  });
 
   it('uses the applied gate mode after permission resolves', async () => {
     let resolveCapture!: (stream: StreamMock) => void;

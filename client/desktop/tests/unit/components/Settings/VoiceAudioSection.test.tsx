@@ -23,7 +23,11 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
         setVideoDevice: vi.fn(),
       })
     ),
-    { getState: vi.fn(() => ({ reset: vi.fn() })), setState: vi.fn() }
+    {
+      getState: vi.fn(() => ({ reset: vi.fn() })),
+      setState: vi.fn(),
+      subscribe: vi.fn(() => () => {}),
+    }
   ),
   AUDIO_QUALITY_TIERS: {
     minimum: {
@@ -84,13 +88,21 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
     },
   },
 }));
-vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
-  effectiveNoiseGateMode: vi.fn(() => 'dynamic'),
-  useAudioSettingsStore: Object.assign(
-    vi.fn((s) => s({ advancedMode: false, setAdvancedMode: vi.fn() })),
-    { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: vi.fn() })) }
-  ),
-}));
+vi.mock('@/renderer/stores/audio/audioSettingsStore', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@/renderer/stores/audio/audioSettingsStore')>();
+  return {
+    effectiveNoiseGateMode: actual.effectiveNoiseGateMode,
+    effectiveMicLevelPercent: actual.effectiveMicLevelPercent,
+    useAudioSettingsStore: Object.assign(
+      vi.fn((s) => s({ advancedMode: false, setAdvancedMode: vi.fn() })),
+      {
+        getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: vi.fn() })),
+        subscribe: vi.fn(() => () => {}),
+      }
+    ),
+  };
+});
 vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   useVideoSettingsStore: vi.fn((s) =>
     s({ codecCapabilities: [], gpuInfo: null, videoAdvancedMode: false, systemHdr: false })
@@ -105,7 +117,7 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
         noiseCancellation: true,
         echoCancellation: true,
         autoGainControl: true,
-        noiseGateMode: 'auto',
+        noiseGateMode: 'dynamic',
         noiseGateLevel: -50,
         inputVolume: 100,
         outputVolume: 100,
@@ -144,6 +156,14 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
 }));
 const mockStartTest = vi.fn();
 const mockStopTest = vi.fn();
+const micCalibrationDefaults = {
+  isPending: false,
+  inputOverloaded: false,
+  dynamicGateStatus: null,
+  startCalibration: vi.fn(async () => null),
+  getActivityVersion: vi.fn(() => 0),
+  subscribeActivity: vi.fn((_listener: () => void) => () => {}),
+};
 const mockPlayOutputTest = vi.fn().mockResolvedValue(undefined);
 const mockStopOutputTest = vi.fn();
 const mockToggleCameraTest = vi.fn().mockResolvedValue(undefined);
@@ -163,6 +183,7 @@ let cameraTestState = {
 };
 vi.mock('@/renderer/hooks/device/useMicTest', () => ({
   useMicTest: vi.fn(() => ({
+    ...micCalibrationDefaults,
     isTesting: false,
     dbfsLevel: -80,
     error: null,
@@ -291,7 +312,7 @@ describe('VoiceAudioSection', () => {
           noiseCancellation: true,
           echoCancellation: true,
           autoGainControl: true,
-          noiseGateMode: 'auto',
+          noiseGateMode: 'dynamic',
           noiseGateLevel: -50,
           inputVolume: 100,
           outputVolume: 100,
@@ -308,6 +329,7 @@ describe('VoiceAudioSection', () => {
         })[key] ?? false
     );
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
+      ...micCalibrationDefaults,
       isTesting: false,
       dbfsLevel: -80,
       error: null,
@@ -553,6 +575,7 @@ describe('VoiceAudioSection', () => {
   it('shows Stop Testing when mic test active', async () => {
     const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
+      ...micCalibrationDefaults,
       isTesting: true,
       dbfsLevel: -40,
       error: null,
@@ -565,6 +588,7 @@ describe('VoiceAudioSection', () => {
   it('shows meter when mic test active', async () => {
     const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
+      ...micCalibrationDefaults,
       isTesting: true,
       dbfsLevel: -40,
       error: null,
@@ -577,6 +601,7 @@ describe('VoiceAudioSection', () => {
   it('shows mic test error', async () => {
     const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
+      ...micCalibrationDefaults,
       isTesting: false,
       dbfsLevel: -80,
       error: 'Microphone access denied',
@@ -931,7 +956,7 @@ describe('VoiceAudioSection', () => {
           noiseCancellation: true,
           echoCancellation: true,
           autoGainControl: true,
-          noiseGateMode: 'auto',
+          noiseGateMode: 'dynamic',
           noiseGateLevel: -50,
           inputVolume: 100,
           outputVolume: 100,

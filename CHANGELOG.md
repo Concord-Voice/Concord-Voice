@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Copying a friend code no longer leaves a feedback timer running after leaving Add Friend.
+
+Auto Calibrate now offers a fixed microphone gate starting point from explicitly
+started room and voice readings. Manual Calibrate adds a live meter and the same
+optional suggestion. Review the result, choose Use threshold, then Apply;
+Dynamic continues adapting during use. Calibration can refuse overlapping or
+insufficient readings and asks you to retest after microphone or room changes.
+
+Dynamic microphone gating now releases stale thresholds after sustained level changes
+and retains phrase-learning evidence across ordinary silent pauses. Invalid saved
+fixed thresholds recover the default, and an old microphone Test error no longer
+hides the current call’s gate status.
+
 Recovery Circle recovery is temporarily paused. Your saved contacts remain in
 Settings, where you can still change the configuration. Use another recovery
 method to regain access to your account.
@@ -122,6 +135,9 @@ you verify your email.
 
 ### Added
 
+- **Guided fixed microphone gate calibration** (internal development reference omitted, internal development reference omitted) — Auto Calibrate explicitly starts a silent room-and-voice check and offers a fixed threshold for review. Manual Calibrate adds a live pre-gate digital peak meter and Suggest a starting point using the same check. Overlapping levels, insufficient readings or clipping can prevent a suggestion. Use threshold changes only the Settings draft; Apply activates it. Capture stops on completion, refusal or cancellation. Use headphones for ordinary listening Test, and retest after room, microphone, processing or level changes.
+
+
 - **Managed ingress verification groundwork** (internal development reference omitted) — source projection and a bounded offline CLI evaluate supplied ingress evidence. Synthetic tests do not establish production compatibility; host commissioning and deployment enforcement remain pending.
 - **Managed egress support now waits for host commissioning** (internal development reference omitted) — ordinary deployments keep their direct path until the root-owned outbound boundary is fully verified. A partial installation stops before it changes services, and enabling filtering still requires a separate approved host operation.
 - **Managed Redis credential rotation groundwork** (internal development reference omitted) — a default-off runtime path prepares scoped service identities and rotates their credentials. Activation still requires separate host checks and deployment approval.
@@ -167,6 +183,10 @@ you verify your email.
 - **Up Arrow edits your last message** (internal development reference omitted) — in an empty message box, Up Arrow opens your most recent message for editing, in channels, direct messages and voice text chat. It keeps its usual cursor behaviour while the box holds text, a reply or an attached file, while an input method is composing, and with Shift, Ctrl, Alt or Cmd held. When your newest message is still sending, failed to send or cannot be read, Up Arrow does nothing rather than opening an older message. Any message edit now opens with the cursor at the end of the text, saving or cancelling it returns focus to the message box you were using, and the edit box has an accessible name. If an edit cannot be saved, the edit box opens again with your text. An edit you leave open closes when you switch channels, and a message that cannot be read offers Delete but not Edit.
 
 ### Fixed
+
+- **Settings accessibility** — use a native microphone level meter and respect the operating system’s reduced-motion preference for pending-change animations and color-scheme hover motion (internal development reference omitted).
+
+- **Conservative microphone gating** — expire stale Dynamic thresholds across sustained levels and digital silence, retain phrase evidence through ordinary pauses, recover invalid saved thresholds to the default, and keep old Test errors from hiding live gate status (internal development reference omitted).
 
 - **Pilot client compatibility** (#3905) — valid Pilot versions use their stable base for minimum-version admission across HTTP and WebSocket connections. Malformed versions and below-minimum clients remain blocked; update release ordering is unchanged.
 
@@ -258,7 +278,7 @@ you verify your email.
 - **New-account privacy defaults** — Friend requests start at Mutual Servers, Server Voice details start off, Private Call presence starts at Friends, and notifications show the sender without message text. Existing saved choices remain unchanged.
 - **Friend discovery and username changes** — Under Mutual Servers, people who share a server or mutual friend with you can request you, and someone with a valid friend code can too. No One and blocks still stop requests. Username changes use six calendar months on Free and three on Premium.
 - **Advanced audio DTX** — Turning DTX off in Advanced settings now disables it, even when the selected Basic quality preset normally enables it.
-- **Noise Gate adds Dynamic and explicit modes** (internal development reference omitted) — Dynamic learns from microphone levels during an active call or Microphone Test and favors letting sound through when background noise and speech overlap. Manual Calibrate keeps a fixed dBFS threshold you set; Off leaves the gate open. With automatic gain control (AGC) on, the choices are Dynamic and Off. With AGC off, including Music Mode, Manual Calibrate is available too. Mode and threshold follow Apply/Revert. The guided Auto Calibrate test will follow separately. Recheck a manual threshold after changing your room, microphone position, hardware, processing, or Microphone Level. AGC still limits outgoing sample peaks to −6 dBFS; the gate controls activation, not microphone loudness.
+- **Noise Gate adds Dynamic and explicit modes** (internal development reference omitted) — Dynamic learns from microphone levels during an active call or Microphone Test and favors letting sound through when background noise and speech overlap. Auto Calibrate offers a fixed threshold from an explicitly started room-and-voice check; Manual Calibrate keeps the fixed dBFS slider and can run the same suggestion flow. Off leaves the gate open. With automatic gain control (AGC) on, the choices are Dynamic and Off. With AGC off, including Music Mode, all four choices are available. Enabling effective AGC changes either fixed mode to Dynamic. Mode and threshold follow Apply/Revert. Recheck either fixed threshold after changing your room, microphone position, hardware, processing, or Microphone Level. AGC still limits outgoing sample peaks to −6 dBFS; the gate controls activation, not microphone loudness.
 - **One confirmation prompt for purges, purge protection and DM Clear** (internal development reference omitted) — purging a DM or group chat, turning off purge protection, and clearing a DM's history now share one prompt that asks only for what your account uses. An account without an authenticator app or security key no longer sees a code box it cannot fill, a passkey or security key works in one step, and the prompt opens on the method your account used most recently. With purge protection on, Clear goes straight to that prompt instead of first sending a request it knew would be refused.
 - **Security settings and session prompts ask only for what you use** (internal development reference omitted) — Security settings, session management, backup-code regeneration, Recovery Circle and the delete and purge confirmations now ask only for what your account uses, and a passkey or security key works there in one step. On a server that requires two-factor authentication, an account without it is told to set it up instead of being asked to retry. Pressing Enter in the password or code field confirms, and an expired confirmation when clearing a direct message's history now says so on the password field. If your session ends while one of these prompts is open, it says so and stops asking, and a code you typed is kept when you are asked to wait before trying again.
 - **AGC now limits microphone sample peaks** (internal development reference omitted) — calls and Microphone Test use the same microphone processing path. When automatic gain control is active, Concord Voice limits samples leaving its microphone processor to −6 dBFS, with about 4 ms of lookahead and 100 ms recovery. This does not repair clipping already present in the source or measure acoustic loudness. The Off and fixed-threshold noise-gate choices remain available; the fixed gate now measures float samples in the processor.
