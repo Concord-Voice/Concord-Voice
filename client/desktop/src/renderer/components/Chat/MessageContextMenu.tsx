@@ -42,7 +42,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
     <ContextMenu position={position} onClose={onClose}>
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <rect
               x="5"
               y="5"
@@ -65,7 +65,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
 
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path
               d="M14 8c0 3.31-2.69 6-6 6H4l-2 2V8c0-3.31 2.69-6 6-6s6 2.69 6 6z"
               stroke="currentColor"
@@ -86,7 +86,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
 
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path
               d="M9 2L5 8h3v6l4-6H9V2z"
               stroke="currentColor"
@@ -106,7 +106,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
 
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5" />
             <circle cx="5.5" cy="6.5" r="1" fill="currentColor" />
             <circle cx="10.5" cy="6.5" r="1" fill="currentColor" />
@@ -128,7 +128,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
       {canModify && onEdit && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M11.5 1.5l3 3L5 14H2v-3L11.5 1.5z"
                 stroke="currentColor"
@@ -151,7 +151,7 @@ const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
           <ContextMenu.Separator />
           <ContextMenu.Item
             icon={
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                 <path
                   d="M2 4h12M5.33 4V2.67a1.33 1.33 0 011.34-1.34h2.66a1.33 1.33 0 011.34 1.34V4M12.67 4v9.33a1.33 1.33 0 01-1.34 1.34H4.67a1.33 1.33 0 01-1.34-1.34V4"
                   stroke="currentColor"

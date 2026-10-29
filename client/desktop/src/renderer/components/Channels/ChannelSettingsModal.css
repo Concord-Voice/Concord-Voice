@@ -35,7 +35,10 @@
   border-radius: 11px;
   border: 1px solid var(--border-color);
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property:
+    background, border-color, opacity, transform, width, height, border-radius, left, top;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .sync-toggle[aria-disabled='true'] {

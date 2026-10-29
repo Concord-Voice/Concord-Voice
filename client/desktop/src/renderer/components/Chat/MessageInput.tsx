@@ -1154,7 +1154,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
               disabled={disabled || isUploading || (!content.trim() && !hasFiles)}
               aria-label="Send message"
             >
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none">
                 <path d="M2 10l16-8-8 16-2-6-6-2z" fill="currentColor" />
               </svg>
             </button>

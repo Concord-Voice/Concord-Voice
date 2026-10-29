@@ -232,7 +232,7 @@ const InviteToServerModal: React.FC<InviteToServerModalProps> = ({ isOpen, serve
                 onClick={() => handleCopyCode(generatedCode)}
               >
                 {copied ? (
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                     <path
                       d="M2 8.5l3.5 3.5L14 3"
                       stroke="currentColor"
@@ -242,7 +242,7 @@ const InviteToServerModal: React.FC<InviteToServerModalProps> = ({ isOpen, serve
                     />
                   </svg>
                 ) : (
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                     <rect
                       x="5"
                       y="5"
@@ -310,7 +310,7 @@ const InviteToServerModal: React.FC<InviteToServerModalProps> = ({ isOpen, serve
                     onClick={() => handleCopyCode(inv.code)}
                     title="Copy code"
                   >
-                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                    <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none">
                       <rect
                         x="5"
                         y="5"

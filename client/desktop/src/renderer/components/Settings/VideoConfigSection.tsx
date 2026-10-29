@@ -60,6 +60,7 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   if (v.includes('apple'))
     return (
       <svg
+        aria-hidden="true"
         width="13"
         height="16"
         viewBox="0 0 256 315"
@@ -76,6 +77,7 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   if (v.includes('nvidia'))
     return (
       <svg
+        aria-hidden="true"
         width="16"
         height="16"
         viewBox="0 0 16 16"
@@ -100,6 +102,7 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   if (v.includes('intel'))
     return (
       <svg
+        aria-hidden="true"
         width="16"
         height="16"
         viewBox="0 0 16 16"
@@ -124,6 +127,7 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   if (v.includes('amd'))
     return (
       <svg
+        aria-hidden="true"
         width="16"
         height="16"
         viewBox="0 0 16 16"
@@ -148,6 +152,7 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   if (v.includes('qualcomm'))
     return (
       <svg
+        aria-hidden="true"
         width="16"
         height="16"
         viewBox="0 0 16 16"
@@ -172,6 +177,7 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   if (v.includes('arm'))
     return (
       <svg
+        aria-hidden="true"
         width="16"
         height="16"
         viewBox="0 0 16 16"

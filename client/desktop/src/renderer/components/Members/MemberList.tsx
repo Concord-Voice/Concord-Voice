@@ -364,6 +364,7 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
           type="button"
         >
           <svg
+            aria-hidden="true"
             className={`member-group-chevron${isCollapsed ? ' collapsed' : ''}`}
             width="10"
             height="10"

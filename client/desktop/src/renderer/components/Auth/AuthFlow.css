@@ -54,7 +54,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background-color, color, border-color, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .auth-placeholder button:hover {

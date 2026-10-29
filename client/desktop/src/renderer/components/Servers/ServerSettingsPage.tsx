@@ -163,7 +163,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
       id: 'general',
       label: 'General',
       icon: (
-        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
           <path
             d="M9 11.25a2.25 2.25 0 100-4.5 2.25 2.25 0 000 4.5z"
             stroke="currentColor"
@@ -182,7 +182,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
       label: 'Roles',
       permCheck: canManageRoles,
       icon: (
-        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
           <path
             d="M9 1.5l1.35 2.74 3.02.44-2.19 2.13.52 3.01L9 8.36 6.3 9.82l.52-3.01-2.19-2.13 3.02-.44L9 1.5z"
             stroke="currentColor"
@@ -204,7 +204,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
       label: 'Members',
       permCheck: canAssignRoles,
       icon: (
-        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
           <circle cx="7" cy="6" r="2.5" stroke="currentColor" strokeWidth="1.5" />
           <path
             d="M2 15c0-2.49 2.24-4.5 5-4.5s5 2.01 5 4.5"
@@ -638,7 +638,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
             <nav ref={navRef} className="settings-nav">
               <div className="settings-nav-scroll">
                 <button className="settings-back-btn" onClick={closeOverlay}>
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                     <path
                       d="M10 12L6 8l4-4"
                       stroke="currentColor"

@@ -681,8 +681,9 @@
   color: var(--accent-color, #5865f2);
 }
 
+.mfa-status-item .mfa-status-warn,
 .mfa-status-warn {
-  color: var(--error-color, #ed4245) !important;
+  color: var(--error-color, #ed4245);
 }
 
 .mfa-status-muted {

@@ -566,7 +566,7 @@ export async function purgeMessages(
       kind: 'success',
       deletedCount,
       hiddenCount,
-      ...(affectedChannelIds !== undefined ? { affectedChannelIds } : {}),
+      ...(affectedChannelIds === undefined ? {} : { affectedChannelIds }),
     };
   }
 

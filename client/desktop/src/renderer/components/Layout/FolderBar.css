@@ -56,7 +56,9 @@
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   white-space: nowrap;
   flex-shrink: 0;
   font-size: calc(12px * var(--font-scale, 1) * var(--folder-scale, 1));
@@ -251,7 +253,9 @@
   background: transparent;
   cursor: pointer;
   color: var(--text-secondary);
-  transition: all 0.15s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   flex-shrink: 0;
 }
 

@@ -43,7 +43,9 @@
   border: 2px solid var(--border-color);
   border-radius: 8px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   /* --text-primary, NOT the --text-secondary that .font-size-option uses. Copying
      that precedent verbatim reproduced its contrast defect: the pair measured
      4.31:1 against the 4.5:1 floor in [data-scheme='midnightsky'], caught by the

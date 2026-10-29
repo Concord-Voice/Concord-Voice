@@ -94,7 +94,9 @@
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   flex-shrink: 0;
 }
 
@@ -111,7 +113,9 @@
   height: 14px;
   border-radius: 50%;
   background: var(--text-secondary);
-  transition: all 0.2s ease;
+  transition-property: background, left;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .permission-toggle.active .permission-toggle-knob {
@@ -137,7 +141,9 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   padding: 0;
   font-size: calc(14px * var(--font-scale, 1));
   line-height: 1;

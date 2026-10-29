@@ -320,7 +320,9 @@
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
 }
 
 .member-profile-view-full-btn:hover {
@@ -347,7 +349,9 @@
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background, border-color, opacity;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   border: 1px solid var(--accent-primary);
   background: var(--accent-fill);
   color: var(--on-accent);

@@ -61,7 +61,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .delete-message-cancel-btn:hover {
@@ -81,7 +83,9 @@
   font-family: var(--font-display-stack);
   letter-spacing: 0.5px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, box-shadow, transform;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .delete-message-confirm-btn:hover {

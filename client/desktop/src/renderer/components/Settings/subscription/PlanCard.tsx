@@ -14,6 +14,7 @@ import { useSubscriptionStore } from '../../../stores/auth/subscriptionStore';
 import {
   findPlanPrice,
   useBillingStore,
+  type PlanChangeQuote,
   type PlanId,
   type PlanInterval,
   type PortalFlow,
@@ -94,6 +95,48 @@ const PlanHeader: React.FC<PlanHeaderProps> = ({ name, children }) => (
   </div>
 );
 
+/** The row's own price, else the catalogue price at the row's rate. */
+function planUnitAmount(
+  stripe: StripeRow,
+  price: ReturnType<typeof findPlanPrice>
+): number | undefined {
+  if (stripe.unit_amount !== undefined) return stripe.unit_amount;
+  if (!price) return undefined;
+  return stripe.founders_rate ? foundersAmount(price.unit_amount) : price.unit_amount;
+}
+
+function trialBlurb(
+  stripe: StripeRow,
+  ends: string | undefined,
+  amount: string | undefined
+): string {
+  if (stripe.canceling) return `Your free trial ends ${ends ?? 'soon'}. You won't be charged.`;
+  if (!ends) {
+    return 'Your chosen plan starts billing when the trial ends unless you cancel before then. Any redeemed code credit reduces the first paid charge.';
+  }
+  const at = amount ? ` at ${amount}` : '';
+  return `Paid billing begins on ${ends}${at} unless you cancel before then. Any redeemed code credit reduces the first paid charge.`;
+}
+
+function quoteLine(
+  previewing: boolean,
+  previewError: boolean,
+  quote: PlanChangeQuote | null | undefined
+): string {
+  if (previewing) return 'Calculating your charge…';
+  if (previewError) return 'Quote unavailable. Choose your plan again to refresh it.';
+  if (!quote) return 'Calculating your charge…';
+  if (quote.effective === 'scheduled') return 'Due now: $0.00. The new price starts at renewal.';
+  return `Due now: ${formatPrice(quote.due_now, 'usd')} (Stripe invoice preview).`;
+}
+
+function cancelHint(inAppCancel: boolean, pendingPlan: boolean): string {
+  if (!inAppCancel) return BILLING_COPY.manageHint;
+  return pendingPlan
+    ? 'Opening billing never changes your booking. Paid access lasts until the period ends if you cancel.'
+    : 'Paid access lasts until the period ends if you cancel.';
+}
+
 function stripePriceLine(
   stripe: StripeRow,
   price: ReturnType<typeof findPlanPrice>,
@@ -101,14 +144,7 @@ function stripePriceLine(
 ): string | undefined {
   const renewal = renews ? `Renews ${renews}.` : undefined;
   if (!stripe.interval || (stripe.unit_amount === undefined && !price)) return renewal;
-  const amount =
-    stripe.unit_amount !== undefined
-      ? stripe.unit_amount
-      : price
-        ? stripe.founders_rate
-          ? foundersAmount(price.unit_amount)
-          : price.unit_amount
-        : undefined;
+  const amount = planUnitAmount(stripe, price);
   if (amount === undefined) return renewal;
   const charge = `${formatPrice(amount, 'usd')}${intervalSuffix(stripe.interval)}.`;
   return renewal ? `${charge} ${renewal}` : charge;
@@ -273,13 +309,7 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
       const price = stripe.plan
         ? findPlanPrice(plans, stripe.plan, stripe.interval ?? 'month')
         : undefined;
-      const unitAmount =
-        stripe.unit_amount ??
-        (price
-          ? stripe.founders_rate
-            ? foundersAmount(price.unit_amount)
-            : price.unit_amount
-          : undefined);
+      const unitAmount = planUnitAmount(stripe, price);
       const amount =
         unitAmount !== undefined && stripe.interval
           ? formatPrice(unitAmount, 'usd') + intervalSuffix(stripe.interval)
@@ -291,13 +321,7 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
           </PlanHeader>
           {activated && <span className="subscription-activation-rule" aria-hidden="true" />}
           <div className="subscription-plan-details">
-            <p className="subscription-plan-blurb">
-              {stripe.canceling
-                ? `Your free trial ends ${ends ?? 'soon'}. You won't be charged.`
-                : ends
-                  ? `Paid billing begins on ${ends}${amount ? ` at ${amount}` : ''} unless you cancel before then. Any redeemed code credit reduces the first paid charge.`
-                  : 'Your chosen plan starts billing when the trial ends unless you cancel before then. Any redeemed code credit reduces the first paid charge.'}
-            </p>
+            <p className="subscription-plan-blurb">{trialBlurb(stripe, ends, amount)}</p>
             {stripe.founders_rate && !stripe.canceling && (
               <p className="subscription-plan-blurb">
                 {BILLING_COPY.foundersChip} applies after the trial.
@@ -421,7 +445,7 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
           <fieldset className="subscription-plan-change">
             <legend>Change plan</legend>
             <label>
-              Plan
+              <span>Plan</span>
               <select
                 value={nextPlan}
                 onChange={(e) =>
@@ -438,7 +462,7 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
               </select>
             </label>
             <label>
-              Billing
+              <span>Billing</span>
               <select
                 value={nextInterval}
                 onChange={(e) =>
@@ -474,15 +498,7 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
             )}
             {!sameSelection && (
               <p className="subscription-plan-blurb" aria-live="polite">
-                {previewing
-                  ? 'Calculating your charge…'
-                  : previewError
-                    ? 'Quote unavailable. Choose your plan again to refresh it.'
-                    : selectedQuote
-                      ? selectedQuote.effective === 'scheduled'
-                        ? 'Due now: $0.00. The new price starts at renewal.'
-                        : `Due now: ${formatPrice(selectedQuote.due_now, 'usd')} (Stripe invoice preview).`
-                      : 'Calculating your charge…'}
+                {quoteLine(previewing, previewError, selectedQuote)}
               </p>
             )}
             <button
@@ -562,11 +578,7 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
               </div>
             )}
             <p className="subscription-plan-hint">
-              {useInAppCancel
-                ? stripe.pending_plan
-                  ? 'Opening billing never changes your booking. Paid access lasts until the period ends if you cancel.'
-                  : 'Paid access lasts until the period ends if you cancel.'
-                : BILLING_COPY.manageHint}
+              {cancelHint(useInAppCancel, Boolean(stripe.pending_plan))}
             </p>
           </>
         )}
@@ -583,23 +595,21 @@ const PlanCard: React.FC<PlanCardProps> = ({ info }) => {
     );
   } else if (pending) {
     body = (
-      <>
-        <PlanHeader name={tierDisplayName(info.tier)}>
-          <span className="subscription-plan-state">
-            <LoaderCircle
-              size={16}
-              className="subscription-plan-state-icon subscription-confirming-spinner"
-              aria-hidden="true"
-            />
-            <Clock
-              size={16}
-              className="subscription-plan-state-icon subscription-confirming-still"
-              aria-hidden="true"
-            />
-            Confirming
-          </span>
-        </PlanHeader>
-      </>
+      <PlanHeader name={tierDisplayName(info.tier)}>
+        <span className="subscription-plan-state">
+          <LoaderCircle
+            size={16}
+            className="subscription-plan-state-icon subscription-confirming-spinner"
+            aria-hidden="true"
+          />
+          <Clock
+            size={16}
+            className="subscription-plan-state-icon subscription-confirming-still"
+            aria-hidden="true"
+          />
+          Confirming
+        </span>
+      </PlanHeader>
     );
   } else if (info.error || !stateLabel) {
     body = (

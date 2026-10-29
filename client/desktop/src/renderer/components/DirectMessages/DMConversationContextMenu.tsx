@@ -162,7 +162,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
       {conversation.unreadCount > 0 && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M13 4l-7 7-3-3"
                 stroke="currentColor"
@@ -195,7 +195,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
       {!conversation.isPersonal && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M3 4a1 1 0 011-1h2.28a1 1 0 01.95.68l1 3a1 1 0 01-.27 1.03L5.6 9.31a8 8 0 003.09 3.09l1.6-1.36a1 1 0 011.03-.27l3 1a1 1 0 01.68.95V15a1 1 0 01-1 1h-1C7.4 16 0 8.6 0 0v-1z"
                 stroke="currentColor"
@@ -227,7 +227,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
       {isOneOnOne && peer && onBlockUser && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5" />
               <path
                 d="M3.5 3.5l9 9"
@@ -248,7 +248,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
       {isOneOnOne && peer && peerIsFriend && onUnfriend && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M5 6a3 3 0 116 0 3 3 0 01-6 0zM2 14c0-2.5 2.5-4.5 6-4.5s6 2 6 4.5"
                 stroke="currentColor"
@@ -294,7 +294,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
       {canRotateKey && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M11 1.5a3.5 3.5 0 00-3.5 3.5c0 .47.1.92.27 1.33L2 12.1V14h1.9l5.77-5.77c.41.17.86.27 1.33.27A3.5 3.5 0 0014.5 5 3.5 3.5 0 0011 1.5zm0 2a1.5 1.5 0 110 3 1.5 1.5 0 010-3z"
                 fill="currentColor"

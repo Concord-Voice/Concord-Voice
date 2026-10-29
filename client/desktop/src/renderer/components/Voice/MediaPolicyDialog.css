@@ -50,7 +50,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .media-policy-dialog__close:hover {

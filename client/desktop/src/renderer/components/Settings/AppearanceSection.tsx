@@ -54,7 +54,7 @@ const themes: { value: AppearanceSettings['theme']; label: string; icon: React.R
     value: 'dark',
     label: 'Dark',
     icon: (
-      <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <svg aria-hidden="true" width="22" height="22" viewBox="0 0 22 22" fill="none">
         <path
           d="M21 12.79A9 9 0 119.21 1a7 7 0 0011.79 11.79z"
           stroke="currentColor"
@@ -69,7 +69,7 @@ const themes: { value: AppearanceSettings['theme']; label: string; icon: React.R
     value: 'light',
     label: 'Light',
     icon: (
-      <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <svg aria-hidden="true" width="22" height="22" viewBox="0 0 22 22" fill="none">
         <circle cx="11" cy="11" r="5" stroke="currentColor" strokeWidth="1.5" />
         <path
           d="M11 1v2M11 19v2M3.22 3.22l1.42 1.42M17.36 17.36l1.42 1.42M1 11h2M19 11h2M3.22 18.78l1.42-1.42M17.36 4.64l1.42-1.42"
@@ -84,7 +84,7 @@ const themes: { value: AppearanceSettings['theme']; label: string; icon: React.R
     value: 'system',
     label: 'System',
     icon: (
-      <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <svg aria-hidden="true" width="22" height="22" viewBox="0 0 22 22" fill="none">
         <rect x="2" y="3" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="1.5" />
         <path d="M8 21h6M11 17v4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
       </svg>
@@ -187,7 +187,7 @@ const AppearanceSection: React.FC = () => {
             title="Custom"
           >
             {!appearance.customColors && (
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                 <path
                   d="M8 2v12M2 8h12"
                   stroke="currentColor"

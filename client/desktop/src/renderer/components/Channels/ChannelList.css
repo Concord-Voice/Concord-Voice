@@ -158,7 +158,9 @@
   border-radius: 4px;
   border-left: 3px solid transparent;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background-color, color, opacity, transform, width, height, right, top;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   user-select: none;
   position: relative;
 }
@@ -327,7 +329,9 @@
   border-radius: 4px;
   cursor: pointer;
   font-size: calc(14px * var(--font-scale, 1));
-  transition: all 0.2s ease;
+  transition-property: background-color, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .retry-btn:hover {

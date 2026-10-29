@@ -33,7 +33,7 @@ const navItems: NavItem[] = [
     label: 'Appearance',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <circle cx="9" cy="9" r="4" stroke="currentColor" strokeWidth="1.5" />
         <path
           d="M9 1v2M9 15v2M2.64 2.64l1.41 1.41M13.95 13.95l1.41 1.41M1 9h2M15 9h2M2.64 15.36l1.41-1.41M13.95 4.05l1.41-1.41"
@@ -49,7 +49,7 @@ const navItems: NavItem[] = [
     label: 'Privacy',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <rect x="3" y="8" width="12" height="8" rx="2" stroke="currentColor" strokeWidth="1.5" />
         <path
           d="M6 8V5a3 3 0 016 0v3"
@@ -65,7 +65,7 @@ const navItems: NavItem[] = [
     label: 'Account',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <circle cx="9" cy="6" r="3" stroke="currentColor" strokeWidth="1.5" />
         <path
           d="M3 16c0-2.76 2.69-5 6-5s6 2.24 6 5"
@@ -81,7 +81,7 @@ const navItems: NavItem[] = [
     label: 'Security',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <path
           d="M9 1.5 15 4v4.5c0 4.1-6 7.5-6 7.5s-6-3.4-6-7.5V4l6-2.5Z"
           stroke="currentColor"
@@ -98,7 +98,7 @@ const navItems: NavItem[] = [
     label: 'Notifications',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <path
           d="M13.73 12.73A15.5 15.5 0 0114.5 9V7.5a5.5 5.5 0 00-11 0V9c0 1.31.26 2.56.77 3.73L3 14h12l-1.27-1.27z"
           stroke="currentColor"
@@ -120,7 +120,7 @@ const navItems: NavItem[] = [
     label: 'Audio & Video',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         {/* Headphone arc */}
         <path
           d="M3.5 9a5.5 5.5 0 0111 0"
@@ -142,7 +142,7 @@ const navItems: NavItem[] = [
     label: 'Accessibility',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <circle cx="9" cy="4" r="2" stroke="currentColor" strokeWidth="1.5" />
         <path
           d="M3 8l6 1 6-1M9 9v4M6 17l3-4 3 4"
@@ -159,7 +159,7 @@ const navItems: NavItem[] = [
     label: 'About & Updates',
     enabled: true,
     icon: (
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none">
         <circle cx="9" cy="9" r="7.5" stroke="currentColor" strokeWidth="1.5" />
         <path d="M9 8v4M9 6h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
       </svg>
@@ -358,7 +358,7 @@ const SettingsPage: React.FC = () => {
                     }
                   }}
                 >
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                     <path
                       d="M10 12L6 8l4-4"
                       stroke="currentColor"

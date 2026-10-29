@@ -1242,7 +1242,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                 {newMessageCount > 99 ? '99+' : newMessageCount}
               </span>
             )}
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none">
               <path d="M10 14l-6-6h12l-6 6z" fill="currentColor" />
             </svg>
             Return to Latest

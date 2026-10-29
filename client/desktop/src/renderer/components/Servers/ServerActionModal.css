@@ -13,7 +13,9 @@
   border: 1px solid var(--border-color);
   border-radius: 10px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   text-align: left;
   width: 100%;
   color: var(--text-primary);

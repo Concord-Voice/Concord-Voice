@@ -66,7 +66,9 @@
   background: var(--bg-secondary);
   border: 2px solid var(--border-color);
   border-radius: 8px;
-  transition: all 0.2s ease;
+  transition-property: border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .checkbox-label:hover {
@@ -114,7 +116,9 @@
   background: linear-gradient(135deg, rgba(250, 112, 154, 0.08) 0%, rgba(144, 86, 245, 0.08) 100%);
   border: 2px solid rgba(250, 112, 154, 0.2);
   border-radius: 12px;
-  transition: all 0.2s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .info-banner:hover {
@@ -166,7 +170,9 @@
   font-family: var(--font-display-stack);
   letter-spacing: 0.5px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: box-shadow, opacity, transform;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .register-submit-btn:hover:not(:disabled) {
@@ -199,7 +205,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .register-back-btn:hover:not(:disabled) {

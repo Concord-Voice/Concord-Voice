@@ -187,7 +187,7 @@ const Item: React.FC<ItemProps> = ({
     <span style={{ flex: 1 }}>{label}</span>
     {hasSubMenu && (
       <span className="ctx-menu-item-chevron">
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+        <svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none">
           <path
             d="M4.5 2.5L8 6L4.5 9.5"
             stroke="currentColor"
@@ -238,7 +238,6 @@ const SubMenu: React.FC<SubMenuProps> = ({ children, closing }) => {
     // trigger, so one wider than the space there (a wide root menu pinned to the
     // right of an 800px layout) put its leading items at a negative `left`.
     if (rect.left + width > vw) {
-      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the flip needs the submenu's measured width, which exists only after mount; it sets state once, only when the submenu overflows
       setFlipped(true);
       const parentLeft = parentRect?.left ?? 0;
       const flippedLeft = parentLeft - SUBMENU_GAP - width;

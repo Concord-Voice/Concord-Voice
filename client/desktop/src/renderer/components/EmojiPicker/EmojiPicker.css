@@ -149,7 +149,9 @@
   font-size: 16px;
   cursor: pointer;
   border-radius: 4px 4px 0 0;
-  transition: all 0.15s ease;
+  transition-property: background, color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   color: var(--text-secondary);
   display: flex;
   align-items: center;
@@ -289,7 +291,9 @@
   font-size: 18px;
   padding: 2px 4px;
   line-height: 1;
-  transition: all 0.15s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -334,7 +338,9 @@
   justify-content: center;
   font-size: 18px;
   line-height: 1;
-  transition: all 0.1s ease;
+  transition-property: background;
+  transition-duration: 0.1s;
+  transition-timing-function: ease;
   background: none;
   padding: 0;
 }

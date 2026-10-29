@@ -43,6 +43,7 @@ const CollapsibleSection: React.FC<CollapsibleSectionProps> = ({
         <>
           <h2 className="settings-section-title">{title}</h2>
           <svg
+            aria-hidden="true"
             className="settings-collapsible-chevron"
             width="16"
             height="16"

@@ -64,7 +64,7 @@ export interface VoiceParticipantContextMenuProps {
 }
 
 const profileIcon = (
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
     <circle cx="8" cy="5" r="3" stroke="currentColor" strokeWidth="1.5" />
     <path
       d="M2 14c0-2.76 2.69-5 6-5s6 2.24 6 5"
@@ -76,7 +76,7 @@ const profileIcon = (
 );
 
 const dmIcon = (
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
     <path
       d="M2 3h12v9H4l-2 2V3z"
       stroke="currentColor"
@@ -88,7 +88,7 @@ const dmIcon = (
 );
 
 const friendIcon = (
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
     <circle cx="7" cy="5" r="3" stroke="currentColor" strokeWidth="1.5" />
     <path
       d="M1 14c0-2.76 2.24-5 6-5"
@@ -101,7 +101,7 @@ const friendIcon = (
 );
 
 const kickIcon = (
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
     <path
       d="M10 2l4 4-4 4M14 6H6M2 2v12"
       stroke="currentColor"
@@ -113,7 +113,7 @@ const kickIcon = (
 );
 
 const banIcon = (
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
     <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" />
     <path d="M3.75 3.75l8.5 8.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
   </svg>

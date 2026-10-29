@@ -43,6 +43,7 @@ gate can learn from your voice.
 
 ### Changed
 
+- **Accessibility:** The desktop app follows the system's reduced-motion setting, hides decorative icons from screen readers, and shows text while bundled fonts load.
 - **Plans:** Every account can create any number of servers, search as far back as a subscriber, and customize theme colors. One account can create up to 10 servers in 24 hours.
 - **Web:** Opening the web address in a browser shows a link to download the desktop app, not an "Update Required" prompt.
 - **Search:** Message search looks back 90 days or 600 messages at a time, loads older results as you scroll, and says when it is paused or stopped.
@@ -122,6 +123,7 @@ gate can learn from your voice.
 
 ### Security
 
+- **Dependencies:** Updated golang.org/x/net and fast-uri for security fixes.
 - **Accounts:** Sign-in protection accepts a key re-encryption only from the maintenance run that started it. It refuses to roll back while its state is unknown.
 - **Accounts:** An account with suspicious session use stays blocked until session revocation finishes.
 - **Accounts:** Account recovery asks for the authenticator you reserved for recovery.

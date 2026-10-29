@@ -73,7 +73,9 @@
   cursor: pointer;
   padding: 4px;
   border-radius: 4px;
-  transition: all 0.2s ease;
+  transition-property: background, color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   display: flex;
   align-items: center;
   justify-content: center;

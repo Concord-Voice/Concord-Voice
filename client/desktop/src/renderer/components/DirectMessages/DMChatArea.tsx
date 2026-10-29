@@ -497,7 +497,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId, onRequestRemo
               aria-label="Pinned messages"
               aria-expanded={showPinnedPanel}
             >
-              <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+              <svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="none">
                 <path
                   d="M9 2L5 8h3v6l4-6H9V2z"
                   stroke="currentColor"

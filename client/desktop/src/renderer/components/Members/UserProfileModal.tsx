@@ -167,7 +167,7 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
             />
           )}
           <button className="user-profile-modal-close" onClick={onClose} aria-label="Close">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M4 4l8 8M12 4l-8 8"
                 stroke="currentColor"
@@ -294,7 +294,12 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
                       // jsdom test cases that explicitly delete window.electron.openExternal.
                     }}
                   >
-                    <svg className="user-profile-modal-link-icon" viewBox="0 0 16 16" fill="none">
+                    <svg
+                      aria-hidden="true"
+                      className="user-profile-modal-link-icon"
+                      viewBox="0 0 16 16"
+                      fill="none"
+                    >
                       <path
                         d="M6.5 3.5H3.5C2.95 3.5 2.5 3.95 2.5 4.5V12.5C2.5 13.05 2.95 13.5 3.5 13.5H11.5C12.05 13.5 12.5 13.05 12.5 12.5V9.5M9.5 2.5H13.5V6.5M13.5 2.5L7 9"
                         stroke="currentColor"

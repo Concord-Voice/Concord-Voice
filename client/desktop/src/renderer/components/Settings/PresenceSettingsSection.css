@@ -30,7 +30,9 @@
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background, color, box-shadow, opacity, min-width;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   border-right: 1px solid var(--border-color);
 }
 

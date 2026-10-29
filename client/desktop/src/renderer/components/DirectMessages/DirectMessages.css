@@ -784,14 +784,14 @@
 }
 
 .personal-thread-avatar {
-  width: 28px !important;
-  height: 28px !important;
+  width: 28px;
+  height: 28px;
   background: var(--accent-fill);
   color: var(--bg-primary);
 }
 
 .personal-thread-name {
-  font-size: calc(13px * var(--font-scale, 1)) !important;
+  font-size: calc(13px * var(--font-scale, 1));
 }
 
 .personal-thread-divider {
@@ -1044,7 +1044,9 @@
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   border-radius: 10px;
-  transition: all 0.2s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .add-friend-toggle input:checked + .add-friend-toggle-track {

@@ -26,7 +26,7 @@ const ServerActionModal: React.FC<ServerActionModalProps> = ({
           }}
         >
           <div className="server-action-icon create">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+            <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none">
               <path
                 d="M12 5v14M5 12h14"
                 stroke="currentColor"
@@ -40,6 +40,7 @@ const ServerActionModal: React.FC<ServerActionModalProps> = ({
             <span className="server-action-desc">Start a new community from scratch</span>
           </div>
           <svg
+            aria-hidden="true"
             className="server-action-arrow"
             width="16"
             height="16"
@@ -64,7 +65,7 @@ const ServerActionModal: React.FC<ServerActionModalProps> = ({
           }}
         >
           <div className="server-action-icon join">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+            <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none">
               <path
                 d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M15 12H3"
                 stroke="currentColor"
@@ -81,6 +82,7 @@ const ServerActionModal: React.FC<ServerActionModalProps> = ({
             </span>
           </div>
           <svg
+            aria-hidden="true"
             className="server-action-arrow"
             width="16"
             height="16"

@@ -22,6 +22,7 @@ const InfoTooltip: React.FC<InfoTooltipProps> = ({ content }) => {
         aria-label="More information"
       >
         <svg
+          aria-hidden="true"
           width="16"
           height="16"
           viewBox="0 0 16 16"

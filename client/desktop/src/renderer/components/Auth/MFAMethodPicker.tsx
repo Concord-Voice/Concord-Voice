@@ -31,6 +31,7 @@ const ALL_METHODS: MethodOption[] = [
     description: 'Verification code sent to your email or phone',
     icon: (
       <svg
+        aria-hidden="true"
         width="20"
         height="20"
         viewBox="0 0 24 24"
@@ -48,6 +49,7 @@ const ALL_METHODS: MethodOption[] = [
     description: 'One-time use recovery code',
     icon: (
       <svg
+        aria-hidden="true"
         width="20"
         height="20"
         viewBox="0 0 24 24"

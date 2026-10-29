@@ -113,7 +113,7 @@ const MuteContextMenuItem: React.FC<MuteContextMenuItemProps> = ({
 
   const muteIcon = (
     // Bell-with-slash for "Mute"; plain bell for "Unmute".
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+    <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
       <path
         d="M4 6a4 4 0 018 0v3l1 1.5h-10l1-1.5V6z"
         stroke="currentColor"

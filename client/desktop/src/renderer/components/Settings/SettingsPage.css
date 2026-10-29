@@ -397,8 +397,9 @@
 }
 
 /* Child settings spawned by a parent toggle — no separator line */
-.settings-row-child {
-  border-top: none !important;
+.settings-row-child,
+.settings-row + .settings-row-child {
+  border-top: none;
 }
 
 .settings-row-info {

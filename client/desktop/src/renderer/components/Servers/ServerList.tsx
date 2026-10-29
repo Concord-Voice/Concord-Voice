@@ -57,7 +57,7 @@ const ServerList: React.FC<ServerListProps> = ({ onOpenActionModal, onContextMen
           title={`Failed to load servers: ${error}. Click to retry.`}
           aria-label="Retry loading servers"
         >
-          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none">
             <path
               d="M10 2L10 6M10 14L10 18M2 10L6 10M14 10L18 10"
               stroke="currentColor"
@@ -123,7 +123,7 @@ const ServerList: React.FC<ServerListProps> = ({ onOpenActionModal, onContextMen
         title="Add a Server"
         aria-label="Add a Server"
       >
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+        <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none">
           <path d="M10 4v12M4 10h12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
         </svg>
       </button>

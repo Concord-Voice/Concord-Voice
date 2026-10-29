@@ -64,7 +64,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: border-color, border-radius;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   overflow: hidden;
   padding: 0;
 }
@@ -160,7 +162,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, border-radius;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   color: var(--text-secondary);
 }
 
@@ -221,7 +225,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, border-radius;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   color: var(--danger);
 }
 

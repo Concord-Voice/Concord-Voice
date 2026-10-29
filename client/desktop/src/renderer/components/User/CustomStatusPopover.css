@@ -127,7 +127,9 @@
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: color, border-color, opacity, filter;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
 }
 
 .custom-status-clear-btn {

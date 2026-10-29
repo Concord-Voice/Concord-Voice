@@ -100,6 +100,7 @@ const WebAuthnPrompt: React.FC<WebAuthnPromptProps> = ({
         <>
           <div className="webauthn-icon">
             <svg
+              aria-hidden="true"
               width="48"
               height="48"
               viewBox="0 0 24 24"

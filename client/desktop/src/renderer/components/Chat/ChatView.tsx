@@ -334,6 +334,7 @@ const ChatView: React.FC = () => {
           <span className="chat-header-emoji">{activeChannel.emoji}</span>
         ) : (
           <svg
+            aria-hidden="true"
             className="chat-header-icon"
             width="20"
             height="20"
@@ -371,6 +372,7 @@ const ChatView: React.FC = () => {
             aria-expanded={showSearchPanel}
           >
             <svg
+              aria-hidden="true"
               width="18"
               height="18"
               viewBox="0 0 24 24"
@@ -390,7 +392,7 @@ const ChatView: React.FC = () => {
             aria-label="Pinned messages"
             aria-expanded={showPinnedPanel}
           >
-            <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="none">
               <path
                 d="M9 2L5 8h3v6l4-6H9V2z"
                 stroke="currentColor"

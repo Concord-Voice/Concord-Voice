@@ -1,11 +1,15 @@
 import type { ImgHTMLAttributes } from 'react';
 import { useAuthenticatedMediaUrl } from '../../hooks/ui/useAuthenticatedMediaUrl';
 
-interface AuthenticatedMediaImageProps extends Omit<ImgHTMLAttributes<HTMLImageElement>, 'src'> {
-  source?: string | null;
-}
+type AuthenticatedMediaImageProps = Readonly<
+  Omit<ImgHTMLAttributes<HTMLImageElement>, 'src' | 'alt'> & {
+    source?: string | null;
+    /** Required: pass "" for a decorative image. */
+    alt: string;
+  }
+>;
 
-export function AuthenticatedMediaImage({ source, ...props }: AuthenticatedMediaImageProps) {
+export function AuthenticatedMediaImage({ source, alt, ...props }: AuthenticatedMediaImageProps) {
   const url = useAuthenticatedMediaUrl(source);
-  return <img {...props} src={url} />;
+  return <img {...props} alt={alt} src={url} />;
 }

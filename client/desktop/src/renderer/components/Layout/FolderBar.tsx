@@ -589,7 +589,14 @@ const FolderBar: React.FC = () => {
         >
           <div className="delete-server-content">
             <div className="delete-server-warning">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" className="warning-icon">
+              <svg
+                aria-hidden="true"
+                width="24"
+                height="24"
+                viewBox="0 0 24 24"
+                fill="none"
+                className="warning-icon"
+              >
                 <path
                   d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
                   stroke="currentColor"

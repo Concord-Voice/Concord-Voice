@@ -75,7 +75,9 @@
   color: var(--text-primary);
   font-size: calc(15px * var(--font-scale, 1));
   font-family: var(--font-mono, monospace);
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .server-url-input:focus {
@@ -149,7 +151,9 @@
   font-family: var(--font-display-stack);
   letter-spacing: 0.5px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: box-shadow, opacity, transform;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .server-connect-btn:active:not(:disabled):not([aria-disabled='true']) {
@@ -182,7 +186,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .server-back-btn:hover:not(:disabled):not([aria-disabled='true']) {

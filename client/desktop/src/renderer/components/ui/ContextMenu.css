@@ -57,7 +57,7 @@
 .ctx-menu-closing .ctx-menu-item,
 .ctx-menu-closing .ctx-menu-header,
 .ctx-menu-closing .ctx-menu-separator {
-  animation: none !important;
+  animation: none;
 }
 
 @keyframes ctxMenuOut {
@@ -242,18 +242,18 @@
 
 /* SubMenu close animation */
 .ctx-submenu-closing {
-  animation: ctxSubMenuOut 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards !important;
+  animation: ctxSubMenuOut 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards;
 }
 
 .ctx-submenu-closing.ctx-submenu-flip {
-  animation: ctxSubMenuOutFlip 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards !important;
+  animation: ctxSubMenuOutFlip 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards;
 }
 
 /* Cancel child entrance animations during close to prevent flash */
 .ctx-submenu-closing .ctx-menu-item,
 .ctx-submenu-closing .ctx-menu-header,
 .ctx-submenu-closing .ctx-menu-separator {
-  animation: none !important;
+  animation: none;
 }
 
 @keyframes ctxSubMenuOut {

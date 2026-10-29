@@ -96,7 +96,7 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
       {/* Mark as Read */}
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path
               d="M2 8.5l3.5 3.5L14 3"
               stroke="currentColor"
@@ -127,7 +127,7 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
       {/* Copy Link */}
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M6.5 9.5l3-3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
             <path
               d="M9 10.5l1.5-1.5a2.83 2.83 0 000-4l0 0a2.83 2.83 0 00-4 0L5 6.5"
@@ -157,7 +157,7 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
           <ContextMenu.Separator />
           <ContextMenu.Item
             icon={
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                 <path
                   d="M11.5 1.5l3 3L5 14H2v-3L11.5 1.5z"
                   stroke="currentColor"
@@ -175,7 +175,7 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
           />
           <ContextMenu.Item
             icon={
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none">
                 <path
                   d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
                   stroke="currentColor"
@@ -204,7 +204,7 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
           return (
             <ContextMenu.Item
               icon={
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
                   <path
                     d="M11 1.5a3.5 3.5 0 00-3.5 3.5c0 .47.1.92.27 1.33L2 12.1V14h1.9l5.77-5.77c.41.17.86.27 1.33.27A3.5 3.5 0 0014.5 5 3.5 3.5 0 0011 1.5zm0 2a1.5 1.5 0 110 3 1.5 1.5 0 010-3z"
                     fill="currentColor"
@@ -246,7 +246,7 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
       {canDelete && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M2 4h12M5.33 4V2.67a1.33 1.33 0 011.34-1.34h2.66a1.33 1.33 0 011.34 1.34V4M12.67 4v9.33a1.33 1.33 0 01-1.34 1.34H4.67a1.33 1.33 0 01-1.34-1.34V4"
                 stroke="currentColor"

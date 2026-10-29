@@ -79,6 +79,9 @@
 }
 
 .subscription-plan-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   color: var(--text-primary);
@@ -205,6 +208,8 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  margin: 0;
+  min-width: 0;
   padding: 8px 12px;
   border-radius: 8px;
   border: 1px solid var(--accent-primary);
@@ -302,12 +307,6 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
-}
-
-.subscription-plan-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
 }
 
 .subscription-plan-state-icon {

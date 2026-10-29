@@ -35,7 +35,9 @@
   color: var(--text-primary);
   font-size: calc(15px * var(--font-scale, 1));
   font-family: inherit;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, box-shadow, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .form-input:focus {

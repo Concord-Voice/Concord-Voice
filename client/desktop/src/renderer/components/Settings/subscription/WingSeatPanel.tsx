@@ -50,17 +50,17 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
   const swapAt = seat.next_swap_at ? Date.parse(seat.next_swap_at) : Number.NaN;
   useEffect(() => {
     const wait = swapAt - Date.now();
-    if (!(wait > 0)) return undefined;
+    if (Number.isNaN(wait) || wait <= 0) return undefined;
     // ponytail: setTimeout caps at ~24.8 days; a longer cooldown fires early,
     // `now` moves and the effect re-arms for the rest.
-    const timer = window.setTimeout(
+    const timer = globalThis.setTimeout(
       () => {
         setNow(Date.now());
         void fetchMe();
       },
       Math.min(wait, 2 ** 31 - 1)
     );
-    return () => window.clearTimeout(timer);
+    return () => globalThis.clearTimeout(timer);
   }, [swapAt, now, fetchMe]);
 
   const nextSwap = swapAt > now ? formatExpiry(seat.next_swap_at) : undefined;
@@ -121,9 +121,7 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
         </div>
       </>
     );
-  } else if (!hasFriends) {
-    body = <p className="subscription-plan-blurb">{SEAT_COPY.noFriends}</p>;
-  } else {
+  } else if (hasFriends) {
     body = (
       <>
         {seat.state === 'expired' && (
@@ -142,6 +140,8 @@ const WingSeatPanel: React.FC<WingSeatPanelProps> = ({ seat }) => {
         </div>
       </>
     );
+  } else {
+    body = <p className="subscription-plan-blurb">{SEAT_COPY.noFriends}</p>;
   }
 
   return (

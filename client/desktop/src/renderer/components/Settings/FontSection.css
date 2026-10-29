@@ -37,7 +37,9 @@
   border-radius: 10px;
   color: var(--text-primary);
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .font-option:hover {

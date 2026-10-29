@@ -20,6 +20,15 @@ import (
 // ends on finish, whether or not its transaction changed anything, because
 // the first run's commit may be the one still waiting on a standby.
 
+// Owner verbs, as audit rows and refusals name them.
+const (
+	verbRevokeKey  = "revoke-key"
+	verbEndDrain   = "end-drain"
+	verbSealLegacy = "seal-legacy"
+)
+
+const refusedTrustUndecodable = "the trust file does not decode"
+
 // revoked_keys.kind's three values (D-207).
 const (
 	revokeCAK      = "cak"
@@ -145,7 +154,7 @@ func setOwnerTimeouts(ctx context.Context, tx *sql.Tx) error {
 // accepts any 48 bytes and a mistyped row silently never matches (DoR:1734).
 // An existing row converges to nil (B3-D8).
 func (o *Owner) RevokeKey(ctx context.Context, kind string, digest []byte) error {
-	return o.write(ctx, "revoke-key", func(ctx context.Context, tx *sql.Tx) error {
+	return o.write(ctx, verbRevokeKey, func(ctx context.Context, tx *sql.Tx) error {
 		if err := checkRevocationArgs(kind, digest); err != nil {
 			return err
 		}
@@ -172,10 +181,10 @@ func checkRevocationArgs(kind string, digest []byte) error {
 	switch kind {
 	case revokeCAK, revokeOperator, revokeCPTLS:
 	default:
-		return refused("revoke-key", "the kind is cak, operator or cp_tls")
+		return refused(verbRevokeKey, "the kind is cak, operator or cp_tls")
 	}
 	if len(digest) != sha512.Size384 {
-		return refused("revoke-key", "a digest is 48 bytes, SHA-384")
+		return refused(verbRevokeKey, "a digest is 48 bytes, SHA-384")
 	}
 	return nil
 }
@@ -184,10 +193,10 @@ func checkRevocationArgs(kind string, digest []byte) error {
 // lists under kind, naming the form that kind takes.
 func unlisted(kind string) error {
 	if kind == revokeCPTLS {
-		return refused("revoke-key", "cp_tls takes the pin, the SHA-384 of the key's SPKI DER as a delegation "+
+		return refused(verbRevokeKey, "cp_tls takes the pin, the SHA-384 of the key's SPKI DER as a delegation "+
 			"lists it in cp_tls_pins, and no installed or trust-file delegation lists this one")
 	}
-	return refused("revoke-key", kind+" takes the SHA-384 of the key's 97-byte point, and no installed or "+
+	return refused(verbRevokeKey, kind+" takes the SHA-384 of the key's 97-byte point, and no installed or "+
 		"trust-file delegation lists this one as "+kind)
 }
 
@@ -206,7 +215,7 @@ func fileDelegations(anchors ac.Anchors, file []byte) ([]ac.Delegation, error) {
 	}
 	env, err := ac.CheckTrustEnvelope(file)
 	if err != nil {
-		return nil, refused("revoke-key", "the trust file does not decode")
+		return nil, refused(verbRevokeKey, refusedTrustUndecodable)
 	}
 	tr, err := ac.NewTrust(anchors)
 	if err != nil {
@@ -217,20 +226,20 @@ func fileDelegations(anchors ac.Anchors, file []byte) ([]ac.Delegation, error) {
 		var halt *ac.HaltError
 		switch err := tr.AddSigned(it); {
 		case errors.As(err, &halt):
-			return nil, refused("revoke-key", "the trust file's trust halts (T4)")
+			return nil, refused(verbRevokeKey, "the trust file's trust halts (T4)")
 		case err != nil: // ignored (T2/T3) or malformed (EN5)
-			return nil, refused("revoke-key", "an item of the trust file does not verify under the anchors")
+			return nil, refused(verbRevokeKey, "an item of the trust file does not verify under the anchors")
 		}
 		sg, err := ac.DecodeSigned(it)
 		if err != nil {
-			return nil, refused("revoke-key", "the trust file does not decode")
+			return nil, refused(verbRevokeKey, refusedTrustUndecodable)
 		}
 		if sg.Type != "delegation" {
 			continue
 		}
 		d, err := ac.DecodeDelegation(sg.Msg)
 		if err != nil {
-			return nil, refused("revoke-key", "the trust file does not decode")
+			return nil, refused(verbRevokeKey, refusedTrustUndecodable)
 		}
 		ds = append(ds, d)
 	}
@@ -329,9 +338,9 @@ func (o *Owner) ReplicationGate(ctx context.Context, on bool) error {
 // or unaccepted (gen, serial) and the current delegation are refused. Grace
 // already 0 converges to nil (B3-D8).
 func (o *Owner) EndDrain(ctx context.Context, gen, serial uint64) error {
-	return o.write(ctx, "end-drain", func(ctx context.Context, tx *sql.Tx) error {
+	return o.write(ctx, verbEndDrain, func(ctx context.Context, tx *sql.Tx) error {
 		if gen > math.MaxInt64 || serial > math.MaxInt64 { // i64 would saturate onto another row's key
-			return refused("end-drain", "no installed delegation has that generation and serial")
+			return refused(verbEndDrain, "no installed delegation has that generation and serial")
 		}
 		_, accepted, err := buildTrust(ctx, tx, o.anchors)
 		if err != nil {
@@ -342,18 +351,18 @@ func (o *Owner) EndDrain(ctx context.Context, gen, serial uint64) error {
 			i64(gen), i64(serial)).Scan(&msg)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			return refused("end-drain", "no installed delegation has that generation and serial")
+			return refused(verbEndDrain, "no installed delegation has that generation and serial")
 		case err != nil:
 			return fmt.Errorf("authority store: end-drain: read: %w", err)
 		case !accepted[string(ac.Digest(msg))]:
-			return refused("end-drain", "the installed trust does not accept that delegation")
+			return refused(verbEndDrain, "the installed trust does not accept that delegation")
 		}
 		sup, err := supersedingInstalledAt(ctx, tx, gen, serial, accepted)
 		if err != nil {
 			return fmt.Errorf("authority store: end-drain: superseding read: %w", err)
 		}
 		if !sup.Valid {
-			return refused("end-drain", "that delegation is not superseded, and only a superseded delegation drains")
+			return refused(verbEndDrain, "that delegation is not superseded, and only a superseded delegation drains")
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE authority.delegations SET drain_grace_ms = 0
 			WHERE product_root_gen = $1 AND serial = $2 AND drain_grace_ms <> 0`, i64(gen), i64(serial)); err != nil {
@@ -384,9 +393,9 @@ func (o *Owner) EndDrain(ctx context.Context, gen, serial uint64) error {
 // also keeps a nil cpDigest from matching a sealed meta whose digest is NULL.
 // Both comparisons are constant-time.
 func (o *Owner) SealLegacy(ctx context.Context, cpDigest []byte) error {
-	return o.write(ctx, "seal-legacy", func(ctx context.Context, tx *sql.Tx) error {
+	return o.write(ctx, verbSealLegacy, func(ctx context.Context, tx *sql.Tx) error {
 		if len(cpDigest) != sha512.Size384 {
-			return refused("seal-legacy", "the CP digest is 48 bytes, SHA-384")
+			return refused(verbSealLegacy, "the CP digest is 48 bytes, SHA-384")
 		}
 		var sealedAt sql.NullTime
 		var sealed []byte
@@ -400,7 +409,7 @@ func (o *Owner) SealLegacy(ctx context.Context, cpDigest []byte) error {
 		}
 		if sealedAt.Valid {
 			if subtle.ConstantTimeCompare(sealed, cpDigest) != 1 {
-				return refused("seal-legacy", "the population is already sealed under a different digest")
+				return refused(verbSealLegacy, "the population is already sealed under a different digest")
 			}
 			return nil
 		}
@@ -409,7 +418,7 @@ func (o *Owner) SealLegacy(ctx context.Context, cpDigest []byte) error {
 			return fmt.Errorf("authority store: seal-legacy: population digest: %w", err)
 		}
 		if subtle.ConstantTimeCompare(got, cpDigest) != 1 {
-			return refused("seal-legacy", "the CP digest does not match the authority's population")
+			return refused(verbSealLegacy, "the CP digest does not match the authority's population")
 		}
 		res, err := tx.ExecContext(ctx, `UPDATE authority.meta SET legacy_sealed_at = clock_timestamp(), population_digest = $1
 			WHERE id = 1`, got)

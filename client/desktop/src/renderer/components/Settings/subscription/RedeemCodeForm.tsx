@@ -76,7 +76,7 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
   const [quote, setQuote] = useState<CreditQuote | null>(null);
   const hydrateEntitlements = useSubscriptionStore((s) => s.hydrate);
   const inputRef = useRef<HTMLInputElement>(null);
-  const confirmRef = useRef<HTMLDivElement>(null);
+  const confirmRef = useRef<HTMLFieldSetElement>(null);
 
   // Move focus to the quote when it appears, so a screen reader reads it.
   useEffect(() => {
@@ -226,10 +226,9 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
       </div>
 
       {quote && (
-        <div
+        <fieldset
           ref={confirmRef}
           className="subscription-redeem-confirm"
-          role="group"
           aria-label="Confirm credit"
           tabIndex={-1}
         >
@@ -256,7 +255,7 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
               Cancel
             </button>
           </div>
-        </div>
+        </fieldset>
       )}
       {result?.kind === 'error' && (
         <div className="subscription-redeem-alert" role="alert">

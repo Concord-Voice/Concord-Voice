@@ -153,7 +153,9 @@
   justify-content: center;
   cursor: pointer;
   color: var(--text-muted);
-  transition: all 0.15s ease;
+  transition-property: background, color, left, right;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   padding: 0;
 }
 
@@ -330,7 +332,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, border-radius;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   color: var(--text-secondary);
   flex-shrink: 0;
   padding: 0;

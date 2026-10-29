@@ -11,6 +11,7 @@
   src: url('/branding/Concord-Voice/fonts/Droidiga.otf') format('opentype');
   font-weight: normal;
   font-style: normal;
+  font-display: swap;
 }
 
 @font-face {
@@ -18,6 +19,7 @@
   src: url('/branding/Concord-Voice/fonts/SourceSans.otf') format('opentype');
   font-weight: normal;
   font-style: normal;
+  font-display: swap;
 }
 
 /* Agency theme fonts — SIL OFL 1.1 (see public/branding/Concord-Voice/fonts/LICENSES.md) */

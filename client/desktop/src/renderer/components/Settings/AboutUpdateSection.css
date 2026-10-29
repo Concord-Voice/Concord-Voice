@@ -309,7 +309,9 @@
   font-family: inherit;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background, color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
 }
 
 .about-update-action-btn:hover {

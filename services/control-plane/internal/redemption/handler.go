@@ -19,6 +19,8 @@ import (
 // learn WHICH condition failed, only that the code is not valid.
 const genericInvalidMessage = "That code is not valid."
 
+const logRedeemRejected = "redeem rejected"
+
 // Handler serves the redemption HTTP surface: the authenticated user /redeem
 // endpoint and the admin code-generation endpoint. Built with the standard
 // handler-struct DI pattern.
@@ -102,19 +104,19 @@ func (h *Handler) handleRedeemError(c *gin.Context, userID uuid.UUID, err error)
 	var confirm *CreditConfirmationError
 	switch {
 	case errors.Is(err, ErrCodeNotValid):
-		h.log.Info("redeem rejected", "outcome", "invalid", "user_id", sanitizeID(userID.String()))
+		h.log.Info(logRedeemRejected, "outcome", "invalid", "user_id", sanitizeID(userID.String()))
 		c.JSON(http.StatusBadRequest, gin.H{"error": genericInvalidMessage})
 	case errors.Is(err, ErrAlreadyRedeemed):
-		h.log.Info("redeem rejected", "outcome", "already_redeemed", "user_id", sanitizeID(userID.String()))
+		h.log.Info(logRedeemRejected, "outcome", "already_redeemed", "user_id", sanitizeID(userID.String()))
 		c.JSON(http.StatusConflict, gin.H{"error": "You have already redeemed this code."})
 	case errors.As(err, &confirm):
-		h.log.Info("redeem rejected", "outcome", "credit_confirmation_required", "user_id", sanitizeID(userID.String()))
+		h.log.Info(logRedeemRejected, "outcome", "credit_confirmation_required", "user_id", sanitizeID(userID.String()))
 		c.JSON(http.StatusConflict, gin.H{"error": "credit_confirmation_required", "credit": confirm})
 	case errors.Is(err, ErrSeatMember):
-		h.log.Info("redeem rejected", "outcome", "seat_member", "user_id", sanitizeID(userID.String()))
+		h.log.Info(logRedeemRejected, "outcome", "seat_member", "user_id", sanitizeID(userID.String()))
 		c.JSON(http.StatusConflict, gin.H{"error": "seat_member"})
 	case errors.Is(err, ErrCreditUnavailable):
-		h.log.Error("redeem rejected", "outcome", "credit_unavailable", "user_id", sanitizeID(userID.String()), "error", err.Error())
+		h.log.Error(logRedeemRejected, "outcome", "credit_unavailable", "user_id", sanitizeID(userID.String()), "error", err.Error())
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "billing_unavailable"})
 	default:
 		// An error AFTER a successful commit (post-commit notify) still means

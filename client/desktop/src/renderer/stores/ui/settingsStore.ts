@@ -246,8 +246,12 @@ function applyCompactMode(enabled: boolean) {
   document.documentElement.dataset.compact = enabled ? 'true' : 'false';
 }
 
+// The OS reduced-motion preference reduces motion too; the setting only adds to it.
+const reducedMotionQuery = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
+
 function applyReduceAnimations(enabled: boolean) {
-  document.documentElement.dataset.reduceAnimations = enabled ? 'true' : 'false';
+  document.documentElement.dataset.reduceAnimations =
+    enabled || reducedMotionQuery?.matches ? 'true' : 'false';
 }
 
 function applyUiScale(chosen: number) {
@@ -569,6 +573,9 @@ useSettingsStore.subscribe(
   (state) => state.appearance.reduceAnimations,
   (reduceAnimations) => applyReduceAnimations(reduceAnimations),
   { fireImmediately: true }
+);
+reducedMotionQuery?.addEventListener('change', () =>
+  applyReduceAnimations(useSettingsStore.getState().appearance.reduceAnimations)
 );
 
 // Subscribe to UI scale changes and apply to DOM

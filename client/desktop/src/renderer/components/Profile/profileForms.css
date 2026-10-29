@@ -41,7 +41,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   overflow: hidden;
   flex-shrink: 0;
 }
@@ -124,7 +126,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   overflow: hidden;
   margin-top: 8px;
 }
@@ -192,7 +196,9 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.15s ease;
+  transition-property: background, color, border-color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   flex-shrink: 0;
 }
 
@@ -211,7 +217,9 @@
   font-family: inherit;
   cursor: pointer;
   padding: 8px 12px;
-  transition: all 0.15s ease;
+  transition-property: color, border-color;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   text-align: left;
 }
 
@@ -237,7 +245,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .profile-cancel-btn:hover:not(:disabled) {
@@ -262,7 +272,9 @@
   font-family: var(--font-display-stack);
   letter-spacing: 0.5px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: box-shadow, opacity, transform;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -297,7 +309,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, border-color, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   display: flex;
   align-items: center;
   gap: 8px;

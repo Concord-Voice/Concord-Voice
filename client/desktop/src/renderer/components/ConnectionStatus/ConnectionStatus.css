@@ -6,7 +6,9 @@
   border-radius: 12px;
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 500;
-  transition: all 0.2s ease;
+  transition-property: background, background-color, color, width, height, padding, min-width;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   flex-shrink: 0;
   white-space: nowrap;
   /* Fixed width to prevent resizing between status changes ("CONNECTING" is the longest) */

@@ -229,7 +229,7 @@ function MessageHeader({
       {message.edited_at && <span className="message-edited">(edited)</span>}
       {message.pinned_at && (
         <span className="message-pinned-indicator" title="Pinned message">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none">
             <path
               d="M9 2L5 8h3v6l4-6H9V2z"
               stroke="currentColor"

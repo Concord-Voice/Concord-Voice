@@ -61,6 +61,7 @@ const MainPrimaryContent: React.FC<MainPrimaryContentProps> = ({
       <div className="main-content-placeholder">
         <div className="empty-server-graphic">
           <svg
+            aria-hidden="true"
             width="48"
             height="48"
             viewBox="0 0 24 24"

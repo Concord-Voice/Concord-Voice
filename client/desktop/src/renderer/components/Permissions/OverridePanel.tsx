@@ -503,7 +503,7 @@ const OverridePanel: React.FC<OverridePanelProps> = ({
             aria-label="Delete override"
             disabled={locked || isUpsertPending || deletingOverrideIds.has(override.id)}
           >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M2 4h12M5.33 4V2.67a1.33 1.33 0 011.34-1.34h2.66a1.33 1.33 0 011.34 1.34V4M12.67 4v9.33a1.33 1.33 0 01-1.34 1.34H4.67a1.33 1.33 0 01-1.34-1.34V4"
                 stroke="currentColor"

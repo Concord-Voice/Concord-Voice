@@ -36,7 +36,9 @@
   color: var(--text-secondary);
   cursor: pointer;
   padding: 2px 0;
-  transition: all 0.15s ease;
+  transition-property: color, border-radius;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   text-align: center;
   user-select: none;
   white-space: nowrap;

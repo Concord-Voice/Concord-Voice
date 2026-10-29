@@ -156,7 +156,9 @@
   padding: calc(6px * var(--sp, 1)) calc(8px * var(--sp, 1));
   cursor: pointer;
   font-size: calc(16px * var(--font-scale, 1));
-  transition: all 0.15s ease;
+  transition-property: background-color, border-color, opacity;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -197,7 +199,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: box-shadow, opacity, transform;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
   color: var(--on-brand);
   flex-shrink: 0;
 }

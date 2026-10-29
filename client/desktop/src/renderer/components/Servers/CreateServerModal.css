@@ -24,7 +24,9 @@
   justify-content: center;
   cursor: pointer;
   overflow: hidden;
-  transition: all 0.2s ease;
+  transition-property: background, border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   background: var(--bg-tertiary);
 }
 
@@ -69,7 +71,9 @@
   cursor: pointer;
   padding: 2px 8px;
   border-radius: 4px;
-  transition: all 0.2s ease;
+  transition-property: background;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .icon-remove-btn:hover {
@@ -91,7 +95,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: border-color;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   overflow: hidden;
   margin-top: 8px;
 }
@@ -169,7 +175,9 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: background, color, border-color, opacity;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
 }
 
 .create-server-cancel-btn:hover:not(:disabled) {
@@ -194,7 +202,9 @@
   font-family: var(--font-display-stack);
   letter-spacing: 0.5px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition-property: box-shadow, opacity, transform;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
   display: flex;
   align-items: center;
   gap: 8px;

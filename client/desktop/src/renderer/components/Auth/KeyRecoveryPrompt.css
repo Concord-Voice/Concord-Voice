@@ -69,7 +69,9 @@
   font-family: inherit;
   font-size: calc(13px * var(--font-scale, 1));
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition-property: background-color, color, border-color, opacity;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
 }
 .key-recovery-prompt__cancel {
   background: none;

@@ -381,7 +381,7 @@ const ProfileInfoForm: React.FC = () => {
             }
             return (
               <div className="profile-avatar-placeholder">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none">
                   <path
                     d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"
                     stroke="currentColor"
@@ -449,7 +449,7 @@ const ProfileInfoForm: React.FC = () => {
             <img src={header.preview} alt="Header preview" className="profile-header-preview" />
           ) : (
             <div className="profile-header-placeholder">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none">
                 <path
                   d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"
                   stroke="currentColor"
@@ -612,7 +612,7 @@ const ProfileInfoForm: React.FC = () => {
                   disabled={isProfileSubmitting}
                   aria-label="Remove link"
                 >
-                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none">
                     <path
                       d="M10.5 3.5L3.5 10.5M3.5 3.5l7 7"
                       stroke="currentColor"

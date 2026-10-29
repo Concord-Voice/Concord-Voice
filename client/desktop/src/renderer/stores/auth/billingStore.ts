@@ -199,6 +199,14 @@ export type BillingNotice =
   | 'subscription_canceling'
   | 'subscription_cancel_failed';
 
+// Server error code → notice for a refused plan change; anything else is a plain failure.
+const PLAN_CHANGE_ERROR_NOTICES = new Map<string, BillingNotice>([
+  ['card_declined', 'card_declined'],
+  ['pending_plan_change', 'pending_plan_change'],
+  ['payment_pending', 'plan_change_payment_pending'],
+  ['plan_change_conflict', 'plan_change_conflict'],
+]);
+
 /** How long Confirming waits before its one silent refetch (spec §13 P6). */
 export const CONFIRMING_STALL_MS = 45_000;
 /** How long a Checkout or Portal session request may take (spec §13 error copy). */
@@ -620,13 +628,14 @@ export const useBillingStore = createStore<BillingState>()((set, get) => {
           }
           const opened = await globalThis.electron?.openExternal?.(payment.payment_url);
           if (!current()) return;
-          set({
-            notice: opened?.ok
-              ? payment.payment_status === 'card_declined'
+          let notice: BillingNotice = 'plan_change_payment_unavailable';
+          if (opened?.ok) {
+            notice =
+              payment.payment_status === 'card_declined'
                 ? 'card_declined'
-                : 'plan_change_payment_pending'
-              : 'plan_change_payment_unavailable',
-          });
+                : 'plan_change_payment_pending';
+          }
+          set({ notice });
         } else if (res.ok) {
           const result = PlanChangeResultSchema.parse(await safeJson<unknown>(res));
           if (!current()) return;
@@ -641,18 +650,7 @@ export const useBillingStore = createStore<BillingState>()((set, get) => {
         } else {
           const code = await readErrorCode(res);
           if (!current()) return;
-          set({
-            notice:
-              code === 'card_declined'
-                ? 'card_declined'
-                : code === 'pending_plan_change'
-                  ? 'pending_plan_change'
-                  : code === 'payment_pending'
-                    ? 'plan_change_payment_pending'
-                    : code === 'plan_change_conflict'
-                      ? 'plan_change_conflict'
-                      : 'plan_change_failed',
-          });
+          set({ notice: PLAN_CHANGE_ERROR_NOTICES.get(code ?? '') ?? 'plan_change_failed' });
           if (code === 'card_declined' || code === 'payment_pending') {
             previewTicket += 1;
             set({ preview: null, previewing: false, previewError: true });

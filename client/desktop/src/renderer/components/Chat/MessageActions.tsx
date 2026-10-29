@@ -70,7 +70,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
           aria-label="Add Reaction"
           title="Add Reaction"
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5" />
             <circle cx="5.5" cy="6.5" r="1" fill="currentColor" />
             <circle cx="10.5" cy="6.5" r="1" fill="currentColor" />
@@ -85,7 +85,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
       )}
       {onReply && (
         <button className="message-quick-reply" onClick={onReply} aria-label="Reply" title="Reply">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path
               d="M6 3L2 7l4 4"
               stroke="currentColor"
@@ -110,7 +110,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
           aria-label="Delete message"
           title="Delete message"
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path
               d="M2.5 4.5h11M6 4.5V3.5h4v1M4 4.5v8.5a1 1 0 001 1h6a1 1 0 001-1V4.5"
               stroke="currentColor"
@@ -127,7 +127,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
           onClick={() => setShowOptions(!showOptions)}
           aria-label="Message options"
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <circle cx="8" cy="3" r="1.5" fill="currentColor" />
             <circle cx="8" cy="8" r="1.5" fill="currentColor" />
             <circle cx="8" cy="13" r="1.5" fill="currentColor" />
@@ -145,7 +145,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
                 setShowOptions(false);
               }}
             >
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none">
                 <path
                   d="M8 1.5L4.5 7H7v5l3.5-5H8V1.5z"
                   stroke="currentColor"
@@ -165,7 +165,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
                 setShowOptions(false);
               }}
             >
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none">
                 <path
                   d="M10.5 1.5l2 2L4 12H2v-2L10.5 1.5z"
                   stroke="currentColor"
@@ -187,7 +187,7 @@ const MessageActions: React.FC<MessageActionsProps> = ({
                 }
               }}
             >
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none">
                 <path
                   d="M2 4h10M5 4V3h4v1M3 4v8a1 1 0 001 1h6a1 1 0 001-1V4"
                   stroke="currentColor"

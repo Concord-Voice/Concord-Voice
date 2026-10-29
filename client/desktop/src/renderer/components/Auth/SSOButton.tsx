@@ -43,7 +43,13 @@ export function SSOButton({ provider, onClick, disabled }: Readonly<SSOButtonPro
  */
 function GoogleLogo() {
   return (
-    <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+    <svg
+      aria-hidden="true"
+      width="18"
+      height="18"
+      viewBox="0 0 18 18"
+      xmlns="http://www.w3.org/2000/svg"
+    >
       <path
         d="M16.51 8.18c0-.59-.05-1.16-.15-1.71H8.5v3.24h4.49c-.19 1.04-.78 1.92-1.66 2.51v2.08h2.69c1.57-1.45 2.49-3.59 2.49-6.12z"
         fill="#4285F4"
@@ -71,6 +77,7 @@ function GoogleLogo() {
 function AppleLogo() {
   return (
     <svg
+      aria-hidden="true"
       width="18"
       height="18"
       viewBox="0 0 24 24"

@@ -64,7 +64,7 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
       {/* Mark All as Read */}
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path
               d="M2 8.5l3.5 3.5L14 3"
               stroke="currentColor"
@@ -94,7 +94,7 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
       {canEdit && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <circle cx="8" cy="8" r="2" stroke="currentColor" strokeWidth="1.5" />
               <path
                 d="M8 1v1.5M8 13.5V15M15 8h-1.5M2.5 8H1M12.95 3.05l-1.06 1.06M4.11 11.89l-1.06 1.06M12.95 12.95l-1.06-1.06M4.11 4.11L3.05 3.05"
@@ -119,7 +119,7 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
       {/* Invite to Server */}
       <ContextMenu.Item
         icon={
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
             <circle cx="6" cy="5" r="3" stroke="currentColor" strokeWidth="1.5" />
             <path
               d="M1 14c0-2.76 2.24-5 5-5s5 2.24 5 5"
@@ -162,7 +162,7 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
       {!isOwner && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M6 2H4a2 2 0 00-2 2v8a2 2 0 002 2h2"
                 stroke="currentColor"
@@ -191,7 +191,7 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
       {isOwner && (
         <ContextMenu.Item
           icon={
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
                 d="M2 4h12M5.33 4V2.67a1.33 1.33 0 011.34-1.34h2.66a1.33 1.33 0 011.34 1.34V4M12.67 4v9.33a1.33 1.33 0 01-1.34 1.34H4.67a1.33 1.33 0 01-1.34-1.34V4"
                 stroke="currentColor"
