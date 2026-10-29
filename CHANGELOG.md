@@ -69,6 +69,7 @@ gate can learn from your voice.
 
 ### Fixed
 
+- **Billing:** Blocking someone ends a Wing seat between you, whichever side blocks. Unfriending or blocking also cancels a pending seat invite at once; unfriending alone keeps an active seat.
 - **Billing:** Switching from a monthly to a yearly plan works again. It credits the unused part of the month and keeps your billing date.
 - **Billing:** Subscribing twice at the same time no longer creates a second subscription.
 - **Billing:** Opening billing no longer withdraws a booked plan change. Cancellation keeps access through the paid period, and the plan card shows your actual price.
@@ -117,6 +118,7 @@ gate can learn from your voice.
 - **Server:** Animated image uploads use less memory.
 - **Self-hosting:** Calls through the bundled TURN relay work when the relay and media server share one public address. An IPv6 loopback rule no longer blocks IPv4 peers.
 - **Self-hosting:** The offline ingress verifier refuses ambiguous NAT address and source-port pools instead of reading them as fixed translations.
+- **Operations:** A production deploy keeps running on the server when its SSH tunnel drops mid-rollout, and the deploy reconnects to that run instead of failing.
 
 ### Security
 

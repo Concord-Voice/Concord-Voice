@@ -44,6 +44,39 @@ type Handler struct {
 	// graph these handlers mutate (#2446). Nil until the router wires it, and a
 	// nil capture leaves every handler behaving exactly as it did before.
 	graphPresence presencecapture.GraphPresenceCapture
+	// seatPair ends Wing seats a committed unfriend or block no longer
+	// supports. Nil when billing is not configured.
+	seatPair SeatPairNotifier
+}
+
+// SeatPairNotifier is billing's post-commit seat hook, a func so friends does
+// not import billing. blocker is the user who blocked, or uuid.Nil for an
+// unfriend. It runs after the friendship commit, in its own transactions,
+// because a seat write inside BlockUser's users lock would invert the seat
+// lock order (billing/seat_pair.go). It logs its own failures; the billing
+// drift pass is the backstop.
+type SeatPairNotifier func(ctx context.Context, a, b, blocker uuid.UUID)
+
+// SetSeatPairNotifier wires the Wing seat hook.
+func (h *Handler) SetSeatPairNotifier(n SeatPairNotifier) { h.seatPair = n }
+
+// notifySeatPair runs the seat hook for a committed friendship change. It is
+// detached from the request's cancellation: the change already committed, and
+// a client that hangs up must not leave the seat for the drift pass to find.
+func (h *Handler) notifySeatPair(ctx context.Context, userID, targetUserID string, blocked bool) {
+	if h.seatPair == nil {
+		return
+	}
+	a, aErr := uuid.Parse(userID)
+	b, bErr := uuid.Parse(targetUserID)
+	if aErr != nil || bErr != nil {
+		return
+	}
+	blocker := uuid.Nil
+	if blocked {
+		blocker = a
+	}
+	h.seatPair(context.WithoutCancel(ctx), a, b, blocker)
 }
 
 // UserBroadcaster is the single hub method this package needs. It is an
@@ -741,6 +774,7 @@ func (h *Handler) RemoveFriend(c *gin.Context) {
 	// Counterpart omitted: this handler DELETES the row, so keeping the edge in
 	// logs would outlive the record the user just removed.
 	h.log.Info("Friend removed", "user_id", userID)
+	h.notifySeatPair(ctx, userID, targetUserID, false)
 
 	// Notify the other user
 	if h.hub != nil {
@@ -961,6 +995,7 @@ func (h *Handler) BlockUser(c *gin.Context) {
 	}
 
 	h.log.Info("User blocked", "user_id", userID, "blocked", targetUserID)
+	h.notifySeatPair(ctx, userID, targetUserID, true)
 	h.notifyBlock(userID, targetUserID)
 	c.JSON(http.StatusOK, gin.H{"message": "User blocked"})
 }

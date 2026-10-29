@@ -1372,6 +1372,7 @@ func NewRouter(
 	startBillingWorkers(lifecycleCtx, billingSvc)
 	if billingSvc != nil {
 		accountService.SetErasedSeatNotifier(erasedSeatNotifier(billingSvc))
+		friendsHandler.SetSeatPairNotifier(billingSvc.OnPairChanged)
 	}
 	redemptionHandler := buildRedemptionHandler(db, entCache, redemptionEntNotifier, billingSvc, cfg, log)
 

@@ -60,6 +60,11 @@ func TestMigration000188_UpDownUpRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	defer migrationRollback(t, tx)
 
+	// 000193 widened end_reason after this file; step back over it so the
+	// round trip compares 000188's own shape.
+	_, err = tx.Exec(migration000193DownSQL(t))
+	require.NoError(t, err)
+
 	applied := migrationSchemaSnapshot(t, tx, "subscription_seats")
 	for _, line := range []string{
 		"column holder_user_id uuid - NO -",

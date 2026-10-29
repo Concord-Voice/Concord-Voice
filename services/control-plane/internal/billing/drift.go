@@ -115,6 +115,7 @@ type DriftReport struct {
 	Discovered  int // subscriptions found in Stripe that changed a local row
 	Pruned      int // dedupe rows deleted
 	Expired     int // Wing invites that lapsed (PR-5)
+	PairEnded   int // seats ended because the pair unfriended or blocked
 }
 
 // RunDriftWorker runs a drift pass at startup and then every driftInterval
@@ -138,6 +139,7 @@ func (s *Service) logDriftSummary(report DriftReport) {
 	attrs := []any{
 		"fetched", report.Fetched, "corrected", report.Corrections, "failed", report.Failed,
 		"discovered", report.Discovered, "pruned", report.Pruned, "invites_expired", report.Expired,
+		"pair_ended", report.PairEnded,
 	}
 	if report.Failed > 0 {
 		s.Log.Warn("billing: drift pass finished", attrs...)
@@ -147,14 +149,15 @@ func (s *Service) logDriftSummary(report DriftReport) {
 }
 
 // RunDrift runs one pass: reconcile the most urgent live rows, run discovery,
-// prune old events, expire lapsed Wing invites. A subscription whose reconcile fails is logged and skipped;
+// prune old events, expire lapsed Wing invites, end seats the pair no longer
+// supports. A subscription whose reconcile fails is logged and skipped;
 // the error returned is a failed stage query or ctx ending, and the report
 // still describes the work that was done. Each pass that did anything logs one
 // summary line.
 func (s *Service) RunDrift(ctx context.Context) (report DriftReport, err error) {
 	defer func() { s.logDriftSummary(report) }()
 	var errs []error
-	stages := []func(context.Context, *DriftReport) error{s.driftRows, s.discover, s.pruneEvents, s.expireInvites}
+	stages := []func(context.Context, *DriftReport) error{s.driftRows, s.discover, s.pruneEvents, s.expireInvites, s.endUnsupportedSeats}
 	for _, stage := range stages {
 		if err := ctx.Err(); err != nil {
 			return report, err
