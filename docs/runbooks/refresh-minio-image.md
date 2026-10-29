@@ -131,15 +131,56 @@ daemon, failed query or invalid response stops the job before registry
 credentials are supplied. The exact-main admission remains required; a skipped
 branch dispatch does not validate the publisher.
 
-Hosted amd64 jobs only verify their preinstalled daemon. The ephemeral native
+Hosted amd64 publish and finalize jobs install official Docker CE on fixed
+`ubuntu-24.04` before their unchanged guards. Install or startup failure stops
+the job before credentials or Engine registry effects. The ephemeral native
 arm64 job installs Docker CE from Docker's official signed Ubuntu apt repository,
 checks daemon startup, then runs the guard as root before root Docker login.
 That installation is confined to the runner; the existing 15-minute timeout is
 unchanged. Installation time and cost need a real run.
 
-Production/staging Docker server inventories, applicable Blacksmith local-Engine
-and remote-BuildKit inventories, and successful guarded publisher runs with
-sanitized amd64 and native arm64 server versions remain outstanding. A local
+The MinIO bootstrap pins Docker's primary signing identity to
+`9DC858229FC7DD38854AE2D88D81803C0EBFCD88`, independently recorded in
+[Docker's reviewed installation documentation](https://github.com/docker/docs/blob/d813acb6e172a9af209c4acdc0d6c7c03d969aa2/engine/install/ubuntu.md).
+Before installing the downloaded keyring or adding the repository, GPG must
+report exactly one primary key with that fingerprint. Additional primary keys,
+verification failures and unexpected identities refuse. The Signed-By field
+also selects that fingerprint. Apt's signed metadata and package-hash chain then
+authenticate package bytes; this does not claim protection from compromise of
+Docker's legitimate signing key.
+
+All three MinIO jobs use Ubuntu 24.04 (native arm64 uses `ubuntu-24.04-arm`) and
+install this reviewed package set with automatic recommends disabled:
+
+| Package | Exact Noble version |
+| --- | --- |
+| docker-ce | `5:29.9.2-1~ubuntu.24.04~noble` |
+| docker-ce-cli | `5:29.9.2-1~ubuntu.24.04~noble` |
+| docker-ce-rootless-extras | `5:29.9.2-1~ubuntu.24.04~noble` |
+| containerd.io | `2.4.2-3~ubuntu.24.04~noble` |
+| docker-buildx-plugin | `0.36.1-1~ubuntu.24.04~noble` |
+| docker-compose-plugin | `5.5.0-1~ubuntu.24.04~noble` |
+
+Missing versions refuse; do not silently substitute latest packages or trust a
+new key. Refreshes require source review. These versions are grounded in the East
+operator's package inventory and transaction; fresh native runner availability
+is established only by actual protected preflight execution.
+
+The owner-only protected `docker-runner-inventory.yml` also executes the actual
+MinIO installation and admission blocks on their matching runner profiles. Its
+helper allowlists only the three publisher jobs and refuses runner drift,
+missing/conditional/advisory guards or reordered installation. The probe runs
+neither registry login nor build/push/promotion steps and grants no registry-write
+permission. Successful Engine probes satisfy only the Engine-install/admission
+portion of #3692; final-image/compiler/runtime/publication evidence remains under
+#3716/#3482 and this runbook's separate release gates.
+
+East production has a protected Server 29.9.2 receipt in
+internal development reference omitted.
+Buildtools internal development reference omitted
+admitted 29.9.2 on amd64 and native arm64. West's operator reported Docker
+unavailable on sudo's command path. Applicable Blacksmith local-Engine/remote-
+BuildKit inventories and changed MinIO publisher evidence remain outstanding. A local
 Engine version does not certify a remote BuildKit service. Repository tests and
 the historical publication/cutover receipts below do not establish those facts
 or a deployed Engine upgrade. Affected managed hosts require separate
