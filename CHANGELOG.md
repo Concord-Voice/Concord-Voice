@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+The offline ingress verifier now refuses ambiguous NAT address and source-port
+pools instead of interpreting them as fixed translations.
+
 The server's sign-in protection now accepts a key re-encryption only from the
 maintenance run that started it, and refuses to roll back while its activation
 state is unknown.
