@@ -43,6 +43,14 @@ describe('parseChangelog', () => {
     expect(sections[2]).toMatchObject({ version: '0.2.0', label: '0.2.0-Beta' });
   });
 
+  it('parses Keep a Changelog 1.1 hyphen headings and skips [Prerelease]', () => {
+    const sections = parseChangelog(
+      '## [Prerelease]\n\n- Pending.\n\n## [0.2.48] - 2026-10-04\n\n### Fixed\n\n- A fix.\n'
+    );
+    expect(sections).toHaveLength(1);
+    expect(sections[0]).toMatchObject({ version: '0.2.48', label: '0.2.48', date: '2026-10-04' });
+  });
+
   it('returns [] on malformed / empty input without throwing', () => {
     expect(parseChangelog('')).toEqual([]);
     expect(parseChangelog('no headings here')).toEqual([]);

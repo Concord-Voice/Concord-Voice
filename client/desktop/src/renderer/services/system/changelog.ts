@@ -24,7 +24,7 @@ export interface ChangelogSection {
   preamble: string;
 }
 
-// Matches: ## [0.2.1] — 2026-06-20 (optional trailing annotation)
+// Matches: ## [0.2.48] - 2026-10-04 (Keep a Changelog 1.1; optional trailing annotation)
 // Dash variants tolerated: em/en dash or hyphen.
 const HEADING_RE = /^## \[([^\]]+)\](?:\s*[—–-]+\s*(\d{4}-\d{2}-\d{2}))?/;
 const VERSION_PREFIX_RE = /^(\d+\.\d+\.\d+)/;
