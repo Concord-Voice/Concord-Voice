@@ -133,60 +133,66 @@ describe('WebSocketService', () => {
       expect(service.getState()).toBe(ConnectionState.CONNECTING);
     });
 
-    it('declares the desktop version on the raw ticket request and final WebSocket URL', async () => {
-      const getVersion = vi.fn().mockResolvedValue('1.2.3');
-      const originalElectron = globalThis.electron;
-      (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
-        getVersion,
-      };
+    it.each(['1.2.3', '1.1.0-pilot.2'])(
+      'declares the desktop version on the raw ticket request and final WebSocket URL (%s)',
+      async (version) => {
+        const getVersion = vi.fn().mockResolvedValue(version);
+        const originalElectron = globalThis.electron;
+        (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
+          getVersion,
+        };
 
-      try {
-        const ws = await connectAndWaitForOpen(service);
-        const headers = mockFetch.mock.calls[0][1]?.headers as Record<string, string>;
+        try {
+          const ws = await connectAndWaitForOpen(service);
+          const headers = mockFetch.mock.calls[0][1]?.headers as Record<string, string>;
 
-        expect(headers['X-Concord-Client-Version']).toBe('1.2.3');
-        expect(new URL(ws.url).searchParams.get('client_version')).toBe('1.2.3');
-        expect(getVersion).toHaveBeenCalledTimes(1);
-      } finally {
-        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
-          originalElectron;
+          expect(headers['X-Concord-Client-Version']).toBe(version);
+          expect(new URL(ws.url).searchParams.get('client_version')).toBe(version);
+          expect(getVersion).toHaveBeenCalledTimes(1);
+        } finally {
+          (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+            originalElectron;
+        }
       }
-    });
+    );
 
-    it('declares the desktop version on a final URL built from a cached ticket', async () => {
-      const getVersion = vi.fn().mockResolvedValue('1.2.3');
-      const originalElectron = globalThis.electron;
-      (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
-        getVersion,
-      };
-      const cachedService = new WebSocketService('ws://localhost:8080');
-      const cache = cachedService as unknown as {
-        ticketCache: {
-          ticket: string;
-          issuedAt: number;
-          token: string;
-          sessionId: string | null;
-        } | null;
-      };
-      cache.ticketCache = {
-        ticket: 'cached-ticket',
-        issuedAt: Date.now(),
-        token: 'test-token',
-        sessionId: null,
-      };
+    it.each(['1.2.3', '1.1.0-pilot.2'])(
+      'declares the desktop version on a final URL built from a cached ticket (%s)',
+      async (version) => {
+        const getVersion = vi.fn().mockResolvedValue(version);
+        const originalElectron = globalThis.electron;
+        (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
+          getVersion,
+        };
+        const cachedService = new WebSocketService('ws://localhost:8080');
+        const cache = cachedService as unknown as {
+          ticketCache: {
+            ticket: string;
+            issuedAt: number;
+            token: string;
+            sessionId: string | null;
+          } | null;
+        };
+        cache.ticketCache = {
+          ticket: 'cached-ticket',
+          issuedAt: Date.now(),
+          token: 'test-token',
+          sessionId: null,
+        };
 
-      try {
-        const ws = await connectAndWaitForOpen(cachedService);
+        try {
+          const ws = await connectAndWaitForOpen(cachedService);
 
-        expect(mockFetch).not.toHaveBeenCalled();
-        expect(new URL(ws.url).searchParams.get('client_version')).toBe('1.2.3');
-        expect(getVersion).toHaveBeenCalledTimes(1);
-      } finally {
-        cachedService.disconnect();
-        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
-          originalElectron;
+          expect(mockFetch).not.toHaveBeenCalled();
+          expect(new URL(ws.url).searchParams.get('client_version')).toBe(version);
+          expect(getVersion).toHaveBeenCalledTimes(1);
+        } finally {
+          cachedService.disconnect();
+          (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+            originalElectron;
+        }
       }
-    });
+    );
 
     it.each([
       ['the runtime server changes', () => setRuntimeServerBase('https://successor.example')],

@@ -2,10 +2,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   _resetClientVersionCache,
   compactSpaHash,
+  compareStableDesktopVersions,
+  compareDesktopClientVersionToStableFloor,
   formatClientVersion,
   getDesktopClientDisplayVersion,
   getDesktopClientVersion,
 } from '@/renderer/utils/runtime/clientVersion';
+
+import {
+  isStableDesktopVersion,
+  isSupportedDesktopClientVersion,
+} from '../../../src/shared/stableDesktopVersion';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 const FULL_HASH = 'a'.repeat(40);
 
@@ -47,6 +55,7 @@ describe('client version formatting', () => {
 
 describe('desktop client version lookup', () => {
   beforeEach(() => {
+    resetAllStores();
     _resetClientVersionCache();
   });
 
@@ -74,16 +83,20 @@ describe('desktop client version lookup', () => {
     expect(getVersion).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['18446744073709551615.0.0', '1234567890.1234567890.1234567890'])(
-    'accepts the Go parser boundary version %j',
-    async (version) => {
-      (globalThis as unknown as { electron?: unknown }).electron = {
-        getVersion: vi.fn().mockResolvedValue(version),
-      };
+  it.each([
+    '18446744073709551615.0.0',
+    '1234567890.1234567890.1234567890',
+    '1.0.0-pilot.0',
+    '1.1.0-pilot.2',
+    '1.0.0-pilot.18446744073709551615',
+    '18446744073709551615.0.0-pilot.0',
+  ])('accepts the Go parser boundary version %j', async (version) => {
+    (globalThis as unknown as { electron?: unknown }).electron = {
+      getVersion: vi.fn().mockResolvedValue(version),
+    };
 
-      await expect(getDesktopClientVersion()).resolves.toBe(version);
-    }
-  );
+    await expect(getDesktopClientVersion()).resolves.toBe(version);
+  });
 
   it.each([
     'v0.2.18',
@@ -107,6 +120,7 @@ describe('desktop client version lookup', () => {
   it('omits the declaration when the bridge is absent or rejects', async () => {
     await expect(getDesktopClientVersion()).resolves.toBeNull();
 
+    resetAllStores();
     _resetClientVersionCache();
     (globalThis as unknown as { electron?: unknown }).electron = {
       getVersion: vi.fn().mockRejectedValue(new Error('bridge unavailable')),
@@ -136,5 +150,69 @@ describe('desktop client version lookup', () => {
     await expect(getDesktopClientVersion()).resolves.toBeNull();
 
     expect(getVersion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Pilot admission grammar and stable floor comparison', () => {
+  beforeEach(() => {
+    resetAllStores();
+    _resetClientVersionCache();
+  });
+  afterEach(() => {
+    (globalThis as unknown as { electron?: unknown }).electron = undefined;
+  });
+
+  it.each([
+    '1.0.0-pilot.0',
+    '1.1.0-pilot.2',
+    '1.0.0-pilot.18446744073709551615',
+    '18446744073709551615.0.0-pilot.0',
+  ])('accepts supported Pilot %s without widening stable APIs', (version) => {
+    expect(isSupportedDesktopClientVersion(version)).toBe(true);
+    expect(isStableDesktopVersion(version)).toBe(false);
+    expect(compareStableDesktopVersions(version, '1.0.0')).toBeNull();
+  });
+  it.each([
+    '',
+    '1.1.1-pilot.2',
+    '1.1.0-pilot.',
+    '1.1.0-pilot.01',
+    '1.1.0-pilot.-1',
+    '1.1.0-pilot.18446744073709551616',
+    '1.1.0-pilot.1+build',
+    '1.1.0-Pilot.1',
+    '1.1.0-pilot.1\n',
+    ' 1.1.0-pilot.1',
+    '1.1.0-pilot.1 ',
+    '1.1.0-pilot.1\t',
+    '1.1.0-pilot.1\0',
+    '01.1.0-pilot.1',
+    '1.01.0-pilot.1',
+    '1.1.00-pilot.1',
+    '1.1.0-pilot.１',
+    '1.1.0-beta.1',
+    '18446744073709551616.0.0-pilot.0',
+    '1.18446744073709551616.0-pilot.0',
+    '12.0.0-pilot.18446744073709551615',
+    '1.1.0-pilot.1-pilot.2',
+  ])('rejects malformed client %j', async (version) => {
+    expect(isSupportedDesktopClientVersion(version)).toBe(false);
+    (globalThis as unknown as { electron?: unknown }).electron = {
+      getVersion: vi.fn().mockResolvedValue(version),
+    };
+    await expect(getDesktopClientVersion()).resolves.toBeNull();
+    expect(compareDesktopClientVersionToStableFloor(version, '1.0.0')).toBeNull();
+  });
+  it.each([
+    ['1.0.0-pilot.2', '1.0.0', 0],
+    ['1.1.0-pilot.2', '1.0.0', 1],
+    ['0.9.0-pilot.99', '1.0.0', -1],
+    ['1.0.0-pilot.0', '1.0.1', -1],
+    ['1.0.0', '1.0.0', 0],
+    ['1.0.1', '1.0.0', 1],
+    ['1.1.0-pilot.2', '1.0.0-pilot.0', null],
+    ['1.1.0-pilot.2', 'invalid', null],
+  ] as const)('compares %s against stable floor %s', (client, floor, expected) => {
+    expect(compareDesktopClientVersionToStableFloor(client, floor)).toBe(expected);
   });
 });

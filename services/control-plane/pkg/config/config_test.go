@@ -275,7 +275,7 @@ func TestClientVersionLoad(t *testing.T) {
 
 func TestClientVersionValidationRejectsMalformedValuesInEveryEnvironment(t *testing.T) {
 	for _, environment := range []string{"development", "staging", "production"} {
-		for _, version := range []string{"0.2", " 0.2.44 "} {
+		for _, version := range []string{"0.2", " 0.2.44 ", "1.0.0-pilot.0"} {
 			t.Run(environment+"/"+version, func(t *testing.T) {
 				cfg := &Config{Environment: environment, ClientMinVersion: version}
 

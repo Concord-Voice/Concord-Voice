@@ -8,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ClientVersionHeader identifies the authenticated client's stable release.
+// ClientVersionHeader identifies the authenticated client's supported desktop version.
 const ClientVersionHeader = "X-Concord-Client-Version"
 
 // RequireClientVersion rejects clients older than the configured minimum.
@@ -36,7 +36,7 @@ func EnforceClientVersion(c *gin.Context, minimum, supplied string) bool {
 	}
 
 	minimumVersion, minimumErr := clientversion.Parse(minimum)
-	suppliedVersion, suppliedErr := clientversion.Parse(supplied)
+	suppliedVersion, suppliedErr := clientversion.ParseClient(supplied)
 	if minimumErr == nil && suppliedErr == nil && clientversion.Compare(suppliedVersion, minimumVersion) >= 0 {
 		return true
 	}

@@ -698,6 +698,12 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 		clientVersion string
 		wantStatus    int
 	}{
+		{name: "Pilot equal", minimum: "1.0.0", clientVersion: "1.0.0-pilot.0", wantStatus: http.StatusSwitchingProtocols},
+		{name: "Pilot newer", minimum: "1.0.0", clientVersion: "1.1.0-pilot.2", wantStatus: http.StatusSwitchingProtocols},
+		{name: "Pilot older", minimum: "1.0.0", clientVersion: "0.9.0-pilot.99", wantStatus: http.StatusForbidden},
+		{name: "Pilot malformed", minimum: "1.0.0", clientVersion: "1.1.0-pilot.01", wantStatus: http.StatusForbidden},
+		{name: "Pilot nonzero patch", minimum: "1.0.0", clientVersion: "1.1.1-pilot.2", wantStatus: http.StatusForbidden},
+		{name: "Pilot floor", minimum: "1.0.0-pilot.0", clientVersion: "1.1.0-pilot.2", wantStatus: http.StatusForbidden},
 		{name: "disabled", clientVersion: "0.0.1", wantStatus: http.StatusSwitchingProtocols},
 		{name: "missing", minimum: "3.0.0", wantStatus: http.StatusForbidden},
 		{name: "malformed", minimum: "3.0.0", clientVersion: "three", wantStatus: http.StatusForbidden},

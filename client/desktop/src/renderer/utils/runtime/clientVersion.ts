@@ -1,4 +1,7 @@
-import { isStableDesktopVersion } from '../../../shared/stableDesktopVersion';
+import {
+  isStableDesktopVersion,
+  isSupportedDesktopClientVersion,
+} from '../../../shared/stableDesktopVersion';
 
 export { isStableDesktopVersion } from '../../../shared/stableDesktopVersion';
 
@@ -19,6 +22,15 @@ export function compareStableDesktopVersions(a: string, b: string): number | nul
   return 0;
 }
 
+/** Compares admission compatibility only; never use this to order update releases. */
+export function compareDesktopClientVersionToStableFloor(
+  client: string,
+  floor: string
+): number | null {
+  if (!isSupportedDesktopClientVersion(client)) return null;
+  return compareStableDesktopVersions(client.split('-pilot.')[0], floor);
+}
+
 /**
  * Returns the raw desktop version for display and legacy config advisory only.
  * Never use this for declarations or trust decisions; use getDesktopClientVersion instead.
@@ -37,7 +49,7 @@ export function getDesktopClientDisplayVersion(): Promise<string | null> {
 
 export function getDesktopClientVersion(): Promise<string | null> {
   return getDesktopClientDisplayVersion().then((version) =>
-    version !== null && isStableDesktopVersion(version) ? version : null
+    version !== null && isSupportedDesktopClientVersion(version) ? version : null
   );
 }
 

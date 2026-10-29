@@ -71,3 +71,41 @@ func TestCompare(t *testing.T) {
 		})
 	}
 }
+
+func TestParseClient(t *testing.T) {
+	valid := map[string]Version{
+		"0.0.0": {}, "1.2.3": {1, 2, 3}, "1.0.0-pilot.0": {1, 0, 0}, "1.1.0-pilot.2": {1, 1, 0},
+		"1.0.0-pilot.18446744073709551615": {1, 0, 0},
+		"18446744073709551615.0.0-pilot.0": {^uint64(0), 0, 0},
+	}
+	for raw, want := range valid {
+		t.Run(raw, func(t *testing.T) {
+			got, err := ParseClient(raw)
+			if err != nil || got != want {
+				t.Fatalf("ParseClient(%q) = %#v, %v; want %#v", raw, got, err, want)
+			}
+		})
+	}
+	for _, raw := range []string{
+		"", "1.1.1-pilot.2", "1.1.0-pilot.", "1.1.0-pilot.01", "1.1.0-pilot.-1",
+		"1.1.0-pilot.18446744073709551616", "1.1.0-pilot.1+build", "1.1.0-Pilot.1",
+		"1.1.0-pilot.1\n", " 1.1.0-pilot.1", "1.1.0-pilot.1 ", "1.1.0-pilot.1\t", "1.1.0-pilot.1\x00",
+		"01.1.0-pilot.1", "1.01.0-pilot.1", "1.1.00-pilot.1", "1.1.0-pilot.１", "1.1.0-beta.1",
+		"18446744073709551616.0.0-pilot.0", "1.18446744073709551616.0-pilot.0",
+		"12.0.0-pilot.18446744073709551615", "1.1.0-pilot.1-pilot.2",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := ParseClient(raw); err == nil {
+				t.Fatalf("ParseClient(%q) accepted malformed input", raw)
+			}
+		})
+	}
+}
+
+func TestParseRejectsPilot(t *testing.T) {
+	for _, raw := range []string{"1.0.0-pilot.0", "1.1.0-pilot.2"} {
+		if _, err := Parse(raw); err == nil {
+			t.Fatalf("stable Parse(%q) accepted Pilot", raw)
+		}
+	}
+}

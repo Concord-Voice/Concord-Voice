@@ -72,3 +72,28 @@ func TestRequireClientVersion_EqualAndNewerPassThrough(t *testing.T) {
 		})
 	}
 }
+
+func TestRequireClientVersion_PilotCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		client, floor string
+		allowed       bool
+	}{
+		{"1.0.0-pilot.0", "1.0.0", true},
+		{"1.1.0-pilot.2", "1.0.0", true},
+		{"0.9.0-pilot.99", "1.0.0", false},
+		{"1.1.1-pilot.2", "1.0.0", false},
+		{"1.1.0-pilot.01", "1.0.0", false},
+		{"1.1.0-pilot.2", "1.0.0-pilot.0", false},
+	} {
+		t.Run(tc.client+"/"+tc.floor, func(t *testing.T) {
+			router, called := clientVersionRouter(tc.floor)
+			response := requestClientVersion(router, tc.client)
+			if tc.allowed {
+				assert.Equal(t, http.StatusNoContent, response.Code)
+			} else {
+				assert.Equal(t, http.StatusForbidden, response.Code)
+			}
+			assert.Equal(t, tc.allowed, *called)
+		})
+	}
+}

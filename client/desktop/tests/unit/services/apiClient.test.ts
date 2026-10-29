@@ -76,17 +76,20 @@ describe('apiClient', () => {
     expect(headers.get('Authorization')).toBe('Bearer test-token');
   });
 
-  it('declares the exact desktop client version on the initial request', async () => {
-    const getVersion = vi.fn().mockResolvedValue('0.2.18');
-    globalThis.electron = { getVersion } as unknown as typeof globalThis.electron;
-    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+  it.each(['0.2.18', '1.1.0-pilot.2'])(
+    'declares the exact desktop client version on the initial request (%s)',
+    async (version) => {
+      const getVersion = vi.fn().mockResolvedValue(version);
+      globalThis.electron = { getVersion } as unknown as typeof globalThis.electron;
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
-    await apiFetch('/api/v1/test');
+      await apiFetch('/api/v1/test');
 
-    const headers = mockFetch.mock.calls[0][1].headers as Headers;
-    expect(headers.get('X-Concord-Client-Version')).toBe('0.2.18');
-    expect(getVersion).toHaveBeenCalledTimes(1);
-  });
+      const headers = mockFetch.mock.calls[0][1].headers as Headers;
+      expect(headers.get('X-Concord-Client-Version')).toBe(version);
+      expect(getVersion).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it('omits the client version when the bridge lookup rejects without failing the request', async () => {
     globalThis.electron = {
@@ -190,22 +193,25 @@ describe('apiClient', () => {
     expect(useAuthStore.getState().accessToken).toBe('new-token');
   });
 
-  it('declares the cached desktop client version on a 401 retry', async () => {
-    const getVersion = vi.fn().mockResolvedValue('0.2.18');
-    globalThis.electron = {
-      getVersion,
-      refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'new-token' }),
-    } as unknown as typeof globalThis.electron;
-    useAuthStore.getState().setAccessToken('old-token');
-    mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
-    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+  it.each(['0.2.18', '1.1.0-pilot.2'])(
+    'declares the cached desktop client version on a 401 retry (%s)',
+    async (version) => {
+      const getVersion = vi.fn().mockResolvedValue(version);
+      globalThis.electron = {
+        getVersion,
+        refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'new-token' }),
+      } as unknown as typeof globalThis.electron;
+      useAuthStore.getState().setAccessToken('old-token');
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
-    await apiFetch('/api/v1/test');
+      await apiFetch('/api/v1/test');
 
-    const retryHeaders = mockFetch.mock.calls[1][1].headers as Headers;
-    expect(retryHeaders.get('X-Concord-Client-Version')).toBe('0.2.18');
-    expect(getVersion).toHaveBeenCalledTimes(1);
-  });
+      const retryHeaders = mockFetch.mock.calls[1][1].headers as Headers;
+      expect(retryHeaders.get('X-Concord-Client-Version')).toBe(version);
+      expect(getVersion).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it('calls nuclearReset when IPC refresh fails and rememberMe is off', async () => {
     useAuthStore.getState().setAccessToken('old-token');

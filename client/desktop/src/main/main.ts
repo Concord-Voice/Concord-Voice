@@ -29,7 +29,7 @@ import { loadWindowState, attachWindowState } from './windowState';
 import { isWayland } from './waylandDetect';
 import { deriveCloseAction, deriveMinimizeAction } from '../shared/clientBehavior';
 import { SPA_FALLBACK_MESSAGE } from '../shared/spaIpcTypes';
-import { isStableDesktopVersion } from '../shared/stableDesktopVersion';
+import { isSupportedDesktopClientVersion } from '../shared/stableDesktopVersion';
 import {
   app,
   autoUpdater as electronAutoUpdater,
@@ -1703,7 +1703,7 @@ app.whenReady().then(async () => {
           if (requestOrigin === apiOrigin) {
             details.requestHeaders['Authorization'] = `Bearer ${token}`;
             const clientVersion = app.getVersion();
-            if (isStableDesktopVersion(clientVersion)) {
+            if (isSupportedDesktopClientVersion(clientVersion)) {
               details.requestHeaders['X-Concord-Client-Version'] = clientVersion;
             }
           }

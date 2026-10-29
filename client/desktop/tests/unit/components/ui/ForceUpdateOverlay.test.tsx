@@ -113,19 +113,25 @@ describe('ForceUpdateOverlay', () => {
     expect(getVersion).toHaveBeenCalledTimes(1);
   });
 
-  it('retains a floor when the request began before the denial', async () => {
-    const requestRevision = useClientConfigStore.getState().beginConfigRequest();
-    useAttestationFailureStore.getState().showFailure({
-      code: 'CLIENT_VERSION_TOO_OLD',
-      observedConfigRequestRevision: requestRevision,
-    });
-    acceptConfig(requestRevision, '');
+  it.each(['0.1.0', '1.1.0-pilot.2'])(
+    'retains a floor when the request began before the denial (%s)',
+    async (version) => {
+      (globalThis.electron as Record<string, unknown>).getVersion = vi
+        .fn()
+        .mockResolvedValue(version);
+      const requestRevision = useClientConfigStore.getState().beginConfigRequest();
+      useAttestationFailureStore.getState().showFailure({
+        code: 'CLIENT_VERSION_TOO_OLD',
+        observedConfigRequestRevision: requestRevision,
+      });
+      acceptConfig(requestRevision, '');
 
-    const { container } = render(<ForceUpdateOverlay />);
-    await act(async () => {});
+      const { container } = render(<ForceUpdateOverlay />);
+      await act(async () => {});
 
-    expect(container.querySelector('.force-update-overlay')).toBeInTheDocument();
-  });
+      expect(container.querySelector('.force-update-overlay')).toBeInTheDocument();
+    }
+  );
 
   it('clears an empty floor when a request started after the denial even if version lookup never settles', async () => {
     (globalThis.electron as Record<string, unknown>).getVersion = vi.fn(
@@ -169,6 +175,11 @@ describe('ForceUpdateOverlay', () => {
   });
 
   it.each([
+    ['equal Pilot floor', '1.0.0', '1.0.0-pilot.0', false],
+    ['newer Pilot', '1.0.0', '1.1.0-pilot.2', false],
+    ['lower Pilot', '1.0.0', '0.9.0-pilot.99', true],
+    ['malformed Pilot', '1.0.0', '1.1.0-pilot.01', true],
+    ['Pilot floor rejected', '1.0.0-pilot.0', '1.1.0-pilot.2', true],
     ['equal stable floor', '0.1.0', '0.1.0', false],
     ['lower stable floor', '0.0.9', '0.1.0', false],
     ['below floor', '1.0.0', '0.1.0', true],
@@ -176,7 +187,7 @@ describe('ForceUpdateOverlay', () => {
     ['prerelease local version', '0.1.0', '0.1.0-beta', true],
     ['unresolved local version', '0.1.0', null, true],
   ] as const)(
-    'reconciles a post-denial %s only with an exact stable version',
+    'reconciles a post-denial %s only with a supported compatible client',
     async (_name, minVersion, version, retained) => {
       (globalThis.electron as Record<string, unknown>).getVersion = vi.fn(() =>
         version === null ? new Promise<string>(() => {}) : Promise.resolve(version)

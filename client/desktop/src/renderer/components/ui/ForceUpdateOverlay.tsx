@@ -4,7 +4,7 @@ import { useAttestationFailureStore } from '../../stores/auth/attestationFailure
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import { useTopLayerDialog } from '../../hooks/ui/useTopLayerDialog';
 import {
-  compareStableDesktopVersions,
+  compareDesktopClientVersionToStableFloor,
   getDesktopClientVersion,
   getDesktopClientDisplayVersion,
 } from '../../utils/runtime/clientVersion';
@@ -75,7 +75,7 @@ const ForceUpdateOverlay: React.FC = () => {
     const comparison =
       strictAppVersion === undefined || strictAppVersion === null
         ? null
-        : compareStableDesktopVersions(strictAppVersion, minVersion);
+        : compareDesktopClientVersionToStableFloor(strictAppVersion, minVersion);
     if (minVersion === '' || (comparison !== null && comparison >= 0)) {
       const currentConfig = useClientConfigStore.getState();
       if (

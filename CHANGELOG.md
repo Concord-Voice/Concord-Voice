@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Supported Pilot desktop builds can connect alongside Stable builds without being
+blocked solely because their version includes a Pilot suffix.
+
 Windows updates now recheck the installer before restarting, including downloads
 saved from an earlier session.
 
@@ -159,6 +162,8 @@ you verify your email.
 - **Up Arrow edits your last message** (internal development reference omitted) — in an empty message box, Up Arrow opens your most recent message for editing, in channels, direct messages and voice text chat. It keeps its usual cursor behaviour while the box holds text, a reply or an attached file, while an input method is composing, and with Shift, Ctrl, Alt or Cmd held. When your newest message is still sending, failed to send or cannot be read, Up Arrow does nothing rather than opening an older message. Any message edit now opens with the cursor at the end of the text, saving or cancelling it returns focus to the message box you were using, and the edit box has an accessible name. If an edit cannot be saved, the edit box opens again with your text. An edit you leave open closes when you switch channels, and a message that cannot be read offers Delete but not Edit.
 
 ### Fixed
+
+- **Pilot client compatibility** (#3905) — valid Pilot versions use their stable base for minimum-version admission across HTTP and WebSocket connections. Malformed versions and below-minimum clients remain blocked; update release ordering is unchanged.
 
 - **Cached Windows installers are checked again before installation** (#2455) — signature and publisher checks run for both fresh and saved downloads. Rejected installers cannot launch, and cleanup preserves differential-update metadata.
 
