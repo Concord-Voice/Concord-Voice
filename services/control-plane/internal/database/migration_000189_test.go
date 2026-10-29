@@ -1305,7 +1305,9 @@ func requireBoundedLockTimeout(t *testing.T, start time.Time, err error) {
 // cannot get ACCESS EXCLUSIVE on users, and rolls back whole. The down is
 // committed here (as migration 000145's test does) so the up runs against the
 // pre-000189 schema with nothing else of this test holding a lock; the cleanup
-// restores the up.
+// restores the up, then re-applies 000191, which replaces a function 000189
+// creates. Without it the shared database would keep 000189's body at version
+// 191 for every later test.
 func TestMigration000189_UpFailsWithinLockTimeoutBehindAHeldLock(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	up, down := migration000189UpSQL(t), migration000189DownSQL(t)
@@ -1318,6 +1320,8 @@ func TestMigration000189_UpFailsWithinLockTimeoutBehindAHeldLock(t *testing.T) {
 		if !present {
 			_, restoreErr := db.Exec(up)
 			require.NoError(t, restoreErr, "restore migration 000189 after test")
+			_, restoreErr = db.Exec(migration000191UpSQL(t))
+			require.NoError(t, restoreErr, "re-apply migration 000191 after restoring 000189")
 		}
 	})
 

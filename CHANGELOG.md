@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+The server's sign-in protection now accepts a key re-encryption only from the
+maintenance run that started it, and refuses to roll back while its activation
+state is unknown.
+
 Copying a friend code no longer leaves a feedback timer running after leaving Add Friend.
 
 Auto Calibrate now offers a fixed microphone gate starting point from explicitly

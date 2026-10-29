@@ -142,7 +142,11 @@ func rekeyRow(ctx context.Context, db *sql.DB, ring *Keyring, r pendingRow) (rek
 }
 
 // rewrapFlag and rewrapValue name the transaction-local setting migration
-// 000189's material trigger reads to exempt a rewrap of the same secret.
+// 000189's material trigger reads to exempt a rewrap of the same secret. The
+// value written is rewrapValue + ":" + pg_current_xact_id(): from migration
+// 000191 the trigger accepts only that form, for its own transaction, so a flag
+// a writer leaves at session level (is_local = false) does not exempt a later
+// transaction's write.
 const (
 	rewrapFlag  = "concord.credential_rewrap"
 	rewrapValue = "mfa-rekey"
@@ -175,7 +179,7 @@ func resealRowTx(ctx context.Context, db *sql.DB, r pendingRow, enc, nonce []byt
 			err = errors.Join(err, fmt.Errorf("rollback row transaction: %w", rbErr))
 		}
 	}()
-	if _, err = tx.ExecContext(ctx, `SELECT set_config($1, $2, true)`, rewrapFlag, rewrapValue); err != nil {
+	if _, err = tx.ExecContext(ctx, `SELECT set_config($1, $2::text || ':' || pg_current_xact_id()::text, true)`, rewrapFlag, rewrapValue); err != nil {
 		return 0, fmt.Errorf("set rewrap flag: %w", err)
 	}
 	var written int64

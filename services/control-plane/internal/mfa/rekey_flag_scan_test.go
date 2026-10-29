@@ -31,7 +31,7 @@ import (
 //     an ARBITRARY (enc, nonce) write, so it may be called only from rekeyRow).
 //
 // It also bars the flag's value, mfa-rekey, outside rekey.go and cmd/mfa-rekey,
-// and scans migrations/*.sql: only 000189_* may name the flag.
+// and scans migrations/*.sql: only 000189_* and 000191_* may name the flag.
 //
 // The walk and the reads go through one os.Root, so a symlink inside the tree
 // cannot point a read outside it.
@@ -39,10 +39,12 @@ import (
 const (
 	rewrapAllowed   = "internal/mfa/rekey.go"
 	rewrapCmdDir    = "cmd/mfa-rekey/"
-	rewrapOwnerSQL  = "000189_"
 	rewrapValueText = "mfa-rekey"
 	rewrapCaller    = "rekeyRow"
 )
+
+// The migrations that define the flag's reader, accountguard_is_rewrap().
+var rewrapOwnerSQL = []string{"000189_", "000191_"}
 
 // Fragments only a writer of the flag needs, lower-cased for a case-insensitive
 // match: the GUC name and its namespace prefix.
@@ -149,14 +151,24 @@ func rewrapCallerOffences(t *testing.T, path string, body []byte) []string {
 	return out
 }
 
-// rewrapMigrationOffences returns the message for a migration other than 000189_*
-// that names the flag, in any case.
+// rewrapOwnsFlag reports whether a migration file is one of rewrapOwnerSQL.
+func rewrapOwnsFlag(name string) bool {
+	for _, p := range rewrapOwnerSQL {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// rewrapMigrationOffences returns the message for a migration other than the
+// rewrapOwnerSQL ones that names the flag, in any case.
 func rewrapMigrationOffences(name, body string) []string {
-	if strings.HasPrefix(name, rewrapOwnerSQL) {
+	if rewrapOwnsFlag(name) {
 		return nil
 	}
 	if strings.Contains(strings.ToLower(body), "credential_rewrap") {
-		return []string{"migrations/" + name + ": names credential_rewrap; only " + rewrapOwnerSQL + "* may"}
+		return []string{"migrations/" + name + ": names credential_rewrap; only " + strings.Join(rewrapOwnerSQL, "*, ") + "* may"}
 	}
 	return nil
 }
@@ -167,7 +179,8 @@ func TestRewrapFlagIsSetOnlyByRekey(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	fsys := root.FS()
 
-	var visitedRekey, rekeyNamesFlag, visitedOwnerSQL, visitedCmd bool
+	var visitedRekey, rekeyNamesFlag, visitedCmd bool
+	visitedOwnerSQL := map[string]bool{}
 	var files, migrations int
 	var offenders []string
 	err = fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, walkErr error) error {
@@ -192,7 +205,11 @@ func TestRewrapFlagIsSetOnlyByRekey(t *testing.T) {
 		if isSQL {
 			migrations++
 			name := strings.TrimPrefix(path, "migrations/")
-			visitedOwnerSQL = visitedOwnerSQL || strings.HasPrefix(name, rewrapOwnerSQL)
+			for _, p := range rewrapOwnerSQL {
+				if strings.HasPrefix(name, p) {
+					visitedOwnerSQL[p] = true
+				}
+			}
 			offenders = append(offenders, rewrapMigrationOffences(name, string(body))...)
 			return nil
 		}
@@ -208,7 +225,9 @@ func TestRewrapFlagIsSetOnlyByRekey(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, visitedRekey, "the walk must reach %s, or the scan proves nothing", rewrapAllowed)
 	require.True(t, visitedCmd, "the walk must reach %s", rewrapCmdDir)
-	require.True(t, visitedOwnerSQL, "the walk must reach the 000189 migration, which does name the flag")
+	for _, p := range rewrapOwnerSQL {
+		require.True(t, visitedOwnerSQL[p], "the walk must reach the %s* migration, which does name the flag", p)
+	}
 	require.Greater(t, files, 100, "the walk must cover the module")
 	require.Greater(t, migrations, 100, "the walk must cover the migrations")
 	assert.True(t, rekeyNamesFlag, "%s must set the rewrap flag", rewrapAllowed)
@@ -272,10 +291,12 @@ func TestRewrapScanFlagsPlantedWriters(t *testing.T) {
 	})
 }
 
-// Only 000189_* may name the flag in SQL, in any case.
+// Only 000189_* and 000191_* may name the flag in SQL, in any case.
 func TestRewrapScanFlagsPlantedMigrations(t *testing.T) {
 	assert.NotEmpty(t, rewrapMigrationOffences("000190_later.up.sql", "SELECT set_config('concord.credential_rewrap', 'mfa-rekey', true);"))
 	assert.NotEmpty(t, rewrapMigrationOffences("000190_later.up.sql", "SELECT current_setting('Concord.Credential_Rewrap', true);"))
 	assert.Empty(t, rewrapMigrationOffences("000189_accountguard_maturity.up.sql", "SELECT current_setting('concord.credential_rewrap', true);"))
+	assert.Empty(t, rewrapMigrationOffences("000191_accountguard_rewrap_xact_bind.up.sql", "SELECT current_setting('concord.credential_rewrap', true);"))
+	assert.NotEmpty(t, rewrapMigrationOffences("000192_later.up.sql", "SELECT current_setting('concord.credential_rewrap', true);"))
 	assert.Empty(t, rewrapMigrationOffences("000190_later.up.sql", "SELECT 1;"))
 }
