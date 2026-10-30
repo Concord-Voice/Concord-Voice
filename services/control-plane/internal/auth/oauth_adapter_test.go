@@ -10,7 +10,9 @@ package auth_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -96,14 +99,28 @@ func TestIssueAccessAndRefresh_HappyPath(t *testing.T) {
 }
 
 // TestIssueAccessAndRefresh_UnknownUser_Errors verifies the wrapper surfaces
-// a sql.ErrNoRows-rooted error when the user does not exist.
+// a typed identity denial without minted effects when the user does not exist.
 func TestIssueAccessAndRefresh_UnknownUser_Errors(t *testing.T) {
 	rig := newAdapterRig(t)
 	missing := uuid.New().String()
+	recorder := &adapterSecurityEventRecorder{}
+	rig.Handler.SetSecurityEvents(recorder)
 
-	_, _, _, err := rig.Handler.IssueAccessAndRefresh(context.Background(), missing)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found")
+	access, refresh, sid, err := rig.Handler.IssueAccessAndRefresh(context.Background(), missing)
+	require.ErrorIs(t, err, loginfamily.ErrDenied)
+	require.NotErrorIs(t, err, auth.ErrAccountDisabled)
+	var denial *loginfamily.Error
+	require.ErrorAs(t, err, &denial)
+	assert.Equal(t, loginfamily.ReasonAccessIdentity, denial.Reason())
+	assert.Empty(t, access)
+	assert.Empty(t, refresh)
+	assert.Empty(t, sid)
+	assert.Empty(t, recorder.events)
+	for _, table := range []string{"login_families", "login_family_sids", "refresh_tokens", "user_sso_identities"} {
+		var count int
+		require.NoError(t, rig.DB.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE user_id=$1`, missing).Scan(&count))
+		assert.Zero(t, count, table)
+	}
 }
 
 func TestIssueAccessAndRefreshBound_MatchingCredentialEpoch_Succeeds(t *testing.T) {
@@ -112,12 +129,12 @@ func TestIssueAccessAndRefreshBound_MatchingCredentialEpoch_Succeeds(t *testing.
 	userID := insertAdapterUser(t, rig, "bound-match@example.test", "boundmatch", password)
 
 	_, err := rig.DB.ExecContext(context.Background(),
-		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "epoch-current")
+		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "0123456789abcdef0123456789abcdef")
 	require.NoError(t, err)
 
 	verifiedEpoch, err := rig.Handler.VerifyPassword(context.Background(), userID, password)
 	require.NoError(t, err)
-	require.Equal(t, "epoch-current", verifiedEpoch)
+	require.Equal(t, "0123456789abcdef0123456789abcdef", verifiedEpoch)
 
 	access, refresh, sessionID, err := rig.Handler.IssueAccessAndRefreshBound(context.Background(), userID, verifiedEpoch, auth.SSOIdentityLink{
 		Provider:       "google",
@@ -129,17 +146,38 @@ func TestIssueAccessAndRefreshBound_MatchingCredentialEpoch_Succeeds(t *testing.
 	assert.NotEmpty(t, refresh)
 	assert.NotEmpty(t, sessionID)
 
-	var storedSessionID string
+	var storedSessionID, storedHash string
 	require.NoError(t, rig.DB.QueryRow(
-		`SELECT id FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID,
-	).Scan(&storedSessionID))
+		`SELECT id,token_hash FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID,
+	).Scan(&storedSessionID, &storedHash))
 	assert.Equal(t, sessionID, storedSessionID)
+	digest := sha256.Sum256([]byte(refresh))
+	assert.Equal(t, hex.EncodeToString(digest[:]), storedHash)
 
-	var identityProvider string
+	claims, err := auth.ValidateAccessToken(access, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	require.NotNil(t, claims.ExpiresAt)
+	assert.Equal(t, sessionID, claims.SessionID)
+	assert.Equal(t, verifiedEpoch, claims.CredentialEpoch)
+	var familyID, owner, epoch string
+	var exactExpiry, live bool
+	require.NoError(t, rig.DB.QueryRow(`SELECT s.family_id,s.user_id,f.credential_epoch,s.access_expires_at=$2,f.terminal_at IS NULL FROM login_family_sids s JOIN login_families f USING(family_id,user_id) WHERE s.sid=$1`, sessionID, claims.ExpiresAt.Time).Scan(&familyID, &owner, &epoch, &exactExpiry, &live))
+	assert.NotEqual(t, uuid.Nil.String(), familyID)
+	assert.Equal(t, userID, owner)
+	assert.Equal(t, verifiedEpoch, epoch)
+	assert.True(t, exactExpiry)
+	assert.True(t, live)
+	grant, err := loginfamily.ResolveVerifiedAccess(context.Background(), rig.DB, loginfamily.AccessIdentity{UserID: uuid.MustParse(userID), SID: uuid.MustParse(sessionID), CredentialEpoch: verifiedEpoch, AccessExpiresAt: claims.ExpiresAt.Time})
+	require.NoError(t, err)
+	assert.Equal(t, familyID, grant.FamilyID.String())
+
+	var identityProvider, subject, email string
 	require.NoError(t, rig.DB.QueryRow(
-		`SELECT provider FROM user_sso_identities WHERE user_id = $1`, userID,
-	).Scan(&identityProvider))
+		`SELECT provider,provider_user_id,provider_email FROM user_sso_identities WHERE user_id = $1`, userID,
+	).Scan(&identityProvider, &subject, &email))
 	assert.Equal(t, "google", identityProvider)
+	assert.Equal(t, "bound-subject", subject)
+	assert.Equal(t, "bound@example.test", email)
 }
 
 func TestIssueAccessAndRefreshBound_RejectsAdvancedCredentialEpoch(t *testing.T) {

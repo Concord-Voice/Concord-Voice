@@ -37,6 +37,8 @@
 'use strict';
 
 const { app, BrowserWindow } = require('electron');
+const probeProfile = process.argv.find((arg) => arg.startsWith('--probe-profile='));
+if (probeProfile) app.setPath('userData', probeProfile.slice('--probe-profile='.length));
 
 const GROUP_PAGE = `<!doctype html><meta charset="utf-8"><body>
 <dialog id="under"><button>under</button></dialog>
@@ -64,6 +66,22 @@ async function main() {
   await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(PAGE)}`);
   win.focus();
   const js = (code) => win.webContents.executeJavaScript(code, true);
+  // A dialog's close event is an animation-frame event (Blink queues it with
+  // EnqueueAnimationFrameEvent), so it fires on the next rendered frame, not on a
+  // timer. A slow CI display can produce no frame for seconds after a page loads,
+  // so a fixed sleep then reads `open: false` with no close event. Wait for two
+  // frames instead, bounded, and without user activation so the grouped cases keep
+  // theirs. `false` means the page rendered nothing, which fails the probe rather
+  // than passing without evidence.
+  const frames = () =>
+    Promise.race([
+      win.webContents.executeJavaScript(
+        'new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))',
+        false
+      ),
+      new Promise((resolve) => setTimeout(() => resolve(false), 10_000)),
+    ]);
+  check('the probe page renders animation frames', await frames(), {});
 
   // 1. The inert escape.
   const inert = await js(`(() => {
@@ -98,9 +116,10 @@ async function main() {
     win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
     win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
     await new Promise((resolve) => setTimeout(resolve, 300));
+    const rendered = await frames();
     return js(`(() => {
       const d = document.getElementById('${id}');
-      const seen = { open: d.open, events: __events.slice() };
+      const seen = { open: d.open, events: __events.slice(), rendered: ${rendered} };
       if (d.open) d.close();
       return seen;
     })()`);
@@ -125,6 +144,7 @@ async function main() {
   async function grouped(lockedTop, cancelKeydown) {
     await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(GROUP_PAGE)}`);
     win.focus();
+    await frames();
     await win.webContents.executeJavaScript(
       `(() => {
         window.__events = [];
@@ -147,6 +167,7 @@ async function main() {
     win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
     win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
     await new Promise((resolve) => setTimeout(resolve, 300));
+    await frames();
     return win.webContents.executeJavaScript(
       `({ under: document.getElementById('under').open, top: document.getElementById('top').open, events: __events.slice() })`,
       false
@@ -175,6 +196,7 @@ async function main() {
   process.stdout.write(
     `${pass ? 'PROBE PASS' : 'PROBE FAIL'} (Electron ${process.versions.electron}, Chromium ${process.versions.chrome})\n`
   );
+  if (pass) process.stdout.write('PROBE PASS dialog-top-layer\n');
   app.exit(pass ? 0 : 1);
 }
 

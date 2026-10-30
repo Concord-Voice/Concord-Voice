@@ -1,7 +1,7 @@
 import express from 'express';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { announcedIpAdvisory, config } from './config/index.js';
 import { logger } from './lib/logger.js';
@@ -35,6 +35,8 @@ import {
 } from './lib/mediaPolicyWire.js';
 import {
   createAuthMiddleware,
+  createVoiceAuthConnectionMiddleware,
+  getVoiceAuthConnection,
   createSocketTokenRenewal,
   parsePermissionBitfield,
   releaseDMVoiceAuthorization,
@@ -61,9 +63,12 @@ import {
 } from './lib/forceDisconnect.js';
 import {
   registerVoiceEnforcementSession,
+  setVoiceAuthConnections,
   renewVoiceEnforcementSession,
   pollVoiceEnforcementHealth,
 } from './lib/voiceEnforcementSession.js';
+import { readVoiceAuthResponse, VoiceAuthConnections } from './lib/voiceAuthConnection.js';
+import { newRequestContext, signHttpRequest, verifyHttpResponse } from './lib/voiceAuthProtocol.js';
 import type { VoiceEnforcementSession } from './lib/voiceEnforcementSession.js';
 import { voiceEnforcementNodeBootId } from './lib/voiceEnforcementIdentity.js';
 import {
@@ -71,7 +76,7 @@ import {
   snapshotVoiceEnforcementSessions,
   VoiceEnforcementSessionReleaseQueue,
 } from './lib/voiceEnforcementShutdown.js';
-import { VoiceEnforcementExpiryFence, VoiceEnforcementLease } from './lib/voiceEnforcementLease.js';
+import { FailureStateLogger, VoiceEnforcementExpiryFence, VoiceEnforcementHealth, VoiceEnforcementLease } from './lib/voiceEnforcementLease.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import {
   handleNatsEnforcementCommand,
@@ -487,6 +492,7 @@ async function rollbackRegisteredRoomJoin({
   roomId,
   userId,
   socketId,
+  sessionGeneration,
   roomKind,
   callId,
 }: {
@@ -495,14 +501,15 @@ async function rollbackRegisteredRoomJoin({
   roomId: string;
   userId: string;
   socketId: string;
+  sessionGeneration: string;
   roomKind: 'channel' | 'dm';
   callId?: string;
 }): Promise<void> {
   await rollbackSocketRoomJoin({
     cleanupDMJoin: () => cleanupDMJoin(callId),
-    leaveChannelIfOwned: () => roomManager.leaveRoomIfSocketOwned(roomId, userId, socketId),
+    leaveChannelIfOwned: () => roomManager.leaveRoomIfSocketOwned(roomId, userId, socketId, sessionGeneration),
     removeDMParticipant: () =>
-      roomManager.removeProvisionalParticipantIfSocketOwned(roomId, userId, socketId),
+      roomManager.removeProvisionalParticipantIfSocketOwned(roomId, userId, socketId, sessionGeneration),
     roomKind,
   });
 }
@@ -532,7 +539,7 @@ function registerJoinRoomHandler(
     roomManager,
     dmJoinFence,
     channelAdmissionFence,
-    voiceEnforcementReleaseQueue,
+    voiceAuthConnections,
     emitSecurityEvent,
     // Required: the per-connection wrapper carries this socket's security-event
     // reporter. A module-level default existed and was unreachable -- the sole
@@ -543,7 +550,7 @@ function registerJoinRoomHandler(
     roomManager: RoomManager;
     dmJoinFence: KeyedJoinFence;
     channelAdmissionFence: KeyedJoinFence;
-    voiceEnforcementReleaseQueue: VoiceEnforcementSessionReleaseQueue;
+    voiceAuthConnections: VoiceAuthConnections;
     emitSecurityEvent: EmitSecurityEvent | undefined;
     withRateLimit: <H extends SocketListener>(
       socket: RateLimitedSocket,
@@ -595,7 +602,14 @@ function registerJoinRoomHandler(
         refuseJoin('Socket is already joining or joined to a voice room', callback);
         return;
       }
+      const connection = getVoiceAuthConnection(socket);
+      if (!connection) {
+        releaseSocketRoomClaim();
+        refuseJoin('Voice connection unavailable', callback);
+        return;
+      }
       const commitSocketMembership = () => {
+        voiceAuthConnections.assertProductive(connection);
         socket.join(roomId);
         data.roomId = roomId;
         // Deliberately INSIDE this function, not after its call sites. The
@@ -614,6 +628,7 @@ function registerJoinRoomHandler(
         socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
       const token = socket.handshake.auth.token;
       let enforcementSession: VoiceEnforcementSession | undefined;
+      let admissionCommitted = false;
       let placementRefused = false;
       const inputCallId = typeof callId === 'string' ? callId : undefined;
       const dmCallId = new DMJoinCallIdTracker(inputCallId);
@@ -646,16 +661,23 @@ function registerJoinRoomHandler(
       // deliberately created by the media service, never accepted from a peer.
       const admissionId = roomKind === 'channel' ? randomUUID() : undefined;
       const authorizeRoom = async (requestedCallId?: string, activate = false) => {
-        const access = await validateChannelAccess(
-          data.userId,
-          roomId,
-          token,
-          roomKind,
-          requestedCallId,
-          admissionId ? { admissionId, socketId: socket.id, activate } : undefined
-        );
-        if (roomKind === 'dm') dmCallId.observe(access.callId);
-        return access;
+        const exactSession = enforcementSession;
+        if (!exactSession) throw new Error('Voice room reservation required');
+        // A1 can create durable admission state. Retain its in-flight work just
+        // like native creation, so a concurrent terminal command cannot release
+        // this generation while authorization is still unresolved.
+        return voiceAuthConnections.trackRoomOperation(exactSession, async () => {
+          const access = await validateChannelAccess(
+            data.userId,
+            roomId,
+            token,
+            roomKind,
+            requestedCallId,
+            admissionId ? { admissionId, socketId: socket.id, activate } : undefined
+          );
+          if (roomKind === 'dm') dmCallId.observe(access.callId);
+          return access;
+        });
       };
       const isAuthorizedAccess = (
         access: Awaited<ReturnType<typeof authorizeRoom>>,
@@ -668,7 +690,7 @@ function registerJoinRoomHandler(
             access.callId === authorizedAccess.callId));
       const executeJoin = async () => {
         try {
-          if (!socket.connected) {
+          if (!socket.connected || Date.now() >= data.tokenExpiresAt || isShuttingDown()) {
             await cleanupDMJoin(dmCallId.current());
             return;
           }
@@ -682,10 +704,11 @@ function registerJoinRoomHandler(
           const outcome = await runSocketBoundJoin({
             authorize: () => authorizeRoom(inputCallId, false),
             isAllowed: isAuthorizedAccess,
-            // The lease fence is checked by runSocketBoundJoin before A1 and
-            // again before promotion, so a late expiry cannot promote a row.
+            // executeJoin checks availability after the queue wait and before
+            // A1; repeat it at the promotion boundaries after authorization.
             isConnected: () =>
-              socket.connected && Date.now() < data.tokenExpiresAt && !isShuttingDown(),
+              socket.connected && Date.now() < data.tokenExpiresAt && !isShuttingDown() &&
+              voiceAuthConnections.snapshot(connection).state === 'registered',
             join: async (access) => {
               logger.debug('Channel access validated', { roomId, userId: data.userId });
               // Prefer the server-authoritative identity returned by the
@@ -695,29 +718,14 @@ function registerJoinRoomHandler(
                 displayName: data.displayName,
                 avatarUrl: data.avatarUrl,
               });
-              // Generate before A1 so a target command racing the registration
-              // response can identify this exact provisional participant.
-              enforcementSession = {
-                sessionGeneration: randomUUID(),
-                nodeBootId: voiceEnforcementNodeBootId,
-                roomId,
-                roomKind,
-                userId: data.userId,
-                credentialEpoch: data.credentialEpoch,
-                socketId: socket.id,
-              };
+              const exactSession = enforcementSession;
+              if (!exactSession) throw new Error('Voice room reservation required');
               // Thread the server-authoritative entitlement and permissions
               // into the participant; neither comes from the handshake.
               let result: JoinRoomResult;
               try {
-                result = await roomManager.joinRoom(
-                  roomId,
-                  data.userId,
-                  socket.id,
-                  identity,
-                  rtpCapabilities,
-                  {
-                    voiceEnforcementSessionGeneration: enforcementSession.sessionGeneration,
+                const joinOptions: Parameters<typeof roomManager.joinRoom>[5] = {
+                    voiceEnforcementSessionGeneration: exactSession.sessionGeneration,
                     entitlement: {
                       tier: access.userTier,
                       allowedAudioTiers: access.allowedAudioTiers,
@@ -742,18 +750,27 @@ function registerJoinRoomHandler(
                     authorizationRevision: access.authorizationRevision,
                     credentialEpoch: data.credentialEpoch,
                     deferChannelPromotion: roomKind === 'channel',
-                  }
-                );
+                };
+                // bind, not a closure: keeps the handler within the nesting limit.
+                result = await voiceAuthConnections.trackRoomOperation(exactSession, roomManager.joinRoom.bind(
+                  roomManager, roomId, data.userId, socket.id, identity, rtpCapabilities, joinOptions,
+                ));
               } catch (error) {
                 if (error instanceof RoomCreationRefusedError) placementRefused = true;
+                await voiceAuthConnections.releaseRoom(exactSession);
                 throw error;
               }
 
               // A2 must see an enforcement-addressable exact socket before it
               // can promote it. Failure is an admission failure: runSocketBoundJoin
               // rolls this provisional candidate back without mutating the room.
-              await registerVoiceEnforcementSession(token, enforcementSession);
-              data.voiceEnforcementSession = enforcementSession;
+              try {
+                await registerVoiceEnforcementSession(token, exactSession);
+              } catch (error) {
+                await voiceAuthConnections.releaseRoom(exactSession);
+                throw error;
+              }
+              data.voiceEnforcementSession = exactSession;
 
               return {
                 authorizedCallId: access.callId,
@@ -812,39 +829,30 @@ function registerJoinRoomHandler(
               };
             },
             commit: (_access, value) => {
-              if (roomKind === 'channel') {
-                return commitChannelAdmission(
-                  roomManager,
-                  socket,
-                  data,
-                  roomId,
-                  value,
-                  commitSocketMembership
-                );
-              }
-              return commitDMAdmission(
-                roomManager,
-                socket,
-                data,
-                roomId,
-                value,
-                commitSocketMembership
-              );
+              const committed = roomKind === 'channel'
+                ? commitChannelAdmission(roomManager, socket, data, roomId, value, commitSocketMembership)
+                : commitDMAdmission(roomManager, socket, data, roomId, value, commitSocketMembership);
+              // Later broadcast/ack failures cannot roll back a successful
+              // synchronous promotion or free its still-live identity slot.
+              admissionCommitted = true;
+              return committed;
             },
             rollback: async (access) => {
-              if (placementRefused) return;
+              const exactSession = enforcementSession;
+              if (placementRefused || !exactSession) return;
               await rollbackRegisteredRoomJoin({
                 roomManager,
                 cleanupDMJoin,
                 roomId,
                 userId: data.userId,
                 socketId: socket.id,
+                sessionGeneration: exactSession.sessionGeneration,
                 roomKind,
                 callId: access.callId,
               });
               if (enforcementSession) {
                 try {
-                  await voiceEnforcementReleaseQueue.releaseAfterTerminalClose(enforcementSession);
+                  await voiceAuthConnections.releaseRoom(enforcementSession);
                 } finally {
                   if (data.voiceEnforcementSession === enforcementSession) {
                     data.voiceEnforcementSession = undefined;
@@ -976,6 +984,21 @@ function registerJoinRoomHandler(
       };
 
       try {
+        const exactSession: VoiceEnforcementSession = {
+          connectionGeneration: voiceAuthConnections.snapshot(connection).target.connectionGeneration,
+          sessionGeneration: randomUUID(),
+          nodeBootId: voiceEnforcementNodeBootId,
+          roomId,
+          roomKind,
+          userId: data.userId,
+          credentialEpoch: data.credentialEpoch,
+          socketId: socket.id,
+        };
+        // Reserve atomically before even waiting for the admission fence. A1
+        // has durable effects, so a count check or post-A1 reservation is late.
+        roomManager.reserveVoiceAuthRoom(connection, exactSession);
+        // Only a successfully reserved owner is eligible for rollback/release.
+        enforcementSession = exactSession;
         if (roomKind === 'dm') await withKeyedJoinFence(dmJoinFence, roomId, executeJoin);
         else {
           // Serialize A1 through rollback for one channel user across sockets.
@@ -987,8 +1010,17 @@ function registerJoinRoomHandler(
             executeJoin
           );
         }
+      } catch (error) {
+        emitJoinError(socket, roomId, data.userId, error, callback);
       } finally {
-        releaseSocketRoomClaim();
+        try {
+          if (enforcementSession && !admissionCommitted) {
+            await voiceAuthConnections.releaseRoom(enforcementSession);
+            if (data.voiceEnforcementSession === enforcementSession) data.voiceEnforcementSession = undefined;
+          }
+        } finally {
+          releaseSocketRoomClaim();
+        }
       }
     }
   );
@@ -1028,7 +1060,6 @@ async function main() {
   // Initialize NATS (inter-service messaging)
   const natsService = new NatsService();
   const voiceEnforcementLease = new VoiceEnforcementLease();
-  let fenceExpiredVoiceEnforcementLease: () => Promise<void> = async () => {};
   let voiceEnforcementSubscriptionReady = false;
   let shuttingDown = false;
   const voiceEnforcementSubject = `voice.enforce.session.${voiceEnforcementNodeBootId}`;
@@ -1158,13 +1189,14 @@ async function main() {
     ) {
       res.status(503).json({
         ready: false,
+        ...voiceEnforcementHealth.status(),
         ...placementBody,
       });
       return;
     }
     res.json({
       ready: true,
-      voiceEnforcementProtocol: 3,
+      ...voiceEnforcementHealth.status(),
       ...placementBody,
     });
   });
@@ -1229,6 +1261,12 @@ async function main() {
     // Compression on attacker-controlled inbound payloads is a
     // decompression-amplification vector. Do not enable it for "performance".
   });
+  const voiceAuthConnections = new VoiceAuthConnections({
+    nodeBootId: voiceEnforcementNodeBootId, secret: config.jwtSecret,
+    controlPlaneUrl: config.controlPlaneUrl,
+  });
+  roomManager.setVoiceAuthConnections(voiceAuthConnections);
+  setVoiceAuthConnections(voiceAuthConnections);
   const voiceEnforcementReleaseQueue = new VoiceEnforcementSessionReleaseQueue(
     (session) =>
       roomManager.awaitNativeTermination(
@@ -1242,39 +1280,36 @@ async function main() {
         capacity,
         overflowedCount,
       });
-    }
+    },
+    voiceAuthConnections
   );
   const voiceEnforcementExpiryFence = new VoiceEnforcementExpiryFence(
     voiceEnforcementLease,
     async () => {
-      await roomManager.closeAll();
-      // Snapshot only after terminal room teardown. Expiry cannot infer a
-      // release, so quarantine these exact sessions until a fresh signed health
-      // round trip reaches this same target subscriber.
-      const terminalSessions = snapshotVoiceEnforcementSessions(io.sockets.sockets.values());
-      voiceEnforcementReleaseQueue.holdAll(terminalSessions);
+      // Capture only legacy liabilities before disconnect callbacks remove public
+      // references. Every family room/idle/provisional connection stays private.
+      const legacy = snapshotVoiceEnforcementSessions(io.sockets.sockets.values(), voiceAuthConnections);
+      voiceEnforcementReleaseQueue.holdAll(legacy);
+      const owned = voiceAuthConnections.terminateAll();
       for (const socket of io.sockets.sockets.values()) {
-        // Disconnect cleanup normally releases a terminal session. Clear this
-        // exact local reference only after it has been held, so expiry cannot
-        // bypass quarantine through that ordinary path.
         socket.data.voiceEnforcementSession = undefined;
         socket.disconnect(true);
       }
-    }
+      await Promise.all([owned, roomManager.closeAll()]);
+    },
+    () => voiceAuthConnections.reservationGeneration()
   );
 
+  let availabilityTeardownEpisode: object | undefined;
   const enforcementAvailability = new EnforcementAvailability(async () => {
-    voiceEnforcementLease.expire();
-    const terminalization = voiceEnforcementExpiryFence.enforce();
-    // The socket deadline must not wait for a pending native termination proof.
-    // Hold exact releases first; disconnection never proves native completion.
-    const sessions = snapshotVoiceEnforcementSessions(io.sockets.sockets.values());
-    voiceEnforcementReleaseQueue.holdAll(sessions);
-    for (const socket of io.sockets.sockets.values()) {
-      socket.data.voiceEnforcementSession = undefined;
-      socket.disconnect(true);
+    if (!availabilityTeardownEpisode) {
+      availabilityTeardownEpisode = Object.freeze({});
+      voiceEnforcementExpiryFence.invalidate();
     }
-    await terminalization;
+    const episode = availabilityTeardownEpisode;
+    voiceEnforcementLease.expire();
+    await voiceEnforcementExpiryFence.enforce();
+    if (availabilityTeardownEpisode === episode) availabilityTeardownEpisode = undefined;
   });
   const stopObservingRequiredSubscriptions = natsService.observeRequiredSubscriptions((ready) => {
     enforcementAvailability.setAvailable(ready);
@@ -1283,18 +1318,32 @@ async function main() {
     return (
       mediasoupService.isReady() &&
       natsService.requiredSubscriptionsReady() &&
-      enforcementAvailability.isReady()
+      enforcementAvailability.isReady() &&
+      voiceEnforcementLease.valid() &&
+      natsService.voiceCommandReady() &&
+      voiceEnforcementExpiryFence.ready() &&
+      !shuttingDown
     );
   }
 
-  const quarantineVoiceCommands = async (_reason: string): Promise<void> => {
+  const enforceVoiceCommandQuarantine = async (): Promise<void> => {
     voiceEnforcementLease.expire();
     await voiceEnforcementExpiryFence.enforce();
+  };
+  let lastCommandQuarantineEpisode: object | undefined;
+  const quarantineVoiceCommands = async (_reason: string, episode: object): Promise<void> => {
+    if (lastCommandQuarantineEpisode !== episode) {
+      lastCommandQuarantineEpisode = episode;
+      voiceEnforcementExpiryFence.invalidate();
+    }
+    await enforceVoiceCommandQuarantine();
   };
   const voiceCommandOwner = await natsService.createVoiceCommandOwner({
     nodeBootId: voiceEnforcementNodeBootId,
     onInvalidated: () => {
+      voiceEnforcementExpiryFence.invalidate();
       voiceEnforcementLease.expire();
+      if (voiceEnforcementExpiryFence.pending()) return;
       void voiceEnforcementExpiryFence.enforce().catch(() => {
         logger.error('Voice command authority quarantine failed', {
           error: 'voice_command_quarantine_failed',
@@ -1303,6 +1352,7 @@ async function main() {
     },
   });
   roomManager.setNativeTerminationFailureHandler(() => {
+    voiceEnforcementExpiryFence.invalidate();
     voiceEnforcementLease.expire();
     voiceCommandOwner.invalidate();
   });
@@ -1322,7 +1372,7 @@ async function main() {
           throw new Error('Voice command authority unavailable');
       } catch {
         voiceCommandOwner.invalidate();
-        await quarantineVoiceCommands('continuity_unavailable');
+        await enforceVoiceCommandQuarantine();
         throw new Error('Voice command authority unavailable');
       }
     },
@@ -1358,8 +1408,8 @@ async function main() {
   };
   io.use(requireEnforcementAvailability);
   io.use(createAuthMiddleware((event) => securityEvents.emit(event)));
-  // Recheck after asynchronous authentication, before namespace admission.
-  io.use(requireEnforcementAvailability);
+  // Registration installs its private owner before await and joins failed middleware cleanup.
+  io.use(createVoiceAuthConnectionMiddleware(voiceAuthConnections, enforcementAvailable));
 
   // ── Media-rate policer (#2153) ────────────────────────────────────────
   // Installed before the first socket can connect, so no join or produce is
@@ -1540,30 +1590,13 @@ async function main() {
       config.jwtSecret,
       voiceEnforcementNodeBootId,
       async () => {
-        if (shuttingDown) {
-          if (!natsService.requiredSubscriptionsReady())
-            throw new Error('Voice enforcement unavailable');
-        } else {
-          await natsService.confirmRequiredSubscriptions();
-        }
-        await enforcementAvailability.awaitTeardown();
-        // A late valid command cannot revive a process that crossed expiry
-        // without first terminalizing all local media state.
-        await fenceExpiredVoiceEnforcementLease();
-        if (!shuttingDown && !natsService.voiceCommandReady()) {
-          await natsService.recoverVoiceCommandConsumerAfterTeardown();
-        }
-        await natsService.confirmVoiceCommandContinuity();
-        if (
-          !natsService.requiredSubscriptionsReady() ||
-          (!shuttingDown && !enforcementAvailability.isReady())
-        )
-          throw new Error('Voice enforcement unavailable');
-        voiceEnforcementLease.renew();
-        // This is only a retry trigger after a verified same-subscriber health
-        // round trip; it never treats the timer expiry itself as settlement.
+        // Legacy proof may help drain legacy obligations, never renew protocol4.
         voiceEnforcementReleaseQueue.promoteHeld();
         void voiceEnforcementReleaseQueue.retryPending();
+      },
+      {
+        fenceAndJoin: (command) => voiceAuthConnections.fenceAndJoin(command),
+        healthSnapshot: (command) => voiceEnforcementHealth.healthSnapshot(command),
       }
     ),
     { required: true }
@@ -1574,26 +1607,49 @@ async function main() {
 
   const enforceVoiceEnforcementLease = (): Promise<void> => {
     if (shuttingDown) return Promise.resolve();
-    // All expiry observers share one terminalization barrier. In particular, a
-    // late signed health command must wait for this promise before it can renew
-    // admission, otherwise a join could escape closeAll's room snapshot.
     return voiceEnforcementExpiryFence.enforce();
   };
-  fenceExpiredVoiceEnforcementLease = enforceVoiceEnforcementLease;
+  const leaseEnforcementFailures = new FailureStateLogger('Voice enforcement lease teardown failed; will retry');
+  const enforceLeaseObserved = (): void => {
+    enforceVoiceEnforcementLease().then(
+      () => leaseEnforcementFailures.succeeded(),
+      () => leaseEnforcementFailures.failed()
+    );
+  };
+  const voiceEnforcementHealth = new VoiceEnforcementHealth({
+    lease: voiceEnforcementLease,
+    nodeBootId: voiceEnforcementNodeBootId,
+    transportReady: () => natsService.exactVoiceTransportReady(voiceEnforcementSubject),
+    localReady: () => !shuttingDown && mediasoupService.isReady() &&
+      enforcementAvailability.isReady() && voiceEnforcementExpiryFence.ready() &&
+      !voiceAuthConnections.hasStalledTermination() && natsService.voiceCommandReady(),
+    poll: () => pollVoiceEnforcementHealth(voiceEnforcementNodeBootId),
+    recover: async () => {
+      if (!shuttingDown) await natsService.confirmRequiredSubscriptions();
+      await enforcementAvailability.awaitTeardown();
+      await enforceVoiceEnforcementLease();
+      if (!shuttingDown && !natsService.voiceCommandReady()) {
+        await natsService.recoverVoiceCommandConsumerAfterTeardown();
+      }
+      await natsService.confirmVoiceCommandContinuity();
+    },
+    onTransport: () => {
+      voiceEnforcementReleaseQueue.promoteHeld();
+      void voiceEnforcementReleaseQueue.retryPending();
+    },
+  });
   const healthPoll = async () => {
-    try {
-      await pollVoiceEnforcementHealth(voiceEnforcementNodeBootId);
-    } catch {
-      /* lease remains expired */
-    }
-    await enforceVoiceEnforcementLease();
+    await voiceEnforcementHealth.poll();
+    // Never join a hung teardown into the poll lane; the fence retains ONE task.
+    if (!voiceEnforcementExpiryFence.pending()) enforceLeaseObserved();
   };
   void healthPoll();
   const voiceEnforcementHealthInterval = setInterval(() => {
     void healthPoll();
   }, 10_000);
   const voiceEnforcementLeaseInterval = setInterval(() => {
-    void enforceVoiceEnforcementLease();
+    // The fence keeps ownership; avoid adding one reaction per tick while hung.
+    if (!voiceEnforcementExpiryFence.pending()) enforceLeaseObserved();
   }, 1_000);
 
   natsService.subscribeRequest(
@@ -1707,12 +1763,11 @@ async function main() {
       roomManager,
       dmJoinFence,
       channelAdmissionFence,
-      voiceEnforcementReleaseQueue,
+      voiceAuthConnections,
       emitSecurityEvent: emitSocketSecurityEvent,
       withRateLimit,
       isShuttingDown: () =>
         shuttingDown ||
-        voiceEnforcementReleaseQueue.saturated() ||
         !voiceEnforcementLease.valid() ||
         !natsService.voiceCommandReady() ||
         !enforcementAvailable(),
@@ -2252,12 +2307,17 @@ async function main() {
     const enforcementSession = socketData.voiceEnforcementSession;
 
     if (!roomId || !userId) return;
+    // Start the retained family-aware task once, fencing before any cleanup
+    // await. Its native callback owns exact RoomManager teardown.
+    const familyRelease = enforcementSession?.connectionGeneration
+      ? voiceAuthConnections.releaseRoom(enforcementSession) : undefined;
 
     const releaseEnforcementSession = async () => {
       const session = enforcementSession;
       if (!session) return;
       try {
-        await voiceEnforcementReleaseQueue.releaseAfterTerminalClose(session);
+        if (familyRelease) await familyRelease;
+        else await voiceEnforcementReleaseQueue.releaseAfterTerminalClose(session);
       } finally {
         // A failed release keeps the DB row for durable retry, but it must not
         // strand this locally departed socket in a pseudo-admitted state.
@@ -2293,13 +2353,12 @@ async function main() {
       return;
     }
 
-    // Clean up via RoomManager (closes transports, producers, consumers)
-    await roomManager.leaveRoomIfSocketOwned(
-      roomId,
-      userId,
-      socket.id,
-      enforcementSession?.sessionGeneration
-    );
+    if (familyRelease) await familyRelease;
+    else {
+      await roomManager.leaveRoomIfSocketOwned(
+        roomId, userId, socket.id, enforcementSession?.sessionGeneration
+      );
+    }
     try {
       await releaseEnforcementSession();
     } finally {
@@ -2463,9 +2522,42 @@ async function main() {
   };
   let shutdownTerminalDeadline: ReturnType<typeof setTimeout> | undefined;
   let shutdownNativeDeadline: number | undefined;
+  let shutdownTerminalWork: Promise<void> | undefined;
+  // Only this shutdown continuation can invoke retirement. The signed request
+  // authenticates its completed native/in-flight witness, never an empty count.
+  const retireVoiceEnforcementBoot = async (deadline: number): Promise<void> => {
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining <= 0) throw new Error('Boot retirement deadline exhausted');
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nonce = randomBytes(32).toString('hex');
+    const secret = Buffer.from(config.jwtSecret, 'utf8');
+    const body = Buffer.from(JSON.stringify({
+      schema: 'concord.auth-boot-retirement', version: 1, nodeBootId: voiceEnforcementNodeBootId,
+    }));
+    const { wire, request } = signHttpRequest('boot_retire', body, '', { timestamp, nonce }, secret);
+    const context = newRequestContext(request, {});
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    for (const header of wire.headers) headers[header.name] = header.value;
+    const response = await fetch(`${config.controlPlaneUrl}${wire.path}`, {
+      method: 'POST', headers, body, signal: AbortSignal.timeout(Math.min(5000, remaining)),
+    });
+    verifyHttpResponse('boot_retire', await readVoiceAuthResponse(response),
+      context, secret, BigInt(Math.floor(Date.now() / 1000)));
+    if (performance.now() >= deadline) throw new Error('Boot retirement deadline exhausted');
+  };
   const completeShutdown = async () => {
     if (shutdownNativeDeadline === undefined)
       throw new Error('Native shutdown deadline unavailable');
+    // Stop scheduling only after releases drain. Join the final poll and the
+    // retained terminal owner it may have retried; retryPending only schedules.
+    const finalPoll = voiceEnforcementHealth.stopPollingAndJoin();
+    clearInterval(voiceEnforcementHealthInterval);
+    await finalPoll;
+    if (!shutdownTerminalWork) throw new Error('Shutdown terminal owner unavailable');
+    await shutdownTerminalWork;
+    await voiceAuthConnections.terminateAll();
+    if (voiceEnforcementReleaseQueue.outstandingCount() !== 0)
+      throw new Error('Shutdown retains voice identities');
     // Keep exact subscribers alive through registry release and actual child exit.
     await mediasoupService.close(shutdownNativeDeadline);
     await natsService.stopVoiceCommandRenewal();
@@ -2473,8 +2565,8 @@ async function main() {
       throw new Error('Native shutdown deadline exhausted');
     }
     await voiceCommandOwner.release();
+    await retireVoiceEnforcementBoot(shutdownNativeDeadline);
     if (shutdownTerminalDeadline) clearTimeout(shutdownTerminalDeadline);
-    clearInterval(voiceEnforcementHealthInterval);
 
     // Close inter-service connections
     await natsService.close();
@@ -2499,6 +2591,18 @@ async function main() {
 
   // Graceful shutdown
   let shutdownPromise: Promise<void> | undefined;
+  // Lives in main (not module scope) so the shutdown continuation stays one unit.
+  // Polls each second until outstanding() is zero, then settles with onDrained().
+  function afterQueueDrains(outstanding: () => number, onDrained: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setInterval(() => {
+        if (outstanding() !== 0) return;
+        clearInterval(timer);
+        void onDrained().then(resolve, reject);
+      }, 1_000);
+    });
+  }
+
   const shutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
@@ -2506,6 +2610,10 @@ async function main() {
       shutdownNativeDeadline = shutdownStartedAt + shutdownReleaseDrainTimeoutMs;
       // Reject A1/A2 work before closeAll so no registry row can race teardown.
       shuttingDown = true;
+      const shutdownRecovery = voiceEnforcementHealth.fenceRecoveryAndJoin();
+      const shutdownLegacySessions = snapshotVoiceEnforcementSessions(io.sockets.sockets.values(), voiceAuthConnections);
+      voiceEnforcementReleaseQueue.enqueueAll(shutdownLegacySessions);
+      shutdownTerminalWork = voiceAuthConnections.terminateAll();
       enforcementAvailability.stop();
       stopObservingRequiredSubscriptions();
       natsService.stopRequiredSubscriptionRecovery();
@@ -2521,13 +2629,15 @@ async function main() {
       mediaPolicerTick.stop();
       clearInterval(voiceEnforcementLeaseInterval);
       await opsMetricsPublisher.stop();
+      await shutdownRecovery;
       await natsService.stopVoiceCommandConsumer();
 
       // Close all rooms first (notifies participants, publishes NATS events)
       await roomManager.closeAll(shutdownNativeDeadline);
       const retainedReleases = await releaseVoiceEnforcementSessionsAfterClose(
-        io.sockets.sockets.values(),
-        voiceEnforcementReleaseQueue
+        [],
+        voiceEnforcementReleaseQueue,
+        voiceAuthConnections
       );
       const remainingReleaseDrainMs =
         shutdownReleaseDrainTimeoutMs - (performance.now() - shutdownStartedAt);
@@ -2555,12 +2665,10 @@ async function main() {
           logger.error('Voice enforcement releases exceeded shutdown deadline', { failureCount });
           process.exit(1);
         }, remainingReleaseDrainMs);
-        const awaitRetainedReleases = setInterval(() => {
-          if (voiceEnforcementReleaseQueue.outstandingCount() !== 0) return;
-          clearInterval(awaitRetainedReleases);
+        await afterQueueDrains(() => voiceEnforcementReleaseQueue.outstandingCount(), () => {
           clearTimeout(shutdownReleaseDeadline);
-          void completeShutdown().catch(failShutdown);
-        }, 1_000);
+          return completeShutdown();
+        });
         return;
       }
 

@@ -213,7 +213,7 @@ func guardTemporaryGrantAuthorization(
 	if !authorization.guardCredential {
 		return nil
 	}
-	if err := credepoch.GuardTx(ctx, tx, authorization.actorID, authorization.credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, authorization.actorID, authorization.credentialEpoch); err != nil {
 		return fmt.Errorf("temp grant credential guard: %w", err)
 	}
 	if authorization.authority != nil {
@@ -617,7 +617,7 @@ func (m *tempGrantManager) deleteTemporaryGrantWithCapture(
 		return nil, nil, false, fmt.Errorf("temp revoke lock: %w", err)
 	}
 	if authorization.guardCredential {
-		if err := credepoch.GuardTx(ctx, tx, authorization.actorID, authorization.credentialEpoch); err != nil {
+		if err := credepoch.GuardFamilyTx(ctx, tx, authorization.actorID, authorization.credentialEpoch); err != nil {
 			return nil, nil, false, fmt.Errorf("temp revoke credential guard: %w", err)
 		}
 		if authorization.authority != nil {

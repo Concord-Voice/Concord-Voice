@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/uuid"
@@ -14,6 +15,9 @@ import (
 type fakeAgeHub struct{}
 
 func (fakeAgeHub) DisconnectUser(uuid.UUID) {}
+func (fakeAgeHub) DisconnectFamilyContext(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
 
 // TestBuildAgeHandler verifies the #1623 DI builder wires a non-nil age.Handler.
 // buildAgeHandler delegates to age.NewHandler, which stores its deps without

@@ -64,6 +64,7 @@ func invokeCommitFailureVoiceEffect(
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", actorID)
+		c.Request = c.Request.WithContext(dbtest.ActorContext(c.Request.Context(), t, h.db, actorID))
 		c.Next()
 	})
 	router.POST("/servers/:id/voice/:userId/disconnect", h.ServerDisconnect)

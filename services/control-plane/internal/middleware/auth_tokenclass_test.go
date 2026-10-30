@@ -36,8 +36,8 @@ import (
 // drift from the production token shape and go on passing while the real hole
 // reopened — the assertion would be right and the violating path never reached.
 const (
-	tokenClassSecret = "shared-hmac-secret-for-both-token-families" //nolint:gosec // test fixture, not a real credential // pragma: allowlist secret
-	tokenClassUser   = "11111111-1111-4111-8111-111111111111"
+	tokenClassSecret   = "shared-hmac-secret-for-both-token-families" //nolint:gosec // test fixture, not a real credential // pragma: allowlist secret
+	classFixtureUserID = "0f1e2d3c-4b5a-4968-8776-655443322110"
 )
 
 // realChallengeTokens returns every token the MFA package can mint with the shared
@@ -50,18 +50,18 @@ func realChallengeTokens(t *testing.T) map[string]string {
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
 	issuer := mfa.NewHandler(nil, redisClient, logger.New("test"), nil, tokenClassSecret, nil, "test")
 	login, _, err := issuer.GenerateLoginChallenge(
-		context.Background(), tokenClassUser, false, "", securityevent.AuthPassword)
+		context.Background(), classFixtureUserID, false, "", securityevent.AuthPassword)
 	require.NoError(t, err)
 
 	suspicious, _, err := mfa.GenerateChallengeToken(
-		tokenClassUser, mfa.PurposeSuspiciousRefresh, mfa.JWTSecret(tokenClassSecret), "")
+		classFixtureUserID, mfa.PurposeSuspiciousRefresh, mfa.JWTSecret(tokenClassSecret), "")
 	require.NoError(t, err)
 
 	upgrade, _, err := mfa.GenerateChallengeToken(
-		tokenClassUser, mfa.PurposeMFAUpgrade, mfa.JWTSecret(tokenClassSecret), "")
+		classFixtureUserID, mfa.PurposeMFAUpgrade, mfa.JWTSecret(tokenClassSecret), "")
 	require.NoError(t, err)
 
-	recovery, _, err := mfa.GenerateRecoveryToken(tokenClassUser, mfa.JWTSecret(tokenClassSecret))
+	recovery, _, err := mfa.GenerateRecoveryToken(classFixtureUserID, mfa.JWTSecret(tokenClassSecret))
 	require.NoError(t, err)
 
 	return map[string]string{
@@ -72,11 +72,11 @@ func realChallengeTokens(t *testing.T) map[string]string {
 	}
 }
 
-// realAccessToken is the positive control. Without it these tests would pass just as
-// happily against a mistakenly always-false check, proving nothing.
+// realAccessToken is a parser-only legacy token. HTTP admission additionally needs
+// the persisted family/SID evidence returned by authRequiredUnderTest.
 func realAccessToken(t *testing.T) string {
 	t.Helper()
-	tok, err := auth.GenerateAccessToken(tokenClassUser, tokenClassSecret, true, "", "")
+	tok, err := auth.GenerateAccessToken(classFixtureUserID, tokenClassSecret, true, "", "")
 	require.NoError(t, err)
 	return tok
 }
@@ -96,7 +96,7 @@ func parseWithSharedSecret(t *testing.T, token string) jwt.MapClaims {
 	return claims
 }
 
-func authRequiredUnderTest(t *testing.T) *gin.Engine {
+func authRequiredUnderTest(t *testing.T) (*gin.Engine, string) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -104,6 +104,9 @@ func authRequiredUnderTest(t *testing.T) *gin.Engine {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { assert.NoError(t, rdb.Close()) })
 	db, _ := dbtest.SetupTestDB(t)
+	_, err := db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified) VALUES ($1, $2, $3, $4, true, true)`, classFixtureUserID, "tokenclass@test.concord.chat", "tokenclass", "unused-test-hash")
+	require.NoError(t, err)
+	access := familyAccessToken(t, db, classFixtureUserID, tokenClassSecret)
 
 	r := gin.New()
 	// nil fence: the credential-epoch fence is NOT what rejects these tokens, and
@@ -111,7 +114,7 @@ func authRequiredUnderTest(t *testing.T) *gin.Engine {
 	r.GET("/protected", middleware.AuthRequired(tokenClassSecret, rdb, db, nil), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"user_id": c.GetString("user_id")})
 	})
-	return r
+	return r, access
 }
 
 func getProtected(t *testing.T, r *gin.Engine, bearer string) *httptest.ResponseRecorder {
@@ -124,7 +127,7 @@ func getProtected(t *testing.T, r *gin.Engine, bearer string) *httptest.Response
 }
 
 func TestAuthRequiredRejectsNonAccessTokenFamilies(t *testing.T) {
-	r := authRequiredUnderTest(t)
+	r, _ := authRequiredUnderTest(t)
 
 	for name, token := range realChallengeTokens(t) {
 		t.Run(name, func(t *testing.T) {
@@ -133,7 +136,7 @@ func TestAuthRequiredRejectsNonAccessTokenFamilies(t *testing.T) {
 			require.Equal(t, http.StatusUnauthorized, rec.Code,
 				"a %s is signed with the bearer secret and carries user_id; "+
 					"accepting it as an access token is an authentication bypass", name)
-			assert.NotContains(t, rec.Body.String(), tokenClassUser,
+			assert.NotContains(t, rec.Body.String(), classFixtureUserID,
 				"a rejected request must not leak the subject it would have authenticated as")
 		})
 	}
@@ -143,13 +146,20 @@ func TestAuthRequiredRejectsNonAccessTokenFamilies(t *testing.T) {
 // suite above becomes vacuous — it would pass against a middleware that refuses
 // everything, which is not the property under test.
 func TestAuthRequiredStillAcceptsGenuineAccessToken(t *testing.T) {
-	r := authRequiredUnderTest(t)
+	r, access := authRequiredUnderTest(t)
 
-	rec := getProtected(t, r, realAccessToken(t))
+	rec := getProtected(t, r, access)
 
 	require.Equal(t, http.StatusOK, rec.Code,
 		"the issuer check must narrow the accepted set to access tokens, not empty it")
-	assert.Contains(t, rec.Body.String(), tokenClassUser)
+	assert.Contains(t, rec.Body.String(), classFixtureUserID)
+}
+
+// Legacy issuer-valid access tokens without family evidence must stay refused.
+func TestAuthRequiredRejectsLegacyAccessWithoutSID(t *testing.T) {
+	r, access := authRequiredUnderTest(t)
+	require.Equal(t, http.StatusOK, getProtected(t, r, access).Code)
+	require.Equal(t, http.StatusUnauthorized, getProtected(t, r, realAccessToken(t)).Code)
 }
 
 // IsAccessToken is exported because the WebSocket handshake shares this boundary
@@ -178,7 +188,7 @@ func TestIsAccessTokenPartitionsTheTwoMints(t *testing.T) {
 	})
 
 	t.Run("rejects claims with no issuer at all", func(t *testing.T) {
-		assert.False(t, middleware.IsAccessToken(jwt.MapClaims{"user_id": tokenClassUser}))
+		assert.False(t, middleware.IsAccessToken(jwt.MapClaims{"user_id": classFixtureUserID}))
 	})
 }
 
@@ -191,7 +201,7 @@ func TestValidateAccessTokenEnforcesTheSameBoundary(t *testing.T) {
 	t.Run("accepts a genuine access token", func(t *testing.T) {
 		claims, err := auth.ValidateAccessToken(realAccessToken(t), tokenClassSecret)
 		require.NoError(t, err)
-		assert.Equal(t, tokenClassUser, claims.UserID)
+		assert.Equal(t, classFixtureUserID, claims.UserID)
 	})
 
 	t.Run("rejects every mfa-family token", func(t *testing.T) {
@@ -230,7 +240,7 @@ func TestBothReadersRejectAnyPurposeClaim(t *testing.T) {
 			now := time.Now()
 			tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 				"iss":     middleware.AccessTokenIssuer,
-				"user_id": tokenClassUser,
+				"user_id": classFixtureUserID,
 				"purpose": val,
 				"exp":     now.Add(15 * time.Minute).Unix(),
 				"iat":     now.Unix(),
@@ -279,7 +289,7 @@ func TestReaderExtractionDivergesOnClaimKeyCase(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Now()
 			claims := jwt.MapClaims{
-				"user_id": tokenClassUser,
+				"user_id": classFixtureUserID,
 				"exp":     now.Add(15 * time.Minute).Unix(),
 				"iat":     now.Unix(),
 				tc.key:    tc.val,

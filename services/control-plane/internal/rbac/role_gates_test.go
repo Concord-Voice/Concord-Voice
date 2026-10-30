@@ -31,7 +31,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
@@ -669,10 +668,73 @@ func TestRoleGate_CreateRoleCommitLockConflictIsRetryable(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRGFixture(t, ts, false, false)
-			hook.ArmCommit(false, tc.fault)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			blocker, err := ts.DB.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			defer func() {
+				err := blocker.Rollback()
+				if !errors.Is(err, sql.ErrTxDone) {
+					assert.NoError(t, err)
+				}
+			}()
+			// SHARE permits the real authorization reads but blocks the INSERT.
+			// The statement callback holds Hook's mutex, so ArmCommit must run
+			// outside it; this lock prevents the INSERT/COMMIT racing that arm.
+			_, err = blocker.ExecContext(ctx, `LOCK TABLE roles IN SHARE MODE`)
+			require.NoError(t, err)
+			insertReached := make(chan struct{})
+			hook.ArmArg([]string{`INSERT INTO roles (id, server_id, name`}, f.serverID, func() error {
+				close(insertReached)
+				return nil
+			}, nil)
 
-			w := ts.DoRequest(http.MethodPost, rolesPath(f.serverID),
-				map[string]any{"name": rgCreatedName, "permissions": bitsJSON(0)}, testhelpers.AuthHeaders(f.owner.AccessToken))
+			req := httptest.NewRequest(http.MethodPost, rolesPath(f.serverID),
+				strings.NewReader(fmt.Sprintf(`{"name":%q,"permissions":%q}`, rgCreatedName, bitsJSON(0)))).WithContext(ctx)
+			req.Header = testhelpers.AuthHeaders(f.owner.AccessToken)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				ts.Router.ServeHTTP(w, req)
+			}()
+			defer func() {
+				// Release the lock before cancellation, then join the request.
+				err := blocker.Rollback()
+				if !errors.Is(err, sql.ErrTxDone) {
+					assert.NoError(t, err)
+				}
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("CreateRole request did not finish during teardown")
+				}
+			}()
+			select {
+			case <-insertReached:
+			case <-done:
+				t.Fatalf("CreateRole did not reach its INSERT: %d %s", w.Code, w.Body.String())
+			case <-ctx.Done():
+				t.Fatal("CreateRole did not reach its INSERT before the deadline")
+			}
+			// AuthRequired's family-read transaction has already committed, and
+			// CreateRole's real guards have passed before this productive write.
+			hook.ArmCommit(false, tc.fault)
+			require.NoError(t, blocker.Rollback())
+			select {
+			case <-done:
+			case <-ctx.Done():
+				t.Fatal("CreateRole did not finish before the deadline")
+			}
+			seen, betweenErr := hook.Report()
+			require.Equal(t, 1, seen, "the target INSERT must fire the statement hook")
+			require.NoError(t, betweenErr)
+			// ArmCommit is one-shot: an unconsumed fault fails this control.
+			probe, err := hookedDB.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			require.NoError(t, probe.Commit(), "CreateRole must consume the commit fault")
 
 			assert.Zero(t, rgCount(t, ts.DB, `SELECT count(*) FROM roles WHERE server_id = $1 AND name = $2`,
 				f.serverID, rgCreatedName), "a refused COMMIT creates nothing")
@@ -684,6 +746,7 @@ func TestRoleGate_CreateRoleCommitLockConflictIsRetryable(t *testing.T) {
 			}
 			require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
 			assert.JSONEq(t, `{"error":"Failed to create role"}`, w.Body.String(), "the route's own 500, not the gate's")
+			assert.Empty(t, w.Header().Get("Retry-After"))
 		})
 	}
 }
@@ -874,6 +937,7 @@ func TestRoleGate_ChannelKeyForcedRetryVerifiesOncePerGateAttempt(t *testing.T) 
 	body, err := json.Marshal(map[string]string{"mfa_code": token})
 	require.NoError(t, err)
 	c.Request = httptest.NewRequest(http.MethodDelete, "/", bytes.NewReader(body))
+	ts.AttachActorIdentity(t, c, f.owner.ID)
 	h.DeleteRole(c)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -934,9 +998,8 @@ func TestRoleGate_DeleteRoleGraceCoversTheSameSessionOnly(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	f := newRGFixture(t, ts, true, true)
 	session := func() string {
-		token, err := auth.GenerateAccessToken(f.owner.ID, testhelpers.TestJWTSecret, true, "", uuid.NewString())
-		require.NoError(t, err)
-		return token
+		// Each call creates a canonical fresh family/SID for this owner.
+		return ts.VerifyUserEmail(t, f.owner.ID)
 	}
 	first := session()
 	del := roleGateRoutes()[2]

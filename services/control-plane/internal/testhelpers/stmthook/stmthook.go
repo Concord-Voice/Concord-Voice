@@ -56,6 +56,116 @@ type Hook struct {
 	// back otherwise. See ArmCommit.
 	commitFault   error
 	commitCommits bool
+	admission     admissionArm
+}
+
+// AdmissionReport distinguishes an unobserved boundary, a running callback,
+// and a completed callback whose error must be checked by the fixture owner.
+type AdmissionReport struct {
+	UserID, SID                 string
+	Pending, Running, Completed bool
+	Fired                       int
+	CallbackErr                 error
+}
+
+type admissionArm struct {
+	AdmissionReport
+	generation uint64
+	callback   func() error
+}
+
+// ArmAdmission runs callback after the exact user's SID resolution transaction
+// commits successfully. callback must use a separate pool: database/sql still
+// owns this connection until Commit returns. No callback error changes the real
+// commit result; the caller must inspect AdmissionReport.
+func (h *Hook) ArmAdmission(userID, sid string, callback func() error) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if userID == "" || sid == "" || callback == nil {
+		return errors.New("stmthook: admission needs user, SID and callback")
+	}
+	if h.commitFault != nil || h.admission.Pending || h.admission.Running {
+		return errors.New("stmthook: conflicting commit/admission arm")
+	}
+	h.admission = admissionArm{
+		AdmissionReport: AdmissionReport{UserID: userID, SID: sid, Pending: true},
+		generation:      h.admission.generation + 1, callback: callback,
+	}
+	return nil
+}
+
+// AdmissionReport returns a synchronized snapshot, also safe inside callback.
+func (h *Hook) AdmissionReport() AdmissionReport {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.admission.AdmissionReport
+}
+
+// admissionTransaction is local to one driver connection's active transaction.
+// database/sql serializes its driver calls; the Hook lock protects only the
+// shared arm/report. The generation prevents a prior transaction firing a rearm.
+type admissionTransaction struct {
+	userID, sid string
+	generation  uint64
+	seen        int
+}
+
+var admissionQueries = [...]string{
+	`SELECT family_id, access_expires_at FROM login_family_sids WHERE user_id=$1 AND sid=$2`,
+	`SELECT user_id, family_id, credential_epoch, terminal_at, auth_operation_id, epoch_generation FROM login_families WHERE user_id=$1 AND family_id=$2`,
+	`SELECT clock_timestamp()`,
+	`SELECT COALESCE(credential_epoch, '') FROM users WHERE id = $1`,
+}
+
+func (h *Hook) beginAdmission(opts driver.TxOptions) *admissionTransaction {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.admission.Pending || !opts.ReadOnly || opts.Isolation != driver.IsolationLevel(sql.LevelReadCommitted) {
+		return nil
+	}
+	return &admissionTransaction{userID: h.admission.UserID, sid: h.admission.SID, generation: h.admission.generation}
+}
+
+func (a *admissionTransaction) observe(query string, args []driver.NamedValue) {
+	if a == nil || a.seen >= len(admissionQueries) {
+		return
+	}
+	if query != admissionQueries[a.seen] {
+		return
+	}
+	// Check positions, not mere argument membership: SID and user are distinct.
+	if a.seen != 2 && (len(args) == 0 || !stringArgument(args[0], a.userID)) {
+		return
+	}
+	if a.seen == 0 && (len(args) != 2 || !stringArgument(args[1], a.sid)) {
+		return
+	}
+	a.seen++
+}
+
+func stringArgument(arg driver.NamedValue, want string) bool {
+	value, ok := arg.Value.(string)
+	return ok && value == want
+}
+
+func (h *Hook) afterAdmissionCommit(a *admissionTransaction) {
+	if a == nil || a.seen != len(admissionQueries) {
+		return
+	}
+	h.mu.Lock()
+	if !h.admission.Pending || h.admission.generation != a.generation {
+		h.mu.Unlock()
+		return
+	}
+	h.admission.Pending, h.admission.Running = false, true
+	h.admission.Fired++
+	callback := h.admission.callback
+	h.mu.Unlock()
+	err := callback()
+	h.mu.Lock()
+	h.admission.CallbackErr = err
+	h.admission.Running, h.admission.Completed = false, true
+	h.mu.Unlock()
 }
 
 // Arm resets the hook. between, when non-nil, runs at the hooked statement and
@@ -159,14 +269,19 @@ func (c hookConnector) Driver() driver.Driver { return c.inner.Driver() }
 
 type hookConn struct {
 	hookableConn
-	hook *Hook
+	hook      *Hook
+	admission *admissionTransaction
 }
 
 func (c *hookConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if err := c.hook.beforeQuery(ctx, query, args); err != nil {
 		return nil, err
 	}
-	return c.hookableConn.QueryContext(ctx, query, args)
+	rows, err := c.hookableConn.QueryContext(ctx, query, args)
+	if err == nil {
+		c.admission.observe(query, args)
+	}
+	return rows, err
 }
 
 func (c *hookConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -355,6 +470,9 @@ func RequireInterleaved(t *testing.T, db *sql.DB, hook *Hook, sc Scenario, want 
 func (h *Hook) ArmCommit(committed bool, fault error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.admission.Pending || h.admission.Running {
+		panic("stmthook: commit fault conflicts with admission arm")
+	}
 	h.commitFault, h.commitCommits = fault, committed
 }
 
@@ -372,19 +490,32 @@ func (c *hookConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.T
 	if err != nil {
 		return nil, err
 	}
-	return hookTx{Tx: tx, hook: c.hook}, nil
+	c.admission = c.hook.beginAdmission(opts)
+	return hookTx{Tx: tx, hook: c.hook, conn: c}, nil
 }
 
 // hookTx is a transaction whose Commit ArmCommit can fault.
 type hookTx struct {
 	driver.Tx
 	hook *Hook
+	conn *hookConn
+}
+
+func (t hookTx) Rollback() error {
+	t.conn.admission = nil
+	return t.Tx.Rollback()
 }
 
 func (t hookTx) Commit() error {
+	admission := t.conn.admission
+	t.conn.admission = nil
 	committed, fault := t.hook.takeCommitFault()
 	if fault == nil {
-		return t.Tx.Commit()
+		if err := t.Tx.Commit(); err != nil {
+			return err
+		}
+		t.hook.afterAdmissionCommit(admission)
+		return nil
 	}
 	end := t.Rollback
 	if committed {

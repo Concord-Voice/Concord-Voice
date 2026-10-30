@@ -861,7 +861,7 @@ func (h *Handler) createRoleTx(
 	if lockErr := LockServerVisibilityCapture(ctx, tx, serverID); lockErr != nil {
 		return false, outcome, fmt.Errorf("lock server for create role: %w", lockErr)
 	}
-	if guardErr := credepoch.GuardTx(ctx, tx, userID, confirm.tokenEpoch); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, userID, confirm.tokenEpoch); guardErr != nil {
 		return false, outcome, roleGuardError(ctx, tx, serverID, guardErr)
 	}
 	if toErr := applyGuardLockTimeout(ctx, tx); toErr != nil {
@@ -1163,7 +1163,7 @@ func (h *Handler) updateRoleTx(
 	query string,
 	args []interface{},
 ) (Role, mfaenforce.Outcome, error) {
-	if err := credepoch.GuardTx(ctx, tx, req.userID, req.credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, req.userID, req.credentialEpoch); err != nil {
 		return Role{}, mfaenforce.Unconfirmed, err
 	}
 	if err := applyGuardLockTimeout(ctx, tx); err != nil {
@@ -1816,7 +1816,7 @@ func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID, toke
 	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return err
 	}
-	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
 		return roleGuardError(ctx, tx, serverID, err)
 	}
 	if err := h.requireRoleMutationPermissionTx(ctx, tx, serverID, userID, PermManageRoles); err != nil {
@@ -3273,7 +3273,7 @@ func (h *Handler) DeleteCategoryOverride(c *gin.Context) {
 }
 
 func (h *Handler) deleteChannelOverrideTx(ctx context.Context, tx *sql.Tx, serverID, userID, tokenEpoch, channelID, overrideID string) ([]keyrotation.Rotation, map[string][]string, error) {
-	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
 		return nil, nil, err
 	}
 	if _, err := h.resolveManageChannelsTx(ctx, tx, serverID, userID); err != nil {
@@ -3486,7 +3486,7 @@ func (h *Handler) enableChannelPermissionSyncTx(
 	tx *sql.Tx,
 	req channelSyncRequest,
 ) ([]keyrotation.Rotation, map[string][]string, error) {
-	if err := credepoch.GuardTx(ctx, tx, req.userID, req.credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, req.userID, req.credentialEpoch); err != nil {
 		return nil, nil, err
 	}
 	if err := revalidateChannelPermissionSyncTx(ctx, tx, req.serverID, req.channelID, *req.categoryID, req.isVoice); err != nil {
@@ -3554,7 +3554,7 @@ func replaceChannelOverridesForSyncTx(ctx context.Context, tx *sql.Tx, channelID
 func (h *Handler) disableChannelPermissionSync(ctx context.Context, serverID, channelID, userID, tokenEpoch string) (PresenceRecheckPlan, error) {
 	return h.withAuthorityCapture(ctx, serverID, []string{channelID}, nil,
 		func(ctx context.Context, tx *sql.Tx) error {
-			if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+			if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
 				return err
 			}
 			if _, err := h.resolveManageChannelsTx(ctx, tx, serverID, userID); err != nil {
@@ -3603,7 +3603,7 @@ func (h *Handler) deleteCategoryOverrideWithCapture(
 ) (PresenceRecheckPlan, []string, error) {
 	return h.withStableSyncedCategoryAuthority(ctx, authority.serverID, authority.categoryID,
 		func(ctx context.Context, tx *sql.Tx, lockedChannelIDs []string) error {
-			if err := credepoch.GuardTx(ctx, tx, authority.userID, authority.credentialEpoch); err != nil {
+			if err := credepoch.GuardFamilyTx(ctx, tx, authority.userID, authority.credentialEpoch); err != nil {
 				return err
 			}
 			if _, err := h.resolveManageChannelsTx(ctx, tx, authority.serverID, authority.userID); err != nil {

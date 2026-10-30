@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 )
 
@@ -150,6 +151,8 @@ type hubTestSetup struct {
 	convID string
 	user1  uuid.UUID
 	user2  uuid.UUID
+	// identities caches each user's live frame identity; see live_identity_test.go.
+	identities map[uuid.UUID]loginfamily.AccessIdentity
 }
 
 func setupEpochTest(t *testing.T, seedKey, seedRevocation bool) *hubTestSetup {
@@ -251,7 +254,7 @@ func TestHandleDMMessageCurrentEpochAccepted(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleDMMessage(msg)
+	setup.hub.handleDMMessage(setup.live(t, msg))
 
 	resp := readClientMsg(t, setup.client)
 	assert.NotEqual(t, "error", resp["type"], "message should be accepted, not an error")
@@ -298,7 +301,7 @@ func TestHandleDMMessageRemovedGroupParticipantCannotUseAdvertisedSuccessorEpoch
 	)
 	require.NoError(t, err)
 
-	setup.hub.handleDMMessage(IncomingMessage{
+	setup.hub.handleDMMessage(setup.live(t, IncomingMessage{
 		Type:     msgTypeDM,
 		UserID:   setup.user1,
 		ClientID: setup.client.ID,
@@ -307,7 +310,7 @@ func TestHandleDMMessageRemovedGroupParticipantCannotUseAdvertisedSuccessorEpoch
 			keyContent:        "ciphertext from removed participant",
 			keyKeyVersion:     float64(2),
 		},
-	})
+	}))
 
 	response := readClientMsg(t, setup.client)
 	require.Equal(t, "error", response["type"])
@@ -400,7 +403,7 @@ func TestHandleDMMessagePlaintextAcceptedWithKeyVersion(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleDMMessage(msg)
+	setup.hub.handleDMMessage(setup.live(t, msg))
 
 	resp := readClientMsg(t, setup.client)
 	assert.NotEqual(t, "error", resp["type"], "DM with valid key_version should be accepted under E2EE-everywhere")

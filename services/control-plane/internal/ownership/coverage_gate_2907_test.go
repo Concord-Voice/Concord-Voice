@@ -27,7 +27,7 @@ func TestOwnershipWritersRequireAuthorityCoordinator(t *testing.T) {
 	require.NoError(t, err)
 	h := &Handler{db: db, log: logger.New("coverage-ownership"), hub: nil}
 
-	err = h.executeTransfer(context.Background(), serverID, transferID, owner.String(), target.String())
+	err = h.executeTransfer(dbtest.ActorContext(context.Background(), t, db, owner.String()), serverID, transferID, owner.String(), target.String())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "authority coordinator unavailable")
 

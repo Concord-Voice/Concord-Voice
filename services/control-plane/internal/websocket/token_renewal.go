@@ -2,9 +2,6 @@ package websocket
 
 import (
 	"context"
-	"database/sql"
-	"errors"
-	"fmt"
 	"log"
 	"time"
 
@@ -16,8 +13,8 @@ import (
 // every 14 minutes, so without renewal every idle socket reconnected on that
 // cadence. A renewal frame carries the rotated token over the open socket;
 // the deadline moves only when the token passes the same gate as the
-// handshake AND belongs to this socket's user, credential epoch and refresh
-// lineage. Any failure leaves the old deadline in force, and the socket then
+// handshake AND belongs to this socket's user, family and credential
+// epoch. Any failure leaves the old deadline in force, and the socket then
 // closes and reconnects exactly as before. Spec:
 // [internal]specs/2026-10-22-control-ws-token-renewal-design.md.
 
@@ -25,7 +22,7 @@ const (
 	authRenewMessageType = "auth_renew"
 
 	// tokenRenewalTimeout bounds every round-trip of one renewal (blacklist,
-	// live state, epoch fence, lineage, revocation re-check). It runs on the
+	// live state, epoch fence, family re-check). It runs on the
 	// socket's read goroutine, so this is also the longest a renewal can stall
 	// reads; pongWait (60s) and the client's 60s refresh lead absorb it. The
 	// Redis calls honour it only because the production client sets
@@ -45,12 +42,10 @@ var (
 	authRenewRejectedFrame = []byte(`{"type":"auth_renew_result","data":{"ok":false}}`)
 )
 
-// tokenRenewalAuthority is the narrow slice of Handler a socket needs to
+// tokenValidator is the narrow slice of Handler a socket needs to
 // renew. nil on a Client disables renewal (fail closed).
-type tokenRenewalAuthority interface {
+type tokenValidator interface {
 	validateAccessToken(ctx context.Context, token string) (accessTokenAuth, error)
-	sessionPredecessor(ctx context.Context, userID uuid.UUID, sessionID string) (string, error)
-	sessionRevoked(ctx context.Context, userID uuid.UUID, sessionID string) (bool, error)
 }
 
 // sessionRebind asks Hub.Run to move a client to its successor refresh
@@ -60,52 +55,6 @@ type sessionRebind struct {
 	client    *Client
 	sessionID string
 	done      chan struct{}
-}
-
-var errSessionNotFound = errors.New("session not found")
-
-// sessionPredecessor returns the refresh session a live (unrevoked) session
-// rotated from. Every refresh mints a new sid whose predecessor_id is the old
-// one, so this is the only link between the socket's sid and a rotated token.
-func (h *Handler) sessionPredecessor(ctx context.Context, userID uuid.UUID, sessionID string) (string, error) {
-	sid, err := uuid.Parse(sessionID)
-	if err != nil {
-		return "", errSessionNotFound
-	}
-	var predecessor sql.NullString
-	err = h.db.QueryRowContext(ctx,
-		`SELECT predecessor_id FROM refresh_tokens WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
-		sid, userID).Scan(&predecessor)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", errSessionNotFound
-	}
-	if err != nil {
-		return "", fmt.Errorf("session lineage lookup: %w", err)
-	}
-	if !predecessor.Valid {
-		return "", nil
-	}
-	return predecessor.String, nil
-}
-
-// sessionRevoked reports whether a refresh session is revoked. A missing row
-// counts as revoked; a non-uuid sid is revoked with errSessionNotFound.
-func (h *Handler) sessionRevoked(ctx context.Context, userID uuid.UUID, sessionID string) (bool, error) {
-	sid, err := uuid.Parse(sessionID)
-	if err != nil {
-		return true, errSessionNotFound
-	}
-	var revoked bool
-	err = h.db.QueryRowContext(ctx,
-		`SELECT revoked_at IS NOT NULL FROM refresh_tokens WHERE id = $1 AND user_id = $2`,
-		sid, userID).Scan(&revoked)
-	if errors.Is(err, sql.ErrNoRows) {
-		return true, nil
-	}
-	if err != nil {
-		return true, fmt.Errorf("session revocation lookup: %w", err)
-	}
-	return revoked, nil
 }
 
 // tokenDeadline is the socket's current authority deadline.
@@ -121,7 +70,7 @@ func (c *Client) tokenDeadline() time.Time {
 func (c *Client) extendDeadline(exp time.Time) bool {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if c.tokenExpiryStopped || !time.Now().Before(c.TokenExpiresAt) || !exp.After(c.TokenExpiresAt) {
+	if c.securityTerminal.Load() || c.tokenExpiryStopped || !time.Now().Before(c.TokenExpiresAt) || !exp.After(c.TokenExpiresAt) {
 		return false
 	}
 	c.TokenExpiresAt = exp
@@ -133,7 +82,7 @@ func (c *Client) extendDeadline(exp time.Time) bool {
 func (c *Client) deadlineAccepts(exp time.Time) bool {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	return !c.tokenExpiryStopped && time.Now().Before(c.TokenExpiresAt) && exp.After(c.TokenExpiresAt)
+	return !c.securityTerminal.Load() && !c.tokenExpiryStopped && time.Now().Before(c.TokenExpiresAt) && exp.After(c.TokenExpiresAt)
 }
 
 // stopTokenExpiry stops the expiry timer for teardown. Once stopped, a timer
@@ -153,7 +102,7 @@ func (c *Client) stopTokenExpiry() {
 func (c *Client) rearmTokenExpiry() bool {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if c.tokenExpiryStopped {
+	if c.securityTerminal.Load() || c.tokenExpiryStopped {
 		return true
 	}
 	remaining := time.Until(c.TokenExpiresAt)
@@ -239,15 +188,15 @@ func (c *Client) admitRenewalAttempt(now time.Time) bool {
 }
 
 // verifyRenewalToken checks that the token passes the handshake gate and
-// belongs to this socket's user, credential epoch and refresh lineage. It
+// belongs to this socket's user, family and credential epoch. It
 // returns the token's canonical sid.
-func (c *Client) verifyRenewalToken(ctx context.Context, token, ownSID string) (accessTokenAuth, string, bool) {
+func (c *Client) verifyRenewalToken(ctx context.Context, token string) (accessTokenAuth, string, bool) {
 	verified, err := c.renewAuthority.validateAccessToken(ctx, token)
 	if err != nil {
 		c.logRenewalRefused("invalid")
 		return accessTokenAuth{}, "", false
 	}
-	if verified.UserID != c.UserID {
+	if verified.UserID != c.UserID || c.securityTerminal.Load() {
 		c.logRenewalRefused("mismatch_user")
 		return accessTokenAuth{}, "", false
 	}
@@ -260,26 +209,17 @@ func (c *Client) verifyRenewalToken(ctx context.Context, token, ownSID string) (
 		c.logRenewalRefused("mismatch_session")
 		return accessTokenAuth{}, "", false
 	}
-	if tokenSID == ownSID {
-		return verified, tokenSID, true
-	}
-	predecessor, err := c.renewAuthority.sessionPredecessor(ctx, c.UserID, tokenSID)
-	if err != nil && !errors.Is(err, errSessionNotFound) {
-		c.logRenewalRefused("unavailable")
+	if c.FamilyID == uuid.Nil || verified.FamilyID != c.FamilyID {
+		c.logRenewalRefused("mismatch_family")
 		return accessTokenAuth{}, "", false
 	}
-	if err != nil || canonicalSessionID(predecessor) != ownSID {
-		c.logRenewalRefused("mismatch_session")
-		return accessTokenAuth{}, "", false
-	}
+
 	return verified, tokenSID, true
 }
 
-// rebindRenewedSession moves the socket to its successor sid on Hub.Run. Rebind
-// first, then re-check revocation (the #2414 ordering): a revocation that
-// committed before the check is seen there; one that commits after it sends
-// DisconnectSession for the new sid, which Run services after this rebind and
-// so sweeps this socket.
+// rebindRenewedSession moves the socket to another SID in its family on Hub.Run.
+// Rebind first, then resolve the exact family again. A terminal commit before
+// that check is denied; one after it schedules the same immutable family sweep.
 func (c *Client) rebindRenewedSession(ctx context.Context, sid string) bool {
 	rebind := sessionRebind{client: c, sessionID: sid, done: make(chan struct{})}
 	select {
@@ -291,7 +231,7 @@ func (c *Client) rebindRenewedSession(ctx context.Context, sid string) bool {
 	}
 	select {
 	case <-rebind.done:
-		return true
+		return !c.securityTerminal.Load()
 	case <-ctx.Done():
 		// Run took the rebind but has not applied it; which sid owns the
 		// socket is unknown, so it cannot be proven live.
@@ -304,10 +244,10 @@ func (c *Client) rebindRenewedSession(ctx context.Context, sid string) bool {
 // deadline moves last, after the session is rebound and re-checked, so an
 // extended deadline never exists for a session whose revocation is unproven.
 func (c *Client) renewToken(token string) bool {
-	if c.renewAuthority == nil || c.Hub == nil || !c.admitRenewalAttempt(time.Now()) {
+	if c.securityTerminal.Load() || c.renewAuthority == nil || c.Hub == nil || !c.admitRenewalAttempt(time.Now()) {
 		return false
 	}
-	// A legacy socket with no refresh session has no lineage to prove.
+	// An absent SID cannot establish family authority.
 	ownSID := canonicalSessionID(c.SessionID)
 	if ownSID == "" {
 		c.logRenewalRefused("mismatch_session")
@@ -324,7 +264,7 @@ func (c *Client) renewToken(token string) bool {
 		}
 	}()
 
-	verified, tokenSID, ok := c.verifyRenewalToken(ctx, token, ownSID)
+	verified, tokenSID, ok := c.verifyRenewalToken(ctx, token)
 	if !ok {
 		return false
 	}
@@ -335,13 +275,16 @@ func (c *Client) renewToken(token string) bool {
 	if tokenSID != ownSID && !c.rebindRenewedSession(ctx, tokenSID) {
 		return false
 	}
-	// The same-sid path is re-checked too, so acceptance never rests on every
-	// mint site issuing a fresh sid.
-	revoked, err := c.renewAuthority.sessionRevoked(ctx, c.UserID, tokenSID)
-	if err != nil || revoked {
+	// Repeat the shared gate after Run's rebind. Both SID paths must still
+	// resolve the exact immutable family; no retained refresh row is required.
+	final, err := c.renewAuthority.validateAccessToken(ctx, token)
+	if err != nil || final.UserID != verified.UserID || final.FamilyID != verified.FamilyID ||
+		final.CredEpoch != verified.CredEpoch || canonicalSessionID(final.SessionID) != tokenSID ||
+		!final.ExpiresAt.Equal(verified.ExpiresAt) {
 		c.failRenewalClosed("revoked_or_unavailable")
 		return false
 	}
+
 	if !c.extendDeadline(verified.ExpiresAt) {
 		// The old deadline passed during the round trips; the socket closes at
 		// it, exactly as an unrenewed one does.

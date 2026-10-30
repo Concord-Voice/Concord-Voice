@@ -98,6 +98,9 @@ type AttestedKey struct {
 	Environment Environment
 }
 
+// maxX5C bounds the chain: Apple sends leaf + one intermediate (RT-F3).
+const maxX5C = 4
+
 type attestationObject struct {
 	Fmt     string `cbor:"fmt"`
 	AttStmt struct {
@@ -153,7 +156,7 @@ func (v *Verifier) VerifyAttestation(keyID, attestation, clientDataHash []byte) 
 		return AttestedKey{}, ErrClientDataHash
 	}
 	var obj attestationObject
-	if err := cbor.Unmarshal(attestation, &obj); err != nil || obj.Fmt != "apple-appattest" || len(obj.AttStmt.X5C) < 2 {
+	if err := cbor.Unmarshal(attestation, &obj); err != nil || obj.Fmt != "apple-appattest" || len(obj.AttStmt.X5C) < 2 || len(obj.AttStmt.X5C) > maxX5C {
 		return AttestedKey{}, ErrFormat
 	}
 

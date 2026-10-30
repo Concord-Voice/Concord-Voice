@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -141,11 +142,14 @@ func TestClearReapPinsReadCommittedAgainstARepeatableReadDefault(t *testing.T) {
 					t.Errorf("rollback dm key table blocker: %v", rollbackErr)
 				}
 			}()
+			creatorCtx := actorCtx(context.Background(), t, db, creator)
+			creatorIdentity, ok := loginfamily.AccessIdentityFromContext(creatorCtx)
+			require.True(t, ok)
 			_, err = blocker.Exec(`LOCK TABLE dm_channel_keys IN ACCESS EXCLUSIVE MODE`)
 			require.NoError(t, err)
 			addDone := make(chan error, 1)
 			go func() {
-				_, addErr := h.addMemberTx(context.Background(), conv, newcomer, creator, "", preflight)
+				_, addErr := h.addMemberTx(creatorCtx, conv, newcomer, creator, creatorIdentity.CredentialEpoch, preflight)
 				addDone <- addErr
 			}()
 			redteamWaitFor(t, db, "addMemberTx blocked holding the parent lock", `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid

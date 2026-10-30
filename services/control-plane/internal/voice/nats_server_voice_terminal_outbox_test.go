@@ -411,7 +411,7 @@ func TestServerVoiceTerminalOutbox_AckFailureStillBroadcastsCountsAfterLocalLeav
 	installServerVoiceTerminalAckFailureForOperation(t, ts.DB, op)
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 	synchronizeVoiceWireClient(t, conn)
 
@@ -447,12 +447,12 @@ func TestServerVoiceTerminalOutbox_AccountErasureCancelsPendingLeave(t *testing.
 	insertServerVoiceTerminalOutbox(t, ts.DB, uuid.MustParse(channelID), uuid.MustParse(erasedUser.ID), uuid.MustParse(serverID), op)
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 	synchronizeVoiceWireClient(t, conn)
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
-	require.NoError(t, svc.DeleteAccount(context.Background(), erasedUser.ID))
+	require.NoError(t, svc.DeleteAccount(testdb.ActorContext(context.Background(), t, ts.DB, erasedUser.ID), erasedUser.ID))
 
 	sub := newTestSubscriberWithHub(ts, hub)
 	require.NoError(t, sub.DrainServerVoiceTerminalOutboxCandidateForTest(context.Background(), uuid.MustParse(channelID), uuid.MustParse(erasedUser.ID), op))
@@ -477,7 +477,7 @@ func TestServerVoiceTerminalOutbox_StaleOperationCannotSettleReplacement(t *test
 	require.NoError(t, err)
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 	synchronizeVoiceWireClient(t, conn)
 	sub := newTestSubscriberWithHub(ts, hub)
@@ -542,7 +542,7 @@ func TestServerVoiceTerminalOutbox_SuccessorSuppressesAndSettles(t *testing.T) {
 	insertServerVoiceTerminalOutbox(t, ts.DB, uuid.MustParse(channelID), uuid.MustParse(user.ID), uuid.MustParse(serverID), operationID)
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 	synchronizeVoiceWireClient(t, conn)
 	sub := newTestSubscriberWithHub(ts, hub)
@@ -600,7 +600,7 @@ func TestServerVoiceTerminalOutbox_FullQueueReschedulesThenNewHubDelivers(t *tes
 	assert.True(t, due.After(time.Now()), "full local queue must reschedule the obligation")
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 	synchronizeVoiceWireClient(t, conn)
 	sub = newTestSubscriberWithHub(ts, hub)
@@ -635,7 +635,7 @@ func TestServerVoiceTerminalOutbox_HeldLifecycleLockRetainsThenDelivers(t *testi
 	require.NoError(t, tx.Commit())
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 	synchronizeVoiceWireClient(t, conn)
 	sub = newTestSubscriberWithHub(ts, hub)
@@ -658,7 +658,7 @@ func TestServerVoiceTerminalOutbox_MissingChannelSettlesAndBroadcastsCounts(t *t
 	require.NoError(t, err, "the terminal obligation must outlive its channel parent")
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	subscribeVoiceWireServer(t, conn, serverID)
 	sub := newTestSubscriberWithHub(ts, hub)
 	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 1)
@@ -699,8 +699,8 @@ func TestServerVoiceTerminalOutbox_FiltersServerSubscribersByChannelView(t *test
 	insertServerVoiceTerminalOutbox(t, ts.DB, uuid.MustParse(channelID), uuid.MustParse(user.ID), uuid.MustParse(serverID), op)
 
 	hub, baseURL := newVoiceReplicaHub(t, ts)
-	allowedConn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, allowed)
-	deniedConn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, denied)
+	allowedConn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, allowed)
+	deniedConn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, denied)
 	for _, conn := range []*gorillaWS.Conn{allowedConn, deniedConn} {
 		require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
 		synchronizeVoiceWireClient(t, conn)

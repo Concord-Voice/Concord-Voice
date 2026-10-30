@@ -3,14 +3,23 @@
 package privacy_test
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/stmthook"
 )
 
 // TestEraseAccount_Integration_HappyPath performs a full end-to-end erasure:
@@ -121,37 +130,224 @@ func TestEraseAccount_Integration_IgnoresUnknownClientId(t *testing.T) {
 	assert.Equal(t, 0, userRows, "user must be deleted even when body has unknown clientId field")
 }
 
-// TestEraseAccount_Integration_404OnMissingUser calls the erasure endpoint with
-// a JWT that references a user UUID that does not exist in the database.
-// The handler must return 404; no audit row must be written (nothing was erased).
-func TestEraseAccount_Integration_404OnMissingUser(t *testing.T) {
+// A correctly signed token loses principal authority when the user disappears
+// before real AuthRequired admission; this case covers the generic 401.
+func TestEraseAccount_Integration_401OnMissingPrincipalBeforeAdmission(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "ghostuser")
+	foreign := ts.CreateTestUser(t, "eraseforeign")
+	requireLiveErasureFamily(t, ts, user.AccessToken)
+	_, err := ts.DB.ExecContext(t.Context(), `DELETE FROM users WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+	before := erasureFailureState(t, ts, foreign.ID)
+	requireErasureTokensUnblacklisted(t, ts, user.AccessToken, foreign.AccessToken)
 
-	// Build a JWT for a ghost user that was never inserted into `users`.
-	ghostUser := ts.CreateTestUser(t, "ghostuser")
-	// Delete the row directly so the JWT is valid but the account is gone.
-	_, err := ts.DB.Exec(`DELETE FROM users WHERE id = $1`, ghostUser.ID)
-	require.NoError(t, err, "failed to pre-delete ghost user row")
+	w := ts.DoRequest(http.MethodPost, "/api/v1/privacy/erase-account", map[string]interface{}{}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.JSONEq(t, `{"error":"Authentication required"}`, w.Body.String())
+	assert.Empty(t, w.Result().Cookies(), "failed admission must not emit success cookies")
+	assert.True(t, reflect.DeepEqual(before, erasureFailureState(t, ts, foreign.ID)), "failed erasure changed durable family/audit/foreign state")
+	requireErasureTokensUnblacklisted(t, ts, user.AccessToken, foreign.AccessToken)
+	var exists bool
+	require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)`, user.ID).Scan(&exists))
+	assert.False(t, exists)
+}
 
-	auditBefore := 0
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM account_deletions`,
-	).Scan(&auditBefore))
+// The handler's separate 404 is reachable after actual successful family
+// admission when the principal disappears before the first erasure candidate
+// read. Only the router's pool is hooked; the deletion uses the ordinary pool.
+func TestEraseAccount_Integration_404OnMissingUserAfterAdmission(t *testing.T) {
+	hook, routerDB := stmthook.Open(t)
+	ts := testhelpers.SetupTestServerWithRouterDB(t, routerDB)
+	user := ts.CreateTestUser(t, "erasedafterauth")
+	foreign := ts.CreateTestUser(t, "eraseforeignrace")
+	claims := requireLiveErasureFamily(t, ts, user.AccessToken)
+	before := erasureFailureState(t, ts, foreign.ID)
+	requireErasureTokensUnblacklisted(t, ts, user.AccessToken, foreign.AccessToken)
+	admitted := false
+	require.NoError(t, hook.ArmAdmission(user.ID, claims.SessionID, func() error { admitted = true; return nil }))
+	const candidateQuery = `SELECT DISTINCT dvp.user_id
+		FROM dm_conversations c
+		JOIN dm_voice_participants dvp ON dvp.conversation_id = c.id
+		WHERE c.created_by = $1 AND dvp.user_id <> $1
+		ORDER BY dvp.user_id
+		LIMIT $2`
+	hook.ArmArg([]string{candidateQuery}, user.ID, func() error {
+		// This exact successful auth transaction must precede the candidate query.
+		if !admitted {
+			return fmt.Errorf("candidate read preceded successful authentication")
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		result, err := ts.DB.ExecContext(ctx, `DELETE FROM users WHERE id=$1`, user.ID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return fmt.Errorf("candidate hook deleted %d principals, want one", rows)
+		}
+		return nil
+	}, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/privacy/erase-account", strings.NewReader(`{}`)).WithContext(ctx)
+	req.Header = testhelpers.AuthHeaders(user.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	ts.Router.ServeHTTP(w, req)
+	seen, betweenErr := hook.Report()
+	require.Equal(t, 1, seen, "this request must reach its first erasure candidate query")
+	require.NoError(t, betweenErr)
+	admission := hook.AdmissionReport()
+	require.Equal(t, 1, admission.Fired)
+	require.True(t, admission.Completed)
+	require.False(t, admission.Pending || admission.Running)
+	require.NoError(t, admission.CallbackErr)
+	require.Equal(t, http.StatusNotFound, w.Code)
+	assert.JSONEq(t, `{"error":"account not found"}`, w.Body.String())
+	assert.Empty(t, w.Result().Cookies(), "failed erasure must not emit success cookies")
+	assert.True(t, reflect.DeepEqual(before, erasureFailureState(t, ts, foreign.ID)), "failed erasure changed durable family/audit/foreign state")
+	requireErasureTokensUnblacklisted(t, ts, user.AccessToken, foreign.AccessToken)
+	var exists bool
+	require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)`, user.ID).Scan(&exists))
+	assert.False(t, exists, "the ordinary-pool race deletion must be durable")
+}
 
-	w := ts.DoRequest(
-		http.MethodPost,
-		"/api/v1/privacy/erase-account",
-		map[string]interface{}{},
-		testhelpers.AuthHeaders(ghostUser.AccessToken),
-	)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+// A login revoked after its request passed admission must not erase the
+// account: session revocation rotates no epoch, so erasure revalidates the
+// family under the users lock and answers 401.
+func TestEraseAccount_Integration_401OnFamilyRevokedAfterAdmission(t *testing.T) {
+	hook, routerDB := stmthook.Open(t)
+	ts := testhelpers.SetupTestServerWithRouterDB(t, routerDB)
+	user := ts.CreateTestUser(t, "erasedrevokedauth")
+	claims := requireLiveErasureFamily(t, ts, user.AccessToken)
+	admitted := false
+	require.NoError(t, hook.ArmAdmission(user.ID, claims.SessionID, func() error { admitted = true; return nil }))
+	const candidateQuery = `SELECT DISTINCT dvp.user_id
+		FROM dm_conversations c
+		JOIN dm_voice_participants dvp ON dvp.conversation_id = c.id
+		WHERE c.created_by = $1 AND dvp.user_id <> $1
+		ORDER BY dvp.user_id
+		LIMIT $2`
+	hook.ArmArg([]string{candidateQuery}, user.ID, func() error {
+		if !admitted {
+			return fmt.Errorf("candidate read preceded successful authentication")
+		}
+		return revokeErasureSession(t.Context(), ts, user.AccessToken)
+	}, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/privacy/erase-account", strings.NewReader(`{}`)).WithContext(ctx)
+	req.Header = testhelpers.AuthHeaders(user.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	ts.Router.ServeHTTP(w, req)
+	seen, betweenErr := hook.Report()
+	require.Equal(t, 1, seen, "this request must reach its first erasure candidate query")
+	require.NoError(t, betweenErr)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.JSONEq(t, `{"error":"authentication required"}`, w.Body.String())
+	var exists bool
+	require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)`, user.ID).Scan(&exists))
+	assert.True(t, exists, "a revoked requester must not erase the account")
+}
 
-	// No audit row must be written — nothing happened.
-	var auditAfter int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM account_deletions`,
-	).Scan(&auditAfter))
-	assert.Equal(t, auditBefore, auditAfter, "no audit row must be written when user was not found")
+// revokeErasureSession logs out the token's session family the way the
+// session-revocation writers do.
+func revokeErasureSession(ctx context.Context, ts *testhelpers.TestServer, accessToken string) (err error) {
+	claims, err := auth.ValidateAccessToken(accessToken, ts.Config.JWTSecret)
+	if err != nil {
+		return err
+	}
+	userID, err := uuid.Parse(claims.UserID)
+	if err != nil {
+		return err
+	}
+	sid, err := uuid.Parse(claims.SessionID)
+	if err != nil {
+		return err
+	}
+	tx, err := ts.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	locked, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{userID}, loginfamily.UserNoKeyUpdate)
+	if err != nil {
+		return err
+	}
+	authority, err := locked.ForUser(userID)
+	if err != nil {
+		return err
+	}
+	targets, err := loginfamily.ResolveTargetSIDTx(ctx, tx, authority, sid)
+	if err != nil {
+		return err
+	}
+	if _, err = loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeSession, Reason: loginfamily.ReasonLogout}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func requireLiveErasureFamily(t *testing.T, ts *testhelpers.TestServer, accessToken string) *auth.Claims {
+	t.Helper()
+	claims, err := auth.ValidateAccessToken(accessToken, ts.Config.JWTSecret)
+	require.NoError(t, err)
+	userID, err := uuid.Parse(claims.UserID)
+	require.NoError(t, err)
+	sid, err := uuid.Parse(claims.SessionID)
+	require.NoError(t, err)
+	require.NotNil(t, claims.ExpiresAt)
+	_, err = loginfamily.ResolveVerifiedAccess(t.Context(), ts.DB, loginfamily.AccessIdentity{
+		UserID: userID, SID: sid, CredentialEpoch: claims.CredentialEpoch, AccessExpiresAt: claims.ExpiresAt.Time,
+	})
+	require.NoError(t, err, "real family authority must be live before dispatch")
+	return claims
+}
+
+// Snapshot complete durable family records, the audit count and the unrelated
+// principal/refresh records: a uniform refusal alone cannot prove no mutation.
+func erasureFailureState(t *testing.T, ts *testhelpers.TestServer, foreignID string) map[string]string {
+	t.Helper()
+	state := make(map[string]string)
+	for _, table := range []string{"login_family_rollout", "login_families", "login_family_sids", "login_family_revocations", "login_family_revocation_targets"} {
+		var snapshot string
+		require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY to_jsonb(s)::text)::text, '[]') FROM `+table+` s`).Scan(&snapshot))
+		state[table] = snapshot
+	}
+	var audit string
+	require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT COUNT(*)::text FROM account_deletions`).Scan(&audit))
+	state["audit"] = audit
+	var foreignUser, foreignRefresh string
+	require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT to_jsonb(u)::text FROM users u WHERE id=$1`, foreignID).Scan(&foreignUser))
+	require.NoError(t, ts.DB.QueryRowContext(t.Context(), `SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY r.id)::text, '[]') FROM refresh_tokens r WHERE user_id=$1`, foreignID).Scan(&foreignRefresh))
+	state["foreign_user"], state["foreign_refresh"] = foreignUser, foreignRefresh
+	return state
+}
+
+func requireErasureTokensUnblacklisted(t *testing.T, ts *testhelpers.TestServer, tokens ...string) {
+	t.Helper()
+	for _, token := range tokens {
+		claims, err := auth.ValidateAccessToken(token, ts.Config.JWTSecret)
+		require.NoError(t, err)
+		require.NotEmpty(t, claims.ID)
+		count, err := ts.Redis.Exists(t.Context(), "blacklist:"+claims.ID).Result()
+		require.NoError(t, err)
+		assert.Zero(t, count, "failed erasure must not blacklist an access token")
+	}
 }
 
 // TestEraseAccount_Integration_AuditTableHasNoSentryColumn pins the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,9 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 )
 
@@ -38,30 +39,25 @@ func NewWSTicketHandler(redisClient *redis.Client, jwtSecret string) *WSTicketHa
 
 // IssueTicket creates a short-lived single-use ticket for WebSocket auth.
 // The caller must already be authenticated (AuthRequired middleware).
-// Optionally accepts X-Session-ID header to associate the WebSocket connection
-// with a specific refresh token session (for targeted session revocation).
+// The SID comes only from the verified middleware identity.
 //
 // The stored value carries the issue-time credential epoch (#2201) — read from
-// the request's own already-verified claims, never a second store round-trip —
+// the request's copied verified identity after a fresh family-authority check —
 // so redemption can enforce the same epoch semantics as HTTP bearer auth: a
 // ticket minted before a destructive credential reset must not upgrade after it.
 func (h *WSTicketHandler) IssueTicket(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": wsTicketAuthRequired})
+	identity, _, err := middleware.RecheckVerifiedAccess(c)
+	if err != nil {
+		status, message := http.StatusUnauthorized, wsTicketAuthRequired
+		if errors.Is(err, loginfamily.ErrUnavailable) {
+			status, message = http.StatusServiceUnavailable, "Authentication temporarily unavailable"
+		} else if !errors.Is(err, loginfamily.ErrDenied) {
+			status = http.StatusInternalServerError
+		}
+		c.JSON(status, gin.H{"error": message})
 		return
 	}
-	claimsValue, _ := c.Get(middleware.JWTClaimsContextKey)
-	claims, ok := claimsValue.(jwt.MapClaims)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": wsTicketAuthRequired})
-		return
-	}
-	expiresAt, err := claims.GetExpirationTime()
-	if err != nil || expiresAt == nil || !h.now().Before(expiresAt.Time) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": wsTicketAuthRequired})
-		return
-	}
+	expiresAt := identity.AccessExpiresAt
 
 	// Generate a random ticket
 	b := make([]byte, wsTicketBytes)
@@ -71,27 +67,10 @@ func (h *WSTicketHandler) IssueTicket(c *gin.Context) {
 	}
 	ticket := hex.EncodeToString(b)
 
-	// Store userID:sessionID:credEpoch:expiresAt in Redis. sessionID is the authenticated
-	// access token's `sid` claim (#2201) — the server-verified refresh-session
-	// id, so DisconnectSession can evict this ticket socket on revocation. The
-	// client-supplied X-Session-ID header is a spoofable fallback used ONLY for a
-	// legacy token minted without a `sid` (a single 30s deploy window); a
-	// patched client cannot register its socket under an empty/foreign session to
-	// dodge targeted disconnect. credEpoch is the requester's cred_epoch claim
-	// ("" until the user's first rotation). UUIDs and hex epochs contain no ':',
-	// so the four-segment parse in ValidateTicket is unambiguous — and a
-	// session ID containing ':' is discarded (session IDs are UUIDs; a colon
-	// would let the value shift the epoch segment, #2201).
-	sessionID := middleware.TokenSessionID(c)
-	if sessionID == "" {
-		sessionID = c.GetHeader("X-Session-ID")
-	}
-	if strings.Contains(sessionID, ":") {
-		sessionID = ""
-	}
-	value := fmt.Sprintf("%s:%s:%s:%d", userID, sessionID, middleware.TokenCredentialEpoch(c), expiresAt.Unix())
+	// Preserve the four-part single-use format; family authority is never stored in Redis.
+	value := fmt.Sprintf("%s:%s:%s:%d", identity.UserID, identity.SID, identity.CredentialEpoch, expiresAt.Unix())
+	ctx := c.Request.Context()
 
-	ctx := context.Background()
 	key := wsTicketPrefix + ticket
 	ttl := min(wsTicketTTL, expiresAt.Sub(h.now()))
 	if ttl <= 0 {

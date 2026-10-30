@@ -970,7 +970,7 @@ func (h *Handler) BlockUser(c *gin.Context) {
 		if guardErr := dmblock.LockBlockSubjectsTx(ctx, tx, []uuid.UUID{blocker, blocked}); guardErr != nil {
 			return fmt.Errorf("guard block subjects: %w", guardErr)
 		}
-		if guardErr := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); guardErr != nil {
+		if guardErr := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); guardErr != nil {
 			return fmt.Errorf("guard block credential epoch: %w", guardErr)
 		}
 		plan, blockErr := h.executeBlockTx(ctx, gated, probeSkippedGate, tx, userID, targetUserID)

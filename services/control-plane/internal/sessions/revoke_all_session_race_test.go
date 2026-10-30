@@ -29,6 +29,9 @@ const (
 type revokeAllRaceDisconnector struct{}
 
 func (revokeAllRaceDisconnector) DisconnectUser(uuid.UUID) {}
+func (revokeAllRaceDisconnector) DisconnectFamilyContext(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
 
 // TestRevokeAllSessions_ConcurrentMintDoesNotSurvive is a regression for #2457.
 // It holds a real mint after its refresh row is inserted but before commit, then
@@ -50,7 +53,7 @@ func TestRevokeAllSessions_ConcurrentMintDoesNotSurvive(t *testing.T) {
 		mintDone <- mintResult{refresh: refresh, err: err}
 	}()
 
-	assertMintIsBlockedAtInsert(t, ts.DB)
+	mintPID := assertMintIsBlockedAtInsert(t, ts.DB)
 
 	revokeDone := make(chan int, 1)
 	go func() {
@@ -67,8 +70,9 @@ func TestRevokeAllSessions_ConcurrentMintDoesNotSurvive(t *testing.T) {
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE%'
-		)`).Scan(&waiting)
+			  AND query = 'SELECT COALESCE(credential_epoch, '''') FROM users WHERE id = $1 FOR NO KEY UPDATE'
+			  AND $1 = ANY(pg_blocking_pids(pid))
+		)`, mintPID).Scan(&waiting)
 		return err == nil && waiting
 	}, time.Second, 10*time.Millisecond,
 		"revoke-all must wait on the users-row lock held by the concurrent mint")
@@ -95,6 +99,18 @@ func TestRevokeAllSessions_ConcurrentMintDoesNotSurvive(t *testing.T) {
 		`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, auth.HashRefreshToken(mint.refresh),
 	).Scan(&revokedAt))
 	require.True(t, revokedAt.Valid, "the refresh session minted during revoke-all must be revoked")
+	var owned bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS (
+  SELECT 1 FROM refresh_tokens r
+  JOIN login_family_sids s ON s.sid=r.id AND s.user_id=r.user_id
+  JOIN login_families f ON f.family_id=s.family_id AND f.user_id=s.user_id
+  JOIN login_family_revocation_targets t ON t.family_id=f.family_id AND t.user_id=f.user_id AND t.operation_id=f.auth_operation_id
+  JOIN login_family_revocations o ON o.operation_id=t.operation_id AND o.user_id=t.user_id
+  WHERE r.token_hash=$1 AND r.user_id=$2 AND r.revoked_at IS NOT NULL
+    AND f.terminal_at IS NOT NULL AND f.epoch_generation IS NULL
+    AND o.scope='user' AND o.sealed_at IS NOT NULL
+ )`, auth.HashRefreshToken(mint.refresh), user.ID).Scan(&owned))
+	require.True(t, owned, "the committed concurrent mint must belong to the revoke-all operation's sealed durable frontier")
 }
 
 type mintResult struct {
@@ -150,17 +166,20 @@ func holdRevokeAllMintBarrier(t *testing.T) func() {
 	return release
 }
 
-func assertMintIsBlockedAtInsert(t *testing.T, db *sql.DB) {
+func assertMintIsBlockedAtInsert(t *testing.T, db *sql.DB) int {
 	t.Helper()
+	var mintPID int
 	require.Eventually(t, func() bool {
-		var waiting bool
-		err := db.QueryRow(`SELECT EXISTS (
-			SELECT 1 FROM pg_stat_activity
-			WHERE datname = current_database()
-			  AND wait_event_type = 'Lock'
-			  AND wait_event = 'advisory'
-			  AND query LIKE 'INSERT INTO refresh_tokens%'
-		)`).Scan(&waiting)
-		return err == nil && waiting
+		err := db.QueryRow(`SELECT pid FROM pg_stat_activity
+   WHERE datname = current_database()
+     AND wait_event_type = 'Lock'
+     AND wait_event = 'advisory'
+     AND query LIKE 'INSERT INTO refresh_tokens%'
+     AND EXISTS (SELECT 1 FROM pg_locks l
+       WHERE l.pid=pg_stat_activity.pid AND l.locktype='advisory'
+         AND l.objid=$1::oid AND NOT l.granted)
+  `, revokeAllMintBarrierLockID).Scan(&mintPID)
+		return err == nil && mintPID > 0
 	}, time.Second, 10*time.Millisecond, "mint did not reach the refresh-token insert barrier")
+	return mintPID
 }

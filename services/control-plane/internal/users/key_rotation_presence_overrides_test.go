@@ -351,6 +351,12 @@ func TestChangePasswordRejectsPasswordThatBecameStaleWhileWaitingForUserLock(t *
 	recoveredHash, err := auth.HashPassword(recoveredPassword)
 	require.NoError(t, err)
 
+	var originalKeys, originalEpoch string
+	require.NoError(t, ts.DB.QueryRow(`SELECT to_jsonb(k)::text, COALESCE(u.credential_epoch, '')
+		FROM user_keys k JOIN users u ON u.id=k.user_id WHERE u.id=$1`, user.ID).Scan(&originalKeys, &originalEpoch))
+	var originalEjections int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id=$1`, user.ID).Scan(&originalEjections))
+
 	blocker, err := ts.DB.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = blocker.Rollback() })
@@ -359,6 +365,9 @@ func TestChangePasswordRejectsPasswordThatBecameStaleWhileWaitingForUserLock(t *
 		user.ID,
 	)
 	require.NoError(t, err)
+
+	var blockerPID int
+	require.NoError(t, blocker.QueryRow(`SELECT pg_backend_pid()`).Scan(&blockerPID))
 
 	_, wrappedKey, salt := testhelpers.E2EETestKeys()
 	response := make(chan *httptest.ResponseRecorder, 1)
@@ -385,14 +394,18 @@ func TestChangePasswordRejectsPasswordThatBecameStaleWhileWaitingForUserLock(t *
 			  AND pid <> pg_backend_pid()
 			  AND state = 'active'
 			  AND wait_event_type = 'Lock'
-			  AND (
-				query LIKE '%SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE%'
-				OR query LIKE '%SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE%'
-			  )
-		`).Scan(&waiting)
+			  AND $1 = ANY(pg_blocking_pids(pid))
+			  AND query = $2
+		`, blockerPID, `SELECT COALESCE(credential_epoch, '') FROM users WHERE id = $1 FOR NO KEY UPDATE`).Scan(&waiting)
 		return queryErr == nil && waiting > 0
 	}, 10*time.Second, 25*time.Millisecond,
 		"password-change request never reached the serialized user-row lock")
+
+	select {
+	case w := <-response:
+		t.Fatalf("password-change request completed before the recovered password was committed: %d %s", w.Code, w.Body.String())
+	default:
+	}
 
 	_, err = blocker.Exec(
 		`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
@@ -419,6 +432,16 @@ func TestChangePasswordRejectsPasswordThatBecameStaleWhileWaitingForUserLock(t *
 	require.NoError(t, err)
 	assert.True(t, matchesRecoveredPassword,
 		"stale authorization must not replace credentials committed by recovery")
+	var persistedKeys, persistedEpoch string
+	require.NoError(t, ts.DB.QueryRow(`SELECT to_jsonb(k)::text, COALESCE(u.credential_epoch, '')
+		FROM user_keys k JOIN users u ON u.id=k.user_id WHERE u.id=$1`, user.ID).Scan(&persistedKeys, &persistedEpoch))
+	assert.Equal(t, originalKeys, persistedKeys, "rejected stale credentials must not rewrap keys")
+	assert.Equal(t, originalEpoch, persistedEpoch, "rejected stale credentials must not rotate the epoch")
+	var ejections, preferences int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id=$1`, user.ID).Scan(&ejections))
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM presence_override_preferences WHERE user_id=$1`, user.ID).Scan(&preferences))
+	assert.Equal(t, originalEjections, ejections)
+	assert.Zero(t, preferences, "rejected stale credentials must not install the requested presence override")
 }
 
 func TestChangePasswordMFAReauthenticationUsesLockedTransactionConnection(t *testing.T) {
@@ -668,6 +691,7 @@ func invokeReplaceMyKeysWithHandler(
 	t *testing.T,
 	handler *users.Handler,
 	user testhelpers.TestUser,
+	beforeResponse ...func(),
 ) *httptest.ResponseRecorder {
 	t.Helper()
 	publicKey, wrappedKey, salt := testhelpers.E2EETestKeys()
@@ -682,6 +706,10 @@ func invokeReplaceMyKeysWithHandler(
 	require.NoError(t, err)
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
+	if len(beforeResponse) > 0 {
+		require.Len(t, beforeResponse, 1)
+		c.Writer = &credentialTerminalResponseWriter{ResponseWriter: c.Writer, before: beforeResponse[0]}
+	}
 	c.Set("user_id", user.ID)
 	c.Request = httptest.NewRequest(http.MethodPut, urlUsersMeKeys, bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")

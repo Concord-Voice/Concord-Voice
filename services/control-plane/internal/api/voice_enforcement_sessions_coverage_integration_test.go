@@ -4,130 +4,79 @@ package api
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"os"
-	"path"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	protocol "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voiceauthprotocol"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/mediaproof"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func openVoiceEnforcementCoverageDB(t *testing.T) *sql.DB {
-	t.Helper()
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("requires an explicitly configured isolated DATABASE_URL")
-	}
-	parsed, err := url.Parse(databaseURL)
-	require.NoError(t, err)
-	if !strings.HasSuffix(strings.TrimSuffix(path.Base(parsed.Path), "/"), "_test") {
-		t.Skip("DATABASE_URL must name an isolated *_test database")
-	}
-	db, _ := testdb.SetupTestDB(t)
-	return db
-}
-
-type voiceEnforcementCoverageCall struct {
-	request   voiceEnforcementSessionRequest
-	token     string
-	timestamp string
-	proof     string
-}
-
-func newVoiceEnforcementCoverageCall(request voiceEnforcementSessionRequest, protocolKey, token, proofContext, proofVersion string) voiceEnforcementCoverageCall {
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	var proof string
-	if proofContext == voiceEnforcementRegistrationProofContext {
-		proof = mediaproof.Sign(mediaproof.DeriveKey(protocolKey, proofContext), proofVersion, timestamp,
-			mediaproof.TokenDigest(token), request.SessionGeneration, request.NodeBootID,
-			request.RoomID, request.RoomKind, request.UserID, request.CredentialEpoch, request.SocketID)
-	} else {
-		proof = mediaproof.Sign(mediaproof.DeriveKey(protocolKey, proofContext), proofVersion, timestamp,
-			request.SessionGeneration, request.NodeBootID, request.RoomID, request.RoomKind,
-			request.UserID, request.CredentialEpoch, request.SocketID)
-	}
-	return voiceEnforcementCoverageCall{request: request, token: token, timestamp: timestamp, proof: proof}
-}
-
-func serveVoiceEnforcementCoverageRequest(t *testing.T, handler gin.HandlerFunc, method string, call voiceEnforcementCoverageCall) *httptest.ResponseRecorder {
-	t.Helper()
-	body, err := json.Marshal(call.request)
-	require.NoError(t, err)
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(method, "/api/v1/voice/enforcement-sessions", bytes.NewReader(body))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	ctx.Request.Header.Set("Authorization", "Bearer "+call.token)
-	ctx.Request.Header.Set(voiceEnforcementRegistrationTimestampHeader, call.timestamp)
-	ctx.Request.Header.Set(voiceEnforcementRegistrationProofHeader, call.proof)
-	ctx.Request.Header.Set(voiceEnforcementReleaseTimestampHeader, call.timestamp)
-	ctx.Request.Header.Set(voiceEnforcementReleaseProofHeader, call.proof)
-	ctx.Set("concord_service_hop", true)
-	ctx.Set("user_id", call.request.UserID)
-	ctx.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": call.request.CredentialEpoch})
-	handler(ctx)
-	ctx.Writer.WriteHeaderNow()
-	return recorder
-}
-
 func TestVoiceEnforcementSessionHandlersPersistAndReleaseExactRows(t *testing.T) {
-	db := openVoiceEnforcementCoverageDB(t)
-	userID := testdb.CreateUser(t, db)
-	_, channelID := setupVoiceEnforcementChannel(t, db, userID)
-	request := voiceEnforcementSessionRequest{
-		SessionGeneration: uuid.NewString(),
-		NodeBootID:        uuid.NewString(),
-		RoomID:            channelID.String(),
-		RoomKind:          "channel",
-		UserID:            userID.String(),
-		SocketID:          "coverage-socket-1",
+	r := newVoiceAuthRig(t)
+	binding := r.register(t)
+	_, channelID := setupVoiceEnforcementChannel(t, r.db, r.userID)
+	request := integrationVoiceSessionRequest(r, channelID, "channel")
+	response, signedRequest := r.request(t, protocol.EndpointRoomRegister, request, r.token)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	r.verify(t, protocol.EndpointRoomRegister, response, signedRequest, protocol.ExpectedResponse{Binding: &binding})
+	requireVoiceEnforcementRows(t, r, request, 1)
+	retry, retryRequest := r.request(t, protocol.EndpointRoomRegister, request, r.token)
+	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	r.verify(t, protocol.EndpointRoomRegister, retry, retryRequest, protocol.ExpectedResponse{Binding: &binding})
+	conflicting := request
+	conflicting.SocketID = "coverage-socket-conflict"
+	conflict, _ := r.request(t, protocol.EndpointRoomRegister, conflicting, r.token)
+	require.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+	requireVoiceEnforcementRows(t, r, request, 1)
+	release := protocol.RoomRelease{Schema: "concord.auth-room-binding", Version: 1, Binding: binding, Room: protocol.Room{SessionGeneration: request.SessionGeneration, RoomID: request.RoomID, RoomKind: request.RoomKind}}
+	wrongSocket := release
+	wrongSocket.Binding.Target.SocketID = "coverage-socket-conflict"
+	conflict, _ = r.request(t, protocol.EndpointRoomRelease, wrongSocket, "")
+	require.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+	requireVoiceEnforcementRows(t, r, request, 1)
+	for range 2 {
+		released, releaseRequest := r.request(t, protocol.EndpointRoomRelease, release, "")
+		require.Equal(t, http.StatusNoContent, released.Code, released.Body.String())
+		r.verify(t, protocol.EndpointRoomRelease, released, releaseRequest, protocol.ExpectedResponse{Binding: &binding})
 	}
-	const token = "coverage-token-3140"
-	const protocolKey = voiceEnforcementProtocolTestSecret
-	handler := newVoiceEnforcementSessionHandler(db, protocolKey)
+	requireVoiceEnforcementRows(t, r, request, 0)
+	var closures int
+	require.NoError(t, r.db.QueryRow(`SELECT count(*) FROM voice_auth_room_closures WHERE session_generation=$1`, request.SessionGeneration).Scan(&closures))
+	assert.Equal(t, 1, closures, "release retains immutable exact closure evidence")
+}
 
-	t.Run("registers exact session and accepts idempotent retry", func(t *testing.T) {
-		recorder := serveVoiceEnforcementCoverageRequest(t, handler.Register, http.MethodPost, newVoiceEnforcementCoverageCall(request, protocolKey, token, voiceEnforcementRegistrationProofContext, voiceEnforcementRegistrationProofVersion))
-		require.Equal(t, http.StatusNoContent, recorder.Code)
-
-		retry := serveVoiceEnforcementCoverageRequest(t, handler.Register, http.MethodPost, newVoiceEnforcementCoverageCall(request, protocolKey, token, voiceEnforcementRegistrationProofContext, voiceEnforcementRegistrationProofVersion))
-		assert.Equal(t, http.StatusNoContent, retry.Code)
-
-		conflicting := request
-		conflicting.SocketID = "coverage-socket-2"
-		conflict := serveVoiceEnforcementCoverageRequest(t, handler.Register, http.MethodPost, newVoiceEnforcementCoverageCall(conflicting, protocolKey, token, voiceEnforcementRegistrationProofContext, voiceEnforcementRegistrationProofVersion))
-		assert.Equal(t, http.StatusConflict, conflict.Code)
-	})
-
-	t.Run("release requires the exact session identity", func(t *testing.T) {
-		wrongSocket := request
-		wrongSocket.SocketID = "coverage-socket-2"
-		conflict := serveVoiceEnforcementCoverageRequest(t, handler.Release, http.MethodPost, newVoiceEnforcementCoverageCall(wrongSocket, protocolKey, token, voiceEnforcementReleaseProofContext, voiceEnforcementReleaseProofVersion))
-		require.Equal(t, http.StatusConflict, conflict.Code)
-
-		released := serveVoiceEnforcementCoverageRequest(t, handler.Release, http.MethodPost, newVoiceEnforcementCoverageCall(request, protocolKey, token, voiceEnforcementReleaseProofContext, voiceEnforcementReleaseProofVersion))
-		require.Equal(t, http.StatusNoContent, released.Code)
-
-		idempotent := serveVoiceEnforcementCoverageRequest(t, handler.Release, http.MethodPost, newVoiceEnforcementCoverageCall(request, protocolKey, token, voiceEnforcementReleaseProofContext, voiceEnforcementReleaseProofVersion))
-		assert.Equal(t, http.StatusNoContent, idempotent.Code)
-
-		var count int
-		require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&count))
-		assert.Zero(t, count)
-	})
+// A valid bearer and service-hop proof must not make the old epoch-only body
+// productive. The same caller's protocol-4 request succeeds as a control.
+func TestVoiceEnforcementRegisterRejectsLegacyBodyWithProductiveIdentity(t *testing.T) {
+	r := newVoiceAuthRig(t)
+	binding := r.register(t)
+	_, channelID := setupVoiceEnforcementChannel(t, r.db, r.userID)
+	request := integrationVoiceSessionRequest(r, channelID, "channel")
+	legacy := voiceEnforcementSessionRequest{SessionGeneration: request.SessionGeneration, NodeBootID: request.NodeBootID, RoomID: request.RoomID, RoomKind: request.RoomKind, UserID: r.userID.String(), CredentialEpoch: r.epoch, SocketID: request.SocketID}
+	body, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	wire, _ := r.signed(t, protocol.EndpointRoomRegister, request, r.token)
+	wire.Body = body
+	req := httptest.NewRequest(wire.Method, wire.Path, bytes.NewReader(wire.Body))
+	for _, header := range wire.Headers {
+		req.Header.Add(header.Name, header.Value)
+	}
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(voiceEnforcementRegistrationTimestampHeader, timestamp)
+	req.Header.Set(voiceEnforcementRegistrationProofHeader, mediaproof.Sign(mediaproof.DeriveKey(r.secret, voiceEnforcementRegistrationProofContext), voiceEnforcementRegistrationProofVersion, timestamp, mediaproof.TokenDigest(r.token), legacy.SessionGeneration, legacy.NodeBootID, legacy.RoomID, legacy.RoomKind, legacy.UserID, legacy.CredentialEpoch, legacy.SocketID))
+	response := httptest.NewRecorder()
+	r.router.ServeHTTP(response, req)
+	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	requireVoiceEnforcementRows(t, r, request, 0)
+	control, signedRequest := r.request(t, protocol.EndpointRoomRegister, request, r.token)
+	require.Equal(t, http.StatusOK, control.Code, control.Body.String())
+	r.verify(t, protocol.EndpointRoomRegister, control, signedRequest, protocol.ExpectedResponse{Binding: &binding})
+	requireVoiceEnforcementRows(t, r, request, 1)
 }

@@ -42,6 +42,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -177,8 +178,10 @@ func (e *pocEnv) attackerEngine(
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
+	testdb.RememberActor(t, e.ts.DB, attackerID)
 	engine.Use(func(c *gin.Context) {
 		c.Set("user_id", attackerID)
+		testdb.AttachRememberedActor(c, attackerID)
 		c.Next()
 	})
 	register(engine, h)

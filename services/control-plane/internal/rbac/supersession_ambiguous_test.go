@@ -129,7 +129,7 @@ func TestRoleMutation_AmbiguousCommitInvalidatesPermissionCache(t *testing.T) {
 			cacheKey := "perm:" + serverID + ":" + member.ID
 			testhelpers.PublishPermissionCache(t, ts.Redis, serverID, member.ID, "", rbac.PermManageRoles)
 
-			tc.invoke(t, ts, requestCtx, newAcknowledgementLostRoleHandler(t, ts, cancelRequest), owner.ID, member.ID, serverID)
+			tc.invoke(t, ts, ts.ActorContext(requestCtx, t, owner.ID), newAcknowledgementLostRoleHandler(t, ts, cancelRequest), owner.ID, member.ID, serverID)
 
 			exists, err := ts.Redis.Exists(ctx, cacheKey).Result()
 			require.NoError(t, err)
@@ -190,6 +190,7 @@ func TestUpsertChannelOverride_AmbiguousRetainedViewRechecksAuthority(t *testing
 	c.Set("user_id", owner.ID)
 	c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	ts.AttachActorIdentity(t, c, owner.ID)
 
 	h.UpsertChannelOverride(c)
 
@@ -243,6 +244,7 @@ func TestDeleteChannelOverride_AmbiguousCommitFailsClosed(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: channelID}, {Key: "override_id", Value: overrideID}}
 	c.Set("user_id", owner.ID)
 	c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+	ts.AttachActorIdentity(t, c, owner.ID)
 	h.DeleteChannelOverride(c)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
@@ -286,6 +288,7 @@ func TestCategorySyncMutations_AmbiguousCommitUseOnlyFailClosedRecovery(t *testi
 		c.Set("user_id", owner.ID)
 		c.Request = httptest.NewRequest(method, "/", bytes.NewReader(payload))
 		c.Request.Header.Set("Content-Type", "application/json")
+		ts.AttachActorIdentity(t, c, owner.ID)
 		handler(c)
 		return w
 	}
@@ -352,6 +355,7 @@ func TestUpsertCategoryOverride_RetriesWhenLockedSyncedSetChanged(t *testing.T) 
 		c.Set("user_id", owner.ID)
 		c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
 		c.Request.Header.Set("Content-Type", "application/json")
+		ts.AttachActorIdentity(t, c, owner.ID)
 		h.UpsertCategoryOverride(c)
 		completed <- w
 	}()
@@ -407,6 +411,7 @@ func TestUpsertCategoryOverride_RetriesWhenLockedVoiceSubsetChanged(t *testing.T
 		c.Set("user_id", owner.ID)
 		c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
 		c.Request.Header.Set("Content-Type", "application/json")
+		ts.AttachActorIdentity(t, c, owner.ID)
 		h.UpsertCategoryOverride(c)
 		completed <- w
 	}()

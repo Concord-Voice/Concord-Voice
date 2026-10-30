@@ -2,14 +2,13 @@ import { releaseVoiceEnforcementSession } from './voiceEnforcementSession.js';
 import type { NativeSessionVerifier, VoiceEnforcementSession } from './voiceEnforcementSession.js';
 import type { AuthenticatedSocketData } from '../middleware/auth.js';
 import { MAX_SERVER_VOICE_PARTICIPANTS } from './roomManager.js';
+import type { VoiceAuthConnections } from './voiceAuthConnection.js';
 
 type ShutdownSocket = { data: AuthenticatedSocketData };
 
 const releaseRetryBatchSize = 64;
-// A process may serve several rooms, but one full supported room is enough
-// retained release work to make a control-plane outage visible.  Overflow is
-// fail-closed: its durable control-plane rows are never released here and this
-// process stops admitting new voice sessions until operator recovery.
+// Production shares this total with the private connection+room ledger. The
+// standalone compatibility queue also refuses before invoking native/release work.
 export const VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY = MAX_SERVER_VOICE_PARTICIPANTS;
 
 // The control plane is allowed to be unavailable while local transport teardown
@@ -21,15 +20,16 @@ export class VoiceEnforcementSessionReleaseQueue {
   private readonly held = new Map<string, VoiceEnforcementSession>();
   private retrying: Promise<void> | undefined;
   private retryRequested = false;
-  private queueSaturated = false;
-  private overflowedCount = 0;
 
   constructor(
     private readonly verifyNative: NativeSessionVerifier,
-    private readonly onSaturated?: (capacity: number, overflowedCount: number) => void
+    private readonly onSaturated?: (capacity: number, overflowedCount: number) => void,
+    private readonly owner?: VoiceAuthConnections
   ) {}
 
   enqueue(session: VoiceEnforcementSession): boolean {
+    if (this.family(session)) return true;
+    if (this.owner && !this.reserveLegacy(session)) return true;
     if (this.held.has(session.sessionGeneration)) return true;
     if (this.pending.has(session.sessionGeneration)) {
       this.pending.set(session.sessionGeneration, { ...session });
@@ -49,6 +49,8 @@ export class VoiceEnforcementSessionReleaseQueue {
   // fresh signed health command.
   holdAll(sessions: Iterable<VoiceEnforcementSession>): void {
     for (const session of sessions) {
+      if (this.family(session)) continue;
+      if (this.owner && !this.reserveLegacy(session)) continue;
       if (this.held.has(session.sessionGeneration)) continue;
       if (!this.pending.has(session.sessionGeneration) && !this.reserveRetrySlot()) continue;
       this.held.set(session.sessionGeneration, { ...session });
@@ -64,6 +66,14 @@ export class VoiceEnforcementSessionReleaseQueue {
   }
 
   async releaseAfterTerminalClose(session: VoiceEnforcementSession): Promise<void> {
+    if (this.owner?.ownsSession(session)) { await this.owner.releaseRoom(session); return; }
+    if (session.connectionGeneration) throw new Error('Voice connection owner required');
+    if (this.owner) {
+      this.enqueue(session);
+      if (!this.held.has(session.sessionGeneration)) await this.owner.releaseLegacyRoom(session);
+      return;
+    }
+    this.enqueue(session);
     if (this.held.has(session.sessionGeneration)) return;
     try {
       await releaseVoiceEnforcementSession(session, this.verifyNative);
@@ -74,6 +84,10 @@ export class VoiceEnforcementSessionReleaseQueue {
   }
 
   retryPending(): Promise<void> {
+    if (this.owner) {
+      for (const session of this.pending.values()) this.owner.releaseLegacyRoom(session);
+      return this.owner.retryPending();
+    }
     this.retryRequested = true;
     if (this.retrying) return this.retrying;
     this.retrying = this.retryRequestedBatches().finally(() => {
@@ -91,26 +105,41 @@ export class VoiceEnforcementSessionReleaseQueue {
   }
 
   outstandingCount(): number {
-    // Overflowed rows deliberately remain durable control-plane obligations.
-    // Keep them in the shutdown failure count even if retained rows later drain.
-    return this.pending.size + this.held.size + this.overflowedCount;
+    // Live/provisional family parents and rooms remain liabilities even when
+    // no public socket/session snapshot can find them.
+    return this.owner?.retainedIdentityCount() ?? (this.pending.size + this.held.size);
   }
 
   saturated(): boolean {
-    return this.queueSaturated;
+    return this.outstandingCount() >= VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY;
+  }
+
+  private family(session: VoiceEnforcementSession): boolean {
+    if (this.owner?.ownsSession(session)) {
+      void this.owner.releaseRoom(session);
+      return true;
+    }
+    if (session.connectionGeneration) throw new Error('Voice connection owner required');
+    return false;
+  }
+
+  private reserveLegacy(session: VoiceEnforcementSession): boolean {
+    const owner = this.owner;
+    if (!owner) return false;
+    // The callback captures the immutable tuple, never caller-mutable data.
+    const exact = { ...session };
+    return owner.reserveLegacyRoom(session, async () => {
+      await releaseVoiceEnforcementSession(exact, this.verifyNative);
+      this.pending.delete(exact.sessionGeneration);
+      this.held.delete(exact.sessionGeneration);
+    });
   }
 
   private reserveRetrySlot(): boolean {
-    if (
-      this.queueSaturated ||
-      this.pending.size + this.held.size >= VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY
-    ) {
-      this.overflowedCount += 1;
-      if (!this.queueSaturated) {
-        this.queueSaturated = true;
-        this.onSaturated?.(VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY, this.overflowedCount);
-      }
-      return false;
+    if (this.owner) return true;
+    if (this.pending.size + this.held.size >= VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY) {
+      this.onSaturated?.(VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY, 1);
+      throw new Error('Voice identity capacity exhausted');
     }
     return true;
   }
@@ -154,12 +183,16 @@ export class VoiceEnforcementSessionReleaseQueue {
 }
 
 export function snapshotVoiceEnforcementSessions(
-  sockets: Iterable<ShutdownSocket>
+  sockets: Iterable<ShutdownSocket>,
+  owner?: VoiceAuthConnections
 ): VoiceEnforcementSession[] {
   const sessions = new Map<string, VoiceEnforcementSession>();
   for (const socket of sockets) {
     const session = socket.data.voiceEnforcementSession;
-    if (session) sessions.set(session.sessionGeneration, { ...session });
+    if (!session) continue;
+    if (owner?.ownsSession(session)) continue;
+    if (session.connectionGeneration) throw new Error('Voice connection owner required');
+    sessions.set(session.sessionGeneration, { ...session });
   }
   return Array.from(sessions.values());
 }
@@ -169,9 +202,14 @@ export function snapshotVoiceEnforcementSessions(
 // through its bounded shutdown deadline.
 export async function releaseVoiceEnforcementSessionsAfterClose(
   sockets: Iterable<ShutdownSocket>,
-  releaseQueue: VoiceEnforcementSessionReleaseQueue
+  releaseQueue: VoiceEnforcementSessionReleaseQueue,
+  owner?: VoiceAuthConnections
 ): Promise<number> {
-  releaseQueue.enqueueAll(snapshotVoiceEnforcementSessions(sockets));
+  // Idle and provisional sockets are in the private ledger, even if Socket.IO
+  // never admitted them or removed their public socket map entry.
+  const legacy = snapshotVoiceEnforcementSessions(sockets, owner);
+  if (owner) void owner.terminateAll();
+  releaseQueue.enqueueAll(legacy);
   await releaseQueue.retryPending();
   return releaseQueue.outstandingCount();
 }

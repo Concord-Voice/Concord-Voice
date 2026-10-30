@@ -25,12 +25,17 @@ const (
 	githubIssuer = "https://token.actions.githubusercontent.com"
 	repository   = "Concord-Voice/Concord-Voice-Alpha"
 	repositoryID = "1158152129"
-	workflowRef  = repository + "/.github/workflows/required-pr-build.yml@refs/heads/main"
+	// A ruleset-loaded required workflow signs its ref as @main, not
+	// @refs/heads/main (observed on the 2026-10-30 canary).
+	workflowRef  = repository + "/.github/workflows/required-pr-build.yml@main"
 	audienceBase = "concord-voice:protected-sonar:sha256:"
 	maxProofSize = 64 << 10
 	maxPayload   = 24 << 10
 	maxTokenSize = 32 << 10
 	maxOutput    = 32 << 10
+	// GitHub backdates nbf five minutes before iat (observed 2026-10-30); allow
+	// up to the lifetime bound so a modest change in that offset still verifies.
+	maxNotBeforeSkew = 10 * time.Minute
 )
 
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -240,7 +245,8 @@ func validClaims(token *oidc.IDToken, c signedClaims, p payload, now time.Time) 
 		token.Expiry.After(now) &&
 		token.Expiry.After(token.IssuedAt) &&
 		token.Expiry.Sub(token.IssuedAt) <= 10*time.Minute &&
-		!nbf.Before(token.IssuedAt.Add(-30*time.Second))
+		!nbf.After(token.IssuedAt) &&
+		!nbf.Before(token.IssuedAt.Add(-maxNotBeforeSkew))
 }
 
 func strictJSON(raw []byte, target any) error {

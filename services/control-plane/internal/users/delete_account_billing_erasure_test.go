@@ -49,7 +49,7 @@ func TestDeleteAccountBillingErasure_EnqueuesTheMappedCustomer(t *testing.T) {
 	erased := testdb.CreateUser(t, db)
 	customerID := mapStripeCustomer(t, db, erased)
 
-	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()))
 
 	assert.Zero(t, countUsers(t, db, erased))
 	assert.Equal(t, 1, outboxRows(t, db, customerID), "the erased user's Customer is queued for Stripe erasure")
@@ -80,7 +80,7 @@ func TestDeleteAccountBillingErasure_DoesNotTouchAnotherUsersMapping(t *testing.
 	erasedCustomer := mapStripeCustomer(t, db, erased)
 	bystanderCustomer := mapStripeCustomer(t, db, bystander)
 
-	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()))
 
 	assert.Equal(t, 1, outboxRows(t, db, erasedCustomer))
 	assert.Zero(t, outboxRows(t, db, bystanderCustomer), "another user's Customer must not be enqueued")
@@ -97,7 +97,7 @@ func TestDeleteAccountBillingErasure_UnmappedUserEnqueuesNothing(t *testing.T) {
 	var before int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&before))
 
-	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()))
 
 	var after int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&after))
@@ -114,7 +114,7 @@ func TestDeleteAccountBillingErasure_ExistingObligationIsKeptOnce(t *testing.T) 
 	_, err := db.Exec(`INSERT INTO billing_erasure_outbox (stripe_customer_id, attempts) VALUES ($1, 3)`, customerID)
 	require.NoError(t, err)
 
-	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()),
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()),
 		"ON CONFLICT DO NOTHING keeps erasure from failing on an already-queued Customer")
 
 	assert.Zero(t, countUsers(t, db, erased))
@@ -134,7 +134,7 @@ func TestDeleteAccountBillingErasure_EnqueueFaultFailsErasureAndKeepsTheUser(t *
 	hook, wrapped := stmthook.Open(t)
 	hook.Arm([]string{"INSERT INTO billing_erasure_outbox"}, nil, stmthook.ErrInjected)
 
-	err := NewAccountService(wrapped, logger.New("test")).DeleteAccount(context.Background(), erased.String())
+	err := NewAccountService(wrapped, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String())
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, stmthook.ErrInjected)
@@ -177,7 +177,7 @@ func TestDeleteAccountBillingErasure_EnqueuesSubscriptionCustomers(t *testing.T)
 	var before int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM billing_erasure_outbox`).Scan(&before))
 
-	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()))
 
 	assert.Equal(t, 1, outboxRows(t, db, mapped), "the mapped Customer is queued once")
 	assert.Equal(t, 1, outboxRows(t, db, unmapped), "the unmapped Customer holding the user's Stripe rows is queued once")
@@ -193,7 +193,7 @@ func TestDeleteAccountBillingErasure_UnmappedUserWithStripeRowsIsQueued(t *testi
 	erased := testdb.CreateUser(t, db)
 	customer := seedStripeSubscription(t, db, erased, "cus_test_"+uuid.NewString())
 
-	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), erased.String()))
+	require.NoError(t, NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()))
 
 	assert.Zero(t, countUsers(t, db, erased))
 	assert.Equal(t, 1, outboxRows(t, db, customer), "a Customer known only from a subscription row is queued")
@@ -208,7 +208,7 @@ func TestDeleteAccountBillingErasure_SubscriptionEnqueueFaultFailsErasure(t *tes
 	hook, wrapped := stmthook.Open(t)
 	hook.Arm([]string{"SELECT DISTINCT stripe_customer_id FROM subscriptions"}, nil, stmthook.ErrInjected)
 
-	err := NewAccountService(wrapped, logger.New("test")).DeleteAccount(context.Background(), erased.String())
+	err := NewAccountService(wrapped, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String())
 
 	require.ErrorIs(t, err, stmthook.ErrInjected)
 	assert.Contains(t, err.Error(), "enqueue billing erasure of subscription customers")

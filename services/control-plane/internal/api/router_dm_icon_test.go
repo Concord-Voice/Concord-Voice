@@ -25,6 +25,8 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
@@ -220,13 +222,52 @@ func (f *dmIconRouterFixture) actor(t *testing.T, name string, verified bool) dm
 	} else {
 		user = ts.CreateTestUserUnverified(t, name)
 	}
-	epoch, session, machine, recordedToken := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
-	_, err := f.db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, epoch, user.ID)
+	epoch, err := credepoch.NewEpoch()
 	require.NoError(t, err)
-	// Mint through the production access-token generator after persisting its
-	// exact epoch. No fake authentication or legacy epoch exemption is used.
-	user.AccessToken, err = auth.GenerateAccessToken(user.ID, testhelpers.TestJWTSecret, verified, epoch, session)
+	sid, machine, recordedToken := uuid.New(), uuid.NewString(), uuid.NewString()
+	_, err = f.db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, epoch, user.ID)
 	require.NoError(t, err)
+	// Preserve the current non-null epoch control while committing the exact
+	// SID and signed expiry through the same authority seam as login.
+	ctx := t.Context()
+	id := uuid.MustParse(user.ID)
+	tx, err := f.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("rollback icon actor family fixture: %v", err)
+		}
+	}()
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	require.NoError(t, err)
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{id}, loginfamily.UserNoKeyUpdate)
+	require.NoError(t, err)
+	lockedUser, err := users.ForUser(id)
+	require.NoError(t, err)
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, lockedUser, epoch)
+	require.NoError(t, err)
+	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{
+		UserID: id, SID: sid, CredentialEpoch: epoch, EmailVerified: verified,
+	}, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, loginfamily.BindSIDTx(ctx, tx, family, sid, prepared.ExpiresAt()))
+	require.NoError(t, tx.Commit())
+	user.AccessToken, err = prepared.Sign(testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	claims, err := auth.ValidateAccessToken(user.AccessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	require.NotNil(t, claims.ExpiresAt)
+	grant, err := loginfamily.ResolveVerifiedAccess(ctx, f.db, loginfamily.AccessIdentity{
+		UserID: id, SID: sid, CredentialEpoch: claims.CredentialEpoch, AccessExpiresAt: claims.ExpiresAt.Time,
+	})
+	require.NoError(t, err, "actual bearer must resolve committed family authority before downstream gates")
+	require.Equal(t, family.Binding().FamilyID, grant.FamilyID)
+	require.Equal(t, sid.String(), claims.SessionID)
+	require.Equal(t, epoch, claims.CredentialEpoch)
+	var expiry time.Time
+	require.NoError(t, f.db.QueryRow(`SELECT access_expires_at FROM login_family_sids WHERE sid=$1 AND user_id=$2 AND family_id=$3`, sid, id, grant.FamilyID).Scan(&expiry))
+	require.True(t, expiry.Equal(claims.ExpiresAt.Time), "SQL membership must bind the exact signed NumericDate")
+	session := claims.SessionID
 	record, err := json.Marshal(attestation.TokenRecord{
 		Token: recordedToken, Version: "0.2.44", SpaVersion: "20261013",
 		IssuedAt: time.Now(), UserID: attestation.HashUserID(user.ID),

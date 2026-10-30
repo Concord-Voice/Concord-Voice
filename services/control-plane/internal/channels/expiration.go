@@ -224,7 +224,7 @@ func (h *Handler) lockChannelExpirationGateTx(c *gin.Context, tx *sql.Tx, server
 		return mfaenforce.Gate{}, false
 	}
 	tokenEpoch := middleware.TokenCredentialEpoch(c)
-	if guardErr := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); guardErr != nil {
 		h.respondChannelGuardError(c, guardErr, errMsgFailedUpdateChannel)
 		return mfaenforce.Gate{}, false
 	}

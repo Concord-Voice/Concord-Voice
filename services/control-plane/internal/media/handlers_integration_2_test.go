@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -63,6 +64,7 @@ func TestUploadBannerMissingFile(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	ts.handler.UploadBanner(c)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -184,6 +186,7 @@ func TestUploadAttachmentMissingFile(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", user)
+	testdb.AttachRememberedActor(c, user)
 	ts.handler.UploadAttachment(c)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)

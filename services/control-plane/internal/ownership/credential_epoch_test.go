@@ -2,34 +2,38 @@ package ownership_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// An entry-time cache hit can still admit the token issued before a destructive
-// credential reset. Each interactive ownership mutation must recheck the
-// durable epoch in its write transaction before changing ownership state.
+// Rotate after actual family admission commits. Each interactive ownership
+// mutation must reach its transactional epoch guard before changing state.
 func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 	t.Run("initiate", func(t *testing.T) {
-		ts := setupTS(t)
+		ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 		owner := ts.CreateTestUser(t, "ownership-epoch-init-owner")
 		target := ts.CreateTestUser(t, "ownership-epoch-init-target")
 		serverID := ts.CreateTestServer(t, owner.ID, "Ownership Epoch Initiate")
 		ts.AddMemberToServer(t, serverID, target.ID, keyMember)
 
-		staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
+		require.NoError(t, boundary.Arm(owner.AccessToken))
+		boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
 		w := ts.DoRequest(http.MethodPost, pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
 			keyTargetUserID: target.ID,
 			keyPassword:     testhelpers.TestAuthPlaintext,
-		}, testhelpers.AuthHeaders(staleToken))
+		}, testhelpers.AuthHeaders(owner.AccessToken))
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+		boundary.RequireRotated(t)
+		seen, guardErr := boundary.Hook.Report()
+		require.NoError(t, guardErr)
+		require.Equal(t, 1, seen, "ownership GuardTx must run after family admission")
 
 		var pending int
 		require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM ownership_transfers WHERE server_id = $1`, serverID).Scan(&pending))
@@ -37,7 +41,7 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 	})
 
 	t.Run("confirm", func(t *testing.T) {
-		ts := setupTS(t)
+		ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 		owner := ts.CreateTestUser(t, "ownership-epoch-confirm-owner")
 		target := ts.CreateTestUser(t, "ownership-epoch-confirm-target")
 		serverID := ts.CreateTestServer(t, owner.ID, "Ownership Epoch Confirm")
@@ -49,9 +53,14 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 		}, testhelpers.AuthHeaders(owner.AccessToken))
 		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
-		staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
-		w = ts.DoRequest(http.MethodPost, pathServersPrefix+serverID+pathTransferOwnershipConfirm, nil, testhelpers.AuthHeaders(staleToken))
+		require.NoError(t, boundary.Arm(owner.AccessToken))
+		boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
+		w = ts.DoRequest(http.MethodPost, pathServersPrefix+serverID+pathTransferOwnershipConfirm, nil, testhelpers.AuthHeaders(owner.AccessToken))
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+		boundary.RequireRotated(t)
+		seen, guardErr := boundary.Hook.Report()
+		require.NoError(t, guardErr)
+		require.Equal(t, 1, seen, "ownership GuardTx must run after family admission")
 
 		var currentOwner, status string
 		require.NoError(t, ts.DB.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&currentOwner))
@@ -61,7 +70,7 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 	})
 
 	t.Run("cancel", func(t *testing.T) {
-		ts := setupTS(t)
+		ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 		owner := ts.CreateTestUser(t, "ownership-epoch-cancel-owner")
 		target := ts.CreateTestUser(t, "ownership-epoch-cancel-target")
 		serverID := ts.CreateTestServer(t, owner.ID, "Ownership Epoch Cancel")
@@ -73,9 +82,14 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 		}, testhelpers.AuthHeaders(owner.AccessToken))
 		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
-		staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
-		w = ts.DoRequest(http.MethodDelete, pathServersPrefix+serverID+pathTransferOwnership, nil, testhelpers.AuthHeaders(staleToken))
+		require.NoError(t, boundary.Arm(owner.AccessToken))
+		boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
+		w = ts.DoRequest(http.MethodDelete, pathServersPrefix+serverID+pathTransferOwnership, nil, testhelpers.AuthHeaders(owner.AccessToken))
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+		boundary.RequireRotated(t)
+		seen, guardErr := boundary.Hook.Report()
+		require.NoError(t, guardErr)
+		require.Equal(t, 1, seen, "ownership GuardTx must run after family admission")
 
 		var status string
 		require.NoError(t, ts.DB.QueryRow(`SELECT status FROM ownership_transfers WHERE server_id = $1`, serverID).Scan(&status))
@@ -83,7 +97,7 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 	})
 
 	t.Run("reverse", func(t *testing.T) {
-		ts := setupTS(t)
+		ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 		owner := ts.CreateTestUser(t, "ownership-epoch-reverse-owner")
 		target := ts.CreateTestUser(t, "ownership-epoch-reverse-target")
 		serverID := ts.CreateTestServer(t, owner.ID, "Ownership Epoch Reverse")
@@ -99,11 +113,16 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 
 		var reversalToken string
 		require.NoError(t, ts.DB.QueryRow(`SELECT reversal_token FROM ownership_transfers WHERE server_id = $1 AND status = 'completed'`, serverID).Scan(&reversalToken))
-		staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
+		require.NoError(t, boundary.Arm(owner.AccessToken))
+		boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
 		w = ts.DoRequest(http.MethodPost, pathOwnershipReverse+reversalToken, map[string]interface{}{
 			keyPassword: testhelpers.TestAuthPlaintext,
-		}, testhelpers.AuthHeaders(staleToken))
+		}, testhelpers.AuthHeaders(owner.AccessToken))
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+		boundary.RequireRotated(t)
+		seen, guardErr := boundary.Hook.Report()
+		require.NoError(t, guardErr)
+		require.Equal(t, 1, seen, "ownership GuardTx must run after family admission")
 
 		var currentOwner, status string
 		require.NoError(t, ts.DB.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&currentOwner))
@@ -118,23 +137,22 @@ func TestOwnershipMutationsRejectResetFirstCredentialEpoch(t *testing.T) {
 // observable: the transfer is waiting after its user lock, while the reset is
 // blocked by that same lock.
 func TestInitiateTransferMutationFirstSerializesCredentialReset(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	owner := ts.CreateTestUser(t, "ownership-epoch-mutation-owner")
 	target := ts.CreateTestUser(t, "ownership-epoch-mutation-target")
 	serverID := ts.CreateTestServer(t, owner.ID, "Ownership Epoch Mutation First")
 	ts.AddMemberToServer(t, serverID, target.ID, keyMember)
 
-	const beforeEpoch = "ownership-epoch-before"
-	const afterEpoch = "ownership-epoch-after"
-	_, err := ts.DB.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, beforeEpoch, owner.ID)
-	require.NoError(t, err)
-	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(owner.ID), "active:"+beforeEpoch, time.Minute).Err())
-	token, err := auth.GenerateAccessToken(owner.ID, testhelpers.TestJWTSecret, true, beforeEpoch, "")
-	require.NoError(t, err)
+	require.NoError(t, boundary.ArmControl(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
 
 	serverLock, err := ts.DB.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
-	defer func() { _ = serverLock.Rollback() }()
+	defer func() {
+		if rollbackErr := serverLock.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("release server lock: %v", rollbackErr)
+		}
+	}()
 	var lockedServerID string
 	require.NoError(t, serverLock.QueryRow(`SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&lockedServerID))
 
@@ -143,7 +161,7 @@ func TestInitiateTransferMutationFirstSerializesCredentialReset(t *testing.T) {
 		w := ts.DoRequest(http.MethodPost, pathServersPrefix+serverID+pathTransferOwnership, map[string]interface{}{
 			keyTargetUserID: target.ID,
 			keyPassword:     testhelpers.TestAuthPlaintext,
-		}, testhelpers.AuthHeaders(token))
+		}, testhelpers.AuthHeaders(owner.AccessToken))
 		transferDone <- w.Code
 	}()
 
@@ -163,20 +181,36 @@ func TestInitiateTransferMutationFirstSerializesCredentialReset(t *testing.T) {
 		return err == nil && waiting
 	}, time.Second, 10*time.Millisecond, "transfer did not reach its server lock after locking users")
 
-	resetDone := make(chan error, 1)
+	require.NoError(t, boundary.Check())
+	seen, guardErr := boundary.Hook.Report()
+	require.NoError(t, guardErr)
+	require.Equal(t, 1, seen, "transfer passed GuardTx before the later reset")
+
+	resetDone := make(chan string, 1)
 	go func() {
-		_, resetErr := ts.DB.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, afterEpoch, owner.ID)
-		resetDone <- resetErr
+		defer close(resetDone)
+		resetDone <- ts.RotateCredentialEpoch(t, owner.ID)
 	}()
 	select {
-	case resetErr := <-resetDone:
-		require.Failf(t, "credential reset bypassed transfer user lock", "reset returned early: %v", resetErr)
+	case <-resetDone:
+		require.Fail(t, "credential reset bypassed transfer user lock")
 	case <-time.After(100 * time.Millisecond):
 	}
 
 	require.NoError(t, serverLock.Rollback())
-	require.Equal(t, http.StatusCreated, <-transferDone)
-	require.NoError(t, <-resetDone)
+	select {
+	case status := <-transferDone:
+		require.Equal(t, http.StatusCreated, status)
+	case <-time.After(5 * time.Second):
+		t.Fatal("transfer did not finish after releasing server lock")
+	}
+	select {
+	case epoch, ok := <-resetDone:
+		require.True(t, ok, "public rotation failed before returning an epoch")
+		require.Len(t, epoch, 32)
+	case <-time.After(6 * time.Second):
+		t.Fatal("credential reset did not finish after transfer")
+	}
 
 	var transferCount int
 	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM ownership_transfers WHERE server_id = $1 AND status = 'pending'`, serverID).Scan(&transferCount))

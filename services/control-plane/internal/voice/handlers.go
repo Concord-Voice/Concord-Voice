@@ -18,6 +18,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/joinpause"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/roomplacement"
@@ -30,6 +31,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
+
+const authRequiredMessage = "Authentication required"
 
 const (
 	voiceAdmissionActivationSubject         = "voice.admission.activate"
@@ -305,6 +308,8 @@ func addVoiceAdmissionRevision(response gin.H, isMediaHop bool, authorizationRev
 }
 
 type voiceJoinAuthorization struct {
+	familyUser       loginfamily.UserAuthority
+	familyIdentity   loginfamily.AccessIdentity
 	channelID        string
 	channelName      string
 	serverID         string
@@ -333,28 +338,99 @@ func (failure *voiceJoinAccessFailure) Error() string {
 
 func (failure *voiceJoinAccessFailure) Unwrap() error { return failure.cause }
 
-// CheckChannelVoiceAccessTx reuses voice-join authority inside a caller-owned
-// registration transaction. A failed renewal cannot extend a revoked session.
-func CheckChannelVoiceAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, serverID, channelID, userID, epoch string) (int, error) {
-	_, failure := checkChannelVoiceAccessTx(ctx, tx, resolver, serverID, channelID, userID, epoch)
+// CheckChannelVoiceFamilyAccessTx repeats final channel and family authority in
+// the caller's READ COMMITTED transaction. It owns the visibility and rollout
+// prefix; callers must not acquire a rollout barrier or user/child locks first.
+func CheckChannelVoiceFamilyAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, serverID, channelID string, identity loginfamily.AccessIdentity) (int, error) {
+	_, status, err := CheckChannelVoiceFamilyAuthorityTx(ctx, tx, resolver, serverID, channelID, identity)
+	return status, err
+}
+
+// CheckChannelVoiceFamilyAuthorityTx owns the same complete authority prefix as
+// CheckChannelVoiceFamilyAccessTx and returns its held user capability so callers
+// can recheck family lifetime after later registry waits in this exact transaction.
+func CheckChannelVoiceFamilyAuthorityTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, serverID, channelID string, identity loginfamily.AccessIdentity) (loginfamily.UserAuthority, int, error) {
+	result, failure := checkChannelVoiceFamilyAccessTx(ctx, tx, resolver, serverID, channelID, identity)
 	if failure == nil {
-		return http.StatusNoContent, nil
+		return result.familyUser, http.StatusNoContent, nil
 	}
-	if failure.status >= http.StatusInternalServerError {
-		return http.StatusServiceUnavailable, failure
+	return loginfamily.UserAuthority{}, failure.status, failure
+}
+
+func checkChannelVoiceFamilyAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, serverID, channelID string, identity loginfamily.AccessIdentity) (voiceJoinAuthorization, *voiceJoinAccessFailure) {
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return voiceJoinAuthorization{}, voiceFamilyAccessFailure(err)
 	}
-	return http.StatusForbidden, failure
+	user, err := guardVoiceFamilyTx(ctx, tx, identity)
+	if err != nil {
+		return voiceJoinAuthorization{}, voiceFamilyAccessFailure(err)
+	}
+	result, failure := checkChannelVoiceResourceAccessTx(ctx, tx, resolver, serverID, channelID, identity.UserID.String())
+	if failure != nil {
+		return voiceJoinAuthorization{}, failure
+	}
+	// Resource locks may have waited past the signed deadline. Revalidate with
+	// the same transaction capability, without another barrier or user lock.
+	if _, err := loginfamily.GuardAfterUserLockTx(ctx, tx, user, identity, loginfamily.FamilyShare); err != nil {
+		return voiceJoinAuthorization{}, voiceFamilyAccessFailure(err)
+	}
+	result.familyUser, result.familyIdentity = user, identity
+	return result, nil
+}
+
+func guardVoiceFamilyTx(ctx context.Context, tx *sql.Tx, identity loginfamily.AccessIdentity) (loginfamily.UserAuthority, error) {
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{identity.UserID}, loginfamily.UserShare)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	user, err := users.ForUser(identity.UserID)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	_, err = loginfamily.GuardAfterUserLockTx(ctx, tx, user, identity, loginfamily.FamilyShare)
+	return user, err
+}
+
+func voiceFamilyAccessFailure(err error) *voiceJoinAccessFailure {
+	if errors.Is(err, loginfamily.ErrDenied) {
+		return &voiceJoinAccessFailure{status: http.StatusUnauthorized, message: authRequiredMessage, cause: err}
+	}
+	if errors.Is(err, loginfamily.ErrContract) {
+		return &voiceJoinAccessFailure{status: http.StatusInternalServerError, message: errMsgFailedAuthorize, cause: err}
+	}
+	return &voiceJoinAccessFailure{status: http.StatusServiceUnavailable, message: errMsgFailedAuthorize, cause: err}
+}
+
+// recheckVoiceFamilyBeforeCommit validates the same held capability after the
+// last reservation wait. The result must belong to this exact transaction.
+func recheckVoiceFamilyBeforeCommit(c *gin.Context, tx *sql.Tx, authorization voiceJoinAuthorization) bool {
+	_, err := loginfamily.GuardAfterUserLockTx(c.Request.Context(), tx, authorization.familyUser, authorization.familyIdentity, loginfamily.FamilyShare)
+	if err == nil {
+		return true
+	}
+	failure := voiceFamilyAccessFailure(err)
+	c.JSON(failure.status, gin.H{"error": failure.message})
+	return false
 }
 
 // recheckActivatedVoiceJoin repeats every authority read after the out-of-tx
 // PREPARE acknowledgement. A prepared candidate is not admitted until this
 // transaction commits with the exact reservation still intact.
 func (h *Handler) recheckActivatedVoiceJoin(c *gin.Context, tx *sql.Tx, preflightServerID, channelID, userID string) (voiceJoinAuthorization, bool) {
-	result, failure := checkChannelVoiceAccessTx(c.Request.Context(), tx, h.resolver, preflightServerID, channelID, userID, middleware.TokenCredentialEpoch(c))
+	identity, _, verified := middleware.VerifiedAccessFromContext(c)
+	if !verified || identity.UserID.String() != userID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": authRequiredMessage})
+		return voiceJoinAuthorization{}, false
+	}
+	result, failure := checkChannelVoiceFamilyAccessTx(c.Request.Context(), tx, h.resolver, preflightServerID, channelID, identity)
 	if failure != nil {
 		if failure.status >= http.StatusInternalServerError {
-			h.log.Error("voice join transaction authorization failed", "error", failure.cause)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+			h.log.Error("voice join transaction authorization failed", "failure_class", "authority")
+			c.JSON(failure.status, gin.H{"error": errMsgFailedAuthorize})
 		} else if !failure.until.IsZero() {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Member is timed out", "code": "member_timed_out", "timed_out_until": failure.until})
 		} else {
@@ -374,16 +450,7 @@ func (h *Handler) recheckActivatedVoiceJoin(c *gin.Context, tx *sql.Tx, prefligh
 	return result, true
 }
 
-func checkChannelVoiceAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, preflightServerID, channelID, userID, epoch string) (voiceJoinAuthorization, *voiceJoinAccessFailure) {
-	if err := rbac.LockServerVisibilityCapture(ctx, tx, preflightServerID); err != nil {
-		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("lock voice visibility: %w", err)}
-	}
-	if err := credepoch.GuardTx(ctx, tx, userID, epoch); err != nil {
-		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-			return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusUnauthorized, message: "Authentication required", cause: err}
-		}
-		return voiceJoinAuthorization{}, &voiceJoinAccessFailure{status: http.StatusInternalServerError, cause: fmt.Errorf("guard voice credential epoch: %w", err)}
-	}
+func checkChannelVoiceResourceAccessTx(ctx context.Context, tx *sql.Tx, resolver *rbac.Resolver, preflightServerID, channelID, userID string) (voiceJoinAuthorization, *voiceJoinAccessFailure) {
 	var lockedServerID string
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, preflightServerID).Scan(&lockedServerID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -445,7 +512,7 @@ func (h *Handler) completeActivatedVoiceAdmission(
 		h.afterVoiceAdmissionPrepareForTest()
 	}
 
-	finalTx, err := h.db.BeginTx(c.Request.Context(), nil)
+	finalTx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("voice join: begin final credential transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
@@ -462,6 +529,9 @@ func (h *Handler) completeActivatedVoiceAdmission(
 	}
 	authorizationRevision, authorized := h.prepareMediaVoiceAdmission(c, finalTx, final.channelID, userID, admission)
 	if !authorized {
+		return voiceJoinAuthorization{}, 0, false
+	}
+	if !recheckVoiceFamilyBeforeCommit(c, finalTx, final) {
 		return voiceJoinAuthorization{}, 0, false
 	}
 	if err := finalTx.Commit(); err != nil {
@@ -554,7 +624,7 @@ func (h *Handler) serverTier(ctx context.Context, serverID string) string {
 
 func (h *Handler) respondVoiceGuardTxError(c *gin.Context, guardErr error, genericMsg string) {
 	if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": authRequiredMessage})
 		return
 	}
 	h.log.Error("credential-epoch guard read failed", "error", guardErr)
@@ -690,7 +760,7 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	// membership, and permission decision has been made. Committing it before
 	// those reads would let a concurrent credential reset linearize between the
 	// guard and the successful media-admission response.
-	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("voice join: begin credential transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
@@ -742,32 +812,18 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		channelID = authorization.channelID
 		mediaEnt, roomOwnerTier = resolveVoiceJoinMediaEntitlements(userTier, serverTier, authorization.audioQualityTier)
 	} else {
-		var authorized bool
-		authorizationRevision, authorized = h.maybeAuthorizeMediaVoiceAdmission(c, tx, isMediaHop, channelID, userID, admission)
-		if !authorized {
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			h.log.Error("voice join: commit credential transaction", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		var committed bool
+		authorizationRevision, committed = h.commitVoiceJoinAuthorization(c, tx, isMediaHop, channelID, userID, admission, authorization)
+		if !committed {
 			return
 		}
 	}
 
 	h.log.Info("Voice join authorized", "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(authorization.serverID), "media_tier", mediaEnt.Tier)
 
-	mediaURL, err := h.roomPlacement.Select(c.Request.Context(), channelID, h.cfg.MediaPlaneURL)
-	if err != nil {
-		h.log.Error("Failed to claim voice room placement", "failure_class", "placement")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+	mediaURL, ok := h.claimVoiceJoinPlacement(c, channelID, userID)
+	if !ok {
 		return
-	}
-	if h.roomPlacement.Enabled {
-		if err := h.roomPlacement.MintJoinIntent(c.Request.Context(), channelID, userID); err != nil {
-			h.log.Error("Failed to mint voice join intent", "failure_class", "placement")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
-			return
-		}
 	}
 	response := gin.H{
 		"allowed":            true,
@@ -794,6 +850,41 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	}
 	addVoiceAdmissionRevision(response, isMediaHop, authorizationRevision)
 	c.JSON(http.StatusOK, response)
+}
+
+// commitVoiceJoinAuthorization records any media admission, rechecks the
+// requester's login family and commits the credential transaction.
+func (h *Handler) commitVoiceJoinAuthorization(c *gin.Context, tx *sql.Tx, isMediaHop bool, channelID, userID string, admission voiceJoinAdmission, authorization voiceJoinAuthorization) (int64, bool) {
+	revision, authorized := h.maybeAuthorizeMediaVoiceAdmission(c, tx, isMediaHop, channelID, userID, admission)
+	if !authorized || !recheckVoiceFamilyBeforeCommit(c, tx, authorization) {
+		return 0, false
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("voice join: commit credential transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return 0, false
+	}
+	return revision, true
+}
+
+// claimVoiceJoinPlacement selects the room's media node and, when placement
+// is enabled, mints the join intent that node will require.
+func (h *Handler) claimVoiceJoinPlacement(c *gin.Context, channelID, userID string) (string, bool) {
+	mediaURL, err := h.roomPlacement.Select(c.Request.Context(), channelID, h.cfg.MediaPlaneURL)
+	if err != nil {
+		h.log.Error("Failed to claim voice room placement", "failure_class", "placement")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+		return "", false
+	}
+	if !h.roomPlacement.Enabled {
+		return mediaURL, true
+	}
+	if err := h.roomPlacement.MintJoinIntent(c.Request.Context(), channelID, userID); err != nil {
+		h.log.Error("Failed to mint voice join intent", "failure_class", "placement")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedAuthorize})
+		return "", false
+	}
+	return mediaURL, true
 }
 
 // AuthorizeVoiceAction checks whether a user has permission to perform a voice
@@ -832,7 +923,7 @@ func (h *Handler) AuthorizeVoiceAction(c *gin.Context) {
 			h.log.Error("voice action: credential transaction rollback", "error", rbErr)
 		}
 	}()
-	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+	if err := credepoch.GuardFamilyTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
 		h.respondVoiceGuardTxError(c, err, errMsgFailedAuthAction)
 		return
 	}
@@ -999,7 +1090,7 @@ func (h *Handler) guardVoiceModEffectTx(
 		return false
 	}
 	actorID := c.GetString("user_id")
-	if err := credepoch.GuardTx(c.Request.Context(), tx, actorID, middleware.TokenCredentialEpoch(c)); err != nil {
+	if err := credepoch.GuardFamilyTx(c.Request.Context(), tx, actorID, middleware.TokenCredentialEpoch(c)); err != nil {
 		h.respondVoiceGuardTxError(c, err, failMsg)
 		return false
 	}
@@ -1627,7 +1718,7 @@ func (h *Handler) ServerMove(c *gin.Context) {
 	// through the no-grant move decision. That makes reset and the committed
 	// decision a single linearization point: reset first yields 401; guard first
 	// makes reset wait, then the committed decision may signal the move.
-	if err := credepoch.GuardTx(c.Request.Context(), tx, actorID, middleware.TokenCredentialEpoch(c)); err != nil {
+	if err := credepoch.GuardFamilyTx(c.Request.Context(), tx, actorID, middleware.TokenCredentialEpoch(c)); err != nil {
 		h.respondVoiceGuardTxError(c, err, errMsgMovePrep)
 		return
 	}

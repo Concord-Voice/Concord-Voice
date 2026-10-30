@@ -15,6 +15,7 @@ import type {
   JetStreamManager,
   JsMsg,
   KV,
+  Msg,
   NatsConnection,
   StreamInfo,
   Subscription,
@@ -33,6 +34,7 @@ import { logger } from './logger.js';
 import type { RoomEvent, RoomEventHandler } from './roomManager.js';
 import type { EmitSecurityEvent } from './securityEvent.js';
 import { RequiredNatsSubscriptions } from './requiredNatsSubscriptions.js';
+import type { RawRequestReceiver } from './voiceAuthReceiver.js';
 
 // ---------------------------------------------------------------------------
 // NATS client — publishes voice events for the control plane to consume.
@@ -251,7 +253,7 @@ class NatsVoiceCommandOwnerStore implements VoiceCommandOwnerStore {
 interface VoiceCommandRuntime {
   owner: VoiceCommandOwner;
   dispatcher: VoiceCommandDispatcher;
-  quarantine: (reason: string) => Promise<void>;
+  quarantine: (reason: string, episode: object) => Promise<void>;
   manager: JetStreamManager;
   consumer: Consumer;
   consumerCreatedAt: string;
@@ -262,6 +264,9 @@ interface VoiceCommandRuntime {
   loop?: Promise<void>;
   inFlight?: Promise<void>;
   quarantinePromise?: Promise<void>;
+  quarantineEpisode?: object;
+  quarantineFailed?: boolean;
+  recovery?: Promise<void>;
   renewal?: Promise<void>;
   renewalTimer?: ReturnType<typeof setInterval>;
 }
@@ -381,7 +386,7 @@ export class NatsService {
   async startVoiceCommandConsumer(options: {
     owner: VoiceCommandOwner;
     dispatcher: VoiceCommandDispatcher;
-    quarantine: (reason: string) => Promise<void>;
+    quarantine: (reason: string, episode: object) => Promise<void>;
   }): Promise<void> {
     if (this.voiceCommands) throw commandUnavailable();
     const binding = await this.voiceCommandBinding(options.owner.streamGeneration);
@@ -440,7 +445,7 @@ export class NatsService {
           await runtime.owner.renew();
         })()
           .catch(async () => {
-            await this.invalidateVoiceCommands('continuity_unavailable');
+            await this.invalidateVoiceCommands('continuity_unavailable').catch(() => undefined);
           })
           .finally(() => {
             runtime.renewal = undefined;
@@ -449,7 +454,7 @@ export class NatsService {
       runtime.renewalTimer.unref();
     }
     runtime.loop = this.pullVoiceCommands(runtime, epoch).catch(async () => {
-      await this.invalidateVoiceCommands('consumer_unavailable');
+      await this.invalidateVoiceCommands('consumer_unavailable').catch(() => undefined);
     });
   }
 
@@ -489,7 +494,7 @@ export class NatsService {
       runtime.ready = false;
       runtime.running = false;
       try {
-        await runtime.quarantine('schema_rejected');
+        await this.quarantineVoiceCommands(runtime, 'schema_rejected');
         await this.verifyVoiceCommandContinuity(runtime);
         if (runtime.epoch === epoch) message.term();
       } catch {
@@ -549,37 +554,97 @@ export class NatsService {
     runtime.ready = false;
     runtime.running = false;
     runtime.epoch++;
+    runtime.quarantineEpisode ??= Object.freeze({});
     this.clearVoiceCommandRenewalTimer(runtime);
     runtime.owner.invalidate();
     this.degraded();
-    if (!runtime.quarantinePromise) {
-      runtime.quarantinePromise = runtime.quarantine(reason);
-      void runtime.quarantinePromise.catch(() => {
-        logger.error('Voice command quarantine unavailable', {
-          error: 'voice_command_quarantine_failed',
-        });
-      });
-    }
-    return runtime.quarantinePromise;
+    return this.quarantineVoiceCommands(runtime, reason);
   }
 
-  async recoverVoiceCommandConsumerAfterTeardown(): Promise<void> {
+  private quarantineVoiceCommands(runtime: VoiceCommandRuntime, reason: string, retry = false): Promise<void> {
+    const episode = runtime.quarantineEpisode ??= Object.freeze({});
+    if (runtime.quarantinePromise && !(retry && runtime.quarantineFailed)) return runtime.quarantinePromise;
+    let done: () => void = () => undefined;
+    let failed: (error: unknown) => void = () => undefined;
+    const task = new Promise<void>((resolve, reject) => { done = resolve; failed = reject; });
+    // Own the attempt before the callback can synchronously invalidate again.
+    runtime.quarantinePromise = task;
+    runtime.quarantineFailed = false;
+    void task.catch(() => {
+      if (runtime.quarantineEpisode === episode && runtime.quarantinePromise === task)
+        runtime.quarantineFailed = true;
+      logger.error('Voice command quarantine unavailable', {
+        error: 'voice_command_quarantine_failed',
+      });
+    });
+    // The async wrapper runs quarantine synchronously and turns a throw into a rejection.
+    void (async () => runtime.quarantine(reason, episode))().then(done, failed);
+    return task;
+  }
+
+  recoverVoiceCommandConsumerAfterTeardown(): Promise<void> {
     const runtime = this.voiceCommands;
-    if (!runtime || runtime.inFlight || !this.isConnected()) throw commandUnavailable();
-    if (runtime.quarantinePromise) {
-      await runtime.quarantinePromise.catch(() => runtime.quarantine('recovery_teardown'));
+    if (!runtime) return Promise.reject(commandUnavailable());
+    if (runtime.recovery) return runtime.recovery;
+    let done: () => void = () => undefined;
+    let failed: (error: unknown) => void = () => undefined;
+    const task = new Promise<void>((resolve, reject) => { done = resolve; failed = reject; });
+    runtime.recovery = task;
+    // Capture authority synchronously, after installing the coalescing owner.
+    void this.recoverVoiceCommands(runtime).then(
+      () => {
+        if (runtime.recovery === task) runtime.recovery = undefined;
+        done();
+      },
+      (error: unknown) => {
+        if (runtime.recovery === task) runtime.recovery = undefined;
+        failed(error);
+      }
+    );
+    return task;
+  }
+
+  private async recoverVoiceCommands(runtime: VoiceCommandRuntime): Promise<void> {
+    if (runtime.inFlight || !this.isConnected()) throw commandUnavailable();
+    const epoch = runtime.epoch;
+    const ownerEpoch = runtime.owner.authorityEpoch();
+    const episode = runtime.quarantineEpisode;
+    let attempt = runtime.quarantinePromise;
+    const requireCurrent = () => {
+      if (this.voiceCommands !== runtime || runtime.epoch !== epoch ||
+          runtime.owner.authorityEpoch() !== ownerEpoch || !this.isConnected() ||
+          runtime.quarantineEpisode !== episode || runtime.quarantinePromise !== attempt)
+        throw commandUnavailable();
+    };
+    if (attempt) {
+      try { await attempt; }
+      catch {
+        requireCurrent();
+        attempt = this.quarantineVoiceCommands(runtime, 'recovery_teardown', true);
+        await attempt;
+      }
     }
+    requireCurrent();
     const binding = await this.voiceCommandBinding(runtime.owner.streamGeneration);
-    if (runtime.owner.valid()) await runtime.owner.renew();
+    const ownerValid = runtime.owner.valid();
+    requireCurrent();
+    if (ownerValid) await runtime.owner.renew();
     else await runtime.owner.recoverAfterTeardown();
-    runtime.manager = binding.manager;
-    runtime.consumer = await this.commandConsumer(binding.manager);
-    const info = await runtime.consumer.info();
+    requireCurrent();
+    const consumer = await this.commandConsumer(binding.manager);
+    requireCurrent();
+    const info = await consumer.info();
+    requireCurrent();
     validateCommandConsumer(info);
     if (!info.created) throw commandUnavailable();
+    runtime.manager = binding.manager;
+    runtime.consumer = consumer;
     runtime.consumerCreatedAt = info.created;
     await this.verifyVoiceCommandContinuity(runtime);
+    requireCurrent();
+    runtime.quarantineEpisode = undefined;
     runtime.quarantinePromise = undefined;
+    runtime.quarantineFailed = undefined;
     runtime.ready = true;
     runtime.running = true;
     runtime.stopped = false;
@@ -678,6 +743,11 @@ export class NatsService {
   isRequestSubscriptionHealthy(subject: string): boolean {
     const sub = this.requestSubscriptions.get(subject);
     return this.isConnected() && !!sub && !sub.isClosed();
+  }
+
+  /** Already-established state only; safe in the bounded synchronous health lane. */
+  exactVoiceTransportReady(subject: string): boolean {
+    return this.requiredSubscriptionsReady() && this.isRequestSubscriptionHealthy(subject);
   }
 
   private security(
@@ -802,7 +872,8 @@ export class NatsService {
   private connectionUnavailable(): void {
     this.connected = false;
     this.requiredSubscriptions.connectionChanged();
-    void this.invalidateVoiceCommands('connection_unavailable').catch(() => undefined);
+    // The retained quarantine attempt owns rejection; notifications add no waiter.
+    void this.invalidateVoiceCommands('connection_unavailable');
     this.degraded();
   }
 
@@ -1007,12 +1078,14 @@ export class NatsService {
   }
 
   /** Reply only after a handler confirms its terminal effect; failure retains the obligation. */
-  subscribeRequest(
+  subscribeRequest<T = Record<string, unknown>>(
     subject: string,
-    handler: (
-      data: Record<string, unknown>
-    ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>,
-    options: { required?: boolean } = {}
+    handler: ((
+      data: T
+    ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>) & {
+      receive?: RawRequestReceiver;
+    },
+    options: { required?: boolean; decode?: (raw: Uint8Array) => T } = {}
   ): boolean {
     if (options.required && (this.closing || !this.isConnected())) throw commandUnavailable();
     if (!this.nc) {
@@ -1023,7 +1096,25 @@ export class NatsService {
     const install = (): Subscription => {
       const nc = this.nc;
       if (!nc) throw commandUnavailable();
-      const sub = nc.subscribe(subject);
+      const receive = handler.receive;
+      // Only the exact per-boot handler opts into callback delivery. In nats
+      // 2.29.3 this selects noIterator; no SDK or application backlog is created.
+      const callback = (error: Error | null, msg: Msg): void => {
+        if (error) {
+          sub.unsubscribe();
+          ended();
+          return;
+        }
+        if (!msg.reply || this.closing || this.nc !== nc || sub.isClosed()) return;
+        try {
+          receive?.(msg.data, (response) => {
+            if (!this.closing && this.nc === nc && !sub.isClosed()) msg.respond(response);
+          });
+        } catch {
+          logger.error('Failed to handle NATS request', { error: 'nats_request_handler_failed' });
+        }
+      };
+      const sub = receive ? nc.subscribe(subject, { callback }) : nc.subscribe(subject);
       this.subscriptions.add(sub);
       this.requestSubscriptions.set(subject, sub);
       const ended = () => {
@@ -1037,12 +1128,12 @@ export class NatsService {
           error: 'nats_request_subscription_ended',
         });
       };
-      void (async () => {
+      if (!receive) void (async () => {
         for await (const msg of sub) {
           if (options.required && sub.isClosed()) break;
           try {
             if (!msg.reply) continue;
-            const decoded = jsonCodec.decode(msg.data) as Record<string, unknown>;
+            const decoded = options.decode ? options.decode(msg.data) : jsonCodec.decode(msg.data) as T;
             const response = await handler(decoded);
             if (response !== undefined && (!options.required || !sub.isClosed()))
               msg.respond(jsonCodec.encode(response));
@@ -1057,7 +1148,7 @@ export class NatsService {
           error: 'nats_request_subscription_failed',
         });
       });
-      if (options.required) void sub.closed.then(ended, ended);
+      if (options.required || receive) void sub.closed.then(ended, ended);
       return sub;
     };
     if (options.required) {

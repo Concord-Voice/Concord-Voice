@@ -142,12 +142,18 @@ func TestChannelExpirationREST_AuthorityAndValidation(t *testing.T) {
 }
 
 func TestChannelExpirationREST_StaleCredentialRejected(t *testing.T) {
-	ts, owner, serverID, channelID := setupWithChannel(t)
+	boundaryTS, boundary := testhelpers.SetupStaleBoundaryServer(t)
+	ts, owner, serverID, channelID := setupWithChannel(t, boundaryTS)
 	_ = serverID
-	stale := ts.SimulateStaleEpochWindow(t, owner.ID)
+	require.NoError(t, boundary.Arm(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, owner.ID, nil, nil)
 	got := ts.DoRequest(http.MethodPatch, channelExpirationPath+channelID+"/expiration", map[string]interface{}{
 		"mode": "set", "window_seconds": 3600, "retroactive": "new_only",
-	}, testhelpers.AuthHeaders(stale))
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "handler GuardTx must be reached after admitted epoch rotation")
 	assert.Equal(t, http.StatusUnauthorized, got.Code, got.Body.String())
 	assert.Equal(t, int64(0), expirationRevision(t, ts.DB, channelID))
 }

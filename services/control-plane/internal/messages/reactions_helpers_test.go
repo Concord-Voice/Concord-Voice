@@ -100,6 +100,7 @@ func TestToggleDMReactionRowRequiresCurrentParticipant(t *testing.T) {
 		otherUserID, otherUserID+"@test.concord.chat", "dmraceother",
 	)
 	require.NoError(t, err)
+	testdb.RememberActor(t, h.db, userID)
 	_, err = h.db.Exec(
 		`INSERT INTO dm_conversations (id, created_by) VALUES ($1, $2)`,
 		convID, otherUserID,
@@ -121,7 +122,7 @@ func TestToggleDMReactionRowRequiresCurrentParticipant(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	action, err := h.toggleDMReactionInConversation(context.Background(), msgID, userID, "", thumbsUp, convID)
+	action, err := h.toggleDMReactionInConversation(testdb.WithRememberedActor(context.Background(), userID), msgID, userID, "", thumbsUp, convID)
 
 	assert.Empty(t, action)
 	require.Error(t, err)
@@ -161,7 +162,7 @@ func TestToggleDMReactionLocksActorBeforeConversation(t *testing.T) {
 		err    error
 	}, 1)
 	go func() {
-		action, toggleErr := h.toggleDMReactionInConversation(reactionCtx, messageID, actorID, "", "👍", conversationID)
+		action, toggleErr := h.toggleDMReactionInConversation(testdb.WithRememberedActor(reactionCtx, actorID), messageID, actorID, "", "👍", conversationID)
 		result <- struct {
 			action string
 			err    error
@@ -221,7 +222,7 @@ func TestToggleDMReactionSerializesConcurrentToggles(t *testing.T) {
 		go func() {
 			started <- struct{}{}
 			<-start
-			action, toggleErr := h.toggleDMReactionInConversation(toggleCtx, messageID, actorID, "", "👍", conversationID)
+			action, toggleErr := h.toggleDMReactionInConversation(testdb.WithRememberedActor(toggleCtx, actorID), messageID, actorID, "", "👍", conversationID)
 			results <- struct {
 				action string
 				err    error
@@ -277,7 +278,7 @@ func TestToggleDMReactionRequiresVisibleMessageForCurrentParticipant(t *testing.
 		VALUES ($1, $2, '-infinity', NOW() + INTERVAL '1 minute', false)`, actorID, conversationID)
 	require.NoError(t, err)
 
-	action, err := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "", "👍", conversationID)
+	action, err := h.toggleDMReactionInConversation(testdb.WithRememberedActor(context.Background(), actorID), messageID, actorID, "", "👍", conversationID)
 	assert.Empty(t, action)
 	require.Error(t, err)
 	assertNoDMReaction(t, h, messageID, actorID)
@@ -305,6 +306,7 @@ func seedDMReactionForAggregateTest(t *testing.T, h *Handler) (messageID, actorI
 		peerID, peerID+"@test.concord.chat", peerName,
 	)
 	require.NoError(t, err)
+	testdb.RememberActor(t, h.db, actorID)
 	_, err = h.db.Exec(`INSERT INTO dm_conversations (id, created_by) VALUES ($1, $2)`, conversationID, peerID)
 	require.NoError(t, err)
 	_, err = h.db.Exec(
@@ -347,6 +349,7 @@ func TestToggleDMReactionPostCommitSummaryFailureReturnsCommittedAction(t *testi
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodPut, "/", nil)
+	testdb.AttachRememberedActor(c, actorID)
 	h.toggleDMReaction(c, messageID, actorID, "👍", conversationID)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -411,7 +414,7 @@ func TestToggleDMReactionSerializesWithClear(t *testing.T) {
 		err    error
 	}, 1)
 	go func() {
-		action, toggleErr := h.toggleDMReactionInConversation(context.Background(), messageID, actorID, "", "👍", conversationID)
+		action, toggleErr := h.toggleDMReactionInConversation(testdb.WithRememberedActor(context.Background(), actorID), messageID, actorID, "", "👍", conversationID)
 		result := struct {
 			action string
 			err    error

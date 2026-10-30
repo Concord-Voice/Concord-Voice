@@ -67,7 +67,7 @@ func TestErasureCapturesTheErasedPrincipal(t *testing.T) {
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetGraphPresenceCapture(capture)
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 
 	require.Len(t, capture.subjects, 1, "exactly one capture per erasure")
 	require.Equal(t, user.ID, capture.subjects[0].Principal.String(),
@@ -88,7 +88,7 @@ func TestErasureFailsClosedOnCaptureFailure(t *testing.T) {
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetGraphPresenceCapture(capture)
 
-	err := svc.DeleteAccount(context.Background(), user.ID)
+	err := svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID)
 	require.Error(t, err, "a capture failure must fail the erasure")
 
 	var rows int

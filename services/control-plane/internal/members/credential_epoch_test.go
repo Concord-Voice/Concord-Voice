@@ -10,7 +10,7 @@ import (
 )
 
 func TestRemoveMemberRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	owner := ts.CreateTestUser(t, "stale-kick-owner")
 	member := ts.CreateTestUser(t, "stale-kick-member")
 	serverID := ts.CreateTestServer(t, owner.ID, "Stale Kick Server")
@@ -19,9 +19,14 @@ func TestRemoveMemberRejectsStaleCredentialEpoch(t *testing.T) {
 	_, err := ts.DB.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`, channelID, member.ID, []byte("stale-kick-key"))
 	require.NoError(t, err)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
-	w := ts.DoRequest(http.MethodDelete, memberPath(serverID, member.ID), nil, testhelpers.AuthHeaders(staleToken))
+	require.NoError(t, boundary.Arm(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
+	w := ts.DoRequest(http.MethodDelete, memberPath(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	boundary.RequireRotated(t)
+	seen, guardErr := boundary.Hook.Report()
+	require.NoError(t, guardErr)
+	require.Equal(t, 1, seen, "moderation GuardTx must run after family admission")
 
 	var memberExists bool
 	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`, serverID, member.ID).Scan(&memberExists))
@@ -30,7 +35,7 @@ func TestRemoveMemberRejectsStaleCredentialEpoch(t *testing.T) {
 }
 
 func TestBanMemberRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	owner := ts.CreateTestUser(t, "stale-ban-owner")
 	member := ts.CreateTestUser(t, "stale-ban-member")
 	serverID := ts.CreateTestServer(t, owner.ID, "Stale Ban Server")
@@ -39,9 +44,14 @@ func TestBanMemberRejectsStaleCredentialEpoch(t *testing.T) {
 	_, err := ts.DB.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`, channelID, member.ID, []byte("stale-ban-key"))
 	require.NoError(t, err)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
-	w := ts.DoRequest(http.MethodPost, banPath(serverID, member.ID), nil, testhelpers.AuthHeaders(staleToken))
+	require.NoError(t, boundary.Arm(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
+	w := ts.DoRequest(http.MethodPost, banPath(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	boundary.RequireRotated(t)
+	seen, guardErr := boundary.Hook.Report()
+	require.NoError(t, guardErr)
+	require.Equal(t, 1, seen, "moderation GuardTx must run after family admission")
 
 	var memberExists, banExists bool
 	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`, serverID, member.ID).Scan(&memberExists))

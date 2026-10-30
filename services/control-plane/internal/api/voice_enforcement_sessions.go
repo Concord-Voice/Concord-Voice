@@ -4,25 +4,23 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"regexp"
 	"strings"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	protocol "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voiceauthprotocol"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/mediaproof"
 	"github.com/gin-gonic/gin"
@@ -49,18 +47,16 @@ const (
 )
 
 var voiceEnforcementCredentialEpochPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
-var voiceEnforcementHealthNoncePattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var voiceEnforcementRBACLog = logger.New("production")
 
 type voiceEnforcementSessionHandler struct {
-	db               *sql.DB
-	registerKey      []byte
-	releaseKey       []byte
-	capabilityKey    []byte
-	healthKey        []byte
-	healthRequestKey []byte
-	healthACKKey     []byte
-	requester        dmBlockVoiceEjectionRequester
+	db                *sql.DB
+	authSecret        []byte
+	registerKey       []byte
+	releaseKey        []byte
+	capabilityKey     []byte
+	requester         dmBlockVoiceEjectionRequester
+	authoritySnapshot func(context.Context, uuid.UUID) (VoiceAuthAuthoritySnapshot, error)
 }
 
 type voiceEnforcementSessionRequest struct {
@@ -79,70 +75,18 @@ func newVoiceEnforcementSessionHandler(db *sql.DB, secret string, requesters ...
 		requester = requesters[0]
 	}
 	return &voiceEnforcementSessionHandler{
-		db:               db,
-		registerKey:      mediaproof.DeriveKey(secret, voiceEnforcementRegistrationProofContext),
-		releaseKey:       mediaproof.DeriveKey(secret, voiceEnforcementReleaseProofContext),
-		capabilityKey:    mediaproof.DeriveKey(secret, voiceEnforcementCapabilityProofContext),
-		healthKey:        mediaproof.DeriveKey(secret, voiceEnforcementHealthProofContext),
-		healthRequestKey: mediaproof.DeriveKey(secret, "concord/voice-enforcement-session/health/request/v1"),
-		healthACKKey:     mediaproof.DeriveKey(secret, "concord/voice-enforcement-session/health/ack/v1"),
-		requester:        requester,
+		db:            db,
+		authSecret:    []byte(secret),
+		registerKey:   mediaproof.DeriveKey(secret, voiceEnforcementRegistrationProofContext),
+		releaseKey:    mediaproof.DeriveKey(secret, voiceEnforcementReleaseProofContext),
+		capabilityKey: mediaproof.DeriveKey(secret, voiceEnforcementCapabilityProofContext),
+		requester:     requester,
 	}
 }
 
-type voiceEnforcementHealthRequest struct {
-	NodeBootID string `json:"node_boot_id"`
-	Nonce      string `json:"nonce"`
-}
-
-// HealthBootstrap proves the media process can receive the SAME exact target
-// subscription used for ejection. It grants no durable-row mutation authority.
-func (h *voiceEnforcementSessionHandler) HealthBootstrap(c *gin.Context) {
-	if h == nil || h.requester == nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, voiceEnforcementReleaseMaxBodyBytes)
-	var request voiceEnforcementHealthRequest
-	if err := c.ShouldBindBodyWithJSON(&request); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			c.Status(http.StatusRequestEntityTooLarge)
-			return
-		}
-		c.Status(http.StatusBadRequest)
-		return
-	}
-	rawBody, present := c.Get(gin.BodyBytesKey)
-	body, ok := rawBody.([]byte)
-	if !present || !ok || !json.Valid(body) {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-	boot, err := uuid.Parse(request.NodeBootID)
-	if err != nil || boot.String() != request.NodeBootID || !voiceEnforcementHealthNoncePattern.MatchString(request.Nonce) || !mediaproof.Verify(
-		h.healthKey, c.GetHeader(voiceEnforcementReleaseProofHeader), voiceEnforcementHealthProofVersion,
-		c.GetHeader(voiceEnforcementReleaseTimestampHeader), request.NodeBootID, request.Nonce, c.Request.Method, c.Request.URL.RequestURI(),
-	) {
-		c.Status(http.StatusForbidden)
-		return
-	}
-	challengeBytes := make([]byte, 32)
-	if _, err := rand.Read(challengeBytes); err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	if err := publishVoiceEnforcementHealth(c.Request.Context(), h.requester, h.healthRequestKey, h.healthACKKey, boot, hex.EncodeToString(challengeBytes)); err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	c.Status(http.StatusNoContent)
-}
-
-// RequireMediaCapability rejects only service-hop admissions after the
-// operator's post-drain activation receipt exists. Renderer-facing requests
-// remain on their established path; an old media binary cannot create a new,
-// unregistered session once durable enforcement is live.
+// RequireMediaCapability closes service-hop admission while prepared, then
+// requires a signed body/boot capability from a protocol-4 boot. Renderer-facing
+// requests retain their existing path and final family transaction guards.
 func (h *voiceEnforcementSessionHandler) RequireMediaCapability(c *gin.Context) {
 	if h == nil || h.db == nil {
 		c.Status(http.StatusServiceUnavailable)
@@ -155,13 +99,14 @@ func (h *voiceEnforcementSessionHandler) RequireMediaCapability(c *gin.Context) 
 	}
 	var activated bool
 	if err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT activated_at IS NOT NULL FROM voice_enforcement_rollout WHERE id = TRUE`).Scan(&activated); err != nil {
+		`SELECT activated_at IS NOT NULL FROM login_family_rollout WHERE id = TRUE`).Scan(&activated); err != nil {
 		c.Status(http.StatusServiceUnavailable)
 		c.Abort()
 		return
 	}
 	if !activated {
-		c.Next()
+		c.Status(http.StatusForbidden)
+		c.Abort()
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, voiceEnforcementCapabilityMaxBodyBytes+1))
@@ -185,6 +130,17 @@ func (h *voiceEnforcementSessionHandler) RequireMediaCapability(c *gin.Context) 
 		// The node ID is deliberately a signed field, carried separately so the
 		// proof's payload is inspectable and the target identity cannot be
 		// replaced by a bearer-token holder.
+		c.Status(http.StatusForbidden)
+		c.Abort()
+		return
+	}
+	var capable bool
+	if err := h.db.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM voice_auth_boot_fences WHERE node_boot_id=$1 AND retired_at IS NULL)`, nodeBootID).Scan(&capable); err != nil {
+		c.Status(http.StatusServiceUnavailable)
+		c.Abort()
+		return
+	}
+	if !capable {
 		c.Status(http.StatusForbidden)
 		c.Abort()
 		return
@@ -215,225 +171,284 @@ func (r voiceEnforcementSessionRequest) same(other voiceEnforcementSessionReques
 	return r == other
 }
 
-// Register records an exact socket after A1 has made it provisional and before
-// A2 promotion. It is restricted to authenticated media-plane hops: an end
-// user has a bearer token but cannot mint the service-hop proof.
+// Register attaches or renews an exact room under the same family authority as
+// admission. Legacy epoch-only envelopes cannot create family registry evidence.
 func (h *voiceEnforcementSessionHandler) Register(c *gin.Context) {
-	if h == nil || h.db == nil || !middleware.IsMediaPlaneServiceHop(c) {
-		c.Status(http.StatusForbidden)
+	identity, ok := h.productiveVoiceAuth(c)
+	if !ok {
 		return
 	}
-	var request voiceEnforcementSessionRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-	request.UserID = c.GetString("user_id")
-	if !request.valid() {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-	accessToken, found := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
-	if !found || accessToken == "" || !mediaproof.Verify(
-		h.registerKey, c.GetHeader(voiceEnforcementRegistrationProofHeader),
-		voiceEnforcementRegistrationProofVersion,
-		c.GetHeader(voiceEnforcementRegistrationTimestampHeader),
-		mediaproof.TokenDigest(accessToken), request.SessionGeneration, request.NodeBootID,
-		request.RoomID, request.RoomKind, request.UserID, request.CredentialEpoch, request.SocketID,
-	) {
-		c.Status(http.StatusForbidden)
-		return
-	}
-	// This registration is A2's durable admission point. Its row is only
-	// evidence of a session that passed the same credential and DM authority
-	// fences as promotion; otherwise a block or rotation racing A2 could be
-	// committed before a permanently unaddressable row is inserted.
-	if request.CredentialEpoch != middleware.TokenCredentialEpoch(c) {
-		c.Status(http.StatusForbidden)
-		return
-	}
-	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	request, _, err := h.readVoiceAuth(c, protocol.EndpointRoomRegister)
 	if err != nil {
-		c.Status(http.StatusServiceUnavailable)
+		c.Status(voiceAuthStatus(err))
 		return
 	}
-	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			// A failed rollback is logged without writing a second response.
-			log.Printf("rollback voice enforcement registration: %v", rollbackErr)
+	value, ok := voiceAuthPayload(c, request.RoomRegister)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+	serverID, err := h.voiceAuthRoomServer(ctx, value)
+	if err != nil {
+		c.Status(voiceAuthStatus(err))
+		return
+	}
+	var response protocol.HTTPResponse
+	// A changed DM participant set requires a new transaction and complete user
+	// prefix, never a late addition to the previous capability.
+	for attempt := 0; attempt < 2; attempt++ {
+		response, err = h.runVoiceAuth(ctx, request, func(tx *sql.Tx) (protocol.ResponsePayload, error) {
+			return h.registerAuthRoomTx(ctx, tx, request, value, identity, serverID)
+		})
+		if !errors.Is(err, dmblock.ErrMembershipChanged) {
+			break
 		}
-	}()
-	if status, guardErr := guardVoiceEnforcementRegistration(c.Request.Context(), tx, request); guardErr != nil {
-		c.Status(status)
-		return
 	}
-	result, err := tx.ExecContext(c.Request.Context(), `
-		INSERT INTO voice_enforcement_sessions
-			(session_generation, node_boot_id, room_id, room_kind, user_id, credential_epoch, socket_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT DO NOTHING`,
-		request.SessionGeneration, request.NodeBootID, request.RoomID, request.RoomKind,
-		request.UserID, request.CredentialEpoch, request.SocketID)
-	if err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	if changed == 1 {
-		if err := tx.Commit(); err != nil {
-			c.Status(http.StatusServiceUnavailable)
-			return
-		}
-		c.Status(http.StatusNoContent)
-		return
-	}
-	var stored voiceEnforcementSessionRequest
-	err = tx.QueryRowContext(c.Request.Context(), `
-		SELECT session_generation, node_boot_id, room_id, room_kind, user_id, credential_epoch, socket_id
-		FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(
-		&stored.SessionGeneration, &stored.NodeBootID, &stored.RoomID, &stored.RoomKind,
-		&stored.UserID, &stored.CredentialEpoch, &stored.SocketID)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.Status(http.StatusConflict)
-		return
-	}
-	if err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	if !request.same(stored) {
-		c.Status(http.StatusConflict)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	c.Status(http.StatusNoContent)
+	writeVoiceAuth(c, response, err)
 }
 
-// guardVoiceEnforcementRegistration makes the registry row an extension of
-// A2, rather than an independently admitted capability. DM uses the complete
-// users -> participant-set advisory -> parent -> blocked-pair prefix; channel
-// uses the voice-join visibility, credential, membership, and RBAC fence.
-func guardVoiceEnforcementRegistration(ctx context.Context, tx *sql.Tx, request voiceEnforcementSessionRequest) (int, error) {
-	if request.RoomKind == "dm" {
-		return guardDMVoiceEnforcementRegistration(ctx, tx, request)
-	}
-	var serverID string
-	if err := tx.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = $1`, request.RoomID).Scan(&serverID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return http.StatusForbidden, err
-		}
-		return http.StatusServiceUnavailable, fmt.Errorf("preflight channel voice enforcement registration: %w", err)
-	}
-	return voice.CheckChannelVoiceAccessTx(ctx, tx, rbac.NewResolver(nil, nil, voiceEnforcementRBACLog), serverID, request.RoomID, request.UserID, request.CredentialEpoch)
-}
-
-func guardDMVoiceEnforcementRegistration(ctx context.Context, tx *sql.Tx, request voiceEnforcementSessionRequest) (int, error) {
-	conversationID, err := uuid.Parse(request.RoomID)
-	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("parse voice enforcement conversation ID: %w", err)
-	}
-	userID, err := uuid.Parse(request.UserID)
-	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("parse voice enforcement user ID: %w", err)
-	}
-	subjects, err := dmblock.LockConversationUsersTx(ctx, tx, request.RoomID, []uuid.UUID{userID}, dmblock.LockShare)
-	if err != nil {
-		if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
-			return http.StatusForbidden, err
-		}
-		return http.StatusServiceUnavailable, fmt.Errorf("lock voice enforcement DM users: %w", err)
-	}
-	if err := credepoch.GuardTx(ctx, tx, request.UserID, request.CredentialEpoch); err != nil {
-		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, sql.ErrNoRows) {
-			return http.StatusForbidden, err
-		}
-		return http.StatusServiceUnavailable, fmt.Errorf("guard DM voice enforcement registration: %w", err)
-	}
-	if err := dm.LockDMVoiceParticipantSetTx(ctx, tx, conversationID); err != nil {
-		return http.StatusServiceUnavailable, fmt.Errorf("lock voice enforcement DM participant set: %w", err)
-	}
-	if _, err := dmblock.PrepareConversationAfterUserLocksTx(ctx, tx, request.RoomID, subjects, dmblock.LockShare); err != nil {
-		if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
-			return http.StatusForbidden, err
-		}
-		return http.StatusServiceUnavailable, fmt.Errorf("prepare voice enforcement DM registration: %w", err)
-	}
-	var memberID string
-	err = tx.QueryRowContext(ctx, `
-		SELECT user_id FROM dm_participants
-		WHERE conversation_id = $1 AND user_id = $2
-		FOR KEY SHARE`, request.RoomID, request.UserID).Scan(&memberID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return http.StatusForbidden, err
-	}
-	if err != nil {
-		return http.StatusServiceUnavailable, fmt.Errorf("recheck voice enforcement DM membership: %w", err)
-	}
-	return http.StatusNoContent, nil
-}
-
-// Release accepts only a body-bound, domain-separated proof from the media
-// plane. It deliberately does not require the user's bearer token: credential
-// rotation may revoke that token before the exact socket can be torn down.
+// Release keeps schema-absent legacy draining available, but that proof can
+// never delete family-aware room evidence. Unknown schemas never fall back.
 func (h *voiceEnforcementSessionHandler) Release(c *gin.Context) {
 	if h == nil || h.db == nil {
 		c.Status(http.StatusServiceUnavailable)
 		return
 	}
-	// This route is intentionally unauthenticated because the user JWT may be
-	// invalidated before terminal teardown. Bound input before JSON decoding so
-	// an unauthenticated peer cannot allocate an unbounded request body while
-	// failing its proof later.
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, voiceEnforcementReleaseMaxBodyBytes)
-	var request voiceEnforcementSessionRequest
-	if err := c.ShouldBindJSON(&request); err != nil || !request.valid() {
+	body, err := voiceAuthBody(c)
+	if err != nil {
+		c.Status(voiceAuthStatus(err))
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(body, &fields); err != nil {
 		c.Status(http.StatusBadRequest)
 		return
 	}
-	timestamp := c.GetHeader(voiceEnforcementReleaseTimestampHeader)
-	if !mediaproof.Verify(h.releaseKey, c.GetHeader(voiceEnforcementReleaseProofHeader),
-		voiceEnforcementReleaseProofVersion, timestamp,
-		request.SessionGeneration, request.NodeBootID, request.RoomID, request.RoomKind,
-		request.UserID, request.CredentialEpoch, request.SocketID) {
+	if _, present := fields["schema"]; present {
+		h.releaseAuthRoom(c, body)
+		return
+	}
+	h.releaseLegacyRoom(c, body)
+}
+func (h *voiceEnforcementSessionHandler) releaseLegacyRoom(c *gin.Context, body []byte) {
+	var request voiceEnforcementSessionRequest
+	if c.Request.Method != http.MethodPost || c.Request.URL.RequestURI() != "/api/v1/internal/voice/enforcement-sessions/release" || json.Unmarshal(body, &request) != nil || !request.valid() {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	verify := func() bool {
+		return mediaproof.Verify(h.releaseKey, c.GetHeader(voiceEnforcementReleaseProofHeader), voiceEnforcementReleaseProofVersion, c.GetHeader(voiceEnforcementReleaseTimestampHeader), request.SessionGeneration, request.NodeBootID, request.RoomID, request.RoomKind, request.UserID, request.CredentialEpoch, request.SocketID)
+	}
+	if !verify() {
 		c.Status(http.StatusForbidden)
 		return
 	}
-	result, err := h.db.ExecContext(c.Request.Context(), `
-		DELETE FROM voice_enforcement_sessions
-		WHERE session_generation = $1 AND node_boot_id = $2 AND room_id = $3 AND room_kind = $4
-			AND user_id = $5 AND credential_epoch = $6 AND socket_id = $7`,
-		request.SessionGeneration, request.NodeBootID, request.RoomID, request.RoomKind,
-		request.UserID, request.CredentialEpoch, request.SocketID)
+	err := h.releaseLegacyRoomTx(c.Request.Context(), request, verify)
 	if err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	if changed == 1 {
-		c.Status(http.StatusNoContent)
-		return
-	}
-	var exists bool
-	if err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT EXISTS(SELECT 1 FROM voice_enforcement_sessions WHERE session_generation = $1)`,
-		request.SessionGeneration).Scan(&exists); err != nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-	if exists {
-		c.Status(http.StatusConflict)
+		c.Status(voiceAuthStatus(err))
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+func (h *voiceEnforcementSessionHandler) releaseLegacyRoomTx(ctx context.Context, request voiceEnforcementSessionRequest, verify func() bool) (retErr error) {
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, rollbackErr)
+		}
+	}()
+	if err = voiceAuthGeneration(ctx, tx, "room", request.SessionGeneration); err != nil {
+		return err
+	}
+	// An unbound legacy row has no parent connection to lock. The room key
+	// prevents attachment while the following fresh association check holds.
+	if _, bound, err := voiceAuthReadAssociation(ctx, tx, request.SessionGeneration); err != nil {
+		return err
+	} else if bound {
+		return voiceAuthFail(http.StatusConflict)
+	}
+	if _, closed, err := voiceAuthReadRoomClosure(ctx, tx, request.SessionGeneration); err != nil {
+		return err
+	} else if closed {
+		return voiceAuthFail(http.StatusConflict)
+	}
+	row, present, err := voiceAuthReadRoom(ctx, tx, request.SessionGeneration)
+	if err != nil {
+		return err
+	}
+	if !verify() {
+		return voiceAuthFail(http.StatusForbidden)
+	}
+	if present && row != request {
+		return voiceAuthFail(http.StatusConflict)
+	}
+	if present {
+		result, err := tx.ExecContext(ctx, `DELETE FROM voice_enforcement_sessions WHERE session_generation=$1`, request.SessionGeneration)
+		if err != nil {
+			return err
+		}
+		if err = voiceAuthOneChanged(result); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (h *voiceEnforcementSessionHandler) registerAuthRoomTx(ctx context.Context, tx *sql.Tx, request protocol.Request, value protocol.RoomRegister, identity loginfamily.AccessIdentity, serverID string) (protocol.ResponsePayload, error) {
+	user, err := voiceAuthRoomAuthority(ctx, tx, value, identity, serverID)
+	if err != nil {
+		return nil, err
+	}
+	target := protocol.Target{ConnectionGeneration: value.ConnectionGeneration, NodeBootID: value.NodeBootID, SocketID: value.SocketID, CredentialEpoch: value.CredentialEpoch}
+	binding, err := voiceAuthFamily(ctx, tx, user, identity, target)
+	if err != nil {
+		return nil, err
+	}
+	if err = voiceAuthActiveBoot(ctx, tx, value.NodeBootID); err != nil {
+		return nil, err
+	}
+	if err = voiceAuthGeneration(ctx, tx, "connection", value.ConnectionGeneration); err != nil {
+		return nil, err
+	}
+	connection, present, err := voiceAuthReadConnection(ctx, tx, value.ConnectionGeneration, false)
+	if err != nil {
+		return nil, err
+	}
+	if !present || connection.binding != binding {
+		return nil, voiceAuthFail(http.StatusConflict)
+	}
+	if _, closed, err := voiceAuthReadConnectionClosure(ctx, tx, value.ConnectionGeneration); err != nil {
+		return nil, err
+	} else if closed {
+		return nil, voiceAuthFail(http.StatusConflict)
+	}
+	if err = voiceAuthGeneration(ctx, tx, "room", value.SessionGeneration); err != nil {
+		return nil, err
+	}
+	room := protocol.Room{SessionGeneration: value.SessionGeneration, RoomID: value.RoomID, RoomKind: value.RoomKind}
+	fresh := func() error { return h.freshVoiceAuth(ctx, tx, request, user, identity, target) }
+	if err = voiceAuthAttachRoom(ctx, tx, value.Mode, binding, room, fresh); err != nil {
+		return nil, err
+	}
+	if err = fresh(); err != nil {
+		return nil, err
+	}
+	return protocol.RoomRegistrationResult{Schema: "concord.auth-room-binding", Version: 1, VoiceEnforcementProtocol: 4, Binding: binding, Room: room}, nil
+}
+
+// Channel discovery precedes the owned transaction; the authority helper's
+// visibility lock remains its mandatory first statement and rechecks scope.
+func (h *voiceEnforcementSessionHandler) voiceAuthRoomServer(ctx context.Context, value protocol.RoomRegister) (string, error) {
+	if value.RoomKind == "dm" {
+		return "", nil
+	}
+	var serverID string
+	err := h.db.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id=$1`, value.RoomID).Scan(&serverID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", voiceAuthFail(http.StatusForbidden)
+	}
+	return serverID, err
+}
+func voiceAuthRoomAuthority(ctx context.Context, tx *sql.Tx, value protocol.RoomRegister, identity loginfamily.AccessIdentity, serverID string) (loginfamily.UserAuthority, error) {
+	if value.RoomKind == "dm" {
+		return voiceAuthDMRoomAuthority(ctx, tx, value.RoomID, identity)
+	}
+	user, status, err := voice.CheckChannelVoiceFamilyAuthorityTx(ctx, tx, rbac.NewResolver(nil, nil, voiceEnforcementRBACLog), serverID, value.RoomID, identity)
+	if err != nil {
+		// The service protocol distinguishes dependency failure from final
+		// resource denial independently of ordinary voice admission statuses.
+		switch {
+		case errors.Is(err, loginfamily.ErrContract):
+			status = http.StatusInternalServerError
+		case status >= http.StatusInternalServerError:
+			status = http.StatusServiceUnavailable
+		default:
+			status = http.StatusForbidden
+		}
+		return loginfamily.UserAuthority{}, &voiceAuthFailure{status: status, cause: err}
+	}
+	return user, nil
+}
+func voiceAuthDMRoomAuthority(ctx context.Context, tx *sql.Tx, roomID string, identity loginfamily.AccessIdentity) (loginfamily.UserAuthority, error) {
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	subjects, users, err := dmblock.LockConversationAuthorityUsersTx(ctx, tx, barrier, roomID, []uuid.UUID{identity.UserID}, loginfamily.UserShare)
+	if err != nil {
+		return loginfamily.UserAuthority{}, voiceAuthDMError(err)
+	}
+	user, err := users.ForUser(identity.UserID)
+	if err != nil {
+		return user, err
+	}
+	if _, err = loginfamily.GuardAfterUserLockTx(ctx, tx, user, identity, loginfamily.FamilyShare); err != nil {
+		return user, err
+	}
+	if err = dm.LockDMVoiceParticipantSetTx(ctx, tx, uuid.MustParse(roomID)); err != nil {
+		return user, err
+	}
+	if _, err = dmblock.PrepareConversationAfterUserLocksTx(ctx, tx, roomID, subjects, dmblock.LockShare); err != nil {
+		return user, voiceAuthDMError(err)
+	}
+	var member string
+	err = tx.QueryRowContext(ctx, `SELECT user_id FROM dm_participants WHERE conversation_id=$1 AND user_id=$2 FOR KEY SHARE`, roomID, identity.UserID).Scan(&member)
+	if errors.Is(err, sql.ErrNoRows) {
+		return user, voiceAuthFail(http.StatusForbidden)
+	}
+	return user, err
+}
+func voiceAuthDMError(err error) error {
+	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+		return &voiceAuthFailure{status: http.StatusForbidden, cause: err}
+	}
+	return err
+}
+func voiceAuthAttachRoom(ctx context.Context, tx *sql.Tx, mode string, binding protocol.Binding, room protocol.Room, fresh func() error) error {
+	if _, closed, err := voiceAuthReadRoomClosure(ctx, tx, room.SessionGeneration); err != nil {
+		return err
+	} else if closed {
+		return voiceAuthFail(http.StatusConflict)
+	}
+	row, present, err := voiceAuthReadRoom(ctx, tx, room.SessionGeneration)
+	if err != nil {
+		return err
+	}
+	parent, bound, err := voiceAuthReadAssociation(ctx, tx, room.SessionGeneration)
+	if err != nil {
+		return err
+	}
+	if err = fresh(); err != nil {
+		return err
+	}
+	if present {
+		if row != voiceAuthRoomTuple(binding, room) || !bound || parent != binding.Target.ConnectionGeneration {
+			return voiceAuthFail(http.StatusConflict)
+		}
+		return nil
+	}
+	if bound || mode == "renew" {
+		return voiceAuthFail(http.StatusConflict)
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO voice_enforcement_sessions(session_generation,node_boot_id,room_id,room_kind,user_id,credential_epoch,socket_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, room.SessionGeneration, binding.Target.NodeBootID, room.RoomID, room.RoomKind, binding.UserID, binding.Target.CredentialEpoch, binding.Target.SocketID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		var actual voiceEnforcementSessionRequest
+		err = tx.QueryRowContext(ctx, `SELECT session_generation,node_boot_id,room_id,room_kind,user_id,credential_epoch,socket_id FROM voice_enforcement_sessions WHERE node_boot_id=$1 AND socket_id=$2`, binding.Target.NodeBootID, binding.Target.SocketID).Scan(&actual.SessionGeneration, &actual.NodeBootID, &actual.RoomID, &actual.RoomKind, &actual.UserID, &actual.CredentialEpoch, &actual.SocketID)
+		if err != nil {
+			return err
+		}
+		return voiceAuthFail(http.StatusConflict)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO voice_auth_room_bindings(session_generation,connection_generation) VALUES($1,$2)`, room.SessionGeneration, binding.Target.ConnectionGeneration)
+	return err
 }

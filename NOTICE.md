@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-10-22
+**Generated:** 2026-10-30
 **MinIO distribution addendum updated:** 2026-09-27
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -301,7 +301,7 @@ bundle (client/desktop):
 | is-fullwidth-code-point | 3.0.0 | MIT | https://github.com/sindresorhus/is-fullwidth-code-point |
 | is-hexadecimal | 2.0.1 | MIT | https://github.com/wooorm/is-hexadecimal |
 | is-plain-obj | 4.1.0 | MIT | https://github.com/sindresorhus/is-plain-obj |
-| jose | 6.2.12 | MIT | https://github.com/panva/jose |
+| jose | 6.2.13 | MIT | https://github.com/panva/jose |
 | js-yaml | 4.3.2 | MIT | https://github.com/nodeca/js-yaml |
 | jsonfile | 6.2.0 | MIT | https://github.com/jprichardson/node-jsonfile |
 | lazy-val | 1.0.5 | MIT | https://github.com/develar/lazy-val |
@@ -310,7 +310,7 @@ bundle (client/desktop):
 | lodash.isequal | 4.5.0 | MIT | https://github.com/lodash/lodash |
 | longest-streak | 3.1.0 | MIT | https://github.com/wooorm/longest-streak |
 | lowlight | 3.3.0 | MIT | https://github.com/wooorm/lowlight |
-| lucide-react | 1.57.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.64.0 | ISC | https://github.com/lucide-icons/lucide |
 | markdown-table | 3.0.4 | MIT | https://github.com/wooorm/markdown-table |
 | mdast-util-find-and-replace | 3.0.2 | MIT | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | mdast-util-from-markdown | 2.0.3 | MIT | https://github.com/syntax-tree/mdast-util-from-markdown |
@@ -327,7 +327,7 @@ bundle (client/desktop):
 | mdast-util-to-hast | 13.2.1 | MIT | https://github.com/syntax-tree/mdast-util-to-hast |
 | mdast-util-to-markdown | 2.1.2 | MIT | https://github.com/syntax-tree/mdast-util-to-markdown |
 | mdast-util-to-string | 4.0.0 | MIT | https://github.com/syntax-tree/mdast-util-to-string |
-| mediasoup-client | 3.24.5 | ISC | https://github.com/versatica/mediasoup-client |
+| mediasoup-client | 3.25.3 | ISC | https://github.com/versatica/mediasoup-client |
 | micromark-core-commonmark | 2.0.3 | MIT | https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark |
 | micromark-extension-gfm-autolink-literal | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-autolink-literal |
 | micromark-extension-gfm-footnote | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-footnote |
@@ -444,7 +444,7 @@ bundle (services/media-plane):
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |
 | accepts | 2.0.0 | MIT | https://github.com/jshttp/accepts |
 | async | 3.2.6 | MIT | https://github.com/caolan/async |
-| body-parser | 2.3.0 | MIT | https://github.com/expressjs/body-parser |
+| body-parser | 2.4.0 | MIT | https://github.com/expressjs/body-parser |
 | buffer-equal-constant-time | 1.0.1 | BSD-3-Clause | https://github.com/goinstant/buffer-equal-constant-time |
 | bytes | 3.1.2 | MIT | https://github.com/visionmedia/bytes.js |
 | call-bind-apply-helpers | 1.0.2 | MIT | https://github.com/ljharb/call-bind-apply-helpers |
@@ -491,7 +491,7 @@ bundle (services/media-plane):
 | has-symbols | 1.1.0 | MIT | https://github.com/inspect-js/has-symbols |
 | hasown | 2.0.4 | MIT | https://github.com/inspect-js/hasOwn |
 | http-errors | 2.0.1 | MIT | https://github.com/jshttp/http-errors |
-| iconv-lite | 0.7.2 | MIT | https://github.com/pillarjs/iconv-lite |
+| iconv-lite | 0.7.3 | MIT | https://github.com/pillarjs/iconv-lite |
 | inherits | 2.0.4 | ISC | https://github.com/isaacs/inherits |
 | ipaddr.js | 1.9.1 | MIT | https://github.com/whitequark/ipaddr.js |
 | is-promise | 4.0.0 | MIT | https://github.com/then/is-promise |
@@ -510,7 +510,7 @@ bundle (services/media-plane):
 | logform | 2.7.0 | MIT | https://github.com/winstonjs/logform |
 | math-intrinsics | 1.1.0 | MIT | https://github.com/es-shims/math-intrinsics |
 | media-typer | 1.1.0 | MIT | https://github.com/jshttp/media-typer |
-| mediasoup | 3.28.0 | ISC | https://github.com/versatica/mediasoup |
+| mediasoup | 3.31.0 | ISC | https://github.com/versatica/mediasoup |
 | merge-descriptors | 2.0.0 | MIT | https://github.com/sindresorhus/merge-descriptors |
 | mime-db | 1.52.0 | MIT | https://github.com/jshttp/mime-db |
 | mime-db | 1.54.0 | MIT | https://github.com/jshttp/mime-db |
@@ -532,7 +532,7 @@ bundle (services/media-plane):
 | parseurl | 1.3.3 | MIT | https://github.com/pillarjs/parseurl |
 | path-to-regexp | 8.4.0 | MIT | https://github.com/pillarjs/path-to-regexp |
 | proxy-addr | 2.0.8 | MIT | https://github.com/jshttp/proxy-addr |
-| qs | 6.16.0 | BSD-3-Clause | https://github.com/ljharb/qs |
+| qs | 6.16.1 | BSD-3-Clause | https://github.com/ljharb/qs |
 | range-parser | 1.2.1 | MIT | https://github.com/jshttp/range-parser |
 | raw-body | 3.0.2 | MIT | https://github.com/stream-utils/raw-body |
 | readable-stream | 3.6.2 | MIT | https://github.com/nodejs/readable-stream |
@@ -592,7 +592,7 @@ covering the other.
 |---|---|---|---|
 | @types/react | 19.3.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | csstype | 3.2.3 | MIT | https://github.com/frenic/csstype |
-| lucide-react | 1.57.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.61.0 | ISC | https://github.com/lucide-icons/lucide |
 | react-dom | 19.3.1 | MIT | https://github.com/react/react |
 | react | 19.3.1 | MIT | https://github.com/react/react |
 | scheduler | 0.28.0 | MIT | https://github.com/react/react |

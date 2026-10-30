@@ -182,7 +182,8 @@ func TestRemovalFailsClosedOnCaptureFailure(t *testing.T) {
 	h.SetAuthorityHandler(rbac.NewHandler(db, log, nil, nil, resolver, nil, nil))
 	h.SetGraphPresenceCapture(capture)
 
-	err = h.execRemovalTx(context.Background(), captureServerID, targetID.String(), targetID.String())
+	// The family guard (#2272) needs the actor's signed identity below the router.
+	err = h.execRemovalTx(dbtest.ActorContext(context.Background(), t, db, targetID.String()), captureServerID, targetID.String(), targetID.String())
 
 	require.ErrorIs(t, err, forced,
 		"a capture read failure must surface, not be swallowed into a successful removal")
@@ -335,6 +336,7 @@ func TestUnresolvedMemberCommitFailsClosedWithoutTrustingReadd(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodDelete, "/api/v1/servers/"+serverID+"/members/"+target.String(), nil)
+	c.Request = c.Request.WithContext(dbtest.ActorContext(c.Request.Context(), t, db, owner.String()))
 	c.Params = gin.Params{{Key: "id", Value: serverID}, {Key: "user_id", Value: target.String()}}
 	c.Set("user_id", owner.String())
 	h.RemoveMember(c)
@@ -536,7 +538,8 @@ func TestBanSkipsCaptureWhenMemberProbeRacesWithLeave(t *testing.T) {
 	// A ban remains required, while capture must be skipped because there is no
 	// audience left to revoke. captureErr makes an accidental CaptureInTx call
 	// fail this test.
-	err := h.execBanTx(context.Background(), serverID.String(), target.String(), owner.String(), nil, true)
+	// The family guard (#2272) needs the actor's signed identity below the router.
+	err := h.execBanTx(dbtest.ActorContext(context.Background(), t, db, owner.String()), serverID.String(), target.String(), owner.String(), nil, true)
 	require.NoError(t, err)
 
 	var banned bool

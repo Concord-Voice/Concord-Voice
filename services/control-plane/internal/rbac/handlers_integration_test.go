@@ -1755,6 +1755,7 @@ func TestAssignRole_GuardError_FailsClosed(t *testing.T) {
 	body := `{"role_id":"` + roleID + `"}`
 	c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	ts.AttachActorIdentity(t, c, member.ID)
 
 	handler.AssignRole(c)
 

@@ -5,9 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,8 +43,8 @@ import (
 // non-canonical input outright would surface only indirectly, as a disabled
 // account's 403 flipping to 401, which names the wrong cause.
 func TestAuthRequired_PublishesCanonicalUserIDOnContext(t *testing.T) {
-	r := authRequiredUnderTest(t)
-	const canonical = "0f1e2d3c-4b5a-4968-8776-655443322110"
+	r, access := authRequiredUnderTest(t)
+	const canonical = classFixtureUserID
 
 	for _, sp := range []struct{ name, claim string }{
 		{"canonical_control", canonical},
@@ -64,11 +62,9 @@ func TestAuthRequired_PublishesCanonicalUserIDOnContext(t *testing.T) {
 					"a variant row must actually differ from the canonical form")
 			}
 
-			tok := makeToken(t, jwt.MapClaims{
-				"user_id": sp.claim,
-				"exp":     time.Now().Add(15 * time.Minute).Unix(),
-				"iat":     time.Now().Unix(),
-			}, tokenClassSecret)
+			claims := signedFixtureClaims(t, access, tokenClassSecret)
+			claims["user_id"] = sp.claim
+			tok := makeToken(t, claims, tokenClassSecret)
 
 			rec := getProtected(t, r, tok)
 
@@ -103,8 +99,8 @@ func TestAuthRequired_PublishesCanonicalUserIDOnContext(t *testing.T) {
 // string whose middle 36 bytes are canonical — its brace arm never validates
 // the delimiters) and refuses shapes PostgreSQL admits (every case below).
 func TestAuthRequired_RejectsPostgresOnlySpellings(t *testing.T) {
-	r := authRequiredUnderTest(t)
-	const canonical = "0f1e2d3c-4b5a-4968-8776-655443322110"
+	r, access := authRequiredUnderTest(t)
+	const canonical = classFixtureUserID
 
 	dashless := strings.ReplaceAll(canonical, "-", "")
 	groups := make([]string, 0, len(dashless)/4)
@@ -119,11 +115,9 @@ func TestAuthRequired_RejectsPostgresOnlySpellings(t *testing.T) {
 		{"pg_braced_extra_hyphens", "{" + everyFour + "}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tok := makeToken(t, jwt.MapClaims{
-				"user_id": tc.claim,
-				"exp":     time.Now().Add(15 * time.Minute).Unix(),
-				"iat":     time.Now().Unix(),
-			}, tokenClassSecret)
+			claims := signedFixtureClaims(t, access, tokenClassSecret)
+			claims["user_id"] = tc.claim
+			tok := makeToken(t, claims, tokenClassSecret)
 
 			rec := getProtected(t, r, tok)
 

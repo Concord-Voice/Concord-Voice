@@ -22,7 +22,7 @@ func TestDeleteAccount_HappyPath(t *testing.T) {
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 
-	err := svc.DeleteAccount(context.Background(), user.ID)
+	err := svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID)
 	require.NoError(t, err)
 
 	var userRows int
@@ -57,7 +57,7 @@ func TestDeleteAccount_RemovesPendingServerVoiceTerminalOutbox(t *testing.T) {
 	require.Equal(t, 1, pendingBefore, "positive control: pending outbox obligation must be present")
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 
 	var pendingAfter int
 	require.NoError(t, ts.DB.QueryRow(
@@ -97,8 +97,9 @@ func TestDeleteAccount_IdempotentRetry(t *testing.T) {
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 
+	// The user row is gone, so no login can be minted; ErrUserNotFound precedes the guard.
 	err := svc.DeleteAccount(context.Background(), user.ID)
 	require.ErrorIs(t, err, users.ErrUserNotFound)
 
@@ -119,7 +120,7 @@ func TestDeleteAccount_AuditRowInsertWithoutSentryColumn(t *testing.T) {
 	user := ts.CreateTestUser(t, "deleteacct3")
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
-	err := svc.DeleteAccount(context.Background(), user.ID)
+	err := svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID)
 	require.NoError(t, err, "INSERT must succeed without sentry_delete_attempted column")
 }
 
@@ -140,7 +141,7 @@ func TestDeleteAccount_BroadcastsIncompleteChannelDeletion(t *testing.T) {
 	svc.SetChannelDeletedBroadcaster(func(serverID, channelID string) {
 		broadcasts = append(broadcasts, [2]string{serverID, channelID})
 	})
-	require.NoError(t, svc.DeleteAccount(context.Background(), creator.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, creator.ID), creator.ID))
 
 	assert.Equal(t, [][2]string{{serverID, channelID}}, broadcasts)
 	var channelRows int
@@ -170,7 +171,7 @@ func TestDeleteAccount_BroadcastsCascadedIncompleteLinkedChannelDeletion(t *test
 	svc.SetChannelDeletedBroadcaster(func(serverID, channelID string) {
 		broadcasts = append(broadcasts, [2]string{serverID, channelID})
 	})
-	require.NoError(t, svc.DeleteAccount(context.Background(), creator.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, creator.ID), creator.ID))
 
 	assert.ElementsMatch(t, [][2]string{{serverID, voiceID}, {serverID, linkedTextID}}, broadcasts)
 	var channelRows int
@@ -197,7 +198,7 @@ func TestDeleteAccount_CascadeDeletesUserRelatedData(t *testing.T) {
 	ts.AssignRoleToUser(t, serverID, user.ID, roleID)
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 
 	// Verify user is gone.
 	var userExists int

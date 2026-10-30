@@ -11,7 +11,16 @@ import { registerAudiocapIpc } from './ipc/audiocap';
 import { registerBillingIpc } from './ipc/billing';
 import { isBillingWebContents } from './billing/billingWindow';
 import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/windowControls';
-import { initTray, destroyTray, isTrayActive } from './tray';
+import {
+  initTray,
+  destroyTray,
+  isTrayActive,
+  notifyTrayUpdate,
+  setTrayActionSender,
+  setTrayWindowFocused,
+} from './tray';
+import { attachTrayResetHooks, registerTrayStatusIpc } from './ipc/trayStatus';
+import { TRAY_ACTION } from '../shared/trayStatus';
 import {
   audiocapMachineCapability,
   killAudiocapHost,
@@ -1505,6 +1514,13 @@ const createWindow = async (): Promise<void> => {
     // else: leave native minimize -> toolbar as-is
   });
 
+  // Status-aware tray (tray-status spec §3/§4): window focus gates the mention
+  // burst, and a renderer reload / crash / hang drops the tray back to neutral
+  // (R17) so it never keeps live voice controls for a session that is gone.
+  mainWindow.on('focus', () => setTrayWindowFocused(true));
+  mainWindow.on('blur', () => setTrayWindowFocused(false));
+  attachTrayResetHooks(mainWindow.webContents);
+
   mainWindow.on('closed', () => {
     // #974/#975: a window-less SSO flow (apple or google) has no UI to deliver
     // its result to — tear both down so the loopback listener and 5-minute
@@ -1633,6 +1649,9 @@ app.whenReady().then(async () => {
   registerAudiocapIpc(getRemoteSpaBaseUrl, () => mainWindow);
   // Billing launcher (#1305): sender-fenced, Stripe-host-validated, opens a modal sheet.
   registerBillingIpc(getRemoteSpaBaseUrl, () => mainWindow);
+  // Status-aware tray (tray-status spec §4): trusted frame + the main window's own
+  // main frame (a PiP shares the origin) + 20/s bucket + exact closed-enum shape.
+  registerTrayStatusIpc(getRemoteSpaBaseUrl, () => mainWindow);
   // Permission request handler: explicitly allow app-required permissions, deny risky ones.
   // Notifications are allowed (JIT-managed by permissionManager #197).
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
@@ -1722,7 +1741,8 @@ app.whenReady().then(async () => {
     () => mainWindow,
     () => {
       isQuitting = true;
-    }
+    },
+    notifyTrayUpdate
   );
 
   const updateLogger = getUpdateLogger();
@@ -1803,7 +1823,19 @@ app.whenReady().then(async () => {
   // System tray (#1099): init after the first window exists so the activate
   // handler has a window to reveal. Init failure is non-fatal — the app runs
   // trayless and window-all-closed keeps its quit (see handler below).
-  initTray({ getMainWindow: () => mainWindow, createWindow });
+  // Open/Quit and the two update rows are main-direct (spec §4); everything that
+  // changes client state goes to the renderer as a closed-enum `tray:action`.
+  setTrayActionSender((action) => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return;
+    win.webContents.send(TRAY_ACTION, action);
+  });
+  initTray({
+    getMainWindow: () => mainWindow,
+    createWindow,
+    downloadUpdate,
+    installUpdate: safeQuitAndInstall,
+  });
 
   // Notify renderer of rollback after window is created (#384)
   if (rollbackResult) {
@@ -2215,15 +2247,25 @@ ipcMain.handle('app:quit', () => {
 
 // ─── Desktop Notification Helpers (#175) ────────────────────────────
 
-ipcMain.handle('app:setBadgeCount', (_event, count: number) => {
-  app.setBadgeCount(count);
+// Hardened in IPC contract 33 (tray-status spec §4 T7): sender frame first, then
+// the payload shape. Each refusal is a silent no-op, as before for bad input.
+const MAX_BADGE_COUNT = 9999;
+
+ipcMain.handle('app:setBadgeCount', (event, count: unknown) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) return;
+  // A real total can exceed the cap (it sums every channel and DM); clamp, don't drop.
+  app.setBadgeCount(Math.min(count, MAX_BADGE_COUNT));
 });
 
-ipcMain.handle('app:flashFrame', (_event, flash: boolean) => {
+ipcMain.handle('app:flashFrame', (event, flash: unknown) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+  if (typeof flash !== 'boolean') return;
   mainWindow?.flashFrame(flash);
 });
 
-ipcMain.handle('app:focusWindow', () => {
+ipcMain.handle('app:focusWindow', (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();

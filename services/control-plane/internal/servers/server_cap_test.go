@@ -1,11 +1,14 @@
 package servers_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/require"
@@ -82,8 +85,8 @@ func TestCreateServerDailyQuota(t *testing.T) {
 		"a create older than 24h drops out of the count")
 }
 
-// An access token can outlive its account. The quota's users-row lock then
-// finds nothing, and CreateServer answers 401 instead of creating a server.
+// A signed access token can outlive its account; mandatory admission rejects it
+// before server creation can run.
 func TestCreateServerDeletedAccountIsUnauthorized(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "servercapgone")
@@ -95,11 +98,60 @@ func TestCreateServerDeletedAccountIsUnauthorized(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	require.Equal(t, "Session no longer valid", testhelpers.JSONField[string](t, body, "error"),
-		"the 401 must come from the quota lock, not from the auth middleware")
+	require.Equal(t, "Authentication required", testhelpers.JSONField[string](t, body, "error"),
+		"a user missing before admission must fail at AuthRequired")
 
 	var n int
 	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM servers WHERE name = 'Orphan Server'`).Scan(&n))
+	require.Zero(t, n)
+}
+
+// Deletion after real authentication still reaches the quota lock's missing-user
+// branch. The SQL spy pauses before that exact lock; it does not supply identity
+// or skip any middleware.
+func TestCreateServerAccountDisappearsAfterAdmissionIsUnauthorized(t *testing.T) {
+	spy, routerDB := openSQLStateSpyDB(t)
+	env := setupMFAEnforcementEnvWithDB(t, routerDB)
+	ts := env.ts
+	user := ts.CreateTestUser(t, "servercapracegone")
+	pause := spy.armPause(t, `SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/servers",
+		strings.NewReader(`{"name":"After Admission Orphan"}`)).WithContext(ctx)
+	req.Header = testhelpers.AuthHeaders(user.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	request := startRequest(func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		ts.Router.ServeHTTP(w, req)
+		return w
+	})
+	t.Cleanup(func() {
+		defer cancel()
+		pause.Release()
+		select {
+		case <-request.done:
+			return
+		case <-time.After(lockProofBound):
+			cancel()
+		}
+		select {
+		case <-request.done:
+		case <-time.After(lockProofBound):
+			t.Errorf("server creation did not finish after cleanup cancellation within %s", lockProofBound)
+		}
+	})
+	waitForSignal(t, pause.reached, request, "server creation to reach the quota lock after admission")
+	_, err := ts.DB.Exec(`DELETE FROM users WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+	pause.Release()
+	w := request.await(t, "server creation after account deletion")
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	require.Equal(t, "Session no longer valid", testhelpers.JSONField[string](t, body, "error"),
+		"this 401 must come from the quota lock after genuine admission")
+	var n int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM servers WHERE name = 'After Admission Orphan'`).Scan(&n))
 	require.Zero(t, n)
 }
 

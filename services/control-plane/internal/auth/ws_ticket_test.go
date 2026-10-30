@@ -3,12 +3,15 @@ package auth_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -125,23 +128,38 @@ func TestIssueTicketSuccess(t *testing.T) {
 func TestIssueTicketWithSessionID(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "wsticket2")
-
-	headers := testhelpers.AuthHeaders(user.AccessToken)
-	headers.Set("X-Session-ID", "test-session-123")
-
-	w := ts.DoRequest("POST", pathWSTicket, nil, headers)
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	ticket := body["ticket"].(string)
-
-	// Validate and check session ID
-	ctx := context.Background()
-	userID, sessionID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	claims, err := auth.ValidateAccessToken(user.AccessToken, testhelpers.TestJWTSecret)
 	require.NoError(t, err)
-	assert.Equal(t, user.ID, userID)
-	assert.Equal(t, "test-session-123", sessionID)
+	require.NotEmpty(t, claims.SessionID)
+	// Both requests target the same authenticated claims, independent of the header.
+	for _, header := range []string{"", "test-session-123"} {
+		t.Run(fmt.Sprintf("header=%q", header), func(t *testing.T) {
+			headers := testhelpers.AuthHeaders(user.AccessToken)
+			if header != "" {
+				headers.Set("X-Session-ID", header)
+			}
+			w := ts.DoRequest("POST", pathWSTicket, nil, headers)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var body struct {
+				Ticket string `json:"ticket"`
+			}
+			testhelpers.ParseJSON(t, w, &body)
+			require.NotEmpty(t, body.Ticket)
+			stored, err := ts.Redis.Get(t.Context(), wsTicketKeyPrefix+body.Ticket).Result()
+			require.NoError(t, err)
+			require.Len(t, strings.Split(stored, ":"), 4)
+			require.Equal(t, fmt.Sprintf("%s:%s:%s:%d", user.ID, claims.SessionID, claims.CredentialEpoch, claims.ExpiresAt.Unix()), stored)
+			userID, sid, epoch, deadline, err := auth.ValidateTicket(t.Context(), ts.Redis, body.Ticket)
+			require.NoError(t, err)
+			assert.Equal(t, user.ID, userID)
+			assert.Equal(t, claims.SessionID, sid)
+			assert.NotEqual(t, header, sid)
+			assert.Equal(t, claims.CredentialEpoch, epoch)
+			assert.Equal(t, claims.ExpiresAt.Time, deadline)
+			_, _, _, _, err = auth.ValidateTicket(t.Context(), ts.Redis, body.Ticket)
+			require.Error(t, err, "issued ticket must remain single-use")
+		})
+	}
 }
 
 func TestIssueTicketNoAuth(t *testing.T) {
@@ -273,13 +291,14 @@ func TestIssueTicket_StoresEpochFromRequestClaims(t *testing.T) {
 	ctx := context.Background()
 	user := ts.CreateTestUser(t, "wsticketepoch")
 
-	// Give the user an active epoch and a token carrying it, so the issued
-	// ticket must embed that epoch as its third segment.
-	_, err := ts.DB.Exec(`UPDATE users SET credential_epoch = 'tickepoch1' WHERE id = $1`, user.ID)
+	// Mint a fresh canonical family under the active epoch.
+	const epoch = "11111111111111111111111111111111"
+	_, err := ts.DB.Exec(`UPDATE users SET credential_epoch = $2 WHERE id = $1`, user.ID, epoch)
 	require.NoError(t, err)
 	require.NoError(t, ts.Redis.Del(ctx, "cred_epoch:"+user.ID).Err())
 
-	tok, err := auth.GenerateAccessToken(user.ID, testhelpers.TestJWTSecret, true, "tickepoch1", "")
+	minter := auth.NewHandler(ts.DB, ts.Redis, logger.NewWithWriter(io.Discard), testhelpers.TestJWTSecret, noopDisconnector{})
+	tok, _, sid, err := minter.IssueAccessAndRefresh(ctx, user.ID)
 	require.NoError(t, err)
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+tok)
@@ -296,7 +315,19 @@ func TestIssueTicket_StoresEpochFromRequestClaims(t *testing.T) {
 	require.NoError(t, err)
 	claims, err := auth.ValidateAccessToken(tok, testhelpers.TestJWTSecret)
 	require.NoError(t, err)
-	assert.Equal(t, fmt.Sprintf("%s::tickepoch1:%d", user.ID, claims.ExpiresAt.Unix()), stored)
+	require.NotEmpty(t, sid)
+	require.Equal(t, sid, claims.SessionID)
+	require.Equal(t, epoch, claims.CredentialEpoch)
+	require.Len(t, strings.Split(stored, ":"), 4, "family authority must not add a fifth field")
+	assert.Equal(t, fmt.Sprintf("%s:%s:%s:%d", user.ID, sid, epoch, claims.ExpiresAt.Unix()), stored)
+	userID, consumedSID, consumedEpoch, deadline, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	require.NoError(t, err)
+	assert.Equal(t, user.ID, userID)
+	assert.Equal(t, sid, consumedSID)
+	assert.Equal(t, epoch, consumedEpoch)
+	assert.Equal(t, claims.ExpiresAt.Time, deadline)
+	_, _, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
+	require.Error(t, err)
 }
 
 // #2201 (Codex #2397 review): the ticket must bind to the authenticated `sid`
@@ -308,8 +339,10 @@ func TestIssueTicket_PrefersAuthenticatedSidOverSpoofedHeader(t *testing.T) {
 	ctx := context.Background()
 	user := ts.CreateTestUser(t, "wsticketsid")
 
-	tok, err := auth.GenerateAccessToken(user.ID, testhelpers.TestJWTSecret, true, "", "authsid-9")
+	tok := user.AccessToken
+	claims, err := auth.ValidateAccessToken(tok, testhelpers.TestJWTSecret)
 	require.NoError(t, err)
+	require.NotEmpty(t, claims.SessionID)
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+tok)
 	headers.Set("X-Session-ID", "spoofed-attacker-session")
@@ -319,11 +352,22 @@ func TestIssueTicket_PrefersAuthenticatedSidOverSpoofedHeader(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	ticket := body["ticket"].(string)
+	ticket, ok := body["ticket"].(string)
+	require.True(t, ok)
+	require.NotEmpty(t, ticket)
+	stored, err := ts.Redis.Get(ctx, wsTicketKeyPrefix+ticket).Result()
+	require.NoError(t, err)
+	require.Len(t, strings.Split(stored, ":"), 4)
+	require.Equal(t, fmt.Sprintf("%s:%s:%s:%d", user.ID, claims.SessionID, claims.CredentialEpoch, claims.ExpiresAt.Unix()), stored)
 
-	userID, sessionID, _, _, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
+	userID, sessionID, epoch, deadline, err := auth.ValidateTicket(ctx, ts.Redis, ticket)
 	require.NoError(t, err)
 	assert.Equal(t, user.ID, userID)
-	assert.Equal(t, "authsid-9", sessionID,
+	assert.Equal(t, claims.SessionID, sessionID,
 		"ticket must bind to the authenticated sid, not the spoofed X-Session-ID header")
+	assert.NotEqual(t, "spoofed-attacker-session", sessionID)
+	assert.Equal(t, claims.CredentialEpoch, epoch)
+	assert.Equal(t, claims.ExpiresAt.Time, deadline)
+	_, _, _, _, err = auth.ValidateTicket(ctx, ts.Redis, ticket)
+	require.Error(t, err)
 }

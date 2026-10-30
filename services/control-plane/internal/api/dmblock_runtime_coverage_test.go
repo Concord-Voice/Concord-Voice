@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -116,12 +117,14 @@ func TestVoiceEnforcementRolloutActivatedRejectsNilDatabase(t *testing.T) {
 	activated, err := voiceEnforcementRolloutActivated(context.Background(), nil)
 
 	assert.False(t, activated)
-	assert.EqualError(t, err, "voice enforcement database is unavailable")
+	assert.ErrorIs(t, err, dmblock.ErrSecurityAuthorityUnavailable)
+	assert.ErrorContains(t, err, "voice enforcement database is unavailable")
 }
 
 func TestLoadVoiceEnforcementSessionsRejectsNilDatabase(t *testing.T) {
 	sessions, err := loadVoiceEnforcementSessions(context.Background(), nil, voiceEnforcementSessionTarget{}, 0)
 
 	assert.Nil(t, sessions)
-	assert.EqualError(t, err, "voice enforcement database is unavailable")
+	assert.ErrorIs(t, err, dmblock.ErrSecurityAuthorityUnavailable)
+	assert.ErrorContains(t, err, "voice enforcement database is unavailable")
 }

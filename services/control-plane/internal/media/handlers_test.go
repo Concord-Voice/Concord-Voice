@@ -187,6 +187,7 @@ func (ts *testSetup) createTestUser(t *testing.T, username string) string {
 		userID, username+"@test.local", username, testAuthHash,
 	)
 	require.NoError(t, err)
+	testdb.RememberActor(t, ts.db, userID)
 	return userID
 }
 
@@ -339,6 +340,7 @@ func (ts *testSetup) doMultipart(handler gin.HandlerFunc, method, path string, u
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	handler(c)
 	return w
 }
@@ -350,6 +352,7 @@ func (ts *testSetup) doJSON(handler gin.HandlerFunc, method, path string, userID
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	c.Params = params
 	handler(c)
 	return w
@@ -458,6 +461,7 @@ func TestUploadAvatarMissingFile(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	ts.handler.UploadAvatar(c)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -792,6 +796,7 @@ func TestTier1TombstoneSurvivesLateObjectAndReclaimsItAgain(t *testing.T) {
 		c, _ := gin.CreateTestContext(w)
 		c.Request = req
 		c.Set("user_id", userID)
+		testdb.AttachRememberedActor(c, userID)
 		ts.handler.UploadAvatar(c)
 		putDone <- w
 	}()
@@ -983,6 +988,7 @@ func TestProfilePutTimeoutBoundsObjectStoreContextAndReleasesTransaction(t *test
 		c, _ := gin.CreateTestContext(w)
 		c.Request = req
 		c.Set("user_id", userID)
+		testdb.AttachRememberedActor(c, userID)
 		ts.handler.UploadAvatar(c)
 		putDone <- w
 	}()
@@ -2035,6 +2041,7 @@ func TestDeleteMediaWaitsForConcurrentMembershipRevocation(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req.WithContext(ctx)
 	c.Set("user_id", uploader)
+	testdb.AttachRememberedActor(c, uploader)
 	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
 	done := make(chan struct{})
 	go func() {
@@ -2108,6 +2115,7 @@ func TestDeleteMediaWaitsForUploaderLockBeforeDeleting(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req.WithContext(ctx)
 	c.Set("user_id", uploader)
+	testdb.AttachRememberedActor(c, uploader)
 	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
 	done := make(chan struct{})
 	go func() {
@@ -2178,6 +2186,7 @@ func TestDeleteMediaWaitsForDMRetirementBeforeLockingMedia(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req.WithContext(ctx)
 	c.Set("user_id", uploader)
+	testdb.AttachRememberedActor(c, uploader)
 	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
 	done := make(chan struct{})
 	go func() {
@@ -2271,6 +2280,7 @@ func TestDeleteMediaDatabaseReadFailureDoesNotTouchStorage(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 			c.Request = req
 			c.Set("user_id", uploader)
+			testdb.AttachRememberedActor(c, uploader)
 			c.Params = gin.Params{{Key: "file_id", Value: fileID}}
 			ts.handler.DeleteMedia(c)
 			assert.Equal(t, http.StatusInternalServerError, w.Code)
@@ -3211,6 +3221,7 @@ func doAttachmentUpload(t *testing.T, h *Handler, body *bytes.Buffer, ct string)
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", "00000000-0000-0000-0000-000000000001")
+	testdb.AttachRememberedActor(c, "00000000-0000-0000-0000-000000000001")
 	h.UploadAttachment(c)
 	return w
 }
@@ -3254,6 +3265,7 @@ func doImageUpload(t *testing.T, handlerFunc gin.HandlerFunc, nBytes int) *httpt
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", "00000000-0000-0000-0000-000000000001")
+	testdb.AttachRememberedActor(c, "00000000-0000-0000-0000-000000000001")
 	handlerFunc(c)
 	return w
 }

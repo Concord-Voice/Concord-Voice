@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
@@ -50,7 +51,10 @@ func TestAuthorizeVoiceJoin_CommitFailureDisconnectCarriesCallID(t *testing.T) {
 	messages := subscribeDMVoiceDisconnect(t)
 	convUUID := uuid.MustParse(convID)
 	var failedCallID uuid.UUID
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
 	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error {
+		commitReached.Store(true)
 		lease, found, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, convUUID)
 		require.NoError(t, err)
 		require.True(t, found, "the failed direct join must have reserved a call")
@@ -59,7 +63,7 @@ func TestAuthorizeVoiceJoin_CommitFailureDisconnectCarriesCallID(t *testing.T) {
 	})
 	t.Cleanup(func() { dm.SetDMTopologyCommitHookForTest(h, nil) })
 
-	c, response := crossStoreVoiceContext(t, http.MethodPost, "/voice/join", caller.ID, convID, nil)
+	c, response := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/join", caller.AccessToken, convID, nil)
 	h.AuthorizeVoiceJoin(c)
 	require.Equal(t, http.StatusInternalServerError, response.Code)
 	require.NotEqual(t, uuid.Nil, failedCallID, "the test must capture the call that failed to commit")
@@ -87,10 +91,15 @@ func TestAuthorizeDMVoiceForMediaPlane_CommitFailureDisconnectCarriesCallID(t *t
 	require.NoError(t, dm.RememberDMVoiceJoinAdmission(
 		context.Background(), ts.Redis, convUUID, uuid.MustParse(caller.ID), callID, dm.DMVoiceCallReservationTTL,
 	))
-	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error { return errors.New("commit failed") })
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
+	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error {
+		commitReached.Store(true)
+		return errors.New("commit failed")
+	})
 	t.Cleanup(func() { dm.SetDMTopologyCommitHookForTest(h, nil) })
 
-	c, response := crossStoreVoiceContext(t, http.MethodPost, "/voice/authorize", caller.ID, convID,
+	c, response := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/authorize", caller.AccessToken, convID,
 		map[string]string{"call_id": callID.String()})
 	c.Request.Header = dmVoiceMediaAuthorizationHeaders(caller.AccessToken, convID, callID.String())
 	h.AuthorizeDMVoiceForMediaPlane(c)

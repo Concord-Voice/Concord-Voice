@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -72,7 +73,7 @@ func (h *Handler) setConversationHidden(c *gin.Context, hidden bool) {
 		return
 	}
 	defer rollbackVisibilityTx(h, tx)
-	if guardErr := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondGuardTxError(c, guardErr, errMsgVisibilityFailed)
 		return
 	}
@@ -341,8 +342,31 @@ func requireClearAuth(ctx context.Context, tx *sql.Tx, userID string) (bool, err
 // Clears), the credential-epoch fence, then the P1 factor set read from the
 // factor tables after the lock. A stale epoch is a 401, a deleted account a
 // 401, any read failure a 500 with Cause for the caller to log.
+//
+// #2272: the writer barrier precedes that users lock, and the actor's exact
+// login family is share-locked after it (credepoch.GuardFamilyTx reuses both),
+// so a Clear in flight when its session is revoked does not commit.
 func (h *Handler) loadClearStepUpSubject(ctx context.Context, tx *sql.Tx, userID, tokenEpoch string) (stepup.Subject, *stepup.Error) {
-	return stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForNoKeyUpdate, tokenEpoch)
+	if err := loginfamily.EnsureWriterBarrierTx(ctx, tx); err != nil {
+		return stepup.Subject{}, familyGuardStepUpError(err)
+	}
+	subject, stepErr := stepup.LockSubjectTx(ctx, tx, userID, stepup.LockForNoKeyUpdate, tokenEpoch)
+	if stepErr != nil {
+		return stepup.Subject{}, stepErr
+	}
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
+		return stepup.Subject{}, familyGuardStepUpError(err)
+	}
+	return subject, nil
+}
+
+// familyGuardStepUpError renders a family-guard failure in step-up's shape: a
+// denial is the same 401 a stale epoch gets, anything else a 500 with Cause.
+func familyGuardStepUpError(err error) *stepup.Error {
+	if errors.Is(err, credepoch.ErrEpochMismatch) {
+		return &stepup.Error{Status: http.StatusUnauthorized, Body: gin.H{"error": stepup.ErrMsgAuthenticationRequired}}
+	}
+	return &stepup.Error{Status: http.StatusInternalServerError, Body: gin.H{"error": stepup.ErrMsgVerificationFailed}, Cause: err}
 }
 
 // clearStepUpCopy is Clear's own-rule copy, shared with the password mint

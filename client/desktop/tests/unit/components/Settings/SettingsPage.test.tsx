@@ -173,8 +173,8 @@ describe('SettingsPage', () => {
 
   it('renders theme options', () => {
     render(<SettingsPage />);
-    expect(screen.getByText('Dark')).toBeInTheDocument();
-    expect(screen.getByText('Light')).toBeInTheDocument();
+    expect(screen.getByText('Dark', { selector: '.theme-option-label' })).toBeInTheDocument();
+    expect(screen.getByText('Light', { selector: '.theme-option-label' })).toBeInTheDocument();
     expect(screen.getByText('System')).toBeInTheDocument();
   });
 
@@ -235,7 +235,7 @@ describe('SettingsPage', () => {
 
   it('changes theme on click', () => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Light'));
+    fireEvent.click(screen.getByText('Light', { selector: '.theme-option-label' }));
     expect(useSettingsStore.getState().appearance.theme).toBe('light');
   });
 

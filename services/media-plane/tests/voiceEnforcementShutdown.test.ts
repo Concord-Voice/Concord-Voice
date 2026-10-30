@@ -1,6 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 
 const { release } = vi.hoisted(() => ({ release: vi.fn() }));
 vi.mock('../src/lib/voiceEnforcementSession.js', () => ({
@@ -213,18 +211,6 @@ describe('voice-enforcement shutdown release', () => {
     expect(queue.heldCount()).toBe(1);
   });
 
-  it('quarantines expiry sessions before disconnect cleanup can bypass the hold', () => {
-    const source = readFileSync(resolve(import.meta.dirname, '../src/index.ts'), 'utf8');
-    const start = source.indexOf('const voiceEnforcementExpiryFence =');
-    const end = source.indexOf('// Durable authority outboxes', start);
-    const expiryCallback = source.slice(start, end);
-
-    expect(expiryCallback).toMatch(
-      /voiceEnforcementReleaseQueue\.holdAll\(terminalSessions\)[\s\S]*?socket\.data\.voiceEnforcementSession = undefined;[\s\S]*?socket\.disconnect\(true\)/
-    );
-    expect(expiryCallback).not.toContain('retryPending');
-  });
-
   it('retains a terminal join rollback release failure for exact-session retry', async () => {
     const session = {
       sessionGeneration: 'rollback-session',
@@ -297,7 +283,7 @@ describe('voice-enforcement shutdown release', () => {
     expect(queue.pendingCount()).toBe(64);
   });
 
-  it('latches capacity across pending and held rows without allowing shutdown success', async () => {
+  it('refuses overflow before effects while retaining and draining every pending and held exact identity', async () => {
     const sessions = Array.from(
       { length: VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY },
       (_, index) => ({
@@ -314,38 +300,45 @@ describe('voice-enforcement shutdown release', () => {
     const queue = new VoiceEnforcementSessionReleaseQueue(nativeVerifier, onSaturated);
     queue.enqueueAll(sessions);
     queue.holdAll([sessions[0]]);
+    const overflow = { ...sessions[0], sessionGeneration: 'overflow-session', socketId: 'overflow-socket' };
 
-    const overflow = {
-      ...sessions[0],
-      sessionGeneration: 'overflow-session',
-      socketId: 'overflow-socket',
-    };
-    release.mockRejectedValueOnce(new Error('control plane unavailable'));
-    await queue.releaseAfterTerminalClose(overflow);
+    await expect(queue.releaseAfterTerminalClose(overflow)).rejects.toThrow('Voice identity capacity exhausted');
 
-    expect(queue.pendingCount()).toBe(VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY - 1);
+    expect(release).not.toHaveBeenCalled();
+    expect(nativeVerifier).not.toHaveBeenCalled();
+    expect(queue.pendingCount()).toBe(999);
     expect(queue.heldCount()).toBe(1);
+    expect(queue.outstandingCount()).toBe(1000);
     expect(queue.saturated()).toBe(true);
-    expect(queue.outstandingCount()).toBe(VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY + 1);
     expect(onSaturated).toHaveBeenCalledOnce();
-    expect(onSaturated).toHaveBeenCalledWith(VOICE_ENFORCEMENT_RELEASE_QUEUE_CAPACITY, 1);
+    expect(onSaturated).toHaveBeenCalledWith(1000, 1);
 
-    release.mockResolvedValue(undefined);
+    release.mockRejectedValue(new Error('control plane unavailable'));
+    await queue.retryPending();
+    expect(release).toHaveBeenCalledTimes(64);
+    expect(release.mock.calls.some(([session]) => session.sessionGeneration === 'overflow-session')).toBe(false);
+    expect(queue.pendingCount()).toBe(999);
+    expect(queue.heldCount()).toBe(1);
+    expect(queue.outstandingCount()).toBe(1000);
+
+    release.mockReset().mockResolvedValue(undefined);
     queue.promoteHeld();
     await queue.retryPending();
 
+    expect(release).toHaveBeenCalledTimes(1000);
+    expect(new Set(release.mock.calls.map(([session]) => session.sessionGeneration))).toEqual(
+      new Set(sessions.map(session => session.sessionGeneration))
+    );
     expect(queue.pendingCount()).toBe(0);
     expect(queue.heldCount()).toBe(0);
+    expect(queue.outstandingCount()).toBe(0);
+    expect(queue.saturated()).toBe(false);
+
+    // Refusal did not create an anonymous lost identity or permanent latch.
+    expect(queue.enqueue(overflow)).toBe(true);
     expect(queue.outstandingCount()).toBe(1);
-    expect(queue.saturated()).toBe(true);
-  });
-
-  it('wires saturation to readiness and later join admission', () => {
-    const source = readFileSync(resolve(import.meta.dirname, '../src/index.ts'), 'utf8');
-
-    expect(source).toContain('voiceEnforcementReleaseQueue.saturated() ||');
-    expect(source).toMatch(
-      /\(\)\s*=>\s*shuttingDown\s*\|\|\s*voiceEnforcementReleaseQueue\.saturated\(\)\s*\|\|\s*!voiceEnforcementLease\.valid\(\)/
-    );
+    await queue.retryPending();
+    expect(release).toHaveBeenLastCalledWith(overflow, nativeVerifier);
+    expect(queue.outstandingCount()).toBe(0);
   });
 });

@@ -68,7 +68,7 @@ func TestRouterClientVersionWiring(t *testing.T) {
 		require.GreaterOrEqual(t, routeIndex, 0, "public route %q is missing", route)
 		assert.Lessf(t, routeIndex, authIndex, "public route %q must precede auth middleware", route)
 	}
-	assert.Contains(t, source, "middleware.AuthRequired(cfg.JWTSecret, redis, db, credFence),\n\t\t\tfunc(c *gin.Context) { attestationHandler.Verify")
+	assert.Contains(t, source, "middleware.AuthRequired(cfg.JWTSecret, redis, db, credFence),\n\t\t\tmiddleware.RequireSessionHeaderMatchesToken(),\n\t\t\tfunc(c *gin.Context) { attestationHandler.Verify")
 }
 
 // TestRouterClientVersionWiring_Behavior mirrors the production group layout

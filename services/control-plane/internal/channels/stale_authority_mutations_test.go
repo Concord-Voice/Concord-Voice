@@ -128,6 +128,7 @@ func invokeStaleChannelMutation(t *testing.T, actorID string, params gin.Params,
 	c.Set("user_id", actorID)
 	c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload))
 	c.Request.Header.Set("Content-Type", "application/json")
+	testhelpers.AttachUserIdentity(t, c, actorID)
 	completed := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		handler(h, c)

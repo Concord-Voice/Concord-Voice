@@ -231,6 +231,112 @@ describe('native terminalization with controlled completion', () => {
     }
   );
 
+  describe.each(['exact target', 'all routers'] as const)('%s worker exit proof', (boundary) => {
+    async function proofFixture() {
+      const { service, workers } = await fakeService();
+      const router = await service.getOrCreateRouter('room-worker-exit');
+      const target = service.captureNativeTermination(router, ['old-transport']);
+      workers[0].nativeRouters.get(router.id)!.nativeTransportIds.add('old-transport');
+      return {
+        worker: workers[0],
+        confirm: (deadlineMs: number) =>
+          boundary === 'exact target'
+            ? service.confirmNativeTermination(target, deadlineMs)
+            : service.confirmAllRoutersClosed(deadlineMs),
+      };
+    }
+
+    it('waits after already-closed worker IPC until physical subprocess exit', async () => {
+      const { worker, confirm } = await proofFixture();
+      worker.close();
+      worker.dump.mockRejectedValue(new Error('Channel closed'));
+      const proof = observe(confirm(performance.now() + 25));
+      await flush();
+      expect(worker.closed).toBe(true);
+      expect(worker.subprocessClosed).toBe(false);
+      expect(proof.status, 'IPC closure must not settle native closure proof').toBe('pending');
+      worker.completeSubprocessClose();
+      await expect(proof.promise).resolves.toBeUndefined();
+      expect(proof.status).toBe('fulfilled');
+    });
+
+    it('waits when worker IPC closes during an outstanding dump until physical subprocess exit', async () => {
+      const { worker, confirm } = await proofFixture();
+      let rejectDump!: (error: Error) => void;
+      worker.dump.mockImplementation(() => new Promise((_resolve, reject) => {
+        rejectDump = reject;
+      }));
+      const proof = observe(confirm(performance.now() + 25));
+      await flush();
+      expect(proof.status).toBe('pending');
+      worker.close();
+      rejectDump(new Error('Channel closed'));
+      await flush();
+      expect(worker.subprocessClosed).toBe(false);
+      expect(proof.status, 'dump rejection during local close must await physical exit').toBe('pending');
+      worker.completeSubprocessClose();
+      await expect(proof.promise).resolves.toBeUndefined();
+    });
+
+    it('keeps the original deadline when worker IPC closes during a dump without physical exit', async () => {
+      const { worker, confirm } = await proofFixture();
+      let rejectDump!: (error: Error) => void;
+      worker.dump.mockImplementation(() => new Promise((_resolve, reject) => {
+        rejectDump = reject;
+      }));
+      const deadlineMs = performance.now() + 25;
+      const proof = observe(confirm(deadlineMs));
+      await flush();
+      await vi.advanceTimersByTimeAsync(20);
+      worker.close();
+      rejectDump(new Error('Channel closed'));
+      await flush();
+      await vi.advanceTimersByTimeAsync(4);
+      expect(worker.subprocessClosed).toBe(false);
+      expect(proof.status, 'IPC loss must stay pending until the original deadline').toBe('pending');
+      const rejection = expect(proof.promise).rejects.toThrow('Native media termination unavailable');
+      await vi.advanceTimersByTimeAsync(1);
+      await rejection;
+      expect(performance.now()).toBe(deadlineMs);
+      expect(proof.status).toBe('rejected');
+    });
+
+    it('refuses an open-worker dump failure even if physical exit arrives later', async () => {
+      const { worker, confirm } = await proofFixture();
+      worker.dump.mockRejectedValue(new Error('open worker IPC failure'));
+      const proof = observe(confirm(performance.now() + 25));
+      await expect(proof.promise).rejects.toThrow('Native media termination unavailable');
+      expect(worker.closed).toBe(false);
+      expect(worker.subprocessClosed).toBe(false);
+      worker.completeSubprocessClose();
+      expect(proof.status).toBe('rejected');
+    });
+  });
+
+  it('waits for physical exit when worker closes during an exact target router dump', async () => {
+    const { service, workers } = await fakeService();
+    const worker = workers[0];
+    const router = await service.getOrCreateRouter('room-router-dump-worker-exit');
+    const target = service.captureNativeTermination(router, ['old-transport']);
+    const nativeRouter = worker.nativeRouters.get(router.id)!;
+    nativeRouter.nativeTransportIds.add('old-transport');
+    let rejectDump!: (error: Error) => void;
+    nativeRouter.dump.mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectDump = reject;
+    }));
+    const proof = observe(service.confirmNativeTermination(target, performance.now() + 25));
+    await flush();
+    expect(proof.status).toBe('pending');
+    worker.close();
+    worker.dump.mockRejectedValue(new Error('Channel closed'));
+    rejectDump(new Error('Channel closed'));
+    await flush();
+    expect(worker.subprocessClosed).toBe(false);
+    expect(proof.status, 'router dump rejection after IPC close must await physical exit').toBe('pending');
+    worker.completeSubprocessClose();
+    await expect(proof.promise).resolves.toBeUndefined();
+  });
+
   it('rechecks worker absence when router dump races native router removal', async () => {
     const { service, workers } = await fakeService();
     const router = await service.getOrCreateRouter('room-race');

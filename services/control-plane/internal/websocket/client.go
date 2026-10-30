@@ -141,7 +141,12 @@ type Client struct {
 
 	// SessionID links this connection to a specific refresh token session
 	// (for targeted session revocation). Empty if not provided.
-	SessionID string
+	SessionID              string
+	FamilyID               uuid.UUID
+	securityTerminal       atomic.Bool
+	securityCleanupOnce    sync.Once
+	securityCloseConfirmed atomic.Bool // Failed closes remain retryable.
+	securityCleanupReady   bool        // Run-owned; async work has joined.
 
 	// CredEpoch is the credential-epoch claim captured at WS auth time (#2201).
 	// Every message frame from this socket carries it so a ciphertext write can
@@ -159,7 +164,7 @@ type Client struct {
 	unregisterOnce       sync.Once
 
 	// renewAuthority validates in-band token renewals; nil disables them.
-	renewAuthority tokenRenewalAuthority
+	renewAuthority tokenValidator
 	// lastRenewalAttempt and lastThrottleLog are read and written only on the
 	// read goroutine.
 	lastRenewalAttempt time.Time
@@ -301,6 +306,9 @@ func (c *Client) appendBootstrapReplay(data []byte) error {
 }
 
 func (c *Client) bufferBootstrapLive(data []byte) bootstrapBufferOutcome {
+	if c.securityTerminal.Load() {
+		return bootstrapBufferCanceled
+	}
 	c.bootstrapMu.Lock()
 	defer c.bootstrapMu.Unlock()
 	if c.bootstrapCanceled {
@@ -327,6 +335,9 @@ func (c *Client) cancelBootstrap() {
 }
 
 func (c *Client) enqueueOutbound(data []byte) bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
 	// While the reconnect replacement is active, ordinary producers append to
 	// its live tail instead of waiting on sendMu. This keeps Hub.Run responsive
 	// while the publication barrier waits on bounded DB/sender-gate work and
@@ -340,7 +351,7 @@ func (c *Client) enqueueOutbound(data []byte) bool {
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return false
 	}
 	select {
@@ -355,17 +366,16 @@ func (c *Client) enqueueOutbound(data []byte) bool {
 // a socket producer. A busy client drops this delivery; a closed or full queue
 // remains a real client failure for Run to unregister.
 func (c *Client) tryEnqueueDMMessageDelivery(data []byte) dmMessageDeliveryEnqueueOutcome {
+	if c.securityTerminal.Load() {
+		return dmMessageDeliveryEnqueueFailed
+	}
 	if !c.bootstrapMu.TryLock() {
 		return dmMessageDeliveryEnqueueBusy
 	}
 	if c.bootstrapActive || c.bootstrapCanceled {
-		if c.bootstrapCanceled || c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
-			c.bootstrapMu.Unlock()
-			return dmMessageDeliveryEnqueueBusy
-		}
-		c.bootstrapLive = append(c.bootstrapLive, append([]byte(nil), data...))
+		outcome := c.appendBootstrapLiveLocked(data)
 		c.bootstrapMu.Unlock()
-		return dmMessageDeliveryEnqueueDelivered
+		return outcome
 	}
 	c.bootstrapMu.Unlock()
 
@@ -381,13 +391,9 @@ func (c *Client) tryEnqueueDMMessageDelivery(data []byte) dmMessageDeliveryEnque
 		return dmMessageDeliveryEnqueueBusy
 	}
 	if c.bootstrapActive {
-		if c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
-			return dmMessageDeliveryEnqueueBusy
-		}
-		c.bootstrapLive = append(c.bootstrapLive, append([]byte(nil), data...))
-		return dmMessageDeliveryEnqueueDelivered
+		return c.appendBootstrapLiveLocked(data)
 	}
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return dmMessageDeliveryEnqueueFailed
 	}
 	select {
@@ -396,6 +402,16 @@ func (c *Client) tryEnqueueDMMessageDelivery(data []byte) dmMessageDeliveryEnque
 	default:
 		return dmMessageDeliveryEnqueueFailed
 	}
+}
+
+// appendBootstrapLiveLocked buffers a live frame behind an active bootstrap,
+// refusing a canceled, failed or full buffer. The caller holds bootstrapMu.
+func (c *Client) appendBootstrapLiveLocked(data []byte) dmMessageDeliveryEnqueueOutcome {
+	if c.bootstrapCanceled || c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
+		return dmMessageDeliveryEnqueueBusy
+	}
+	c.bootstrapLive = append(c.bootstrapLive, append([]byte(nil), data...))
+	return dmMessageDeliveryEnqueueDelivered
 }
 
 // enqueueOutboundBootstrapSafe delivers a frame whose loss is tolerable and
@@ -417,6 +433,9 @@ func (c *Client) tryEnqueueDMMessageDelivery(data []byte) dmMessageDeliveryEnque
 // bootstrapCanceled is treated as bootstrapping so a frame is never written into
 // a queue whose replacement is unwinding.
 func (c *Client) enqueueOutboundBootstrapSafe(data []byte) bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
 	// sendMu before bootstrapMu, matching enqueuePostBootstrap and
 	// completeClientBootstrap. Holding sendMu across the check keeps a
 	// replacement from starting between the check and the send, which would
@@ -429,7 +448,7 @@ func (c *Client) enqueueOutboundBootstrapSafe(data []byte) bool {
 	if bootstrapping {
 		return false
 	}
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return false
 	}
 	select {
@@ -441,6 +460,9 @@ func (c *Client) enqueueOutboundBootstrapSafe(data []byte) bool {
 }
 
 func (c *Client) enqueueOutboundBlocking(data []byte) bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
 	switch c.bufferBootstrapLive(data) {
 	case bootstrapBufferEnqueued:
 		return true
@@ -455,9 +477,12 @@ func (c *Client) enqueueOutboundBlocking(data []byte) bool {
 // initial connected acknowledgement, which is intentionally published before
 // the replacement. All other blocking producers use enqueueOutboundBlocking.
 func (c *Client) enqueueOutboundBlockingImmediate(data []byte) bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return false
 	}
 	select {
@@ -476,6 +501,9 @@ func (c *Client) enqueueOutboundBlockingImmediate(data []byte) bool {
 // unregister cancellation. If cancellation wins bootstrapMu, no late frame is
 // allowed into the queue; if this send wins, unregister waits for it normally.
 func (c *Client) enqueuePostBootstrap(ctx context.Context, data []byte) bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	c.bootstrapMu.Lock()
@@ -483,7 +511,7 @@ func (c *Client) enqueuePostBootstrap(ctx context.Context, data []byte) bool {
 	if c.bootstrapCanceled || ctx.Err() != nil {
 		return false
 	}
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return false
 	}
 	select {
@@ -536,7 +564,7 @@ func (c *Client) forceRevoke(data []byte) {
 		c.closeRevokedConnection()
 		return
 	}
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return
 	}
 	if data != nil {
@@ -585,7 +613,7 @@ func (c *Client) schedulePrivacyClearsThenClose(frames [][]byte) bool {
 		c.closeRevokedConnection()
 		return true
 	}
-	if c.sendClosed || c.Send == nil {
+	if c.securityTerminal.Load() || c.sendClosed || c.Send == nil {
 		return false
 	}
 	c.privacyClearThenClose = make([][]byte, len(frames))
@@ -684,54 +712,78 @@ func (c *Client) readPump() {
 
 	for {
 		_, message, err := c.Conn.ReadMessage()
-		if c.tokenExpired() {
-			c.closeExpiredToken()
-			return
-		}
-		if err != nil {
-			c.recordReadFailure(err)
-			break
-		}
-		// A received data frame proves the peer is live even while pacing delays its next Pong.
-		if err := c.Conn.SetReadDeadline(c.connectionDeadline(pongWait)); err != nil {
-			return
-		}
-
-		// Meter even malformed and unknown frames before decoding or shared hub work.
-		for !budget.Allow() {
-			select {
-			case <-time.After(applicationFrameInterval):
-			case <-c.Hub.done:
-				return
-			}
-		}
-
-		// Parse incoming message
-		var msg IncomingMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("Invalid message format: %v", err)
-			continue
-		}
-		// Renewal never reaches the hub: it does Redis/DB work, which the Run
-		// goroutine must not, and its frame carries a credential.
-		if msg.Type == authRenewMessageType {
-			c.handleTokenRenewal(msg)
-			continue
-		}
-
-		// Set sender info
-		msg.UserID = c.UserID
-		msg.ClientID = c.ID
-		msg.CredEpoch = c.CredEpoch
-		msg.TokenExpiresAt = c.tokenDeadline()
-
-		// Route message to hub
-		select {
-		case c.Hub.incoming <- msg:
-		case <-c.Hub.done:
+		if !c.admitFrame(err, budget) || !c.dispatchFrame(message) {
 			return
 		}
 	}
+}
+
+// admitFrame decides whether a read result may be dispatched; false ends the read pump.
+func (c *Client) admitFrame(readErr error, budget *ingressbudget.Bucket) bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
+	if c.tokenExpired() {
+		c.closeExpiredToken()
+		return false
+	}
+	if readErr != nil {
+		c.recordReadFailure(readErr)
+		return false
+	}
+	// A received data frame proves the peer is live even while pacing delays its next Pong.
+	if err := c.Conn.SetReadDeadline(c.connectionDeadline(pongWait)); err != nil {
+		return false
+	}
+	// Meter even malformed and unknown frames before decoding or shared hub work.
+	return c.awaitFrameBudget(budget)
+}
+
+// dispatchFrame decodes one metered frame and routes it; false ends the read pump.
+func (c *Client) dispatchFrame(message []byte) bool {
+	var msg IncomingMessage
+	if err := json.Unmarshal(message, &msg); err != nil {
+		log.Printf("Invalid message format: %v", err)
+		return true
+	}
+	if c.securityTerminal.Load() {
+		return false
+	}
+	// Renewal never reaches the hub: it does Redis/DB work, which the Run
+	// goroutine must not, and its frame carries a credential.
+	if msg.Type == authRenewMessageType {
+		c.handleTokenRenewal(msg)
+		return true
+	}
+
+	// Set sender info
+	msg.UserID = c.UserID
+	msg.ClientID = c.ID
+	msg.CredEpoch = c.CredEpoch
+	// Read here, not on Run: only this goroutine's renewal rebinds the SID, and it
+	// waits for the rebind, so the SID and deadline are one consistent snapshot.
+	// An unparseable SID stays uuid.Nil, which every family guard refuses.
+	msg.SID, _ = uuid.Parse(c.SessionID)
+	msg.TokenExpiresAt = c.tokenDeadline()
+
+	select {
+	case c.Hub.incoming <- msg:
+		return true
+	case <-c.Hub.done:
+		return false
+	}
+}
+
+// awaitFrameBudget paces until budget admits a frame; false once the hub stops.
+func (c *Client) awaitFrameBudget(budget *ingressbudget.Bucket) bool {
+	for !budget.Allow() {
+		select {
+		case <-time.After(applicationFrameInterval):
+		case <-c.Hub.done:
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) recordReadFailure(err error) {
@@ -799,6 +851,9 @@ func (c *Client) writePump() {
 }
 
 func (c *Client) writePumpMessage(message []byte, ok bool) bool {
+	if c.securityTerminal.Load() {
+		return true
+	}
 	if c.tokenExpired() {
 		c.closeExpiredToken()
 		return true
@@ -824,6 +879,9 @@ func (c *Client) writePumpMessage(message []byte, ok bool) bool {
 }
 
 func (c *Client) writePumpTick(wroteSinceLastTick bool) bool {
+	if c.securityTerminal.Load() {
+		return true
+	}
 	if c.tokenExpired() {
 		c.closeExpiredToken()
 		return true
@@ -855,9 +913,12 @@ func (c *Client) writePumpTick(wroteSinceLastTick bool) bool {
 // between dequeuing a frame and completing its socket write without making Hub
 // producers wait for that network I/O.
 func (c *Client) claimOutboundWrite() bool {
+	if c.securityTerminal.Load() {
+		return false
+	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	if c.privacyClearThenClosePending() {
+	if c.securityTerminal.Load() || c.privacyClearThenClosePending() {
 		return false
 	}
 	c.outboundWriteInFlight = true
@@ -880,6 +941,9 @@ func (c *Client) privacyClearThenClosePending() bool {
 }
 
 func (c *Client) writePrivacyClearsThenClose() bool {
+	if c.securityTerminal.Load() {
+		return true
+	}
 	if c.tokenExpired() {
 		c.closeExpiredToken()
 		return true
@@ -943,4 +1007,16 @@ func describeSocketFailure(err error) string {
 		return fmt.Sprintf("type=%T timeout=true", err)
 	}
 	return fmt.Sprintf("type=%T", err)
+}
+
+// closeSecurityTransport is frame-free and independent of writer/timer locks.
+func (c *Client) closeSecurityTransport() error {
+	if c.Conn == nil {
+		return errors.New("family transport missing")
+	}
+	if err := c.Conn.Close(); err != nil && !alreadyDisconnected(err) {
+		return err
+	}
+	c.securityCloseConfirmed.Store(true)
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -26,6 +27,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // The submissions the per-route table sends.
@@ -439,9 +441,15 @@ func TestDangerousGate_UpdateServerGraceAndDeleteAlwaysFresh(t *testing.T) {
 	env := setupMFAEnforcementEnv(t)
 	update, del := gateRoutes()[0], gateRoutes()[1]
 	f := newGateFixture(t, env, true, true)
+	var families []string
 	session := func() string {
-		token, err := auth.GenerateAccessToken(f.owner.ID, testhelpers.TestJWTSecret, true, "", uuid.NewString())
+		token, _, sid, err := auth.NewHandler(env.ts.DB, env.ts.Redis, logger.NewWithWriter(io.Discard),
+			testhelpers.TestJWTSecret, nil).IssueAccessAndRefresh(context.Background(), f.owner.ID)
 		require.NoError(t, err)
+		var family string
+		require.NoError(t, env.ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE user_id = $1 AND sid = $2`, f.owner.ID, sid).Scan(&family))
+		require.NotContains(t, families, family, "another login must have its own family, not another SID in the grace-covered login")
+		families = append(families, family)
 		return token
 	}
 	first := session()
@@ -566,7 +574,7 @@ func TestDangerousGate_DeleteServerCrossOwnerPairDoesNotDeadlock(t *testing.T) {
 	second := startRequest(func() *httptest.ResponseRecorder {
 		return del.call(env, b.owner.AccessToken, b.serverID, "")
 	})
-	assert.True(t, waitForLockWaitOrDone(t, ts.DB, second.done),
+	assert.True(t, waitForCrossOwnerUsersLock(t, ts.DB, second.done),
 		"the second deletion must queue behind the first's users locks, or this interleaving proved nothing")
 	pause.Release()
 
@@ -588,11 +596,44 @@ func newCrossOwnerGateFixture(t *testing.T, env *mfaEnv, ownerID, username strin
 		VALUES ($1, $2, $3, $4, TRUE, TRUE)`,
 		owner.ID, owner.Email, owner.Username, testhelpers.TestAuthHash)
 	require.NoError(t, err)
-	owner.AccessToken, err = auth.GenerateAccessToken(owner.ID, testhelpers.TestJWTSecret, true, "", "")
+	owner.AccessToken, _, _, err = auth.NewHandler(env.ts.DB, env.ts.Redis, logger.NewWithWriter(io.Discard),
+		testhelpers.TestJWTSecret, nil).IssueAccessAndRefresh(context.Background(), owner.ID)
 	require.NoError(t, err)
 	f := gateFixture{owner: owner}
 	f.serverID = env.ts.CreateTestServer(t, owner.ID, "Gate "+username)
 	enrollMFATOTP(t, env, owner.ID)
 	setMFAFlag(t, env, f.serverID, false)
 	return f
+}
+
+// waitForCrossOwnerUsersLock requires the second deletion's exact sorted-users
+// query to wait behind a transaction that has already run that same query.
+// Other requests waiting at admission, lifecycle advisory locks, or Go sender
+// gates cannot satisfy this proof.
+func waitForCrossOwnerUsersLock(t *testing.T, observer *sql.DB, done <-chan struct{}) bool {
+	t.Helper()
+	const usersSQL = `SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE`
+	deadline := time.Now().Add(lockProofBound)
+	for {
+		select {
+		case <-done:
+			return false
+		default:
+		}
+		var waiting bool
+		require.NoError(t, observer.QueryRow(`SELECT EXISTS (
+   SELECT 1 FROM pg_stat_activity waiter
+   JOIN pg_stat_activity holder ON holder.pid = ANY(pg_blocking_pids(waiter.pid))
+   WHERE waiter.datname = current_database() AND holder.datname = current_database()
+    AND waiter.wait_event_type = 'Lock' AND waiter.wait_event IN ('tuple', 'transactionid')
+    AND waiter.query = $1 AND holder.state = 'idle in transaction'
+  )`, usersSQL).Scan(&waiting)) // The family guard (#2272) runs after the users lock, so the holder's last statement is no longer this query.
+		if waiting {
+			return true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no cross-owner users-row lock wait within %s", lockProofBound)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

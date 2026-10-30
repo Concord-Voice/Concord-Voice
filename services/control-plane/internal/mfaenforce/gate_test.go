@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 )
@@ -73,7 +74,7 @@ func TestLockGateTx_ReturnsTheFlagTheOwnerAndTheP1Subject(t *testing.T) {
 			serverID := createServer(t, db, owner, tc.enforcing)
 			tx := beginTx(t, db, sql.LevelReadCommitted)
 
-			g, err := mfaenforce.LockGateTx(ctx, tx, serverID, actor, stepup.LockForShare, mfaenforce.ServerForShare, "")
+			g, err := mfaenforce.LockGateTx(actorCtx(ctx, t, db, actor), tx, serverID, actor, stepup.LockForShare, mfaenforce.ServerForShare, "")
 
 			// NoError, not Nil on a typed value: it fails on a typed-nil
 			// *stepup.Error inside the interface, which is the bug the
@@ -89,9 +90,10 @@ func TestLockGateTx_ReturnsTheFlagTheOwnerAndTheP1Subject(t *testing.T) {
 
 func TestLockGateTx_ServerNotFound(t *testing.T) {
 	db := gateTestDB(t)
+	actor := createUser(t, db)
 	tx := beginTx(t, db, sql.LevelReadCommitted)
 
-	_, err := mfaenforce.LockGateTx(context.Background(), tx, uuid.New().String(), createUser(t, db),
+	_, err := mfaenforce.LockGateTx(actorCtx(context.Background(), t, db, actor), tx, uuid.New().String(), actor,
 		stepup.LockForShare, mfaenforce.ServerForShare, "")
 
 	require.ErrorIs(t, err, mfaenforce.ErrServerNotFound)
@@ -111,11 +113,16 @@ func TestLockGateTx_RefusesAnyIsolationButReadCommitted(t *testing.T) {
 		t.Run(level.String(), func(t *testing.T) {
 			tx := beginTx(t, db, level)
 
-			_, err := mfaenforce.LockGateTx(context.Background(), tx, serverID, owner,
+			_, err := mfaenforce.LockGateTx(actorCtx(context.Background(), t, db, owner), tx, serverID, owner,
 				stepup.LockForShare, mfaenforce.ServerForShare, "")
 
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "requires READ COMMITTED")
+			// #2272: LockSubjectTx's login-family writer barrier refuses the
+			// isolation level first, before any users lock, as a 500.
+			var se *stepup.Error
+			require.True(t, errors.As(err, &se), "want a *stepup.Error, got %v", err)
+			require.Equal(t, http.StatusInternalServerError, se.Status)
+			require.ErrorIs(t, se.Cause, loginfamily.ErrContract)
+			require.ErrorContains(t, se.Cause, "argument_invalid")
 			require.NotErrorIs(t, err, mfaenforce.ErrServerNotFound)
 		})
 	}
@@ -132,7 +139,7 @@ func TestLockGateTx_RefusesAnUnknownServerLockBeforeAnyStatement(t *testing.T) {
 
 	for _, lock := range []mfaenforce.ServerLock{0, 99} {
 		t.Run(fmt.Sprintf("ServerLock(%d)", lock), func(t *testing.T) {
-			ctx := context.Background()
+			ctx := actorCtx(context.Background(), t, db, owner)
 			tx := beginTx(t, db, sql.LevelReadCommitted)
 
 			_, err := mfaenforce.LockGateTx(ctx, tx, serverID, owner, stepup.LockForShare, lock, "")
@@ -188,7 +195,7 @@ func TestLockGateTx_TakesTheRequestedServerLock(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tx := beginTx(t, db, sql.LevelReadCommitted)
-			_, err := mfaenforce.LockGateTx(context.Background(), tx, serverID, owner,
+			_, err := mfaenforce.LockGateTx(actorCtx(context.Background(), t, db, owner), tx, serverID, owner,
 				stepup.LockForShare, tc.lock, "")
 			require.NoError(t, err)
 
@@ -234,7 +241,7 @@ func TestLockGateTx_TakesTheRequestedUsersLock(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tx := beginTx(t, db, sql.LevelReadCommitted)
-			_, err := mfaenforce.LockGateTx(context.Background(), tx, serverID, owner, tc.lock, mfaenforce.ServerForShare, "")
+			_, err := mfaenforce.LockGateTx(actorCtx(context.Background(), t, db, owner), tx, serverID, owner, tc.lock, mfaenforce.ServerForShare, "")
 			require.NoError(t, err)
 
 			require.True(t, probeBlocks(t, db, usersForNoKeyUpdate, owner), "a destructive reset must wait on the gate")
@@ -262,7 +269,7 @@ func TestLockGateTx_ALockTimeoutIsALockConflictAtEitherRow(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := actorCtx(context.Background(), t, db, owner)
 			blocker := beginTx(t, db, sql.LevelReadCommitted)
 			_, err := blocker.ExecContext(ctx, tc.blockerSQL, tc.blockerArg)
 			require.NoError(t, err)

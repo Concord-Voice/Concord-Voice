@@ -181,7 +181,7 @@ func (h *Handler) proveIOS(ctx context.Context, userID, sessionID string, p *Ver
 	if p.Attestation != "" {
 		return h.proveAttestation(ctx, userID, keyID, p.Attestation, clientDataHash)
 	}
-	return h.proveAssertion(ctx, keyID, p.Assertion, clientDataHash)
+	return h.proveAssertion(ctx, userID, keyID, p.Assertion, clientDataHash)
 }
 
 func (h *Handler) proveAttestation(ctx context.Context, userID string, keyID []byte, encoded string, clientDataHash []byte) (ErrorCode, error) {
@@ -204,7 +204,7 @@ func (h *Handler) proveAttestation(ctx context.Context, userID string, keyID []b
 	return "", nil
 }
 
-func (h *Handler) proveAssertion(ctx context.Context, keyID []byte, encoded string, clientDataHash []byte) (ErrorCode, error) {
+func (h *Handler) proveAssertion(ctx context.Context, userID string, keyID []byte, encoded string, clientDataHash []byte) (ErrorCode, error) {
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return ErrInvalid, appattest.ErrRejected
@@ -213,7 +213,9 @@ func (h *Handler) proveAssertion(ctx context.Context, keyID []byte, encoded stri
 	if err != nil {
 		return "", errIOSUnavailable
 	}
-	if key == nil {
+	// RT-F1: a key proves only for the account that attested it. Answer
+	// KEY_UNKNOWN so the app attests a fresh key for this account.
+	if key == nil || subtle.ConstantTimeCompare([]byte(key.FirstUserHash), []byte(HashUserID(userID))) != 1 {
 		return ErrKeyUnknown, appattest.ErrRejected
 	}
 	// A development key stops working once the server stops allowing them.

@@ -329,7 +329,7 @@ func TestHandleMessagePlaintextSuccess(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleMessage(msg)
+	setup.hub.handleMessage(setup.live(t, msg))
 
 	// Should receive message_ack
 	resp := readClientMsg(t, setup.client)
@@ -584,7 +584,7 @@ func TestHandleMessageEncryptedContentLongerLimit(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleMessage(msg)
+	setup.hub.handleMessage(setup.live(t, msg))
 
 	// Should succeed (5000 < 65536)
 	resp := readClientMsg(t, setup.client)
@@ -686,7 +686,7 @@ func TestHandleMessageBroadcastToOtherSubscribers(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleMessage(msg)
+	setup.hub.handleMessage(setup.live(t, msg))
 
 	// Sender gets message_ack
 	resp := readClientMsg(t, setup.client)
@@ -1197,7 +1197,7 @@ func TestHandleDMMessageSystemType(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleDMMessage(msg)
+	setup.hub.handleDMMessage(setup.live(t, msg))
 
 	resp := readClientMsg(t, setup.client)
 	assert.Equal(t, "dm_message_ack", resp["type"])
@@ -1231,7 +1231,7 @@ func TestHandleDMMessageEncryptedLongerContentAllowed(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleDMMessage(msg)
+	setup.hub.handleDMMessage(setup.live(t, msg))
 
 	resp := readClientMsg(t, setup.client)
 	assert.Equal(t, "dm_message_ack", resp["type"])
@@ -1268,7 +1268,7 @@ func TestHandleDMMessageBroadcastToSubscribers(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleDMMessage(msg)
+	setup.hub.handleDMMessage(setup.live(t, msg))
 
 	// Sender gets ack
 	resp := readClientMsg(t, setup.client)
@@ -1321,14 +1321,14 @@ func TestHandleDMMessageAdmitsAllDeliveryJobsAtCapacityBoundary(t *testing.T) {
 	setup.hub.userClients[inactiveUser] = map[uuid.UUID]bool{inactivePeer.ID: true}
 
 	setup.hub.dmDeliveryOutstanding = dmMessageDeliveryCapacity - 3
-	setup.hub.handleDMMessage(IncomingMessage{
+	setup.hub.handleDMMessage(setup.live(t, IncomingMessage{
 		Type: "dm_message", UserID: setup.user1, ClientID: setup.client.ID,
 		Data: map[string]interface{}{
 			keyConversationID: setup.convID,
 			keyContent:        "delivery capacity boundary",
 			"key_version":     float64(1),
 		},
-	})
+	}))
 	require.Equal(t, dmMessageDeliveryCapacity, setup.hub.dmDeliveryOutstanding,
 		"acknowledgement, message, and unread notification must all enter the queue")
 	// The other capacity slots are simulated; drain only this message's three real jobs.
@@ -4011,7 +4011,7 @@ func TestHandleMessageAcceptsCiphertextAt65536(t *testing.T) {
 		},
 	}
 
-	setup.hub.handleMessage(msg)
+	setup.hub.handleMessage(setup.live(t, msg))
 
 	// Should succeed (65536 == cap, not > cap)
 	resp := readClientMsg(t, setup.client)

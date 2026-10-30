@@ -17,8 +17,8 @@ import type {
 } from '../shared/sso';
 import type { SpaFallbackDiagnostic } from '../shared/spaIpcTypes';
 
-// The ONLY three runtime local imports in this file. `scripts/build-preload.mjs`
-// runs esbuild with `bundle: true, external: ['electron']`, so all three are
+// The ONLY four runtime local imports in this file. `scripts/build-preload.mjs`
+// runs esbuild with `bundle: true, external: ['electron']`, so all four are
 // inlined into `dist/preload/preload.js` rather than becoming a `require` — which
 // is what keeps `tests/integration/preload-sandbox-contract.test.ts` green.
 //
@@ -29,6 +29,16 @@ import type { SpaFallbackDiagnostic } from '../shared/spaIpcTypes';
 import { isAudiocapInterrupted, type AudiocapInterrupted } from '../shared/audiocapProtocol';
 import { AUDIOCAP_PORT_TAG, installAudiocapRelay, type AudiocapRelayWindow } from './audiocapRelay';
 import { createSetZoomFactor } from './uiZoom';
+// `trayStatus` has no imports of its own. It supplies the channel constants and
+// `isTrayAction`, so the `tray:action` push narrows against the same closed-enum
+// anchor main and the renderer use (tray-status spec §4).
+import {
+  isTrayAction,
+  TRAY_ACTION,
+  TRAY_SET_STATUS,
+  type TrayAction,
+  type TrayStatusSnapshot,
+} from '../shared/trayStatus';
 
 // `tsconfig.preload.json` pins `lib` to ES2022 with no DOM, so the global
 // `window` has no type in this build leg. Declare exactly the slice the relay
@@ -421,6 +431,40 @@ contextBridge.exposeInMainWorld('electron', {
   setBadgeCount: (count: number) => ipcRenderer.invoke('app:setBadgeCount', count),
   flashFrame: (flash: boolean) => ipcRenderer.invoke('app:flashFrame', flash),
   focusWindow: () => ipcRenderer.invoke('app:focusWindow'),
+
+  /**
+   * Push the closed-enum tray snapshot to main (tray-status spec §4). A PASS-THROUGH
+   * THAT AUTHORISES NOTHING: main re-checks the sender frame, that the sender is the
+   * main window, a 20/s token bucket and `isTrayStatusSnapshot` before using it. It
+   * resolves `false` only when the bucket drops the snapshot (the renderer resends),
+   * and `true` otherwise, refusals included. The renderer feature-detects
+   * `typeof globalThis.electron?.traySetStatus === 'function'` and `.catch()`es, so an
+   * older shell without this channel stays silent; `SPA_MIN_CONTRACT` stays 19.
+   */
+  traySetStatus: (s: TrayStatusSnapshot) =>
+    ipcRenderer.invoke(TRAY_SET_STATUS, s) as Promise<boolean>,
+
+  /**
+   * Menu clicks that change client state, pushed by main to the main window. A push, so
+   * there is no sender to validate. VALIDATED, THEN COPIED: `isTrayAction` requires the
+   * exact key set of one closed-enum variant held as data properties, so the shallow
+   * copy is exactly the validated fields and the callback never receives `data` itself.
+   * Unsubscribe disarms the handler as well as removing it, so an emit already in
+   * flight cannot reach the callback after `unsubscribe()` returns (same reasoning as
+   * `audiocap.onInterrupted`).
+   */
+  onTrayAction: (callback: (action: TrayAction) => void) => {
+    let subscribed = true;
+    const handler = (_event: Electron.IpcRendererEvent, data: unknown) => {
+      if (!subscribed || !isTrayAction(data)) return;
+      callback({ ...data });
+    };
+    ipcRenderer.on(TRAY_ACTION, handler);
+    return () => {
+      subscribed = false;
+      ipcRenderer.removeListener(TRAY_ACTION, handler);
+    };
+  },
 
   // Open a URL in the user's default browser via the main process. The main
   // process re-validates the protocol (http/https/mailto only) before calling
@@ -889,6 +933,11 @@ export interface ElectronAPI {
   setBadgeCount: (count: number) => Promise<void>;
   flashFrame: (flash: boolean) => Promise<void>;
   focusWindow: () => Promise<void>;
+
+  // Status-aware tray (tray-status spec §4).
+  /** Resolves `false` only when main's rate limit dropped the snapshot. */
+  traySetStatus: (s: TrayStatusSnapshot) => Promise<boolean>;
+  onTrayAction: (callback: (action: TrayAction) => void) => () => void;
 
   // Open an external URL via shell.openExternal (main process enforces
   // http/https/mailto protocol allowlist).

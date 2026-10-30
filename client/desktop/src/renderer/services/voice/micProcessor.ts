@@ -162,10 +162,14 @@ export async function createMicProcessor(
         onCalibrationEvent?.(data);
       }
     };
-    node.addEventListener('processorerror', () => {
+    const handleProcessorError = () => {
       notifyError();
       close();
-    });
+    };
+    node.addEventListener('processorerror', handleProcessorError);
+    // Chromium also dispatches a trusted ErrorEvent named `error` for a
+    // processor exception. Both paths must retire the permanently silent node.
+    node.addEventListener('error', handleProcessorError);
   } catch (error) {
     notifyError();
     close();

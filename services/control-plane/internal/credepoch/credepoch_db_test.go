@@ -164,7 +164,8 @@ func TestOp_RotateTxStampsDurableEpoch(t *testing.T) {
 
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	require.NoError(t, op.RotateTx(ctx, tx))
+	_, err = op.RotateTx(ctx, tx)
+	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
 	var stored sql.NullString
@@ -197,14 +198,18 @@ func TestOp_ReconcileCommittedEvictionSkipsRollbackAndPublishesAdvancedEpoch(t *
 	require.NoError(t, err)
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	require.NoError(t, op.RotateTx(ctx, tx))
+	_, err = op.RotateTx(ctx, tx)
+	require.NoError(t, err)
 	require.NoError(t, tx.Rollback())
 	op.ReconcileCommittedEviction(ctx)
 	require.Zero(t, calls, "unchanged predecessor proves rollback")
 
+	op, err = f.Begin(ctx, uid)
+	require.NoError(t, err)
 	tx, err = db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	require.NoError(t, op.RotateTx(ctx, tx))
+	_, err = op.RotateTx(ctx, tx)
+	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 	op.ReconcileCommittedEviction(ctx)
 	require.Equal(t, 1, calls, "advanced durable epoch publishes exact predecessor eviction")
@@ -219,7 +224,8 @@ func TestOp_RotateTxOutboxIsAtomicWithCredentialRotation(t *testing.T) {
 	require.NoError(t, err)
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	require.NoError(t, op.RotateTx(ctx, tx))
+	_, err = op.RotateTx(ctx, tx)
+	require.NoError(t, err)
 	require.NoError(t, tx.Rollback())
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id = $1`, uid).Scan(&count))
@@ -229,7 +235,8 @@ func TestOp_RotateTxOutboxIsAtomicWithCredentialRotation(t *testing.T) {
 	require.NoError(t, err)
 	tx, err = db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	require.NoError(t, op.RotateTx(ctx, tx))
+	_, err = op.RotateTx(ctx, tx)
+	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id = $1 AND credential_epoch = $2 AND superseded_credential_epoch = $3`, uid, op.NewEpochValue(), testPredecessorEpoch).Scan(&count))
 	require.Equal(t, 1, count)
@@ -243,7 +250,8 @@ func TestOp_RotateTxUnknownUserErrors(t *testing.T) {
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
-	assert.Error(t, op.RotateTx(ctx, tx), "rotating a missing user row must error (RETURNING id scans nothing)")
+	_, err = op.RotateTx(ctx, tx)
+	assert.Error(t, err, "rotating a missing user row must error (RETURNING id scans nothing)")
 }
 
 func TestBeginTolleratesDeadRedisAndOpsAreSafe(t *testing.T) {

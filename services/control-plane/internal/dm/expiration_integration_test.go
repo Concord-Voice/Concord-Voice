@@ -169,15 +169,18 @@ func TestDMExpiration_GroupAdminOnly(t *testing.T) {
 }
 
 func TestDMExpiration_StaleCredentialCannotMutatePolicy(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	alice := ts.CreateTestUser(t, "exp_stale_alice")
 	bob := ts.CreateTestUser(t, "exp_stale_bob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
-	staleToken := ts.SimulateStaleEpochWindow(t, alice.ID)
+	staleToken := alice.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, alice.ID, nil, nil)
 
 	w := ts.DoRequest(http.MethodPatch, dmExpirationPath+convID+"/expiration",
 		map[string]any{"mode": "set", "window_seconds": 3600, "retroactive": "new_only"}, testhelpers.AuthHeaders(staleToken))
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 	var window sql.NullInt64
 	var revision int64
 	require.NoError(t, ts.DB.QueryRow(`SELECT expiration_window_seconds, expiration_revision FROM dm_conversations WHERE id = $1`, convID).Scan(&window, &revision))

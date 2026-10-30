@@ -3,6 +3,7 @@ package channels_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,22 +16,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 )
 
+const channelEpochGuardSQL = `SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`
+
 // #2201 AC-2: a channel creation (which stores wrapped keys) admitted before a
-// destructive key reset (stale-cache window) must be stopped by GuardTx — no
+// destructive key reset commits must be stopped by GuardTx — no
 // channel row and no wrapped-key rows may land under the superseded epoch.
 func TestCredEpochRace_CreateChannelRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	owner := ts.CreateTestUser(t, "racechanowner")
 	serverID := ts.CreateTestServer(t, owner.ID, "Race Channel Server")
 
-	stale := ts.SimulateStaleEpochWindow(t, owner.ID)
+	require.NoError(t, boundary.Arm(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, owner.ID, nil, nil)
 
 	w := ts.DoRequest("POST", "/api/v1/channels", map[string]interface{}{
 		"server_id": serverID,
@@ -39,7 +41,11 @@ func TestCredEpochRace_CreateChannelRejected(t *testing.T) {
 		"wrapped_keys": map[string]string{
 			owner.ID: "d3JhcHBlZC1rZXktb3duZXI=",
 		},
-	}, testhelpers.AuthHeaders(stale))
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "handler GuardTx must be reached after admitted epoch rotation")
 	assert.Equal(t, http.StatusUnauthorized, w.Code, "GuardTx must reject the admitted stale channel creation")
 
 	var count int
@@ -51,7 +57,8 @@ func TestCredEpochRace_CreateChannelRejected(t *testing.T) {
 // #2530: a manual channel rotation admitted with E1 must not commit or notify
 // after the durable credential epoch has advanced to E2.
 func TestCredEpochRace_ManualRotationRejected(t *testing.T) {
-	ts, owner, _, channelID := setupEncryptedChannel(t)
+	boundaryTS, boundary := testhelpers.SetupStaleBoundaryServer(t)
+	ts, owner, _, channelID := setupEncryptedChannel(t, boundaryTS)
 
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
@@ -71,8 +78,13 @@ func TestCredEpochRace_ManualRotationRejected(t *testing.T) {
 	_, _, err = conn.ReadMessage() // connection bootstrap
 	require.NoError(t, err)
 
-	stale := ts.SimulateStaleEpochWindow(t, owner.ID)
-	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(stale))
+	require.NoError(t, boundary.Arm(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, owner.ID, nil, nil)
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(owner.AccessToken))
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "handler GuardTx must be reached after admitted epoch rotation")
 	assert.Equal(t, http.StatusUnauthorized, w.Code, "GuardTx must reject the admitted stale manual rotation")
 	assert.JSONEq(t, `{"error":"Authentication required"}`, w.Body.String())
 
@@ -98,11 +110,18 @@ func TestCredEpochRace_ManualRotationRejected(t *testing.T) {
 }
 
 func TestCredEpochRace_ManualRotationStaleAttemptsDoNotConsumeChannelQuota(t *testing.T) {
-	ts, owner, _, channelID := setupEncryptedChannel(t)
+	boundaryTS, boundary := testhelpers.SetupStaleBoundaryServer(t)
+	ts, owner, _, channelID := setupEncryptedChannel(t, boundaryTS)
 
-	stale := ts.SimulateStaleEpochWindow(t, owner.ID)
 	for attempt := 1; attempt <= 10; attempt++ {
-		w := ts.DoRequest(http.MethodPost, pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(stale))
+		current := ts.VerifyUserEmail(t, owner.ID)
+		require.NoError(t, boundary.Arm(current))
+		boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, owner.ID, nil, nil)
+		w := ts.DoRequest(http.MethodPost, pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(current))
+		boundary.RequireRotated(t)
+		seen, hookErr := boundary.Hook.Report()
+		require.NoError(t, hookErr)
+		require.Equal(t, 1, seen, "stale attempt %d must reach manual rotation GuardTx", attempt)
 		require.Equal(t, http.StatusUnauthorized, w.Code, "stale attempt %d", attempt)
 		assert.JSONEq(t, `{"error":"Authentication required"}`, w.Body.String())
 	}
@@ -119,16 +138,10 @@ func TestCredEpochRace_ManualRotationStaleAttemptsDoNotConsumeChannelQuota(t *te
 	userRLKey := fmt.Sprintf("ratelimit:user:%s:POST:/api/v1/channels/:id/rotate-key", owner.ID)
 	require.NoError(t, ts.Redis.Del(context.Background(), userRLKey).Err())
 
-	var durableEpoch string
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT credential_epoch FROM users WHERE id = $1`, owner.ID,
-	).Scan(&durableEpoch))
-	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(owner.ID), "active:"+durableEpoch, 5*time.Minute).Err())
-	fresh, err := auth.GenerateAccessToken(owner.ID, testhelpers.TestJWTSecret, true, durableEpoch, "")
-	require.NoError(t, err)
+	fresh := ts.VerifyUserEmail(t, owner.ID)
 
 	w := ts.DoRequest(http.MethodPost, pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(fresh))
-	require.Equal(t, http.StatusOK, w.Code, "a durable-E2 request must retain the channel quota")
+	require.Equal(t, http.StatusOK, w.Code, "a request at the latest durable epoch must retain the channel quota")
 	var committedRows int
 	require.NoError(t, ts.DB.QueryRow(
 		`SELECT count(*) FROM key_revocations WHERE channel_id = $1`, channelID,
@@ -136,22 +149,15 @@ func TestCredEpochRace_ManualRotationStaleAttemptsDoNotConsumeChannelQuota(t *te
 	assert.Equal(t, 1, committedRows)
 }
 
-// #2201: a GuardTx read failure inside the channel-create transaction (fence
-// cache seeded, users renamed) maps to the generic 500, not the epoch 401
+// #2201: a GuardTx read fault injected after valid family auth maps to the
+// generic 500, not the epoch 401
 // (Codex #2397 review).
 func TestCredEpochRace_CreateChannelGuardReadErrorFailsClosed(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	owner := ts.CreateTestUser(t, "createguarderr")
 	serverID := ts.CreateTestServer(t, owner.ID, "Create Guard Error Server")
 
-	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(owner.ID), "none", 5*time.Minute).Err())
-	_, err := ts.DB.Exec("ALTER TABLE users RENAME TO users_createguarderr")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if _, err := ts.DB.Exec("ALTER TABLE users_createguarderr RENAME TO users"); err != nil {
-			t.Errorf("cleanup: failed to rename users back: %v", err)
-		}
-	})
+	boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, owner.ID, nil, errors.New("injected channel-create guard read failure"))
 
 	w := ts.DoRequest("POST", "/api/v1/channels", map[string]interface{}{
 		"server_id": serverID,
@@ -161,14 +167,20 @@ func TestCredEpochRace_CreateChannelGuardReadErrorFailsClosed(t *testing.T) {
 			owner.ID: "d3JhcHBlZC1rZXktb3duZXI=",
 		},
 	}, testhelpers.AuthHeaders(owner.AccessToken))
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "named handler GuardTx fault must be reached after valid auth")
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM channels WHERE server_id = $1 AND name = 'guard-err-channel'`, serverID).Scan(&count))
+	assert.Zero(t, count)
 }
 
-// #2201: a GuardTx read failure inside the distribution transaction (fault-
-// injected by renaming users while the fence answers from cache) maps to the
+// #2201: a GuardTx read fault injected inside the distribution transaction
+// after valid family auth maps to the
 // generic 500 — a store failure is never an epoch-mismatch 401.
 func TestCredEpochRace_DistributionGuardReadErrorFailsClosed(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	owner := ts.CreateTestUser(t, "raceguarderr")
 	serverID := ts.CreateTestServer(t, owner.ID, "Guard Error Server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
@@ -179,19 +191,16 @@ func TestCredEpochRace_DistributionGuardReadErrorFailsClosed(t *testing.T) {
 		channelID, owner.ID)
 	require.NoError(t, err)
 
-	// Seed the fence cache so middleware passes without the users table, then
-	// take the table away so GuardTx's FOR SHARE read errors inside the tx.
-	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(owner.ID), "none", 5*time.Minute).Err())
-	_, err = ts.DB.Exec("ALTER TABLE users RENAME TO users_guarderrtest")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if _, err := ts.DB.Exec("ALTER TABLE users_guarderrtest RENAME TO users"); err != nil {
-			t.Errorf("cleanup: failed to rename users back: %v", err)
-		}
-	})
+	boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, owner.ID, nil, errors.New("injected key-distribution guard read failure"))
 
 	w := ts.DoRequest("POST", "/api/v1/channels/"+channelID+"/keys", map[string]interface{}{
 		"wrapped_keys": map[string]string{owner.ID: "d3JhcHBlZC1rZXk="},
 	}, testhelpers.AuthHeaders(owner.AccessToken))
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "named handler GuardTx fault must be reached after valid auth")
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var wrapped string
+	require.NoError(t, ts.DB.QueryRow(`SELECT wrapped_key FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, owner.ID).Scan(&wrapped))
+	assert.Equal(t, "a2V5", wrapped)
 }

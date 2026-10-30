@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -61,6 +63,189 @@ type Reconciler struct {
 	credentialEpochEject   func(context.Context, uuid.UUID, string, string) error
 	voiceEjectV2           func(context.Context, string, uuid.UUID, uuid.UUID) error
 	credentialEpochEjectV2 func(context.Context, uuid.UUID, string, string, uuid.UUID) error
+	authRevocationEject    func(context.Context, AuthRevocation) error
+	progressMu             sync.Mutex
+	completedRound         time.Time
+	nextCategory           int
+}
+
+// ErrSecurityAuthorityUnavailable distinguishes failed authority observations from
+// recorded delivery failures. Only the latter can count as executor progress.
+var ErrSecurityAuthorityUnavailable = errors.New("security authority unavailable")
+
+// AuthRevocation copies immutable sealed ownership and the claimed attempt.
+type AuthRevocation struct {
+	OperationID, UserID uuid.UUID
+	Scope, Reason       string
+	Attempts            int
+	CreatedAt           time.Time
+}
+
+// SetAuthRevocationEject installs the exact hub/registry completion adapter.
+func (r *Reconciler) SetAuthRevocationEject(eject func(context.Context, AuthRevocation) error) {
+	if r != nil {
+		r.authRevocationEject = eject
+	}
+}
+
+// SecurityRoundCompletedAt returns only progress established by this process.
+func (r *Reconciler) SecurityRoundCompletedAt() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	return r.completedRound
+}
+
+func (r *Reconciler) reconcileSecurityRound(ctx context.Context, limit int) error {
+	roundCtx, cancel := context.WithTimeout(ctx, securityEjectionDrainTimeout)
+	defer cancel()
+	drains := []func(context.Context, int) error{r.drainDueAuthRevocations, r.drainDueCredentialEpochEjections, r.drainDueVoiceEjections}
+	r.progressMu.Lock()
+	start := r.nextCategory
+	r.nextCategory = (start + 1) % len(drains)
+	r.progressMu.Unlock()
+	results := make(chan error, len(drains))
+	for i := range drains {
+		drain := drains[(start+i)%len(drains)]
+		go func() { results <- drain(roundCtx, limit) }()
+	}
+	var result error
+	for range drains {
+		result = errors.Join(result, <-results)
+	}
+	finishedAt := time.Now()
+	result = errors.Join(result, roundCtx.Err())
+	if deadline, ok := roundCtx.Deadline(); ok && !finishedAt.Before(deadline) {
+		result = errors.Join(result, context.DeadlineExceeded)
+	}
+	if result == nil {
+		r.progressMu.Lock()
+		r.completedRound = finishedAt
+		r.progressMu.Unlock()
+	}
+	return result
+}
+
+func (r *Reconciler) drainDueAuthRevocations(ctx context.Context, limit int) error {
+	candidates, err := r.listDueAuthRevocations(ctx, limit)
+	if err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return ErrUnavailable
+	}
+	// Share delivery time between the remaining candidates, leaving the final
+	// tenth of the round for SQL outcomes. A slow callback cannot spend a later
+	// owner's slice or cancel the parent context used to record its own retry.
+	deliveryDeadline := deadline.Add(-time.Until(deadline) / 10)
+	var outcome error
+	for i, candidate := range candidates {
+		if !time.Now().Before(deliveryDeadline) {
+			return errors.Join(outcome, context.DeadlineExceeded)
+		}
+		operation, err := r.claimAuthRevocation(ctx, candidate.OperationID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// A lock or competing completion can invalidate the discovery snapshot.
+			// Visit later candidates, but this unobserved owner cannot prove freshness.
+			outcome = errors.Join(outcome, fmt.Errorf("auth candidate was not observed: %w", ErrUnavailable))
+			continue
+		}
+		if err != nil {
+			return errors.Join(outcome, err)
+		}
+		budget := time.Until(deliveryDeadline) / time.Duration(len(candidates)-i)
+		outcome = errors.Join(outcome, r.deliverAuthRevocation(ctx, operation, budget))
+	}
+	return outcome
+}
+
+func (r *Reconciler) listDueAuthRevocations(ctx context.Context, limit int) (candidates []AuthRevocation, returnErr error) {
+	// Discovery does not lease or increment unvisited owners. Due time leads:
+	// new attempt-zero arrivals cannot displace already overdue retained work.
+	// Unvisited owners keep their old due time; visited retries move forward.
+	// Skip an externally locked prefix while discovering the bounded page. These
+	// statement locks end before callbacks; exact claims recheck later races.
+	rows, err := r.db.QueryContext(ctx, `SELECT operation_id FROM login_family_revocations
+ WHERE completed_at IS NULL AND sealed_at IS NOT NULL AND reconcile_after <= clock_timestamp()
+ ORDER BY reconcile_after,attempts,operation_id LIMIT $1 FOR UPDATE SKIP LOCKED`, min(limit, maxReconcileBatch))
+	if err != nil {
+		return nil, fmt.Errorf("list auth revocations: %w", err)
+	}
+	defer func() { returnErr = errors.Join(returnErr, rows.Close()) }()
+	for rows.Next() {
+		var o AuthRevocation
+		if err := rows.Scan(&o.OperationID); err != nil {
+			return nil, fmt.Errorf("scan due auth revocation: %w", err)
+		}
+		candidates = append(candidates, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate due auth revocations: %w", err)
+	}
+	return candidates, nil
+}
+
+func (r *Reconciler) claimAuthRevocation(ctx context.Context, operationID uuid.UUID) (AuthRevocation, error) {
+	// Claim exactly the owner about to start, and close this statement's locks
+	// before the callback. UPDATE RETURNING ordering is irrelevant for one row.
+	var o AuthRevocation
+	err := r.db.QueryRowContext(ctx, `WITH due AS (
+ SELECT operation_id FROM login_family_revocations
+ WHERE operation_id=$1 AND completed_at IS NULL AND sealed_at IS NOT NULL
+ AND reconcile_after<=clock_timestamp() FOR UPDATE SKIP LOCKED
+ ) UPDATE login_family_revocations o SET attempts=LEAST(o.attempts,2147483646)+1,
+ reconcile_after=clock_timestamp()+INTERVAL '10 seconds',updated_at=clock_timestamp()
+ FROM due WHERE o.operation_id=due.operation_id
+ RETURNING o.operation_id,o.user_id,o.scope,o.reason,o.attempts,o.created_at`, operationID).Scan(
+		&o.OperationID, &o.UserID, &o.Scope, &o.Reason, &o.Attempts, &o.CreatedAt)
+	if err != nil {
+		return AuthRevocation{}, fmt.Errorf("claim auth revocation: %w", err)
+	}
+	return o, nil
+}
+
+func (r *Reconciler) deliverAuthRevocation(ctx context.Context, o AuthRevocation, budget time.Duration) error {
+	deliveryCtx, cancel := context.WithTimeout(ctx, budget)
+	deliveryErr := ErrUnavailable
+	if err := deliveryCtx.Err(); err != nil {
+		deliveryErr = err
+	} else if r.authRevocationEject != nil {
+		deliveryErr = r.authRevocationEject(deliveryCtx, o)
+	}
+	deliveryErr = errors.Join(deliveryErr, deliveryCtx.Err())
+	cancel()
+	if deliveryErr == nil {
+		_, err := r.db.ExecContext(ctx, `UPDATE login_family_revocations SET completed_at=clock_timestamp(),failure_class=NULL,updated_at=clock_timestamp()
+ WHERE operation_id=$1 AND user_id=$2 AND sealed_at IS NOT NULL AND completed_at IS NULL`, o.OperationID, o.UserID)
+		if err != nil {
+			return fmt.Errorf("complete auth revocation: %w", err)
+		}
+		return nil
+	}
+	delay := authRevocationRetryDelay(o.Attempts)
+	_, err := r.db.ExecContext(ctx, `UPDATE login_family_revocations SET failure_class='delivery',
+ reconcile_after=clock_timestamp()+$3*INTERVAL '1 second',updated_at=clock_timestamp()
+ WHERE operation_id=$1 AND user_id=$2 AND completed_at IS NULL`, o.OperationID, o.UserID, int(delay/time.Second))
+	if err != nil {
+		return fmt.Errorf("retain auth revocation: %w", err)
+	}
+	if errors.Is(deliveryErr, ErrSecurityAuthorityUnavailable) || errors.Is(deliveryErr, context.Canceled) || errors.Is(deliveryErr, context.DeadlineExceeded) {
+		return deliveryErr
+	}
+	return ctx.Err()
+}
+
+func authRevocationRetryDelay(attempt int) time.Duration {
+	if attempt >= 5 {
+		return 10 * time.Second
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	return time.Duration(1<<(attempt-1)) * time.Second
 }
 
 // AttachmentRetirer captures the Tier-2 metadata a conversation deletion would
@@ -259,6 +444,31 @@ func LockConversationUsersTx(ctx context.Context, tx *sql.Tx, conversationID str
 		return nil, err
 	}
 	return subjects, nil
+}
+
+// LockConversationAuthorityUsersTx acquires the complete participant-plus-actor
+// set under the caller's early rollout barrier. The returned participant snapshot
+// must be revalidated by PrepareConversationAfterUserLocksTx after family locking;
+// drift requires a new transaction, never an additional user lock.
+func LockConversationAuthorityUsersTx(ctx context.Context, tx *sql.Tx, barrier loginfamily.WriterBarrier, conversationID string, extraUsers []uuid.UUID, userMode loginfamily.UserLockMode) ([]uuid.UUID, loginfamily.UserAuthoritySet, error) {
+	if tx == nil {
+		return nil, loginfamily.UserAuthoritySet{}, ErrUnavailable
+	}
+	subjects, err := conversationSubjectsTx(ctx, tx, conversationID)
+	if err != nil {
+		return nil, loginfamily.UserAuthoritySet{}, err
+	}
+	lockSet := append(slices.Clone(subjects), extraUsers...)
+	slices.SortFunc(lockSet, func(a, b uuid.UUID) int { return slices.Compare(a[:], b[:]) })
+	lockSet = slices.Compact(lockSet)
+	if len(lockSet) == 0 || len(lockSet) > maxDMSubjects {
+		return nil, loginfamily.UserAuthoritySet{}, ErrUnavailable
+	}
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, lockSet, userMode)
+	if err != nil {
+		return nil, loginfamily.UserAuthoritySet{}, err
+	}
+	return subjects, users, nil
 }
 
 // PrepareConversationAfterUserLocksTx locks and revalidates a conversation
@@ -589,35 +799,16 @@ func (r *Reconciler) ReconcileDue(ctx context.Context, limit int) (int, error) {
 	if limit > maxReconcileBatch {
 		limit = maxReconcileBatch
 	}
-	credentialCtx, cancelCredential := context.WithTimeout(ctx, securityEjectionDrainTimeout)
-	voiceCtx, cancelVoice := context.WithTimeout(ctx, securityEjectionDrainTimeout)
-	credentialResults := make(chan error, 1)
-	voiceResults := make(chan error, 1)
-	go func() { credentialResults <- r.drainDueCredentialEpochEjections(credentialCtx, limit) }()
-	go func() { voiceResults <- r.drainDueVoiceEjections(voiceCtx, limit) }()
-	credentialErr := <-credentialResults
-	voiceErr := <-voiceResults
-	cancelCredential()
-	cancelVoice()
-	if credentialErr != nil || voiceErr != nil {
-		var drainErr error
-		if credentialErr != nil {
-			drainErr = errors.Join(drainErr, fmt.Errorf("dm block drain credential media ejections: %w", credentialErr))
-		}
-		if voiceErr != nil {
-			drainErr = errors.Join(drainErr, fmt.Errorf("dm block drain media ejections: %w", voiceErr))
-		}
-		return 0, drainErr
-	}
+	securityErr := r.reconcileSecurityRound(ctx, limit)
 	claimed, err := r.claimDue(ctx, limit)
 	if err != nil {
-		return 0, err
+		return 0, errors.Join(securityErr, err)
 	}
 	count := 0
 	for _, obligation := range claimed {
 		if err := r.reconcilePair(ctx, obligation); err != nil {
 			if retryErr := r.retryPair(ctx, obligation); retryErr != nil {
-				return count, fmt.Errorf("dm block retry obligation: %w", retryErr)
+				return count, errors.Join(securityErr, fmt.Errorf("dm block retry obligation: %w", retryErr))
 			}
 			if r.log != nil {
 				r.log.Error("DM block reconciliation retained", "failure_class", "database")
@@ -630,9 +821,9 @@ func (r *Reconciler) ReconcileDue(ctx context.Context, limit int) (int, error) {
 	postPairVoiceErr := r.drainDueVoiceEjections(postPairVoiceCtx, limit)
 	cancelPostPairVoice()
 	if postPairVoiceErr != nil {
-		return count, fmt.Errorf("dm block drain media ejections: %w", postPairVoiceErr)
+		return count, errors.Join(securityErr, fmt.Errorf("dm block drain media ejections: %w", postPairVoiceErr))
 	}
-	return count, nil
+	return count, securityErr
 }
 
 type claimedCredentialEpochEjection struct {
@@ -659,17 +850,16 @@ func (r *Reconciler) drainDueCredentialEpochEjections(ctx context.Context, limit
 	if err != nil {
 		return err
 	}
+	var outcome error
 	for _, ejection := range claimed {
-		if err := r.deliverCredentialEpochEjection(ctx, ejection); err != nil {
-			return err
-		}
+		outcome = errors.Join(outcome, r.deliverCredentialEpochEjection(ctx, ejection))
 	}
-	return nil
+	return outcome
 }
 
 func (r *Reconciler) deliverCredentialEpochEjection(ctx context.Context, e claimedCredentialEpochEjection) error {
+	var deliveryErr error
 	if r.credentialEpochEjectV2 != nil || r.credentialEpochEject != nil {
-		var deliveryErr error
 		if r.credentialEpochEjectV2 != nil {
 			deliveryErr = r.credentialEpochEjectV2(ctx, e.userID, e.credentialEpoch, e.supersededCredentialEpoch, e.generation)
 		} else {
@@ -704,7 +894,10 @@ func (r *Reconciler) deliverCredentialEpochEjection(ctx context.Context, e claim
 	if r.log != nil {
 		r.log.Error("Credential media ejection retained", "failure_class", "delivery")
 	}
-	return nil
+	if errors.Is(deliveryErr, ErrSecurityAuthorityUnavailable) {
+		return deliveryErr
+	}
+	return ctx.Err()
 }
 
 func (r *Reconciler) claimDueCredentialEpochEjections(ctx context.Context, limit int, userID, credentialEpoch, old *string) (claimed []claimedCredentialEpochEjection, returnErr error) {
@@ -1184,6 +1377,7 @@ func (r *Reconciler) drainDueVoiceEjections(ctx context.Context, limit int) erro
 	if err != nil {
 		return err
 	}
+	var outcome error
 	for _, ejection := range claimed {
 		if r.voiceEjectV2 == nil && r.voiceEject == nil {
 			if retryErr := r.retryVoiceEjection(ctx, ejection); retryErr != nil {
@@ -1201,6 +1395,9 @@ func (r *Reconciler) drainDueVoiceEjections(ctx context.Context, limit int) erro
 			deliveryErr = r.voiceEject(ctx, ejection.conversationID, ejection.userID)
 		}
 		if deliveryErr != nil {
+			if errors.Is(deliveryErr, ErrSecurityAuthorityUnavailable) {
+				outcome = errors.Join(outcome, deliveryErr)
+			}
 			if retryErr := r.retryVoiceEjection(ctx, ejection); retryErr != nil {
 				return fmt.Errorf("retain failed media ejection: %w", retryErr)
 			}
@@ -1213,7 +1410,7 @@ func (r *Reconciler) drainDueVoiceEjections(ctx context.Context, limit int) erro
 			return err
 		}
 	}
-	return nil
+	return errors.Join(outcome, ctx.Err())
 }
 
 func (r *Reconciler) claimDueVoiceEjections(ctx context.Context, limit int) (claimed []claimedVoiceEjection, returnErr error) {

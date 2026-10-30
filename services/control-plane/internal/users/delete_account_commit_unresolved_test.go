@@ -53,7 +53,7 @@ func (*commitUnresolvedCapture) Abandon(presencecapture.Plan, presencecapture.Ca
 
 var _ presencecapture.GraphPresenceCapture = (*commitUnresolvedCapture)(nil)
 
-const unresolvedErasureClearTestSecret = "synthetic-test-secret"
+const unresolvedErasureClearTestSecret = "synthetic-test-secret" // pragma: allowlist secret
 
 // observeErasureClear uses the real control-plane NATS client so this
 // regression observes the cross-replica privacy clear rather than merely
@@ -180,7 +180,7 @@ func TestDeleteAccountCommitUnresolvedPreservesPrivacyOutputButGatesMedia(t *tes
 				reclaimed = append(reclaimed, tier2...)
 			})
 
-			err = service.DeleteAccount(context.Background(), erased.String())
+			err = service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String())
 			require.ErrorIs(t, err, presencecapture.ErrCommitUnresolved)
 			assert.Equal(t, tc.wantAbsent, countUsers(t, db, erased) == 0)
 			assert.Equal(t, 1, drain.clearCount(),

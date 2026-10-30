@@ -395,6 +395,7 @@ func TestOverrideGate_CategoryForcedRetryVerifiesOncePerGateAttempt(t *testing.T
 	body, err := json.Marshal(ogBody(f.roleID, rgDangerous, 0, token))
 	require.NoError(t, err)
 	c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+	ts.AttachActorIdentity(t, c, f.owner.ID)
 	h.UpsertCategoryOverride(c)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())

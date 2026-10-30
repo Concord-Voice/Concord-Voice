@@ -8,9 +8,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -27,10 +25,12 @@ func TestRedTeamRingCannotPublishAfterCredentialResetCommits(t *testing.T) {
 	callee := ts.CreateTestUser(t, "redteam_ring_epoch_callee")
 	conversationID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 	conversationUUID := uuid.MustParse(conversationID)
-	const oldEpoch = "ring-old-epoch-3141"
-	const newEpoch = "ring-new-epoch-3141"
+	const oldEpoch = "00000000000000000000000000003141"
+	const newEpoch = "00000000000000000000000000003142"
+	require.NotEqual(t, oldEpoch, newEpoch, "credential reset must change the epoch")
 	_, err := ts.DB.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, oldEpoch, caller.ID)
 	require.NoError(t, err)
+	caller.AccessToken = ts.VerifyUserEmail(t, caller.ID)
 	calleeConn := dialDMObserver(t, ts, callee.ID, conversationID)
 	handler := crossStoreVoiceHandler(ts)
 
@@ -47,11 +47,8 @@ func TestRedTeamRingCannotPublishAfterCredentialResetCommits(t *testing.T) {
 	t.Cleanup(func() { dm.SetDMTopologyCommitHookForTest(handler, nil) })
 
 	request, recorder := crossStoreVoiceContext(
-		t, http.MethodPost, "/voice/ring", caller.ID, conversationID, nil,
+		t, ts, http.MethodPost, "/voice/ring", caller.AccessToken, conversationID, nil,
 	)
-	// This test calls the handler directly, so install the same non-empty
-	// credential claim that middleware.AuthRequired would have attached.
-	request.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": oldEpoch})
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)

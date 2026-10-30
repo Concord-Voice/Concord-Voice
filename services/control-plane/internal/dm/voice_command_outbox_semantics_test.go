@@ -137,6 +137,11 @@ func newDMOutboxFixture(t *testing.T) (*testhelpers.TestServer, testhelpers.Test
 	t.Helper()
 	t.Setenv("NATS_URL", dmOutboxUnavailableNATSURL)
 	ts := setupTS(t)
+	return populateDMOutboxFixture(t, ts)
+}
+
+func populateDMOutboxFixture(t *testing.T, ts *testhelpers.TestServer) (*testhelpers.TestServer, testhelpers.TestUser, testhelpers.TestUser, string) {
+	t.Helper()
 	admin := ts.CreateTestUser(t, "dm-outbox-semantic-admin")
 	target := ts.CreateTestUser(t, "dm-outbox-semantic-target")
 	convID := createTestGroup(t, ts, admin, target)
@@ -215,13 +220,20 @@ func TestVoiceCommandOutbox_DMRejectsUnregisteredPresence(t *testing.T) {
 func TestVoiceCommandOutbox_DMDeniedActorCreatesNoCommand(t *testing.T) {
 	for _, mode := range []string{"unauthorized", "stale credential"} {
 		t.Run(mode, func(t *testing.T) {
-			ts, admin, target, convID := newDMOutboxFixture(t)
+			t.Setenv("NATS_URL", dmOutboxUnavailableNATSURL)
+			ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
+			ts, admin, target, convID := populateDMOutboxFixture(t, ts)
 			seedDMOutboxSession(t, ts, convID, target.ID)
+			var requireBoundary func()
 			token, status := target.AccessToken, http.StatusForbidden
 			if mode == "stale credential" {
-				token, status = ts.SimulateStaleEpochWindow(t, admin.ID), http.StatusUnauthorized
+				token, status = admin.AccessToken, http.StatusUnauthorized
+				requireBoundary = armDMMediaAdmissionBoundary(t, boundary, admin, false)
 			}
 			response := ts.DoRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+pathDeafen, nil, testhelpers.AuthHeaders(token))
+			if requireBoundary != nil {
+				requireBoundary()
+			}
 			require.Equal(t, status, response.Code, response.Body.String())
 			var muted, deafened bool
 			require.NoError(t, ts.DB.QueryRow(`SELECT server_muted, server_deafened FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target.ID).Scan(&muted, &deafened))

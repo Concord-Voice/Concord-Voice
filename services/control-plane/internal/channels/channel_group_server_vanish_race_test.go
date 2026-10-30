@@ -27,7 +27,7 @@ import (
 
 const groupServerLockFragment = `SELECT id FROM servers WHERE id = $1 FOR UPDATE`
 
-// groupEpochGuardFragment is credepoch.GuardTx's read of the acting user's row,
+// groupEpochGuardFragment is credepoch.GuardFamilyTx's read of the acting user's row,
 // which both channel-group transactions take before their server lock.
 const groupEpochGuardFragment = `SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`
 

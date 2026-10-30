@@ -38,6 +38,7 @@ func TestSetChannelPermissionSync_RetriesWhenChannelBecomesVoice(t *testing.T) {
 
 	// Hold the visibility lock, then change the channel type. The first attempt
 	// captured the text-only state; the retry must capture the newly-voice child.
+	actorCtx := ts.ActorContext(context.Background(), t, owner.ID) // before the test takes any lock
 	tx, err := ts.DB.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	require.NoError(t, rbac.LockServerVisibilityCapture(context.Background(), tx, serverID))
@@ -50,7 +51,7 @@ func TestSetChannelPermissionSync_RetriesWhenChannelBecomesVoice(t *testing.T) {
 		c.Params = gin.Params{{Key: "id", Value: channelID}}
 		c.Set("user_id", owner.ID)
 		body, _ := json.Marshal(map[string]bool{"sync_permissions": true})
-		c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+		c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body)).WithContext(actorCtx)
 		c.Request.Header.Set("Content-Type", "application/json")
 		h.SetChannelPermissionSync(c)
 		completed <- w

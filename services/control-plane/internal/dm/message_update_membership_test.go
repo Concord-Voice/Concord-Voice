@@ -79,6 +79,7 @@ func invokeDMMessageCiphertextUpdate(t *testing.T, db *sql.DB, convID, messageID
 	c, recorder := testCtx()
 	c.Set("user_id", userID)
 	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": ""})
+	withActor(t, db, c, userID)
 
 	_, updated := h.updateDMMessageCiphertext(c, convID, messageID, updateDMMessageRequest{Content: content, KeyVersion: 1})
 	return updated, recorder

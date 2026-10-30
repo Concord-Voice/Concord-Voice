@@ -48,6 +48,7 @@ func seatPairRequest(h *Handler, fn func(*Handler, *gin.Context), method string,
 	c.Request = httptest.NewRequest(method, "/friends/"+target.String(), nil)
 	c.Params = gin.Params{{Key: "user_id", Value: target.String()}}
 	c.Set("user_id", actor.String())
+	dbtest.AttachRememberedActor(c, actor.String())
 	fn(h, c)
 	return w.Code
 }
@@ -57,6 +58,8 @@ func seatPairFixture(t *testing.T) (*Handler, *seatPairRecorder, uuid.UUID, uuid
 	db, cleanup := dbtest.SetupTestDB(t)
 	t.Cleanup(cleanup)
 	a, b := insertTestUser(t, db), insertTestUser(t, db)
+	dbtest.RememberActor(t, db, a.String())
+	dbtest.RememberActor(t, db, b.String())
 	_, err := db.Exec(`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, 'accepted')`, a, b)
 	require.NoError(t, err)
 	h := NewHandler(db, logger.New("test"), nil)

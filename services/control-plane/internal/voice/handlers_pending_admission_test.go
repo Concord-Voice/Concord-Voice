@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -25,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	rawnats "github.com/nats-io/nats.go"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,25 +63,38 @@ func TestActivatedAdmissionReleasesInitialFenceBeforePrepareAndRetainsReservatio
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
 	require.NoError(t, bus.Flush())
 	h := NewHandler(HandlerDeps{DB: db, Log: logger.New("test"), Cfg: &config.Config{JWTSecret: "test-secret"}, NATS: control, Resolver: rbac.NewResolver(db, rbac.NewPermissionCache(redisClient), logger.New("test")), EntCache: entitlements.NewCache(redisClient, db)})
+	token, sid := mintPendingAdmissionAccess(t, db, redisClient, member)
 	r := gin.New()
-	r.POST("/channels/:id/voice/join", func(c *gin.Context) {
-		c.Set("user_id", member.String())
-		c.Set("concord_service_hop", true)
-		h.AuthorizeJoin(c)
-	})
+	r.Use(middleware.AuthRequired("test-secret", redisClient, db, credepoch.New(db, redisClient, logger.New("test"))))
+	r.Use(middleware.MediaPlaneServiceHop("test-secret", logger.New("test")))
+	r.POST("/api/v1/channels/:id/voice/join", h.AuthorizeJoin)
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/channels/"+channelID.String()+"/voice/join", bytes.NewBufferString(fmt.Sprintf(`{"admission_id":%q,"socket_id":%q,"activate":true}`, admissionID, socketID))))
+		r.ServeHTTP(w, pendingAdmissionServiceRequest(token, channelID, admissionID, socketID))
 		close(done)
 	}()
-	msg := <-prepared
-	// This lock acquisition would time out if PREPARE still ran inside the first
-	// server-lock transaction.
+	var msg *rawnats.Msg
+	select {
+	case msg = <-prepared:
+	case <-done:
+		t.Fatalf("voice admission ended before PREPARE: status=%d body=%s", w.Code, w.Body.String())
+	case <-time.After(time.Second):
+		t.Fatal("voice admission did not send PREPARE")
+	}
+	// Acquire user, exact family, then server authority while the remote PREPARE
+	// acknowledgement is withheld. None may remain locked across the network wait.
 	lockCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	lockTx, err := db.BeginTx(lockCtx, nil)
 	require.NoError(t, err)
+	defer func() {
+		if err := lockTx.Rollback(); !errors.Is(err, sql.ErrTxDone) {
+			require.NoError(t, err)
+		}
+	}()
+	require.NoError(t, lockTx.QueryRowContext(lockCtx, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, member).Scan(new(uuid.UUID)))
+	require.NoError(t, lockTx.QueryRowContext(lockCtx, `SELECT f.family_id FROM login_families f JOIN login_family_sids s ON s.family_id=f.family_id WHERE f.user_id=$1 AND s.sid=$2 FOR NO KEY UPDATE OF f`, member, sid).Scan(new(uuid.UUID)))
 	require.NoError(t, lockTx.QueryRowContext(lockCtx, `SELECT id FROM servers WHERE id=$1 FOR UPDATE`, serverID).Scan(new(uuid.UUID)))
 	require.NoError(t, lockTx.Commit())
 	var request voiceAdmissionActivationResponse
@@ -151,19 +169,25 @@ func exerciseActivatedAdmissionMutation(
 			t.Errorf("post-PREPARE mutation failed: %v", err)
 		}
 	}
+	token, _ := mintPendingAdmissionAccess(t, db, redisClient, member)
 	r := gin.New()
-	r.POST("/channels/:id/voice/join", func(c *gin.Context) {
-		c.Set("user_id", member.String())
-		c.Set("concord_service_hop", true)
-		h.AuthorizeJoin(c)
-	})
+	r.Use(middleware.AuthRequired("test-secret", redisClient, db, credepoch.New(db, redisClient, logger.New("test"))))
+	r.Use(middleware.MediaPlaneServiceHop("test-secret", logger.New("test")))
+	r.POST("/api/v1/channels/:id/voice/join", h.AuthorizeJoin)
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/channels/"+channelID.String()+"/voice/join", bytes.NewBufferString(fmt.Sprintf(`{"admission_id":%q,"socket_id":%q,"activate":true}`, admissionID, socketID))))
+		r.ServeHTTP(w, pendingAdmissionServiceRequest(token, channelID, admissionID, socketID))
 		close(done)
 	}()
-	msg := <-prepared
+	var msg *rawnats.Msg
+	select {
+	case msg = <-prepared:
+	case <-done:
+		t.Fatalf("voice admission ended before PREPARE: status=%d body=%s", w.Code, w.Body.String())
+	case <-time.After(time.Second):
+		t.Fatal("voice admission did not send PREPARE")
+	}
 	var request voiceAdmissionActivationResponse
 	require.NoError(t, json.Unmarshal(msg.Data, &request))
 	request.Result = "ok"
@@ -266,14 +290,18 @@ func TestAuthorizeJoinLockedServerLookupErrors(t *testing.T) {
 			log := logger.NewWithWriter(&logBuffer)
 			h := NewHandler(HandlerDeps{DB: db, Log: log, Cfg: &config.Config{JWTSecret: "test-secret"}, Resolver: rbac.NewResolver(db, nil, log)})
 			router := gin.New()
-			router.Use(func(c *gin.Context) { c.Set("user_id", memberID.String()); c.Next() })
+			redisClient := redistest.Client(t)
+			token, _ := mintPendingAdmissionAccess(t, seedDB, redisClient, memberID)
+			router.Use(middleware.AuthRequired("test-secret", redisClient, db, credepoch.New(db, redisClient, log)))
 			router.POST("/channels/:id/voice/join", h.AuthorizeJoin)
 			request := httptest.NewRequest(http.MethodPost, "/channels/"+channelID.String()+"/voice/join", nil)
+			request.Header.Set("Authorization", "Bearer "+token)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 			assert.Equal(t, test.wantStatus, response.Code)
 			if test.wantStatus == http.StatusInternalServerError {
-				assert.Contains(t, logBuffer.String(), "lock voice server")
+				assert.Contains(t, logBuffer.String(), "voice join transaction authorization failed")
+				assert.Contains(t, logBuffer.String(), "authority")
 			}
 		})
 	}
@@ -523,24 +551,44 @@ func TestAuthorizeJoin_DirectPreflightDoesNotReserveAdmission(t *testing.T) {
 	h := NewHandler(HandlerDeps{
 		DB:       db,
 		Log:      logger.New("test"),
-		Cfg:      &config.Config{},
+		Cfg:      &config.Config{JWTSecret: "test-secret"},
 		Resolver: rbac.NewResolver(db, rbac.NewPermissionCache(redisClient), logger.New("test")),
 		EntCache: entitlements.NewCache(redisClient, db),
 	})
 	router := gin.New()
-	router.Use(func(c *gin.Context) {
-		c.Set("user_id", memberID.String())
-		c.Next()
-	})
+	token, _ := mintPendingAdmissionAccess(t, db, redisClient, memberID)
+	router.Use(middleware.AuthRequired("test-secret", redisClient, db, credepoch.New(db, redisClient, logger.New("test"))))
 	router.POST("/channels/:id/voice/join", h.AuthorizeJoin)
 
 	req := httptest.NewRequest(http.MethodPost, "/channels/"+channelID.String()+"/voice/join", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	writer := httptest.NewRecorder()
 	router.ServeHTTP(writer, req)
 	require.Equal(t, http.StatusOK, writer.Code)
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM voice_pending_admissions WHERE channel_id=$1 AND user_id=$2`, channelID, memberID).Scan(&count))
 	require.Zero(t, count, "unverified client preflight must not reserve or activate an admission")
+}
+
+// Mint through the production family/SID binding path so AuthRequired installs
+// the real verified identity, including the exact signed expiration.
+func mintPendingAdmissionAccess(t *testing.T, db *sql.DB, redisClient *redis.Client, memberID uuid.UUID) (string, string) {
+	t.Helper()
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/mint", nil)
+	token, _, sid, err := auth.NewHandler(db, redisClient, logger.New("test"), "test-secret", nil).IssueTokenPair(ctx, memberID.String(), "")
+	require.NoError(t, err)
+	return token, sid
+}
+
+func pendingAdmissionServiceRequest(token string, channelID uuid.UUID, admissionID, socketID string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/channels/"+channelID.String()+"/voice/join", bytes.NewBufferString(fmt.Sprintf(`{"admission_id":%q,"socket_id":%q,"activate":true}`, admissionID, socketID)))
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	request.Header.Set("X-Concord-Service-Timestamp", timestamp)
+	request.Header.Set("X-Concord-Service-Proof", mediaproof.Sign(mediaproof.DeriveKey("test-secret", "concord/media-plane-service-hop/v1"), "v1", timestamp, request.Method, request.URL.RequestURI(), mediaproof.TokenDigest(token)))
+	return request
 }
 
 func insertPendingAdmissionJoinFixture(

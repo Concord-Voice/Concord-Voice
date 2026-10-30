@@ -445,6 +445,8 @@ class PreferencesSyncService {
           fontHeadings: settings.fontHeadings,
           fontNavigation: settings.fontNavigation,
           fontMessages: settings.fontMessages,
+          // Tray icon style. Same terms as appFont: synced, NOT applied on pull, `v` stays 1.
+          trayIconStyle: settings.trayIconStyle,
         },
         layout: {
           sidebarProfiles,

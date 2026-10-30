@@ -659,6 +659,18 @@ describe('updater', () => {
       expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
     });
 
+    it('a refused cached installer sends the tray back to "Download update"', async () => {
+      extractChain.mockRejectedValue(new Error('private PowerShell diagnostic'));
+      const { updater } = await loadModule();
+      const onTray = vi.fn();
+      updater.initAutoUpdater(() => window, releaseQuitVeto, onTray);
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: installer });
+      expect(onTray).toHaveBeenLastCalledWith('ready');
+      await updater.safeQuitAndInstall();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      expect(onTray).toHaveBeenLastCalledWith('available');
+    });
+
     it('verifies the cached artifact before releasing the quit veto and installing', async () => {
       const updater = await armCachedUpdate();
       await updater.safeQuitAndInstall();
@@ -841,6 +853,79 @@ describe('updater', () => {
       expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
       await updater.downloadUpdate();
       expect(mockAutoUpdater.downloadUpdate).toHaveBeenCalledOnce();
+    });
+  });
+  // Status-aware tray (tray-status spec §4): main-owned update phase reaches the tray
+  // through a callback injected at init, never through the renderer.
+  describe('tray update state callback', () => {
+    it('reports available → downloading(percent) → ready', async () => {
+      const { updater } = await loadModule();
+      const onTray = vi.fn();
+      updater.initAutoUpdater(() => null, undefined, onTray);
+
+      getEventHandler('update-available')({ version: '2.0.0', releaseNotes: '', releaseDate: '' });
+      expect(onTray).toHaveBeenLastCalledWith('available');
+      getEventHandler('download-progress')({
+        percent: 42.5,
+        transferred: 1,
+        total: 2,
+        bytesPerSecond: 1,
+      });
+      expect(onTray).toHaveBeenLastCalledWith('downloading', 42.5);
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: '/tmp/u' });
+      expect(onTray).toHaveBeenLastCalledWith('ready');
+    });
+
+    it('an error keeps a downloaded update ready, an announced one available, else none', async () => {
+      const { updater } = await loadModule();
+      const onTray = vi.fn();
+      updater.initAutoUpdater(() => null, undefined, onTray);
+      const fail = () => getEventHandler('error')(new Error('net down'));
+
+      fail();
+      expect(onTray).toHaveBeenLastCalledWith('none');
+      getEventHandler('update-available')({ version: '2.0.0', releaseNotes: '', releaseDate: '' });
+      fail();
+      expect(onTray).toHaveBeenLastCalledWith('available');
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: '/tmp/u' });
+      fail();
+      expect(onTray).toHaveBeenLastCalledWith('ready');
+    });
+
+    it('update-not-available clears an announced update but never a downloaded one', async () => {
+      const { updater } = await loadModule();
+      const onTray = vi.fn();
+      updater.initAutoUpdater(() => null, undefined, onTray);
+      getEventHandler('update-available')({ version: '2.0.0', releaseNotes: '', releaseDate: '' });
+      getEventHandler('update-not-available')({ version: '1.0.0' });
+      expect(onTray).toHaveBeenLastCalledWith('none');
+      getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: '/tmp/u' });
+      onTray.mockClear();
+      getEventHandler('update-not-available')({ version: '1.0.0' });
+      expect(onTray).not.toHaveBeenCalled();
+    });
+
+    it('a throwing tray callback never breaks the updater event', async () => {
+      const { updater, splash } = await loadModule();
+      updater.initAutoUpdater(
+        () => null,
+        undefined,
+        vi.fn(() => {
+          throw new Error('tray gone');
+        })
+      );
+      expect(() =>
+        getEventHandler('update-downloaded')({ version: '2.0.0', downloadedFile: '/tmp/u' })
+      ).not.toThrow();
+      expect(splash.updateSplashStatus).toHaveBeenCalledWith('Ready for liftoff');
+    });
+
+    it('works without a callback (older call sites)', async () => {
+      const { updater } = await loadModule();
+      updater.initAutoUpdater(() => null);
+      expect(() =>
+        getEventHandler('update-available')({ version: '2.0.0', releaseNotes: '', releaseDate: '' })
+      ).not.toThrow();
     });
   });
 });

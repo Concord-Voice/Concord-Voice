@@ -59,7 +59,7 @@ func TestDeleteAccountDrainsPlansAndTransfersTheObligation(t *testing.T) {
 	insertPlanRow(t, db, userID, "server_voice")
 	service, deliverer := newAccountServiceWithRail(t, db)
 
-	require.NoError(t, service.DeleteAccount(context.Background(), userID.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String()))
 
 	assert.Zero(t, countUsers(t, db, userID))
 	assert.Zero(t, countPlansForUser(t, db, userID))
@@ -80,7 +80,7 @@ func TestDeleteAccountSucceedsWhenTheClearFails(t *testing.T) {
 	service, deliverer := newAccountServiceWithRail(t, db)
 	deliverer.failEveryClear = true
 
-	require.NoError(t, service.DeleteAccount(context.Background(), userID.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String()))
 
 	assert.Zero(t, countUsers(t, db, userID))
 	assert.Equal(t, 1, deliverer.failureCount())
@@ -99,7 +99,7 @@ func TestDeleteAccountDrainFailureRetainsUserWithDiagnosableError(t *testing.T) 
 	drain := &stubActivePlanDrain{drainErr: drainErr}
 	service := newAccountServiceWithDrain(t, db, drain)
 
-	err := service.DeleteAccount(context.Background(), userID.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 
 	require.ErrorIs(t, err, drainErr)
 	require.Contains(t, err.Error(), "drain presence plans")
@@ -134,7 +134,7 @@ func TestDeleteAccountTransfersTheObligationAfterCommit(t *testing.T) {
 			`SELECT count(*) FROM users WHERE id = $1`, userID).Scan(&probed)
 	}
 
-	require.NoError(t, service.DeleteAccount(context.Background(), userID.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String()))
 
 	require.NoError(t, probeErr, "the clear frame ran while the erasure still held its locks")
 	assert.Zero(t, probed, "the clear frame ran before the erasure committed")
@@ -151,7 +151,8 @@ func TestDeleteAccountWithRailCompletesInsideTheHeldSenderGate(t *testing.T) {
 	service, _ := newAccountServiceWithRail(t, db)
 
 	done := make(chan error, 1)
-	go func() { done <- service.DeleteAccount(context.Background(), userID.String()) }()
+	actor := testdb.ActorContext(context.Background(), t, db, userID.String())
+	go func() { done <- service.DeleteAccount(actor, userID.String()) }()
 
 	select {
 	case err := <-done:
@@ -190,7 +191,7 @@ func TestDeleteAccountCapturesSurvivorPlansBeforeCreatorCascade(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, service.DeleteAccount(context.Background(), creator.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String()))
 	assert.Zero(t, countUsers(t, db, creator), "positive control: creator erasure committed")
 	assert.Zero(t, countConversation(t, db, conv), "positive control: creator cascade committed")
 	assert.Contains(t, deliverer.categoriesFor(creator), presence.CategoryPrivateCall,
@@ -218,7 +219,7 @@ func TestDeleteAccountCandidateShrinkProceeds(t *testing.T) {
 	drain := &stubActivePlanDrain{}
 	service := configuredAccountServiceWithDrain(t, db, presencehistory.NewService(db, presencehistory.DisclosureState{}, false), drain)
 	service.activityCleanup.activitySuppressor = suppressor
-	err := service.DeleteAccount(context.Background(), creator.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String())
 	assert.True(t, hookRan, "candidate-shrink hook must run")
 	assert.Empty(t, drain.capturedSubjects(), "shrink must not capture a removed active-call survivor")
 	assert.Empty(t, drain.completedSubjects(), "shrink must not complete a removed active-call survivor")
@@ -233,7 +234,7 @@ func TestDeleteAccountCapturesCreatorOwnedOneToOneConversation(t *testing.T) {
 	creator, survivor := testdb.CreateUser(t, db), testdb.CreateUser(t, db)
 	conv := seedCreatorConversation(t, db, creator, survivor, false)
 	service, deliverer := newAccountServiceWithRail(t, db)
-	require.NoError(t, service.DeleteAccount(context.Background(), creator.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String()))
 	assert.Zero(t, countConversation(t, db, conv), "creator-owned 1:1 conversation must cascade")
 	assert.Contains(t, deliverer.categoriesFor(survivor), presence.CategoryPrivateCall,
 		"DEFECT #2901: 1:1 survivor plan/clear evidence is absent")
@@ -253,7 +254,7 @@ func TestDeleteAccountCandidateGrowthFailsClosed(t *testing.T) {
 	}}
 	service := configuredAccountServiceWithDrain(t, db, presencehistory.NewService(db, presencehistory.DisclosureState{}, false), &stubActivePlanDrain{})
 	service.activityCleanup.activitySuppressor = suppressor
-	err := service.DeleteAccount(context.Background(), creator.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String())
 	require.ErrorIs(t, err, ErrErasureCandidateSetDrifted, "candidate growth must fail closed with the real sentinel")
 	assert.Equal(t, 1, countUsers(t, db, creator), "creator must remain after candidate growth")
 	assert.Equal(t, 1, countConversation(t, db, conv), "conversation must remain after candidate growth")
@@ -279,7 +280,7 @@ func TestDeleteAccountCandidateGrowthBeyondBoundFailsClosed(t *testing.T) {
 	}}
 	service := configuredAccountServiceWithDrain(t, db, presencehistory.NewService(db, presencehistory.DisclosureState{}, false), &stubActivePlanDrain{})
 	service.activityCleanup.activitySuppressor = suppressor
-	err := service.DeleteAccount(context.Background(), creator.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String())
 	require.ErrorIs(t, err, ErrErasureCandidateSetDrifted)
 	assert.Equal(t, 1, countUsers(t, db, creator), "overflow drift must not erase creator")
 	var conversationCount int
@@ -300,7 +301,7 @@ func TestDeleteAccountKeepsAudienceFenceOpenThroughPlanCompletion(t *testing.T) 
 	service := newAccountServiceWithDrain(t, db, drain)
 	service.SetAudienceFence(hub)
 
-	require.NoError(t, service.DeleteAccount(context.Background(), creator.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String()))
 	assert.NotZero(t, openDuringCompletion, "audience revocation must remain open through plan completion")
 	assert.Zero(t, hub.PresenceAuthzOpenForTest(), "audience revocation must close after erasure")
 }
@@ -314,7 +315,7 @@ func TestDeleteAccountRejectsSeventeenSurvivorSubjects(t *testing.T) {
 		seedCreatorConversation(t, db, creator, survivor, true)
 	}
 	service, _ := newAccountServiceWithRail(t, db)
-	err := service.DeleteAccount(context.Background(), creator.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String())
 	assert.Error(t, err, "seventeen survivors must exceed the bounded fan-out")
 	assert.Equal(t, 1, countUsers(t, db, creator), "bound rejection must not mutate creator")
 }
@@ -330,7 +331,7 @@ func TestDeleteAccountCaptureFailureRetainsCreatorAndConversations(t *testing.T)
 	service.SetErasedMediaReclaimer(func(context.Context, []media.BlobRef, []media.BlobRef) { reclaimed = true })
 	var auditBefore, auditAfter int
 	require.NoError(t, db.QueryRowContext(context.Background(), `SELECT count(*) FROM account_deletions`).Scan(&auditBefore))
-	err := service.DeleteAccount(context.Background(), creator.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String())
 	assert.ErrorIs(t, err, drain.captureErr, "capture failure must be returned")
 	assert.Equal(t, 1, countUsers(t, db, creator))
 	assert.Equal(t, 1, countConversation(t, db, conv))
@@ -350,7 +351,7 @@ func TestDeleteAccountSurvivorCompletionFailureStillRunsPostCommitObligations(t 
 		drainedCategories: []presence.Category{presence.CategoryPrivateCall},
 	}
 	service := newAccountServiceWithDrain(t, db, drain)
-	err := service.DeleteAccount(context.Background(), creator.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String())
 	assert.ErrorIs(t, err, drain.completionErr, "post-commit completion failure must surface")
 	assert.Zero(t, countUsers(t, db, creator), "completion failure occurs after commit")
 	assert.Equal(t, 1, drain.clearCount(), "existing post-commit drain obligation must run after completion error")
@@ -372,7 +373,7 @@ func TestDeleteAccountLocksSurvivorUsersBeforeCreatorConversations(t *testing.T)
 		return nil
 	}}
 	service := newAccountServiceWithDrain(t, db, drain)
-	assert.NoError(t, service.DeleteAccount(context.Background(), creator.String()))
+	assert.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, creator.String()), creator.String()))
 	assert.True(t, drain.captureCalled, "capture seam must observe lock order")
 }
 
@@ -388,6 +389,7 @@ func TestDeleteAccountDoesNotDeadlockAgainstDMMessageEditOrder(t *testing.T) {
 	suppressor.accountHook = func() { close(started) }
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	creatorActor := testdb.ActorContext(ctx, t, db, creator.String())
 	editor, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer func() {
@@ -407,7 +409,7 @@ func TestDeleteAccountDoesNotDeadlockAgainstDMMessageEditOrder(t *testing.T) {
 		}
 	})
 	done := make(chan error, 1)
-	go func() { done <- service.DeleteAccount(ctx, creator.String()) }()
+	go func() { done <- service.DeleteAccount(creatorActor, creator.String()) }()
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
@@ -494,6 +496,7 @@ func TestDeleteAccountDoesNotDeadlockAgainstFreshPrivateVoiceIngressFKOrder(t *t
 
 	ctx, cancel := context.WithTimeout(context.Background(), gatedErasureBound)
 	defer cancel()
+	creatorActor := testdb.ActorContext(ctx, t, db, creator.String())
 	ingressTx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer func() {
@@ -511,7 +514,7 @@ func TestDeleteAccountDoesNotDeadlockAgainstFreshPrivateVoiceIngressFKOrder(t *t
 	require.NoError(t, err)
 
 	erasureDone := make(chan error, 1)
-	go func() { erasureDone <- service.DeleteAccount(ctx, creator.String()) }()
+	go func() { erasureDone <- service.DeleteAccount(creatorActor, creator.String()) }()
 	testdb.WaitForAdvisoryLockWaiter(t, db, lockKey)
 
 	_, insertErr := ingressTx.ExecContext(ctx, `

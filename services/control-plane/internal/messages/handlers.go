@@ -873,7 +873,7 @@ func (h *Handler) persistMessage(c *gin.Context, serverID string, membershipInca
 	}()
 	// Serialize the message write with member removal. The preflight's immutable
 	// joined_at value prevents a kicked sender from writing through a same-key rejoin.
-	if guardErr := credepoch.GuardTx(ctx, tx, message.UserID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, message.UserID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondGuardTxError(c, guardErr, errMsgFailedSendMessage)
 		return
 	}

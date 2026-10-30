@@ -42,6 +42,7 @@ func TestSpendToken_ExpiryIsCheckedAtTheStatementNotTheTransaction(t *testing.T)
 	ctx := context.Background()
 	userID := subjectTestUser(t, db)
 	token := mintFor(t, db, userID, FactorPassword, PurposeDMClear)
+	actor, epoch := subjectTestActor(t, db, userID)
 	holder := holdUsersRow(t, db, userID)
 
 	// The consumer's transaction starts now: its now() is fixed here.
@@ -59,7 +60,7 @@ func TestSpendToken_ExpiryIsCheckedAtTheStatementNotTheTransaction(t *testing.T)
 	// and waits behind the holder until well after expiry.
 	locked := make(chan error, 1)
 	go func() {
-		_, lockErr := LockSubjectTx(ctx, consumer, userID, LockForShare, "")
+		_, lockErr := LockSubjectTx(actor, consumer, userID, LockForShare, epoch)
 		if lockErr != nil {
 			locked <- lockErr
 			return

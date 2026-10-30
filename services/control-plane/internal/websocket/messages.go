@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 )
 
 // IncomingMessage represents a message received from a client
@@ -22,7 +24,14 @@ type IncomingMessage struct {
 	// (#2201). Server-set; used to fence ciphertext writes against a destructive
 	// reset that advanced the epoch after this socket connected.
 	CredEpoch      string    `json:"-"`
+	SID            uuid.UUID `json:"-"`
 	TokenExpiresAt time.Time `json:"-"`
+}
+
+// accessIdentity is the signed identity this frame's writes revalidate under
+// their own user and family locks (#2272).
+func (m IncomingMessage) accessIdentity() loginfamily.AccessIdentity {
+	return loginfamily.AccessIdentity{UserID: m.UserID, SID: m.SID, CredentialEpoch: m.CredEpoch, AccessExpiresAt: m.TokenExpiresAt}
 }
 
 // OutgoingMessage represents a message sent to a client

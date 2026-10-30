@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import type { ConnectionHandle, VoiceAuthConnections } from '../lib/voiceAuthConnection.js';
 import { createHash, createHmac } from 'node:crypto';
 import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
@@ -84,18 +85,61 @@ function verifySocketToken(token: string): JwtClaims & { exp: number } {
   return claims as JwtClaims & { exp: number };
 }
 
+// The socket object is only an index into private ownership, never its authority.
+const voiceConnections = new WeakMap<Socket, { owner: VoiceAuthConnections; handle: ConnectionHandle }>();
+
+export function getVoiceAuthConnection(socket: Socket): ConnectionHandle | undefined {
+  return voiceConnections.get(socket)?.handle;
+}
+
+export function createVoiceAuthConnectionMiddleware(owner: VoiceAuthConnections, available: () => boolean) {
+  return async (socket: Socket, next: (error?: ExtendedError) => void): Promise<void> => {
+    let handle: ConnectionHandle | undefined;
+    try {
+      const data = socket.data as AuthenticatedSocketData;
+      const token: unknown = socket.handshake.auth.token;
+      if (typeof token !== 'string' || !available()) throw new Error('Voice authentication unavailable');
+      handle = owner.reserve({ socketId: socket.id, userId: data.userId,
+        credentialEpoch: data.credentialEpoch, token, tokenExpiresAt: data.tokenExpiresAt,
+        disconnect: () => { socket.disconnect(true); } });
+      voiceConnections.set(socket, { owner, handle });
+      const exact = handle;
+      const close = () => { void owner.terminate(exact); };
+      // Namespace middleware failure need not emit socket disconnect. Engine
+      // closure is retained as well, before the first remote registration await.
+      socket.conn.once('close', close);
+      socket.once('disconnect', close);
+      await owner.register(handle);
+      if (!available() || socket.conn.readyState !== 'open') throw new Error('Voice authentication unavailable');
+      owner.assertProductive(handle);
+      next();
+    } catch {
+      // terminate() settles only after a successful control-plane release, so
+      // awaiting it here could hang the handshake. Refuse first; the fence and
+      // retained retry own completion. Keep the rejection observed.
+      next(new Error('Voice authentication unavailable'));
+      if (handle) owner.terminate(handle).catch(() => undefined);
+    }
+  };
+}
+
 /** Bind the deadline and renewal to this socket; renewal never replaces room state. */
 export function createSocketTokenRenewal(
   socket: Socket,
   validateRenewal: (token: string) => Promise<void>
 ) {
   const data = socket.data as AuthenticatedSocketData;
+  const connection = voiceConnections.get(socket);
+  const expire = () => {
+    if (connection) void connection.owner.terminate(connection.handle);
+    socket.disconnect(true);
+  };
   let timer: ReturnType<typeof setTimeout>;
   const scheduleExpiry = () => {
     clearTimeout(timer);
     const remaining = data.tokenExpiresAt - Date.now();
     if (remaining <= 0) {
-      socket.disconnect(true);
+      expire();
       return;
     }
     // Node truncates larger delays to 1 ms; recheck long-lived signed tokens.
@@ -105,10 +149,13 @@ export function createSocketTokenRenewal(
   socket.once('disconnect', () => clearTimeout(timer));
   socket.use((_, next) => {
     if (Date.now() >= data.tokenExpiresAt) {
-      socket.disconnect(true);
+      expire();
       return;
     }
-    next();
+    try {
+      if (connection) connection.owner.assertProductive(connection.handle);
+      next();
+    } catch { expire(); }
   });
   scheduleExpiry();
 
@@ -118,6 +165,7 @@ export function createSocketTokenRenewal(
       if (!socket.connected || Date.now() >= data.tokenExpiresAt || typeof token !== 'string') {
         throw new Error('Invalid renewal');
       }
+      if (connection) connection.owner.assertProductive(connection.handle);
       const claims = verifySocketToken(token);
       if (
         claims.user_id !== data.userId ||
@@ -135,6 +183,7 @@ export function createSocketTokenRenewal(
       ) {
         throw new Error('Expired renewal');
       }
+      if (connection) connection.owner.updateDeadline(connection.handle, claims.exp * 1000);
       data.tokenExpiresAt = claims.exp * 1000;
       socket.handshake.auth.token = token;
       scheduleExpiry();

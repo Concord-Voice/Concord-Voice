@@ -127,6 +127,7 @@ func iuCreateUser(t *testing.T, db *sql.DB, password string) string {
 		VALUES ($1, $2, $3, $4, true, true)
 	`, id, id+"@iu-stepup.test", "iu"+id[:8], hash)
 	require.NoError(t, err)
+	mintLiveFamily(t, db, id)
 	return id
 }
 
@@ -189,6 +190,7 @@ func iuGinContext(method, path, body, userID, tokenEpoch string) (*gin.Context, 
 	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("user_id", userID)
+	attachFamily(c, userID)
 	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": tokenEpoch})
 	return c, response
 }
@@ -660,6 +662,7 @@ func TestHandlers_PoolSafety_GreenButProspective(t *testing.T) {
 		router := gin.New()
 		router.Handle(method, path, func(c *gin.Context) {
 			c.Set("user_id", userID)
+			attachFamily(c, userID)
 			c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": ""})
 			handler(c)
 		})

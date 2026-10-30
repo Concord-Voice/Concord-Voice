@@ -17,9 +17,9 @@ const (
 )
 
 // setupWithServer creates a test server with an owner user and a server.
-func setupWithServer(t *testing.T) (*testhelpers.TestServer, testhelpers.TestUser, string) {
+func setupWithServer(t *testing.T, supplied ...*testhelpers.TestServer) (*testhelpers.TestServer, testhelpers.TestUser, string) {
 	t.Helper()
-	ts := setupTS(t)
+	ts := setupTS(t, supplied...)
 	user := ts.CreateTestUser(t, "groupowner")
 	serverID := ts.CreateTestServer(t, user.ID, "Group Test Server")
 	return ts, user, serverID
@@ -257,11 +257,17 @@ func TestDeleteChannelGroupSuccess(t *testing.T) {
 }
 
 func TestDeleteChannelGroupRejectsStaleCredentialEpoch(t *testing.T) {
-	ts, user, serverID := setupWithServer(t)
+	boundaryTS, boundary := testhelpers.SetupStaleBoundaryServer(t)
+	ts, user, serverID := setupWithServer(t, boundaryTS)
 	groupID := createGroup(t, ts, serverID, "Stale epoch group", user.AccessToken)
-	staleToken := ts.SimulateStaleEpochWindow(t, user.ID)
+	require.NoError(t, boundary.Arm(user.AccessToken))
+	boundary.Hook.ArmArg([]string{channelEpochGuardSQL}, user.ID, nil, nil)
 
-	w := ts.DoRequest("DELETE", groupPath(serverID, groupID), nil, testhelpers.AuthHeaders(staleToken))
+	w := ts.DoRequest("DELETE", groupPath(serverID, groupID), nil, testhelpers.AuthHeaders(user.AccessToken))
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "handler GuardTx must be reached after admitted epoch rotation")
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 
 	var count int

@@ -134,6 +134,14 @@ func publishDMBlockVoiceEjection(
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, dmBlockVoiceEjectionRequestTimeout)
 	defer cancel()
+	release, err := acquireVoiceExactRequest(requestCtx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if requester == nil {
+		return errors.New("voice ejection requester unavailable")
+	}
 	response, err := requester.RequestWithContext(requestCtx, dmBlockVoiceEjectionACKSubject, map[string]interface{}{
 		"version":   2,
 		"channelId": channelID,
@@ -197,6 +205,14 @@ func publishCredentialEpochVoiceEjection(
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, dmBlockVoiceEjectionRequestTimeout)
 	defer cancel()
+	release, err := acquireVoiceExactRequest(requestCtx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if requester == nil {
+		return errors.New("voice ejection requester unavailable")
+	}
 	response, err := requester.RequestWithContext(requestCtx, credentialEpochVoiceEjectionACKSubject, map[string]interface{}{
 		"version":                   1,
 		"userId":                    userIDString,
@@ -260,7 +276,7 @@ func publishDurableDMBlockVoiceEjection(
 	}
 	var attempt int
 	if err := db.QueryRowContext(ctx, `SELECT attempts FROM dm_block_voice_ejections WHERE generation = $1`, parentGeneration).Scan(&attempt); err != nil {
-		return fmt.Errorf("read voice enforcement parent attempt: %w", err)
+		return voiceAuthSQLFailure(fmt.Errorf("read voice enforcement parent attempt: %w", err))
 	}
 	return publishDurableVoiceEnforcementSessions(ctx, db, requester, secret, parentGeneration, attempt,
 		voiceEnforcementSessionTarget{
@@ -283,7 +299,7 @@ func publishDurableCredentialEpochVoiceEjection(
 	}
 	var attempt int
 	if err := db.QueryRowContext(ctx, `SELECT attempts FROM credential_epoch_voice_ejections WHERE generation = $1`, parentGeneration).Scan(&attempt); err != nil {
-		return fmt.Errorf("read voice enforcement parent attempt: %w", err)
+		return voiceAuthSQLFailure(fmt.Errorf("read voice enforcement parent attempt: %w", err))
 	}
 	return publishDurableVoiceEnforcementSessions(ctx, db, requester, secret, parentGeneration, attempt,
 		voiceEnforcementSessionTarget{
@@ -293,12 +309,12 @@ func publishDurableCredentialEpochVoiceEjection(
 
 func voiceEnforcementRolloutActivated(ctx context.Context, db *sql.DB) (bool, error) {
 	if db == nil {
-		return false, errors.New("voice enforcement database is unavailable")
+		return false, voiceAuthSQLFailure(errors.New("voice enforcement database is unavailable"))
 	}
 	var activated bool
 	if err := db.QueryRowContext(ctx,
 		`SELECT activated_at IS NOT NULL FROM voice_enforcement_rollout WHERE id = TRUE`).Scan(&activated); err != nil {
-		return false, fmt.Errorf("read voice enforcement rollout activation: %w", err)
+		return false, voiceAuthSQLFailure(fmt.Errorf("read voice enforcement rollout activation: %w", err))
 	}
 	return activated, nil
 }
@@ -382,7 +398,7 @@ func roundRobinVoiceEnforcementSessions(rows []voiceEnforcementSessionRow) []voi
 
 func loadVoiceEnforcementSessions(ctx context.Context, db *sql.DB, target voiceEnforcementSessionTarget, attempt int) (sessions []voiceEnforcementSessionRow, returnErr error) {
 	if db == nil {
-		return nil, errors.New("voice enforcement database is unavailable")
+		return nil, voiceAuthSQLFailure(errors.New("voice enforcement database is unavailable"))
 	}
 	switch target.kind {
 	case voiceEnforcementDMBlockTarget:
@@ -399,7 +415,7 @@ func loadDMBlockVoiceEnforcementSessions(ctx context.Context, db *sql.DB, target
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM voice_enforcement_sessions
 		WHERE room_kind = 'dm' AND room_id = $1 AND user_id = $2`, target.conversationID, target.userID).Scan(&total); err != nil {
-		return nil, fmt.Errorf("count voice enforcement sessions: %w", err)
+		return nil, voiceAuthSQLFailure(fmt.Errorf("count voice enforcement sessions: %w", err))
 	}
 	offset := voiceEnforcementSessionOffset(total, attempt)
 	rows, err := db.QueryContext(ctx, `
@@ -413,7 +429,7 @@ func loadDMBlockVoiceEnforcementSessions(ctx context.Context, db *sql.DB, target
 		ORDER BY node_rank, node_boot_id, session_generation
 		OFFSET $3 LIMIT $4`, target.conversationID, target.userID, offset, voiceEnforcementSessionEjectionMaxFanout)
 	if err != nil {
-		return nil, fmt.Errorf("list voice enforcement sessions: %w", err)
+		return nil, voiceAuthSQLFailure(fmt.Errorf("list voice enforcement sessions: %w", err))
 	}
 	return scanVoiceEnforcementSessionRows(rows)
 }
@@ -423,7 +439,7 @@ func loadCredentialEpochVoiceEnforcementSessions(ctx context.Context, db *sql.DB
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM voice_enforcement_sessions
 		WHERE user_id = $1 AND credential_epoch = $2`, target.userID, target.credentialEpoch).Scan(&total); err != nil {
-		return nil, fmt.Errorf("count voice enforcement sessions: %w", err)
+		return nil, voiceAuthSQLFailure(fmt.Errorf("count voice enforcement sessions: %w", err))
 	}
 	offset := voiceEnforcementSessionOffset(total, attempt)
 	rows, err := db.QueryContext(ctx, `
@@ -437,7 +453,7 @@ func loadCredentialEpochVoiceEnforcementSessions(ctx context.Context, db *sql.DB
 		ORDER BY node_rank, node_boot_id, session_generation
 		OFFSET $3 LIMIT $4`, target.userID, target.credentialEpoch, offset, voiceEnforcementSessionEjectionMaxFanout)
 	if err != nil {
-		return nil, fmt.Errorf("list voice enforcement sessions: %w", err)
+		return nil, voiceAuthSQLFailure(fmt.Errorf("list voice enforcement sessions: %w", err))
 	}
 	return scanVoiceEnforcementSessionRows(rows)
 }
@@ -452,18 +468,18 @@ func voiceEnforcementSessionOffset(total, attempt int) int {
 func scanVoiceEnforcementSessionRows(rows *sql.Rows) (sessions []voiceEnforcementSessionRow, returnErr error) {
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("close voice enforcement session rows: %w", closeErr))
+			returnErr = errors.Join(returnErr, voiceAuthSQLFailure(fmt.Errorf("close voice enforcement session rows: %w", closeErr)))
 		}
 	}()
 	for rows.Next() {
 		var row voiceEnforcementSessionRow
 		if err := rows.Scan(&row.sessionGeneration, &row.nodeBootID, &row.roomID, &row.roomKind, &row.userID, &row.credentialEpoch, &row.socketID); err != nil {
-			return nil, fmt.Errorf("scan voice enforcement session: %w", err)
+			return nil, voiceAuthSQLFailure(fmt.Errorf("scan voice enforcement session: %w", err))
 		}
 		sessions = append(sessions, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate voice enforcement sessions: %w", err)
+		return nil, voiceAuthSQLFailure(fmt.Errorf("iterate voice enforcement sessions: %w", err))
 	}
 	return sessions, nil
 }
@@ -490,6 +506,14 @@ func publishVoiceEnforcementSessionEjection(
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, dmBlockVoiceEjectionRequestTimeout)
 	defer cancel()
+	release, err := acquireVoiceExactRequest(requestCtx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if requester == nil {
+		return errors.New("voice ejection requester unavailable")
+	}
 	response, err := requester.RequestWithContext(requestCtx, "voice.enforce.session."+row.nodeBootID.String(), map[string]interface{}{
 		"version": voiceEnforcementSessionEjectVersion, "parentGeneration": parentGeneration.String(), "sessionGeneration": row.sessionGeneration.String(), "nodeBootId": row.nodeBootID.String(), "roomId": row.roomID.String(), "roomKind": row.roomKind, "userId": row.userID.String(), "credentialEpoch": row.credentialEpoch, "socketId": row.socketID, "timestamp": timestamp, "nonce": nonce, "proof": proof,
 	})

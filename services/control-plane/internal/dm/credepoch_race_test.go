@@ -7,28 +7,28 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 )
 
 // #2201 AC-2: a DM wrapped-key distribution admitted before a destructive key
-// reset (stale-cache window) must be stopped by GuardTx — no dm_channel_keys
+// reset must be stopped by its locked-user epoch comparison — no dm_channel_keys
 // rows may be recreated under the superseded epoch.
 func TestCredEpochRace_DMKeyDistributionRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	alice := ts.CreateTestUser(t, "racedmalice")
 	bob := ts.CreateTestUser(t, "racedmbob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
 
-	stale := ts.SimulateStaleEpochWindow(t, alice.ID)
+	stale := alice.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg(dmDistributionEpochGuardSQL, alice.ID, nil, nil)
 
 	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+convID, map[string]interface{}{
 		"wrapped_keys": map[string]string{
@@ -36,7 +36,8 @@ func TestCredEpochRace_DMKeyDistributionRejected(t *testing.T) {
 			bob.ID:   "d3JhcHBlZC1rZXktYm9i",
 		},
 	}, testhelpers.AuthHeaders(stale))
-	assert.Equal(t, http.StatusUnauthorized, w.Code, "GuardTx must reject the admitted stale distribution")
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "the distribution epoch comparison must reject the admitted stale distribution")
+	requireDMDistributionStaleBoundary(t, boundary)
 
 	var count int
 	require.NoError(t, ts.DB.QueryRow(
@@ -44,20 +45,22 @@ func TestCredEpochRace_DMKeyDistributionRejected(t *testing.T) {
 	assert.Zero(t, count, "no wrapped-key rows may be recreated under the old epoch")
 }
 
-// #2201: middleware admits this bearer from its stale Redis epoch entry after
-// the reset; the creation transaction must still reject it before it can make
-// a new 1:1 conversation durable.
+// #2201: reset commits after real HTTP family admission; the creation
+// transaction must reject it before it can make a new 1:1 conversation durable.
 func TestCredEpochRace_OpenConversationRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	caller := ts.CreateTestUser(t, "raceopencreator")
 	target := ts.CreateTestUser(t, "raceopentarget")
 	ts.CreateFriendship(t, caller.ID, target.ID, "accepted")
 
-	stale := ts.SimulateStaleEpochWindow(t, caller.ID)
+	stale := caller.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, caller.ID, nil, nil)
 	w := ts.DoRequest(http.MethodPost, pathDMConversations, map[string]string{
 		"user_id": target.ID,
 	}, testhelpers.AuthHeaders(stale))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var count int
 	require.NoError(t, ts.DB.QueryRow(
@@ -69,16 +72,19 @@ func TestCredEpochRace_OpenConversationRejected(t *testing.T) {
 // #2201: group creation uses the same complete participant fence as a 1:1
 // conversation. A stale creator must not be able to make any group durable.
 func TestCredEpochRace_CreateGroupRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	creator := ts.CreateTestUser(t, "racegroupcreator")
 	member := ts.CreateTestUser(t, "racegroupmember")
 	ts.CreateFriendship(t, creator.ID, member.ID, "accepted")
 
-	stale := ts.SimulateStaleEpochWindow(t, creator.ID)
+	stale := creator.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, creator.ID, nil, nil)
 	w := ts.DoRequest(http.MethodPost, pathDMConversations+pathGroup, map[string]any{
 		"user_ids": []string{member.ID},
 	}, testhelpers.AuthHeaders(stale))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var count int
 	require.NoError(t, ts.DB.QueryRow(
@@ -87,18 +93,21 @@ func TestCredEpochRace_CreateGroupRejected(t *testing.T) {
 	assert.Zero(t, count, "a stale credential must not create a group DM")
 }
 
-// #2201: a stale bearer may pass middleware while the cache retains its old
-// epoch, but must not read a wrapped key after the DB epoch has rotated.
+// #2201: a bearer admitted before reset must not read a wrapped key after
+// the DB epoch has rotated.
 func TestCredEpochRace_GetKeysRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	caller := ts.CreateTestUser(t, "racegetkeyscaller")
 	target := ts.CreateTestUser(t, "racegetkeystarget")
 	convID := ts.CreateDMConversation(t, caller.ID, target.ID)
 	ts.SeedDMKey(t, convID, caller.ID, 1)
 
-	stale := ts.SimulateStaleEpochWindow(t, caller.ID)
+	stale := caller.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, caller.ID, nil, nil)
 	w := ts.DoRequest(http.MethodGet, pathDMConversationsPrefix+convID+"/keys", nil, testhelpers.AuthHeaders(stale))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var body map[string]any
 	testhelpers.ParseJSON(t, w, &body)
@@ -106,14 +115,16 @@ func TestCredEpochRace_GetKeysRejected(t *testing.T) {
 }
 
 func TestCredEpochRace_DMManualRotationRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	alice := ts.CreateTestUser(t, "racedmrotatealice")
 	bob := ts.CreateTestUser(t, "racedmrotatebob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
 	ts.SeedDMKey(t, convID, alice.ID, 1)
 	ts.SeedDMKey(t, convID, bob.ID, 1)
 
-	stale := ts.SimulateStaleEpochWindow(t, alice.ID)
+	stale := alice.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg(dmDistributionEpochGuardSQL, alice.ID, nil, nil)
 	w := ts.DoRequest("POST", "/api/v1/dm/conversations/"+convID+"/rotate-key", map[string]interface{}{
 		"wrapped_keys": map[string]string{
 			alice.ID: "wrapped-racedmrotatealice-v2",
@@ -121,7 +132,8 @@ func TestCredEpochRace_DMManualRotationRejected(t *testing.T) {
 		},
 		"key_version": 2,
 	}, testhelpers.AuthHeaders(stale))
-	assert.Equal(t, http.StatusUnauthorized, w.Code, "GuardTx must reject a stale manual rotation")
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "the distribution epoch comparison must reject a stale manual rotation")
+	requireDMDistributionStaleBoundary(t, boundary)
 
 	var revocations int
 	require.NoError(t, ts.DB.QueryRow(
@@ -131,7 +143,7 @@ func TestCredEpochRace_DMManualRotationRejected(t *testing.T) {
 }
 
 func TestCredEpochRace_DMMessageDeleteRejected(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	alice := ts.CreateTestUser(t, "racedmdeletealice")
 	bob := ts.CreateTestUser(t, "racedmdeletebob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
@@ -140,11 +152,14 @@ func TestCredEpochRace_DMMessageDeleteRejected(t *testing.T) {
 		INSERT INTO dm_messages (conversation_id, user_id, content, type, key_version)
 		VALUES ($1, $2, 'must-remain', 'text', 1) RETURNING id`, convID, alice.ID).Scan(&messageID))
 
-	stale := ts.SimulateStaleEpochWindow(t, alice.ID)
+	stale := alice.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, alice.ID, nil, nil)
 	w := ts.DoRequest(http.MethodDelete,
 		"/api/v1/dm/conversations/"+convID+"/messages/"+messageID,
 		nil, testhelpers.AuthHeaders(stale))
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var count int
 	require.NoError(t, ts.DB.QueryRow(
@@ -202,29 +217,26 @@ func TestDMMessageDeleteSerializesCurrentMembershipRemoval(t *testing.T) {
 	assert.Equal(t, 1, count, "a membership removal that wins the fence must retain the message")
 }
 
-// #2201: a GuardTx read failure inside the distribution transaction (fence
-// cache seeded so middleware passes, then users renamed so the FOR SHARE read
-// errors) maps to the generic 500 — a store failure is never an epoch 401.
+// A distributor epoch read fault after its users lock and valid family auth
+// is a store failure. Inject at that exact SQL, keeping auth's users read intact.
 func TestDMKeyDistribution_GuardReadErrorFailsClosed(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	alice := ts.CreateTestUser(t, "dmguarderralice")
 	bob := ts.CreateTestUser(t, "dmguarderrbob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
-
-	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(alice.ID), "none", 5*time.Minute).Err())
-	_, err := ts.DB.Exec("ALTER TABLE users RENAME TO users_dmguarderr")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if _, err := ts.DB.Exec("ALTER TABLE users_dmguarderr RENAME TO users"); err != nil {
-			t.Errorf("cleanup: failed to rename users back: %v", err)
-		}
-	})
+	boundary.Hook.ArmArg(dmDistributionEpochGuardSQL, alice.ID, nil, errors.New("injected handler guard read failure"))
 
 	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+convID, map[string]interface{}{
 		"wrapped_keys": map[string]string{bob.ID: "d3JhcHBlZC1rZXktYm9i"},
 		"key_version":  1,
 	}, testhelpers.AuthHeaders(alice.AccessToken))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, len(dmDistributionEpochGuardSQL), seen, "valid family auth must reach the handler's guard read")
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&count))
+	assert.Zero(t, count, "guard read failure must not distribute keys")
 }
 
 // #2201 error-branch coverage: a DB failure while resolving the fallback key
@@ -235,8 +247,7 @@ func TestDMKeyDistribution_KeyVersionResolveErrorFailsClosed(t *testing.T) {
 	bob := ts.CreateTestUser(t, "dmkverrbob")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
 
-	// Seed the fence cache so AuthRequired + participant checks pass without
-	// touching the renamed table below.
+	// Break only the key table; family auth still uses the intact users table.
 	_, err := ts.DB.Exec("ALTER TABLE dm_channel_keys RENAME TO dm_channel_keys_dberrtest")
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -276,4 +287,29 @@ func TestDMKeyDistribution_InsertErrorFailsBatch(t *testing.T) {
 		"key_version":  2,
 	}, testhelpers.AuthHeaders(alice.AccessToken))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+const dmEpochGuardSQL = `SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`
+
+func requireDMStaleBoundary(t *testing.T, boundary *testhelpers.StaleBoundary) {
+	t.Helper()
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "the named handler epoch guard must be reached after successful auth commit and rotation")
+}
+
+// Distribution and manual rotation share a complete-users lock followed by a
+// separate MatchEpoch read. Observe both in order: this is not GuardTx's SQL.
+var dmDistributionEpochGuardSQL = []string{
+	`SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR SHARE`,
+	`SELECT credential_epoch FROM users WHERE id = $1`,
+}
+
+func requireDMDistributionStaleBoundary(t *testing.T, boundary *testhelpers.StaleBoundary) {
+	t.Helper()
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, len(dmDistributionEpochGuardSQL), seen, "the distributor must lock users then reach its actor epoch comparison after auth and rotation")
 }

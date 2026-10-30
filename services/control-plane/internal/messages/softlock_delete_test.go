@@ -301,7 +301,7 @@ func TestDeleteSoftLock_ConfirmOutsidePopulation_Refused(t *testing.T) {
 	s := newSoftLockHarness(t)
 	w := s.world(t, false)
 
-	confirmed, err := s.handler.ConfirmOutsidePopulationForTest(context.Background(), w.moderator.ID, w.serverID)
+	confirmed, err := s.handler.ConfirmOutsidePopulationForTest(testhelpers.UserIdentityContext(context.Background(), t, w.moderator.ID), w.moderator.ID, w.serverID)
 	assert.False(t, confirmed)
 	var stepErr *stepup.Error
 	require.ErrorAs(t, err, &stepErr, "outside the population, nothing may be waved through")

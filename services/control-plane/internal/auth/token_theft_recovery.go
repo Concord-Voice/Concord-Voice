@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
@@ -204,12 +205,12 @@ func ProcessTokenTheftRevocation(ctx context.Context, db *sql.DB, redisClient *r
 			err = errors.Join(err, fmt.Errorf("rollback token theft revocation transaction: %w", rollbackErr))
 		}
 	}()
-	userExists, err := lockTokenTheftUser(ctx, tx, userID)
+	user, err := lockMintUserTx(ctx, tx, userID)
+	if errors.Is(err, loginfamily.ErrDenied) {
+		return commitTokenTheftNoop(tx, "token theft deleted-user transaction")
+	}
 	if err != nil {
 		return err
-	}
-	if !userExists {
-		return commitTokenTheftNoop(tx, "token theft deleted-user transaction")
 	}
 
 	pending, found, err := lockTokenTheftPendingRevocation(ctx, tx, userID)
@@ -220,16 +221,22 @@ func ProcessTokenTheftRevocation(ctx context.Context, db *sql.DB, redisClient *r
 		return commitTokenTheftNoop(tx, "token theft no-op transaction")
 	}
 	if !pending.completedAt.Valid {
-		supersededID, stateErr := beginTokenTheftSweepScript.Run(ctx, redisClient,
+		prerequisiteCtx, cancelPrerequisite := context.WithTimeout(ctx, tokenTheftRedisPersistTimeout)
+		supersededID, stateErr := beginTokenTheftSweepScript.Run(prerequisiteCtx, redisClient,
 			[]string{tokenTheftFallbackHashKey, middleware.TokenTheftBlockedKey(userID)}, userID, tokenTheftStateValue(pending.operationID),
 		).Text()
+		cancelPrerequisite()
 		if stateErr != nil {
 			return fmt.Errorf("set token theft block: %w", stateErr)
 		}
 		if supersededID == tokenTheftStateValue(pending.operationID) {
 			supersededID = ""
 		}
-		if _, err := revokeAllRefreshTokensTx(ctx, tx, userID, RevokeAllRefreshTokensOptions{}); err != nil {
+		targets, err := loginfamily.CaptureUserTargetsTx(ctx, tx, user, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeUser, Reason: loginfamily.ReasonTheft}); err != nil {
 			return fmt.Errorf("revoke refresh tokens: %w", err)
 		}
 		if err := completeTokenTheftRevocation(ctx, tx, userID, pending.operationID, supersededID); err != nil {

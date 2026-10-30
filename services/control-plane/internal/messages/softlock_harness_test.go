@@ -121,6 +121,7 @@ func buildSoftLockHarness(t *testing.T, ts *testhelpers.TestServer, db *sql.DB, 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", c.GetHeader("X-Test-User"))
+		testhelpers.AttachUserIdentity(t, c, c.GetHeader("X-Test-User"))
 		claims := jwt.MapClaims{}
 		if epoch := c.GetHeader("X-Test-Epoch"); epoch != "" {
 			claims["cred_epoch"] = epoch

@@ -90,12 +90,9 @@ func TestRequirementsHandler(t *testing.T) {
 	})
 }
 
-// TestRequirementsRoute_DeletedUserThroughAuthChain is the spec's chain case
-// (PR 1 server tests): the auth gates the router mounts GET /mfa/step-up
-// behind, with the real credential-epoch fence, admit a live token whose user
-// was deleted after minting, and the handler's users-row anchor answers 401.
-// The fence reads an unknown user as having no epoch, so the anchor is what
-// stops the request.
+// TestRequirementsRoute_DeletedUserThroughAuthChain uses the router's real
+// authentication chain. A canonical live login reaches the requirements handler;
+// deleting its user then makes the same still-signed token fail admission.
 func TestRequirementsRoute_DeletedUserThroughAuthChain(t *testing.T) {
 	db := subjectTestDB(t)
 	rdb := redis.NewClient(&redis.Options{Addr: miniredis.RunT(t).Addr()})
@@ -125,9 +122,9 @@ func TestRequirementsRoute_DeletedUserThroughAuthChain(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, get("").Code)
 	})
 
-	t.Run("live token, user deleted after minting: 401 from the anchor", func(t *testing.T) {
+	t.Run("live token, user deleted after minting: 401 at admission", func(t *testing.T) {
 		userID := subjectTestUser(t, db)
-		token, err := auth.GenerateAccessToken(userID, secret, true, "", uuid.NewString())
+		token, _, _, err := auth.NewHandler(db, rdb, log, secret, nil).IssueAccessAndRefresh(context.Background(), userID)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, get(token).Code, "control: the chain admits the live user")
 
@@ -136,7 +133,7 @@ func TestRequirementsRoute_DeletedUserThroughAuthChain(t *testing.T) {
 
 		w := get(token)
 		require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
-		require.JSONEq(t, `{"error":"`+ErrMsgSessionNoLongerValid+`"}`, w.Body.String())
+		require.JSONEq(t, `{"error":"Authentication required"}`, w.Body.String())
 	})
 }
 

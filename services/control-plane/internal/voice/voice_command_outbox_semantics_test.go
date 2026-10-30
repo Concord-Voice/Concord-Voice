@@ -119,6 +119,11 @@ func newServerOutboxFixture(t *testing.T) (*testhelpers.TestServer, testhelpers.
 	t.Helper()
 	t.Setenv("NATS_URL", outboxUnavailableNATSURL)
 	ts := setupTS(t)
+	return populateServerOutboxFixture(t, ts)
+}
+
+func populateServerOutboxFixture(t *testing.T, ts *testhelpers.TestServer) (*testhelpers.TestServer, testhelpers.TestUser, testhelpers.TestUser, string, string) {
+	t.Helper()
 	owner := ts.CreateTestUser(t, "outbox-semantic-owner")
 	target := ts.CreateTestUser(t, "outbox-semantic-target")
 	serverID := ts.CreateTestServer(t, owner.ID, "Outbox Semantics")
@@ -196,18 +201,25 @@ func TestVoiceCommandOutbox_ServerRejectsUnregisteredPresence(t *testing.T) {
 func TestVoiceCommandOutbox_ServerDeniedActorCreatesNoCommand(t *testing.T) {
 	for _, mode := range []string{"unauthorized", "stale credential"} {
 		t.Run(mode, func(t *testing.T) {
-			ts, owner, target, serverID, channelID := newServerOutboxFixture(t)
+			t.Setenv("NATS_URL", outboxUnavailableNATSURL)
+			ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
+			ts, owner, target, serverID, channelID := populateServerOutboxFixture(t, ts)
 			seedOutboxVoiceSession(t, ts, channelID, target.ID)
 			var token string
+			var requireBoundary func()
 			status := http.StatusUnauthorized
 			if mode == "stale credential" {
-				token = ts.SimulateStaleEpochWindow(t, owner.ID)
+				token = owner.AccessToken
+				requireBoundary = armServerMediaAdmissionBoundary(t, boundary, owner, false)
 			} else {
 				actor := ts.CreateTestUser(t, "outbox-denied-actor")
 				ts.AddMemberToServer(t, serverID, actor.ID, roleMember)
 				token, status = actor.AccessToken, http.StatusForbidden
 			}
 			response := ts.DoRequest(http.MethodPost, voiceEnforcePath(serverID, target.ID, pathDeafen), nil, testhelpers.AuthHeaders(token))
+			if requireBoundary != nil {
+				requireBoundary()
+			}
 			require.Equal(t, status, response.Code, response.Body.String())
 			var muted, deafened bool
 			require.NoError(t, ts.DB.QueryRow(`SELECT server_muted, server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, target.ID).Scan(&muted, &deafened))

@@ -647,7 +647,7 @@ func (h *Handler) deleteChannelGroupAuthorityTx(ctx context.Context, tx *sql.Tx,
 }
 
 func (h *Handler) lockAndAuthorizeChannelGroupDeleteTx(ctx context.Context, tx *sql.Tx, serverID, groupID, userID, tokenEpoch string, preflight channelGroupDeletePreflight) ([]string, error) {
-	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
 		return nil, err
 	}
 	if err := lockChannelGroupForDeleteTx(ctx, tx, serverID, groupID); err != nil {
@@ -755,7 +755,7 @@ func (h *Handler) refuseAfterRollback(c *gin.Context, tx *sql.Tx, r *groupRefusa
 // below can see the server is gone. Any other guard failure, and a failed
 // server read after a missing row, is a 500 carrying its cause.
 func guardChannelGroupTx(c *gin.Context, tx *sql.Tx, serverID, userID, goneMessage, faultMessage string) *groupRefusal {
-	err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c))
+	err := credepoch.GuardFamilyTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c))
 	if err == nil {
 		return nil
 	}
@@ -1131,7 +1131,7 @@ func (h *Handler) reorderChannelAuthorityTx(ctx context.Context, tx *sql.Tx, req
 }
 
 func (h *Handler) lockAndAuthorizeChannelReorderTx(ctx context.Context, tx *sql.Tx, request reorderChannelAuthorityRequest) (map[string]groupedChannelState, error) {
-	if err := credepoch.GuardTx(ctx, tx, request.userID, request.tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, request.userID, request.tokenEpoch); err != nil {
 		return nil, err
 	}
 	if err := lockChannelGroupsTx(ctx, tx, request.serverID, groupIDsForReorder(request.reorder, request.preflight)); err != nil {

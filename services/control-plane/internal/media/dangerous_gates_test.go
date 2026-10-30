@@ -38,7 +38,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
@@ -952,9 +951,7 @@ func TestServerImageGate_GraceCoversTheNextUploadInTheSameSession(t *testing.T) 
 	icon, banner := imgRoutes()[0], imgRoutes()[1]
 	f := newImgGateFixture(t, env, true, true)
 	session := func() string {
-		token, err := auth.GenerateAccessToken(f.owner.ID, testhelpers.TestJWTSecret, true, "", uuid.NewString())
-		require.NoError(t, err)
-		return token
+		return env.ts.VerifyUserEmail(t, f.owner.ID)
 	}
 	first := session()
 

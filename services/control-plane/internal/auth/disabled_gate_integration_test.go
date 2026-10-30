@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -19,6 +20,9 @@ import (
 type noopDisconnector struct{}
 
 func (noopDisconnector) DisconnectUser(uuid.UUID) {}
+func (noopDisconnector) DisconnectFamilyContext(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
 
 // These integration tests prove the #1623 age-verification disabled-account gates
 // on the auth surface (spec "integration-proven" AC). They disable an account
@@ -109,18 +113,29 @@ func TestIssueAccessAndRefresh_EnabledAccount_Mints(t *testing.T) {
 	assert.NotEmpty(t, sessionID)
 }
 
-// A userID with no users row hits the sql.ErrNoRows branch and returns a
-// "user not found" error — distinct from the disabled sentinel, and never a
-// minted token.
+// A missing user is a typed identity denial, distinct from a disabled account,
+// with no minted credentials or durable session effects.
 func TestIssueAccessAndRefresh_UserNotFound(t *testing.T) {
 	ts := setupTS(t)
 	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
 
-	access, refresh, sessionID, err := h.IssueAccessAndRefresh(context.Background(), uuid.New().String())
+	recorder := &adapterSecurityEventRecorder{}
+	h.SetSecurityEvents(recorder)
+	missing := uuid.NewString()
+	access, refresh, sessionID, err := h.IssueAccessAndRefresh(context.Background(), missing)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, auth.ErrAccountDisabled)
-	assert.Contains(t, err.Error(), "not found")
+	require.ErrorIs(t, err, loginfamily.ErrDenied)
+	var denial *loginfamily.Error
+	require.ErrorAs(t, err, &denial)
+	assert.Equal(t, loginfamily.ReasonAccessIdentity, denial.Reason())
+	for _, table := range []string{"login_families", "login_family_sids", "refresh_tokens", "user_sso_identities"} {
+		var count int
+		require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE user_id=$1`, missing).Scan(&count))
+		assert.Zero(t, count, table)
+	}
 	assert.Empty(t, access)
 	assert.Empty(t, refresh)
 	assert.Empty(t, sessionID)
+	assert.Empty(t, recorder.events)
 }

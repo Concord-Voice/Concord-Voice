@@ -1154,6 +1154,7 @@ func TestRespondToRecoveryRequestAnswersAMalformedIDAsNotFound(t *testing.T) {
 	h, _ := scriptedHandler(t, &mfaEventDB{}, "test", scriptedAnswer{match: "SELECT id FROM users", values: []driver.Value{userID}}, scriptedAnswer{match: "SELECT credential_epoch", values: []driver.Value{nil}})
 	c, response := enrollRequest("/api/v1/mfa/recovery-requests/not-a-uuid/respond", `{"action":"reject","protocol_version":2}`, "session-a")
 	c.Set("user_id", userID)
+	attachFamily(c, userID)
 	c.Params = gin.Params{{Key: "id", Value: "not-a-uuid"}}
 	h.RespondToRecoveryRequest(c)
 	require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
@@ -1198,6 +1199,7 @@ func recoveryResponseFault(t *testing.T, mode string, expected int) {
 	require.NoError(t, err)
 	c, response := enrollRequest("/api/v1/mfa/recovery-requests/"+requestID+"/respond", string(body), "session-a")
 	c.Set("user_id", userID)
+	attachFamily(c, userID)
 	c.Params = gin.Params{{Key: "id", Value: requestID}}
 	h.RespondToRecoveryRequest(c)
 	require.Equal(t, expected, response.Code, response.Body.String())

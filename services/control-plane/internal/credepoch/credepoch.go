@@ -25,9 +25,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -286,6 +289,9 @@ return 'skip'
 // Rollback (definite rollback) / neither (ambiguous commit — the blocked
 // marker's TTL plus read-through reconciles).
 type Op struct {
+	mu               sync.Mutex
+	captureTx        *sql.Tx
+	rotateAttempted  bool
 	f                *Fence
 	userID           string
 	opID             string
@@ -300,7 +306,20 @@ func (o *Op) NewEpochValue() string { return o.newEpoch }
 
 // CapturePreviousEpochTx records the generation displaced by this operation
 // while the caller holds the user row used by the eventual rotation.
-func (o *Op) CapturePreviousEpochTx(ctx context.Context, tx RowQuerier) error {
+func (o *Op) CapturePreviousEpochTx(ctx context.Context, tx *sql.Tx) error {
+	if o == nil {
+		return loginfamily.NewError(loginfamily.ReasonCapabilityInvalid, nil)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.capturePreviousEpochTx(ctx, tx)
+}
+
+func (o *Op) capturePreviousEpochTx(ctx context.Context, tx *sql.Tx) error {
+	if tx == nil || (o.captureTx != nil && o.captureTx != tx) {
+		return loginfamily.NewError(loginfamily.ReasonCapabilityInvalid, nil)
+	}
+	o.captureTx = tx
 	if o.previousCaptured {
 		return nil
 	}
@@ -308,7 +327,7 @@ func (o *Op) CapturePreviousEpochTx(ctx context.Context, tx RowQuerier) error {
 	if err := tx.QueryRowContext(ctx,
 		`SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, o.userID,
 	).Scan(&epoch); err != nil {
-		return fmt.Errorf("credepoch: capture prior epoch: %w", err)
+		return fmt.Errorf("credepoch: capture prior epoch: %w", loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err))
 	}
 	o.previousEpoch = epoch.String
 	o.previousCaptured = true
@@ -339,35 +358,48 @@ func (f *Fence) Begin(ctx context.Context, userID string) (*Op, error) {
 
 // RotateTx stamps the new epoch inside the destructive flow's transaction.
 // Callers MUST already hold the user-row lock (FOR NO KEY UPDATE).
-func (o *Op) RotateTx(ctx context.Context, tx RowQuerier) error {
-	if err := o.CapturePreviousEpochTx(ctx, tx); err != nil {
-		return err
+func (o *Op) RotateTx(ctx context.Context, tx *sql.Tx) (loginfamily.EpochOwner, error) {
+	if o == nil {
+		return loginfamily.EpochOwner{}, loginfamily.NewError(loginfamily.ReasonCapabilityInvalid, nil)
 	}
-	execTx, ok := tx.(interface {
-		ExecContext(context.Context, string, ...any) (sql.Result, error)
-	})
-	if !ok {
-		return errors.New("credepoch: rotation transaction cannot enqueue media eviction")
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.rotateAttempted {
+		return loginfamily.EpochOwner{}, loginfamily.NewError(loginfamily.ReasonRotateRepeated, nil)
 	}
-	if _, err := execTx.ExecContext(ctx, `
-		INSERT INTO credential_epoch_voice_ejections
-			(user_id, superseded_credential_epoch, credential_epoch, generation, attempts, reconcile_after)
-		VALUES ($1, $2, $3, gen_random_uuid(), 0, clock_timestamp())
-		ON CONFLICT (user_id, superseded_credential_epoch) DO UPDATE SET
-			credential_epoch = EXCLUDED.credential_epoch,
-			generation = gen_random_uuid(), attempts = 0, failure_class = NULL,
-			reconcile_after = clock_timestamp(), updated_at = clock_timestamp()`,
-		o.userID, o.previousEpoch, o.newEpoch); err != nil {
-		return fmt.Errorf("credepoch: enqueue media eviction: %w", err)
+	// An attempt is consumed even if its first SQL fails or its commit is unknown.
+	o.rotateAttempted = true
+	if err := o.capturePreviousEpochTx(ctx, tx); err != nil {
+		return loginfamily.EpochOwner{}, err
+	}
+	userID, err := uuid.Parse(o.userID)
+	if err != nil || userID == uuid.Nil {
+		return loginfamily.EpochOwner{}, loginfamily.NewError(loginfamily.ReasonArgumentInvalid, err)
+	}
+	owner := loginfamily.EpochOwner{UserID: userID, SupersededCredentialEpoch: o.previousEpoch, CredentialEpoch: o.newEpoch}
+	// An existing parent retains its generation and original age. A conflicting
+	// replacement tuple is an invariant failure, never permission to reset it.
+	if err := tx.QueryRowContext(ctx, `
+  INSERT INTO credential_epoch_voice_ejections
+   (user_id, superseded_credential_epoch, credential_epoch, generation, attempts, reconcile_after)
+  VALUES ($1, $2, $3, gen_random_uuid(), 0, clock_timestamp())
+  ON CONFLICT (user_id, superseded_credential_epoch) DO UPDATE SET
+   generation = credential_epoch_voice_ejections.generation
+  WHERE credential_epoch_voice_ejections.credential_epoch = EXCLUDED.credential_epoch
+  RETURNING generation`, o.userID, o.previousEpoch, o.newEpoch).Scan(&owner.Generation); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return loginfamily.EpochOwner{}, loginfamily.NewError(loginfamily.ReasonOwnershipInvalid, err)
+		}
+		return loginfamily.EpochOwner{}, fmt.Errorf("credepoch: enqueue media eviction: %w", loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err))
 	}
 	var id string
 	if err := tx.QueryRowContext(ctx,
 		`UPDATE users SET credential_epoch = $1, updated_at = NOW() WHERE id = $2 RETURNING id`,
 		o.newEpoch, o.userID,
 	).Scan(&id); err != nil {
-		return fmt.Errorf("credepoch: rotate: %w", err)
+		return loginfamily.EpochOwner{}, fmt.Errorf("credepoch: rotate: %w", loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err))
 	}
-	return nil
+	return owner, nil
 }
 
 // Commit finalizes this op's blocked marker after a DEFINITE commit, atomically
@@ -400,24 +432,36 @@ func (o *Op) Commit(ctx context.Context) {
 // EvictSuperseded drives the low-latency exact-generation fast path after a
 // durable commit. Reordered requests cannot target a later epoch.
 func (o *Op) EvictSuperseded(ctx context.Context) {
-	if o == nil || o.f == nil || o.f.postCommitEvictor == nil || !o.previousCaptured {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	captured, previous := o.previousCaptured, o.previousEpoch
+	o.mu.Unlock()
+	if o.f == nil || o.f.postCommitEvictor == nil || !captured {
 		return
 	}
 	deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeOpTimeout)
 	defer cancel()
-	o.f.postCommitEvictor(deliveryCtx, o.userID, o.newEpoch, o.previousEpoch)
+	o.f.postCommitEvictor(deliveryCtx, o.userID, o.newEpoch, previous)
 }
 
 // ReconcileCommittedEviction verifies that an ambiguous transaction committed
 // its durable row before attempting the same exact-generation fast path.
 func (o *Op) ReconcileCommittedEviction(ctx context.Context) {
-	if o == nil || o.f == nil || o.f.postCommitEvictor == nil || !o.previousCaptured || o.f.db == nil {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	captured, previous := o.previousCaptured, o.previousEpoch
+	o.mu.Unlock()
+	if o.f == nil || o.f.postCommitEvictor == nil || !captured || o.f.db == nil {
 		return
 	}
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeOpTimeout)
 	defer cancel()
 	var exists bool
-	if err := o.f.db.QueryRowContext(readCtx, `SELECT EXISTS(SELECT 1 FROM credential_epoch_voice_ejections WHERE user_id = $1 AND credential_epoch = $2 AND superseded_credential_epoch = $3)`, o.userID, o.newEpoch, o.previousEpoch).Scan(&exists); err != nil {
+	if err := o.f.db.QueryRowContext(readCtx, `SELECT EXISTS(SELECT 1 FROM credential_epoch_voice_ejections WHERE user_id = $1 AND credential_epoch = $2 AND superseded_credential_epoch = $3)`, o.userID, o.newEpoch, previous).Scan(&exists); err != nil {
 		if o.f.log != nil {
 			o.f.log.Warn("credepoch: ambiguous media eviction lookup failed", "reason", "db_read")
 		}

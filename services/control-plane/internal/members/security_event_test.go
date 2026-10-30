@@ -123,7 +123,7 @@ func runMemberAuditOperation(t *testing.T, ts *testhelpers.TestServer, actorID s
 	handler := members.NewHandler(ts.DB, log, ts.Redis, ts.Hub, resolver, audit)
 	handler.SetAuthorityHandler(rbac.NewHandler(ts.DB, log, nil, nil, resolver, nil, nil))
 	router := gin.New()
-	router.Use(func(c *gin.Context) { c.Set("user_id", actorID); c.Next() })
+	router.Use(func(c *gin.Context) { c.Set("user_id", actorID); ts.AttachActorIdentity(t, c, actorID); c.Next() })
 	router.PATCH("/api/v1/servers/:id/members/:user_id", handler.UpdateMember)
 	router.DELETE("/api/v1/servers/:id/members/:user_id", handler.RemoveMember)
 	router.DELETE("/api/v1/servers/:id/bans/:user_id", handler.UnbanMember)

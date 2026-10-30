@@ -16,6 +16,9 @@ import (
 // errRegistryUnavailable is the client-facing message when Postgres or Redis fails.
 const errRegistryUnavailable = "attestation registry temporarily unavailable"
 
+// MaxVerifyBodyBytes bounds POST /attestation/verify (RT-F3).
+const MaxVerifyBodyBytes = 64 << 10
+
 // Verify validates client signals and issues an attestation token bound to
 // (session, machine). POST /api/v1/attestation/verify
 //
@@ -65,6 +68,8 @@ func (h *Handler) parseVerifyRequest(c *gin.Context) (string, VerifyPayload, boo
 		return "", VerifyPayload{}, false
 	}
 
+	// RT-F3: an App Attest object is a few KB; cap the body before decoding.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxVerifyBodyBytes)
 	var p VerifyPayload
 	if err := c.ShouldBindJSON(&p); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

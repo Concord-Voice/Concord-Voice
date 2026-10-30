@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voicecommand"
-	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -108,10 +106,16 @@ type dmVoiceCapacityEnvelope struct {
 	Data map[string]interface{} `json:"data"`
 }
 
-func connectDMVoiceCapacityObserver(t *testing.T, ts *testhelpers.TestServer, userID, convID string) *gorillaWS.Conn {
+func connectDMVoiceCapacityObserver(t *testing.T, ts *testhelpers.TestServer, accessToken, convID string) *gorillaWS.Conn {
 	t.Helper()
-	ticket := "dm-voice-capacity-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:capacity-test::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(accessToken))
+	require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+	var ticketBody struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+	require.NotEmpty(t, ticketBody.Ticket)
+	ticket := ticketBody.Ticket
 	server := httptest.NewServer(ts.Router)
 	t.Cleanup(server.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+server.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
@@ -182,7 +186,7 @@ func TestVoiceCommandCapacity_DMActorExhaustionRollsBackHTTPMutation(t *testing.
 			beforeQueue := readDMVoiceCapacity(t, ts.DB)
 			require.Equal(t, int64(dmVoiceActorQueueLimit), beforeQueue.Rows)
 			beforeDomain := readDMVoiceCapacityDomain(t, ts.DB, convID, target.ID)
-			conn := connectDMVoiceCapacityObserver(t, ts, admin.ID, convID)
+			conn := connectDMVoiceCapacityObserver(t, ts, admin.AccessToken, convID)
 
 			response := ts.DoRequest(test.method, pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+test.suffix,
 				nil, testhelpers.AuthHeaders(admin.AccessToken))
@@ -213,7 +217,7 @@ func TestVoiceCommandCapacity_DMRemovalExhaustionPreservesMembershipAndPresence(
 			seedDMVoiceActorQueue(t, ts, admin.ID, convID)
 			beforeQueue := readDMVoiceCapacity(t, ts.DB)
 			beforeDomain := readDMVoiceCapacityDomain(t, ts.DB, convID, target.ID)
-			conn := connectDMVoiceCapacityObserver(t, ts, target.ID, convID)
+			conn := connectDMVoiceCapacityObserver(t, ts, target.AccessToken, convID)
 
 			// SetupTestServer wires the real active-plan rail and sender gates.
 			// Queue refusal must occur before post-commit presence delivery; its
@@ -235,7 +239,7 @@ func TestVoiceCommandCapacity_DMChargesCallerInsteadOfModeratedTarget(t *testing
 	seedDMOutboxSession(t, ts, convID, target.ID)
 	seedDMVoiceParticipant(t, ts, convID, target.ID)
 	seedDMVoiceActorQueue(t, ts, target.ID, convID)
-	conn := connectDMVoiceCapacityObserver(t, ts, admin.ID, convID)
+	conn := connectDMVoiceCapacityObserver(t, ts, admin.AccessToken, convID)
 
 	response := ts.DoRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathVoiceSlash+target.ID+pathDeafen,
 		nil, testhelpers.AuthHeaders(admin.AccessToken))
@@ -260,7 +264,7 @@ func TestVoiceCommandCapacity_DMRemovalSpareCallerBudgetBroadcastsCommit(t *test
 	ts, admin, target, convID := newDMOutboxFixture(t)
 	seedDMOutboxSession(t, ts, convID, target.ID)
 	seedDMVoiceActorQueue(t, ts, target.ID, convID)
-	conn := connectDMVoiceCapacityObserver(t, ts, target.ID, convID)
+	conn := connectDMVoiceCapacityObserver(t, ts, target.AccessToken, convID)
 
 	response := ts.DoRequest(http.MethodDelete, pathDMConversationsPrefix+convID+pathMembersSlash+target.ID,
 		nil, testhelpers.AuthHeaders(admin.AccessToken))

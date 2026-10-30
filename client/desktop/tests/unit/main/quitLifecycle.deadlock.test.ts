@@ -79,7 +79,11 @@ vi.mock('electron', () => ({
   autoUpdater: mockElectronAutoUpdater,
   ipcMain: { handle: vi.fn(), on: vi.fn() },
   nativeImage: {
-    createFromPath: vi.fn(() => ({ isEmpty: () => false, toDataURL: () => '' })),
+    createFromPath: vi.fn(() => ({
+      isEmpty: () => false,
+      toDataURL: () => '',
+      setTemplateImage: vi.fn(),
+    })),
   },
   // Tray/Menu stubs (#1099): main.ts initTray runs during whenReady. Without
   // these, initTray's graceful-failure path fires (console.error noise) and
@@ -89,6 +93,9 @@ vi.mock('electron', () => ({
     return {
       setToolTip: vi.fn(),
       setContextMenu: vi.fn(),
+      setImage: vi.fn(),
+      setIgnoreDoubleClickEvents: vi.fn(),
+      popUpContextMenu: vi.fn(),
       on: vi.fn(),
       destroy: vi.fn(),
       isDestroyed: vi.fn(() => false),
@@ -114,7 +121,15 @@ vi.mock('electron', () => ({
     },
   },
   shell: { openExternal: vi.fn(() => Promise.resolve()) },
-  powerMonitor: { on: vi.fn() },
+  powerMonitor: { on: vi.fn(), removeListener: vi.fn(), isOnBatteryPower: vi.fn(() => false) },
+  // The status-aware tray reads OS motion settings on each render.
+  systemPreferences: {
+    getAnimationSettings: vi.fn(() => ({
+      shouldRenderRichAnimation: true,
+      scrollAnimationsEnabledBySystem: true,
+      prefersReducedMotion: false,
+    })),
+  },
 }));
 
 vi.mock('node:fs', () => ({

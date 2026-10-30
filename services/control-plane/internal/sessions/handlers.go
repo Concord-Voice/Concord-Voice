@@ -13,15 +13,19 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
+
+const sessionNotFoundMessage = "Session not found"
 
 const (
 	errMsgUnauthorized          = "Unauthorized"
@@ -32,15 +36,16 @@ const (
 	errMsgIncorrectPassword     = "Incorrect password"
 	errMsgFailedFetchSessions   = "Failed to fetch sessions"
 	errMsgCurrentSessionUnknown = "Current session cannot be identified"
+	errMsgAuthUnavailable       = "Authentication temporarily unavailable"
 )
 
 var errCurrentSessionUnknown = errors.New("current session cannot be identified")
 
-// SessionDisconnector allows forcefully disconnecting WebSocket connections.
-// Defined as an interface to avoid coupling to the websocket package.
+// SessionDisconnector synchronously fences the WebSocket transports of one
+// exact login family. Defined as an interface to avoid coupling to the
+// websocket package.
 type SessionDisconnector interface {
-	DisconnectUser(userID uuid.UUID)
-	DisconnectSession(sessionID string)
+	loginfamily.FamilyCloser
 }
 
 // MFAVerifier checks MFA status and verifies codes for sensitive operations.
@@ -412,24 +417,28 @@ func (h *Handler) RevokeSession(c *gin.Context) {
 		}
 	}
 
-	h.executeRevocation(ctx, c, uid, sessionID, needsPassword)
+	h.executeRevocation(ctx, c, uid, sessionID)
 }
 
-// verifySessionOwnership checks that the session exists, belongs to the user, and is not revoked.
+// verifySessionOwnership checks immutable SID ownership, including terminal families.
 // Returns true if valid, false if a response was already written.
 func (h *Handler) verifySessionOwnership(ctx context.Context, c *gin.Context, sessionID, uid string) bool {
+	if sid, err := uuid.Parse(sessionID); err != nil || sid == uuid.Nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": sessionNotFoundMessage})
+		return false
+	}
 	var sessionExists bool
 	err := h.db.QueryRowContext(ctx, //nolint:gosec // parameterized query — not injectable
-		`SELECT EXISTS(SELECT 1 FROM refresh_tokens WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL)`,
+		`SELECT EXISTS(SELECT 1 FROM login_family_sids WHERE sid = $1 AND user_id = $2)`,
 		sessionID, uid,
 	).Scan(&sessionExists)
 	if err != nil {
-		h.log.Error("Failed to verify session ownership", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRevokeSession})
+		h.log.Error("Failed to verify session ownership")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgAuthUnavailable})
 		return false
 	}
 	if !sessionExists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": sessionNotFoundMessage})
 		return false
 	}
 	return true
@@ -511,27 +520,27 @@ func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid
 }
 
 // executeRevocation performs the actual session revocation, tracking, and disconnect.
-func (h *Handler) executeRevocation(ctx context.Context, c *gin.Context, uid, sessionID string, needsPassword bool) {
-	result, err := h.db.ExecContext(ctx, //nolint:gosec // parameterized query — not injectable
-		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
-		sessionID, uid,
-	)
+func (h *Handler) executeRevocation(ctx context.Context, c *gin.Context, uid, sessionID string) {
+	result, err := auth.RevokeRefreshSession(ctx, h.db, uid, sessionID, middleware.TokenCredentialEpoch(c))
 	if err != nil {
-		h.log.Error("Failed to revoke session", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRevokeSession})
+		// An unknown commit may have terminalized the family: fence what committed.
+		h.closeCommittedFamilies(ctx, result)
+		switch {
+		case errors.Is(err, loginfamily.ErrTargetNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": sessionNotFoundMessage})
+		case errors.Is(err, loginfamily.ErrUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgAuthUnavailable})
+		case errors.Is(err, loginfamily.ErrDenied), errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
+		default:
+			h.log.Error("Failed to revoke session")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRevokeSession})
+		}
 		return
 	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
-		return
-	}
-
 	h.recordRevoke(ctx, uid, sessionID)
-	h.hub.DisconnectSession(sessionID)
-
-	h.log.Info("Session revoked", "user_id", uid, "session_id", sessionID, "password_used", needsPassword)
+	h.closeCommittedFamilies(ctx, result)
+	h.log.Info("Session revoked", "user_id", uid)
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionDelete})
 
 	c.JSON(http.StatusOK, gin.H{
@@ -570,6 +579,8 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 
 	result, err := h.revokeAllSessionsDB(uid, req.IncludeCurrent, c)
 	if err != nil {
+		// An unknown commit may have terminalized families: fence what committed.
+		h.closeCommittedFamilies(c.Request.Context(), result)
 		if errors.Is(err, errCurrentSessionUnknown) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCurrentSessionUnknown})
 			return
@@ -578,16 +589,21 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
 			return
 		}
-		h.log.Error("Failed to revoke sessions", "error", err)
+		if errors.Is(err, loginfamily.ErrUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgAuthUnavailable})
+			return
+		}
+		if errors.Is(err, loginfamily.ErrDenied) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
+			return
+		}
+		h.log.Error("Failed to revoke sessions")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke sessions"})
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-
-	if uidParsed, parseErr := uuid.Parse(uid); parseErr == nil {
-		h.hub.DisconnectUser(uidParsed)
-	}
+	rowsAffected := result.RevokedRefreshRows
+	h.closeCommittedFamilies(c.Request.Context(), result)
 
 	h.resetRevokeTracking(ctx, uid)
 	h.log.Info("Sessions revoked", "user_id", uid, "count", rowsAffected, "include_current", req.IncludeCurrent)
@@ -606,26 +622,59 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 	})
 }
 
+// closeCommittedFamilies fences the revoked families' sockets before the
+// response. The commit already stands: a failed close is logged and left to the
+// durable owner's reconciler, never surfaced as a revocation failure.
+func (h *Handler) closeCommittedFamilies(ctx context.Context, result loginfamily.RevocationResult) {
+	if len(result.Owners) == 0 {
+		return
+	}
+	if err := loginfamily.CloseCommittedFamilies(ctx, h.db, h.hub, result.Owners); err != nil {
+		h.log.Warn("Revoked session socket close deferred to reconciliation")
+	}
+}
+
 // revokeAllSessionsDB revokes all sessions, optionally excluding the current one.
-func (h *Handler) revokeAllSessionsDB(uid string, includeCurrent bool, c *gin.Context) (sql.Result, error) {
+func (h *Handler) revokeAllSessionsDB(uid string, includeCurrent bool, c *gin.Context) (loginfamily.RevocationResult, error) {
 	options := auth.RevokeAllRefreshTokensOptions{
 		ExpectedCredentialEpoch: middleware.TokenCredentialEpoch(c),
 		EnforceCredentialEpoch:  true,
 	}
 	if !includeCurrent {
-		options.ExcludeSessionID = middleware.TokenSessionID(c)
-		if currentToken, cookieErr := c.Cookie("refresh_token"); cookieErr == nil && currentToken != "" {
-			options.ExcludeTokenHash = auth.HashRefreshToken(currentToken)
-		}
-		if options.ExcludeSessionID == "" && options.ExcludeTokenHash == "" {
-			return nil, errCurrentSessionUnknown
+		if err := excludeCurrentSession(c, &options); err != nil {
+			return loginfamily.RevocationResult{}, err
 		}
 	}
 	result, err := auth.RevokeAllRefreshTokens(c.Request.Context(), h.db, uid, options)
 	if errors.Is(err, auth.ErrNoActiveRefreshSession) {
-		return nil, errCurrentSessionUnknown
+		return loginfamily.RevocationResult{}, errCurrentSessionUnknown
 	}
 	return result, err
+}
+
+// excludeCurrentSession spares the requester's own session by its access
+// claims and refresh cookie; it fails when neither identifies the session.
+func excludeCurrentSession(c *gin.Context, options *auth.RevokeAllRefreshTokensOptions) error {
+	options.ExcludeSessionID = middleware.TokenSessionID(c)
+	if options.ExcludeSessionID != "" {
+		raw, _ := c.Get(middleware.JWTClaimsContextKey)
+		claims, ok := raw.(jwt.MapClaims)
+		if !ok {
+			return errCurrentSessionUnknown
+		}
+		expiry, err := claims.GetExpirationTime()
+		if err != nil || expiry == nil {
+			return errCurrentSessionUnknown
+		}
+		options.ExcludeAccessExpiresAt = expiry.Time
+	}
+	if currentToken, cookieErr := c.Cookie("refresh_token"); cookieErr == nil && currentToken != "" {
+		options.ExcludeTokenHash = auth.HashRefreshToken(currentToken)
+	}
+	if options.ExcludeSessionID == "" && options.ExcludeTokenHash == "" {
+		return errCurrentSessionUnknown
+	}
+	return nil
 }
 
 // UpdateRevocationMode allows users to toggle between "simple" and "secure"

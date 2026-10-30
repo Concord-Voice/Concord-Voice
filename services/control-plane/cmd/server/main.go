@@ -28,6 +28,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedbackscreenshots"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -1108,7 +1109,18 @@ func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, l
 // runCleanup's 30 s: what it has not drained by then waits for the next hour.
 const stepUpSweepBudget = 10 * time.Second
 
+// loginFamilySweepBudget is the retired login-family evidence sweep's own
+// budget. It is derived from the caller's context rather than runCleanup's
+// 30 s task context, so the tasks before it cannot exhaust it, while parent
+// cancellation and a shorter parent deadline still bind it. What it has not
+// retired by then waits for the next hour.
+const loginFamilySweepBudget = 10 * time.Second
+
 func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, log *logger.Logger, ownershipCleanup func(context.Context)) {
+	runCleanupWithLoginFamilySweep(ctx, db, redisClient, log, ownershipCleanup, loginfamily.SweepRetiredEvidence)
+}
+
+func runCleanupWithLoginFamilySweep(ctx context.Context, db *sql.DB, redisClient *redis.Client, log *logger.Logger, ownershipCleanup func(context.Context), sweep func(context.Context, *sql.DB, int) (loginfamily.GCResult, error)) {
 	taskCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -1159,7 +1171,14 @@ func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, log 
 		ownershipCleanup(taskCtx)
 	}
 
-	log.Debug("Cleanup completed")
+	// Task 6: Retire eligible login-family evidence on its own bounded budget.
+	// The adapter owns bounded pages and complete-unit commits.
+	familyCtx, familyCancel := context.WithTimeout(ctx, loginFamilySweepBudget)
+	result, sweepErr := sweep(familyCtx, db, 100)
+	logLoginFamilyCleanup(familyCtx, log, result, sweepErr)
+	familyCancel()
+
+	log.Debug("Cleanup pass finished")
 }
 
 const (

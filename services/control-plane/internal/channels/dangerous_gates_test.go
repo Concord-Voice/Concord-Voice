@@ -520,6 +520,7 @@ func TestChannelGate_GraceSpansBothRoutes(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", f.mod.ID)
+		testhelpers.AttachUserIdentity(t, c, f.mod.ID)
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": sid})
 		c.Next()
 	})

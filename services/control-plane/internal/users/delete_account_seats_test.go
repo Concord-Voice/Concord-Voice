@@ -27,7 +27,7 @@ func TestDeleteAccountReportsErasedWingSeats(t *testing.T) {
 	var got []ErasedSeat
 	service.SetErasedSeatNotifier(func(_ context.Context, seats []ErasedSeat) { got = seats })
 
-	require.NoError(t, service.DeleteAccount(context.Background(), payer.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, payer.String()), payer.String()))
 
 	assert.ElementsMatch(t, []ErasedSeat{
 		{SeatID: activeSeat, Survivor: holder, Holder: true},

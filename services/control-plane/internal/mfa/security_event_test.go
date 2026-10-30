@@ -19,11 +19,13 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"github.com/redis/go-redis/v9"
@@ -200,7 +202,8 @@ func TestCredentialDisableDenialsEmitAuthenticationEvents(t *testing.T) {
 			c, _ := gin.CreateTestContext(response)
 			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/disable", strings.NewReader(test.body))
 			c.Request.Header.Set("Content-Type", "application/json")
-			c.Set("user_id", "user-fixture")
+			c.Set("user_id", fixtureUserID)
+			attachFamily(c, fixtureUserID)
 			if test.name == "webauthn" {
 				c.Params = gin.Params{{Key: "id", Value: "11111111-2222-3333-4444-555555555555"}}
 			}
@@ -399,7 +402,8 @@ func TestTOTPConfirmSetupEmitsFactorEnabledOnlyAfterWrites(t *testing.T) {
 		response := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(response)
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/totp/confirm-setup", nil)
-		c.Set("user_id", "user")
+		c.Set("user_id", fixtureUserID)
+		attachFamily(c, fixtureUserID)
 		return c, response
 	}
 
@@ -451,7 +455,8 @@ func TestEmailSmsDisableEmitsOnlyAfterFlagsAndDeleteCommit(t *testing.T) {
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/email-sms",
 			strings.NewReader(`{"password":"EmailSmsDisableEventTest1!"}`))
 		c.Request.Header.Set("Content-Type", "application/json")
-		c.Set("user_id", "user")
+		c.Set("user_id", fixtureUserID)
+		attachFamily(c, fixtureUserID)
 		return c, response
 	}
 
@@ -536,14 +541,15 @@ func TestEmailSmsVerifyEmitsFactorEnabledOnlyAfterFlagWrite(t *testing.T) {
 		c, _ := gin.CreateTestContext(response)
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/email-sms/verify", strings.NewReader(`{"codes":{"email":"123456"}}`))
 		c.Request.Header.Set("Content-Type", "application/json")
-		c.Set("user_id", "user")
+		c.Set("user_id", fixtureUserID)
+		attachFamily(c, fixtureUserID)
 		return c, response
 	}
 	run := func(t *testing.T, state *mfaEventDB) (*httptest.ResponseRecorder, *securityEventRecorder) {
 		t.Helper()
 		db := sql.OpenDB(mfaEventConnector{state: state})
 		t.Cleanup(func() { require.NoError(t, db.Close()) })
-		require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf(redisKeyEmailSmsSetup, "user", "email"), "123456", time.Minute).Err())
+		require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf(redisKeyEmailSmsSetup, fixtureUserID, "email"), "123456", time.Minute).Err())
 		h := NewHandler(db, redisClient, logger.New("test"), nil, "test", nil, "test")
 		recorder := &securityEventRecorder{}
 		h.SetSecurityEvents(recorder)
@@ -572,7 +578,8 @@ func TestWebAuthnDeleteEmitsFactorDisabledOnlyAfterDelete(t *testing.T) {
 		c.Params = gin.Params{{Key: "id", Value: "11111111-2222-3333-4444-555555555555"}}
 		c.Request = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa/webauthn/credential", strings.NewReader(`{"password":"correct"}`))
 		c.Request.Header.Set("Content-Type", "application/json")
-		c.Set("user_id", "user")
+		c.Set("user_id", fixtureUserID)
+		attachFamily(c, fixtureUserID)
 		return c, response
 	}
 	run := func(t *testing.T, state *mfaEventDB) (*httptest.ResponseRecorder, *securityEventRecorder) {
@@ -616,7 +623,8 @@ func TestTOTPDisableEmitsFactorDisabledOnlyAfterDelete(t *testing.T) {
 		c, _ := gin.CreateTestContext(response)
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/totp/disable", strings.NewReader(`{"password":"credential-fixture","code":"`+requestCode+`"}`))
 		c.Request.Header.Set("Content-Type", "application/json")
-		c.Set("user_id", "user-fixture")
+		c.Set("user_id", fixtureUserID)
+		attachFamily(c, fixtureUserID)
 		return c, response
 	}
 	run := func(t *testing.T, state *mfaEventDB, requestCode string) (*httptest.ResponseRecorder, *securityEventRecorder, *gin.Context) {
@@ -729,7 +737,9 @@ func TestStepUpGateFailsClosedOnSubjectReadFailure(t *testing.T) {
 			c, _ := gin.CreateTestContext(response)
 			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/mfa/step-up", strings.NewReader(`{"password":"`+credential+`"}`))
 			c.Request.Header.Set("Content-Type", "application/json")
-			c.Set("user_id", "user-fixture-"+strconv.Itoa(len(tc.name)))
+			userID := uuid.NewString()
+			c.Set("user_id", userID)
+			attachFamily(c, userID)
 
 			tc.call(h, c)
 
@@ -804,7 +814,12 @@ func TestWebAuthnRegisterFinishEmitsFactorEnabledOnlyAfterCredentialInsert(t *te
 	requireSerializedEventPrivacy(t, successRecorder.events)
 }
 
+// fixtureUserID is the fake-database tests' actor. It is a UUID because the
+// login-family guard refuses any other actor before reading anything.
+const fixtureUserID = "0f0f0f0f-0000-4000-8000-000000000001"
+
 type mfaEventDB struct {
+	guard         dbtest.FakeFamilyGuard
 	failFirstExec bool
 	failExecAt    int
 	// failLock fails the step-up's first-statement users-row lock read;
@@ -922,7 +937,10 @@ type mfaEventTx struct{}
 func (mfaEventTx) Commit() error   { return nil }
 func (mfaEventTx) Rollback() error { return nil }
 
-func (c mfaEventConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+func (c mfaEventConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.state.guard.Exec(query, args) {
+		return driver.RowsAffected(1), nil
+	}
 	c.state.record(c.id, query)
 	c.state.execCalls++
 	if (c.state.failFirstExec && c.state.execCalls == 1) || c.state.failExecAt == c.state.execCalls {
@@ -933,7 +951,10 @@ func (c mfaEventConn) ExecContext(_ context.Context, query string, _ []driver.Na
 	}
 	return driver.RowsAffected(1), nil
 }
-func (c mfaEventConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c mfaEventConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if rows, ok := c.state.guard.Query(query, args); ok {
+		return rows, nil
+	}
 	c.state.record(c.id, query)
 	switch {
 	// The MFA-settings step-up gate's first-statement users-row lock

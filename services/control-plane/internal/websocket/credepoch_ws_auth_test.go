@@ -67,23 +67,25 @@ func TestAuthenticateWS_JWTStaleEpochRejected(t *testing.T) {
 }
 
 func TestAuthenticateWS_JWTMatchingEpochWithoutEmailClaimAdmitsWithSession(t *testing.T) {
-	userID := uuid.New()
 	h, rc := fenceWiredWSHandler(t)
-	require.NoError(t, rc.Set(context.Background(), credepoch.Key(userID.String()), "active:goodEpoch", time.Minute).Err())
-
-	token := signedJWTWithClaims(t, jwt.MapClaims{
-		"user_id":    userID.String(),
-		"sid":        "sess-xyz",
-		"cred_epoch": "goodEpoch",
-		"exp":        jwt.NewNumericDate(time.Now().Add(time.Hour)),
-	})
+	userID, sid, canonical, _ := epochFixtureMintAccess(t, h.db, "epochemailabsent")
+	require.NoError(t, rc.Set(context.Background(), credepoch.Key(userID.String()), "active:11111111111111111111111111111111", time.Minute).Err())
+	parsed, err := jwt.Parse(canonical, func(_ *jwt.Token) (interface{}, error) { return []byte(testJWTSecret), nil })
+	require.NoError(t, err)
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+	require.Equal(t, true, claims["email_verified"])
+	// The sole wire variation is removal of this optional claim. User, SID,
+	// epoch, JTI and exact expiry retain the committed canonical authority.
+	delete(claims, "email_verified")
+	token := signedJWTWithClaims(t, claims)
 	r, _ := http.NewRequest("GET", "/ws", nil)
 	r.Header.Set("Authorization", "Bearer "+token)
 
 	gotID, sessionID, err := h.authenticateWebSocket(newGinContext(r))
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
-	assert.Equal(t, "sess-xyz", sessionID)
+	assert.Equal(t, sid.String(), sessionID)
 }
 
 // regression for #2352: the JWT fallback must not admit an unverified account.

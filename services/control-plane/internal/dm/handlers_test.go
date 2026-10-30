@@ -24,6 +24,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -1137,38 +1138,35 @@ func TestCreateGroup_OneBlockedTarget_RejectsWholeGroup(t *testing.T) {
 
 // A DB error while verifying a target exists must fail-CLOSED with 500 (not be
 // silently collapsed into a 404 "user not found"), matching enforceDMPrivacy's
-// error handling. Fault-injected by renaming the users table so the existence
-// EXISTS query returns a non-nil error.
+// error handling. Fault only the exact target query after successful family
+// admission so an authentication store error cannot satisfy the oracle.
 func TestCreateGroup_TargetExistenceQueryError_FailsClosed(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	creator := ts.CreateTestUser(t, "grptargeterr1")
 	target := ts.CreateTestUser(t, "grptargeterr2")
+	ts.CreateFriendship(t, creator.ID, target.ID, statusAccepted)
 
-	// #2201: seed the creator's credential-epoch cache so AuthRequired's fence
-	// answers from Redis and does NOT read the (about to be renamed) users
-	// table — keeping this test pointed at the HANDLER's fail-closed path
-	// rather than the middleware's earlier store-unavailable 401.
-	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(creator.ID), "none", 5*time.Minute).Err())
-
-	_, err := ts.DB.Exec("ALTER TABLE users RENAME TO users_dberrtest")
-	require.NoError(t, err, "failed to rename users table for fault injection")
-	t.Cleanup(func() {
-		// Surface rename-back failures explicitly — leaving the table renamed
-		// would break every subsequent test in the package run.
-		if _, err := ts.DB.Exec("ALTER TABLE users_dberrtest RENAME TO users"); err != nil {
-			t.Errorf("cleanup: failed to rename users back to original: %v", err)
-		}
-	})
-
+	// Observe committed canonical admission, then fail only this target's
+	// existence query in the productive handler pool.
+	require.NoError(t, boundary.ArmControl(creator.AccessToken))
+	boundary.Hook.ArmArg([]string{`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`}, target.ID, nil, errors.New("injected target existence read failure"))
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
 		"user_ids": []string{target.ID},
 	}, testhelpers.AuthHeaders(creator.AccessToken))
 	assert.Equal(t, http.StatusInternalServerError, w.Code,
 		"target-existence query error must fail-CLOSED with 500, not a 404")
-
+	require.NoError(t, boundary.Check())
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "valid family admission must reach the exact target existence query")
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, "Failed to create group", body["error"])
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_participants WHERE user_id = $1 OR user_id = $2`, creator.ID, target.ID).Scan(&count))
+	assert.Zero(t, count, "failed target lookup must not partially create group membership")
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_conversations WHERE created_by = $1`, creator.ID).Scan(&count))
+	assert.Zero(t, count, "failed target lookup must not leave an empty conversation")
 }
 
 // ============================================================================
@@ -1202,16 +1200,19 @@ func TestUpdateConversation_RenameGroup(t *testing.T) {
 }
 
 func TestUpdateConversationRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	admin := ts.CreateTestUser(t, "rename_stale_epoch_admin")
 	member := ts.CreateTestUser(t, "rename_stale_epoch_member")
 	convID := createTestGroup(t, ts, admin, member)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	staleToken := admin.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, admin.ID, nil, nil)
 	w := ts.DoRequest(http.MethodPatch, pathDMConversationsPrefix+convID, map[string]interface{}{
 		"name": "must not persist",
 	}, testhelpers.AuthHeaders(staleToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var name sql.NullString
 	require.NoError(t, ts.DB.QueryRow(`SELECT name FROM dm_conversations WHERE id = $1`, convID).Scan(&name))
@@ -2429,13 +2430,22 @@ func TestDeleteMessage_RetirementFailureRollsBack(t *testing.T) {
 	msgID := insertDMMessage(t, ts, convID, user1.ID, "to be retained")
 	fileID := insertDMMediaFile(t, ts, user1.ID, convID, "file", "application/octet-stream", 1)
 	insertDMMessageAttachment(t, ts, msgID, fileID, 0)
-	ticket := "dm-delete-broadcast-test-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:delete-test::%d", user2.ID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(user2.AccessToken))
+	require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+	var ticketBody struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+	require.NotEmpty(t, ticketBody.Ticket)
+	ticket := ticketBody.Ticket
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
+	remaining, err := ts.Redis.Exists(t.Context(), "ws_ticket:"+ticket).Result()
+	require.NoError(t, err)
+	require.Zero(t, remaining, "WebSocket upgrade must consume the canonical single-use ticket")
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
 	for {
 		var event struct {
@@ -3253,7 +3263,7 @@ func TestAddMemberTriggersKeyRevocation(t *testing.T) {
 }
 
 func TestAddMemberRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	admin := ts.CreateTestUser(t, "addstalepochadmin")
 	member := ts.CreateTestUser(t, "addstalepochmember")
 	target := ts.CreateTestUser(t, "addstalepochtarget")
@@ -3261,11 +3271,14 @@ func TestAddMemberRejectsStaleCredentialEpoch(t *testing.T) {
 	ts.CreateFriendship(t, admin.ID, target.ID, statusAccepted)
 	ts.SeedDMKey(t, convID, admin.ID, 1)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	staleToken := admin.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, admin.ID, nil, nil)
 	w := ts.DoRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathMembers, map[string]interface{}{
 		"user_id": target.ID,
 	}, testhelpers.AuthHeaders(staleToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var participantExists bool
 	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, target.ID).Scan(&participantExists))
@@ -3282,13 +3295,22 @@ func TestRemoveMemberAdminRemovesOther(t *testing.T) {
 	target := ts.CreateTestUser(t, "rmadm3")
 
 	convID := createTestGroup(t, ts, admin, member, target)
-	ticket := "removed-member-notification"
-	require.NoError(t, ts.Redis.Set(context.Background(), "ws_ticket:"+ticket, fmt.Sprintf("%s:test-session::%d", target.ID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(target.AccessToken))
+	require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+	var ticketBody struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+	require.NotEmpty(t, ticketBody.Ticket)
+	ticket := ticketBody.Ticket
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
+	remaining, err := ts.Redis.Exists(t.Context(), "ws_ticket:"+ticket).Result()
+	require.NoError(t, err)
+	require.Zero(t, remaining, "WebSocket upgrade must consume the canonical single-use ticket")
 	require.Eventually(t, func() bool {
 		return ts.Hub.GetUserClientCount(uuid.MustParse(target.ID)) > 0
 	}, time.Second, 10*time.Millisecond)
@@ -3340,16 +3362,19 @@ func TestRemoveMemberSelfLeave(t *testing.T) {
 }
 
 func TestRemoveMemberRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	admin := ts.CreateTestUser(t, "remstalepochadmin")
 	member := ts.CreateTestUser(t, "remstalepochmember")
 	target := ts.CreateTestUser(t, "remstalepochtarget")
 	convID := createTestGroup(t, ts, admin, member, target)
 	ts.SeedDMKey(t, convID, admin.ID, 1)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	staleToken := admin.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, admin.ID, nil, nil)
 	w := ts.DoRequest(http.MethodDelete, pathDMConversationsPrefix+convID+pathMembersSlash+target.ID, nil, testhelpers.AuthHeaders(staleToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var participantExists bool
 	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`, convID, target.ID).Scan(&participantExists))
@@ -3503,16 +3528,19 @@ func TestUpdateMemberRolePromoteToAdmin(t *testing.T) {
 }
 
 func TestUpdateMemberRoleRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	admin := ts.CreateTestUser(t, "rolstalepochadmin")
 	member := ts.CreateTestUser(t, "rolstalepochmember")
 	convID := createTestGroup(t, ts, admin, member)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	staleToken := admin.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, admin.ID, nil, nil)
 	w := ts.DoRequest(http.MethodPatch, pathDMConversationsPrefix+convID+pathMembersSlash+member.ID, map[string]interface{}{
 		"role": "admin",
 	}, testhelpers.AuthHeaders(staleToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var role string
 	require.NoError(t, ts.DB.QueryRow(`SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, member.ID).Scan(&role))
@@ -3631,15 +3659,18 @@ func TestDeleteGroupSuccess(t *testing.T) {
 }
 
 func TestDeleteGroupRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	admin := ts.CreateTestUser(t, "delgrpstale1")
 	member := ts.CreateTestUser(t, "delgrpstale2")
 	convID := createTestGroup(t, ts, admin, member)
 	messageID := insertDMMessage(t, ts, convID, admin.ID, "must survive stale delete")
 
-	staleToken := ts.SimulateStaleEpochWindow(t, admin.ID)
+	staleToken := admin.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, admin.ID, nil, nil)
 	w := ts.DoRequest(http.MethodDelete, pathDMConversationsPrefix+convID, nil, testhelpers.AuthHeaders(staleToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 
 	var conversationExists, messageExists bool
 	require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM dm_conversations WHERE id = $1)`, convID).Scan(&conversationExists))
@@ -6056,12 +6087,18 @@ func TestAuthorizeVoiceJoin_ReleasesMembershipLockBeforeEntitlementLookup(t *tes
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: convID}}
-	c.Request = httptest.NewRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathVoiceJoin, nil).WithContext(ctx)
-	c.Set("user_id", user1.ID)
-	h.AuthorizeVoiceJoin(c)
-	require.Equal(t, http.StatusOK, w.Code)
+	router := gin.New()
+	router.Use(middleware.AuthRequired(ts.Config.JWTSecret, ts.Redis, db, credepoch.New(db, ts.Redis, logger.New("test"))))
+	handlerEntered := false
+	router.POST(pathDMConversationsPrefix+":id"+pathVoiceJoin, func(c *gin.Context) {
+		handlerEntered = true
+		h.AuthorizeVoiceJoin(c)
+	})
+	request := httptest.NewRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathVoiceJoin, nil).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+user1.AccessToken)
+	router.ServeHTTP(w, request)
+	require.True(t, handlerEntered, "canonical middleware admission must reach the custom single-connection handler")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	assertDMMediaEntitlements(t, body, entitlements.TierPremium)

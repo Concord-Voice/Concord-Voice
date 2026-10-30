@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,7 @@ import {
   scanFuseWires,
   verifyAsarDigest,
   verifyDigestSlots,
+  verifyTrayAssets,
   verifyFuseWire,
   type AsarIntegrity,
   type Deps,
@@ -994,6 +995,107 @@ describe('main', () => {
     const usage = makeDeps();
     expect(await main([], usage.deps)).toBe(2);
     expect(usage.lines).toHaveLength(1);
+  });
+});
+
+describe('verifyTrayAssets', () => {
+  const MANIFEST = {
+    keys: ['dim35.dim35.dim35', 'green.full.star'],
+    modes: ['template', 'colour'],
+    sizes: { darwin: [16, 32], win32: [16, 32], linux: [22] },
+  };
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+
+  function expectedFiles(platform: string): string[] {
+    const names = (key: string): string[] =>
+      platform === 'linux' ? [`${key}-22.png`] : [`${key}.png`, `${key}@2x.png`];
+    return MANIFEST.modes.flatMap((mode) =>
+      MANIFEST.keys.flatMap((key) => names(key).map((n) => path.join(mode, n)))
+    );
+  }
+  async function makeResources(platform: string, skip: string[] = []): Promise<string> {
+    const resources = path.join(tmp, `res-${platform}`);
+    await mkdir(path.join(resources, 'tray'), { recursive: true });
+    await writeFile(path.join(resources, 'tray', 'manifest.json'), JSON.stringify(MANIFEST));
+    for (const rel of expectedFiles(platform)) {
+      if (skip.includes(rel)) continue;
+      await mkdir(path.dirname(path.join(resources, 'tray', rel)), { recursive: true });
+      await writeFile(path.join(resources, 'tray', rel), PNG);
+    }
+    return resources;
+  }
+
+  it.each(['darwin', 'win32', 'linux'])('passes when every %s sprite is present', async (p) => {
+    expect(await verifyTrayAssets(await makeResources(p), p)).toEqual([]);
+  });
+
+  it('fails when the manifest is missing', async () => {
+    const resources = path.join(tmp, 'res-empty');
+    await mkdir(resources, { recursive: true });
+    const violations = await verifyTrayAssets(resources, 'darwin');
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain('manifest.json');
+  });
+
+  it('fails when the manifest is not the expected shape', async () => {
+    const resources = path.join(tmp, 'res-bad');
+    await mkdir(path.join(resources, 'tray'), { recursive: true });
+    await writeFile(path.join(resources, 'tray', 'manifest.json'), '{"keys":[]}');
+    expect((await verifyTrayAssets(resources, 'darwin'))[0]).toContain('manifest.json');
+  });
+
+  it('names a missing @2x sprite on macOS and Windows', async () => {
+    const skip = [path.join('colour', 'green.full.star@2x.png')];
+    for (const p of ['darwin', 'win32']) {
+      const violations = await verifyTrayAssets(await makeResources(p, skip), p);
+      expect(violations).toHaveLength(1);
+      expect(violations[0]).toContain('green.full.star@2x.png');
+    }
+  });
+
+  it('requires the -22 sprite on Linux and ignores @2x there', async () => {
+    const skip = [path.join('template', 'dim35.dim35.dim35-22.png')];
+    const violations = await verifyTrayAssets(await makeResources('linux', skip), 'linux');
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain('dim35.dim35.dim35-22.png');
+  });
+
+  it('fails on an empty sprite', async () => {
+    const resources = await makeResources('darwin');
+    await writeFile(path.join(resources, 'tray', 'template', 'dim35.dim35.dim35.png'), '');
+    const violations = await verifyTrayAssets(resources, 'darwin');
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain('empty');
+  });
+
+  it('main tray-assets: exits 0 for a complete macOS bundle and 1 for a broken one', async () => {
+    const out = path.join(tmp, 'out');
+    const app = path.join(out, 'Concord Voice-darwin-arm64', 'Concord Voice.app');
+    const resources = path.join(app, 'Contents', 'Resources');
+    await mkdir(resources, { recursive: true });
+    const lines: string[] = [];
+    const deps: Deps = {
+      loadForgeConfig: async () => ({ packagerConfig: { executableName: 'Concord Voice' } }),
+      readFuseWire: async () => {
+        throw new Error('unused');
+      },
+      readIntegrity: () => {
+        throw new Error('unused');
+      },
+      platform: 'darwin',
+      log: (line) => lines.push(line),
+    };
+    expect(await main(['tray-assets', '--out', out], deps)).toBe(1);
+    const source = await makeResources('darwin');
+    await mkdir(path.join(resources, 'tray'), { recursive: true });
+    for (const rel of ['manifest.json', ...expectedFiles('darwin')]) {
+      await mkdir(path.dirname(path.join(resources, 'tray', rel)), { recursive: true });
+      await writeFile(
+        path.join(resources, 'tray', rel),
+        await readFile(path.join(source, 'tray', rel))
+      );
+    }
+    expect(await main(['tray-assets', '--out', out], deps)).toBe(0);
   });
 });
 

@@ -531,11 +531,10 @@ paths:
       tags:
       - Auth
       summary: Log out
-      description: 'Invalidate the current session. Blacklists the access token in Redis.
+      description: 'Revoke the selected logical login family, including all its refresh and access tokens. Before HTTP 200 the server synchronously fences and closes the family''s control WebSockets; a failed close does not fail the committed logout and is retried by the durable owner, which also carries voice-disconnect obligations. HTTP 200 does not assert native media closure. Only a bearer in the selected family is locally blacklisted.
 
         Explicit X-Refresh-Token and X-Session-ID credentials take precedence over the
-        refresh-token cookie, in that order. X-Session-ID is authorized by either a valid
-        same-user bearer or an exact atomic match against the ambient refresh cookie hash.
+        refresh-token cookie, in that order. With none of those, a valid bearer selects its own family. An invalid explicit target never falls through. X-Session-ID needs either a valid same-user bearer or an exact ambient refresh-cookie hash match for that SID.
         Explicit refresh/bearer cleanup never expires an ambient cookie; cookie-authorized
         cleanup expires it only when the database row matched.
 
@@ -549,13 +548,13 @@ paths:
       - name: X-Refresh-Token
         in: header
         required: false
-        description: Explicit refresh token to revoke. Takes precedence over X-Session-ID and the refresh-token cookie.
+        description: Explicit refresh token selecting its whole logical login family. Takes precedence over X-Session-ID, the refresh-token cookie, and bearer-only selection.
         schema:
           type: string
       - name: X-Session-ID
         in: header
         required: false
-        description: Session to revoke when X-Refresh-Token is absent. Requires either a valid bearer whose user owns the session or an ambient refresh cookie whose hash belongs to this exact session.
+        description: SID selecting its whole logical login family when X-Refresh-Token is absent. Requires a valid same-user bearer or an ambient refresh cookie matching this exact SID.
         schema:
           type: string
           format: uuid
@@ -566,6 +565,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
+        '401':
+          description: Invalid bearer when one is required to authorize the selected target.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal family-authority contract failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Family authority or persistence is temporarily unavailable; no success or postcommit grant is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
   /auth/mfa/email/send:
@@ -3707,198 +3724,622 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /internal/voice/auth-connections:
+    post:
+      tags:
+      - Voice
+      summary: Register exact media connection
+      operationId: registerVoiceAuthConnection
+      description: >-
+        Protected media-plane callback, limited to 60 requests per user per minute. The verified bearer selects user and live family; service-hop proof and protocol proof bind the original token and body. Registration returns a SQL-derived immutable binding and protocol capability; identical retry is idempotent. The canonical POST path is /api/v1/internal/voice/auth-connections, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
+      security:
+      - BearerAuth: []
+        AuthConnectionProofAuth: []
+      parameters:
+      - name: X-Concord-Auth-Connection-Timestamp
+        in: header
+        required: true
+        description: Canonical positive Unix seconds within the verifier proof window.
+        schema:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Connection-Nonce
+        in: header
+        required: true
+        description: Fresh 32-byte lowercase hexadecimal nonce.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Auth-Connection-Proof
+        in: header
+        required: true
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Service-Timestamp
+        in: header
+        required: true
+        description: Media-plane service-hop timestamp.
+        schema:
+          type: integer
+          format: int64
+      - name: X-Concord-Service-Proof
+        in: header
+        required: true
+        description: Media-plane service-hop proof; bearer identity is checked separately.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceAuthConnectionRegister'
+      responses:
+        '200':
+          description: Durable exact connection registered or confirmed. Signed response headers echo the request nonce; verify the response proof and expected identity before accepting success.
+          headers:
+            X-Concord-Auth-Connection-Response-Timestamp:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Connection-Response-Nonce:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Connection-Response-Proof:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceAuthRegistrationResult'
+        '400':
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
+        '401':
+          description: Bearer authentication rejected the request before protocol handling; JSON error envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Protocol handler proof/authority refusal has an empty body. Earlier bearer/account or verified-email middleware returns its JSON error envelope instead. No success proof.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/Error'
+        '409':
+          description: Conflicting immutable connection or room identity. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Protocol handler contract/invariant failure has an empty body. Earlier authentication middleware may return a JSON error envelope. No success proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Protocol handler dependency/commit uncertainty has an empty body. Earlier authentication middleware may return a JSON error envelope, including a pending revocation. No success proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /internal/voice/auth-connections/release:
+    post:
+      tags:
+      - Voice
+      summary: Close exact media connection
+      operationId: releaseVoiceAuthConnection
+      description: >-
+        Service-only terminal callback. The exact signed binding is checked against retained original registration evidence; no live bearer or family authority is required. Room associations must already be closed; identical closure retry is idempotent. The canonical POST path is /api/v1/internal/voice/auth-connections/release, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
+      security:
+      - AuthConnectionProofAuth: []
+      parameters:
+      - name: X-Concord-Auth-Connection-Timestamp
+        in: header
+        required: true
+        description: Canonical positive Unix seconds within the verifier proof window.
+        schema:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Connection-Nonce
+        in: header
+        required: true
+        description: Fresh 32-byte lowercase hexadecimal nonce.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Auth-Connection-Proof
+        in: header
+        required: true
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceAuthConnectionRelease'
+      responses:
+        '204':
+          description: Exact bound connection closed or previously closed. Signed response headers echo the request nonce; verify the response proof and expected identity before accepting success.
+          headers:
+            X-Concord-Auth-Connection-Response-Timestamp:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Connection-Response-Nonce:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Connection-Response-Proof:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+        '400':
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
+        '403':
+          description: Invalid service proof, denied family or resource authority, or retired boot. Empty body; no success proof.
+        '409':
+          description: Conflicting immutable connection or room identity. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Internal contract or persistence invariant failure. Empty body; no success proof.
+        '503':
+          description: Dependency unavailable or commit outcome unknown. Empty body; no success proof.
+        '410':
+          description: Exact binding evidence was collected after boot retirement; empty body, no historical signed success.
+  /internal/voice/auth-connections/provisional-close:
+    post:
+      tags:
+      - Voice
+      summary: Close provisional media connection
+      operationId: provisionalCloseVoiceAuthConnection
+      description: >-
+        Service-only closure when the initial registration receipt may have been lost. The target and SHA-256 digests of the original bearer token and raw registration body identify the original attempt. A signed receipt reports registered (with binding), unregistered, or retired_boot; it never invents user/family identity. The canonical POST path is /api/v1/internal/voice/auth-connections/provisional-close, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
+      security:
+      - AuthConnectionProofAuth: []
+      parameters:
+      - name: X-Concord-Auth-Connection-Timestamp
+        in: header
+        required: true
+        description: Canonical positive Unix seconds within the verifier proof window.
+        schema:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Connection-Nonce
+        in: header
+        required: true
+        description: Fresh 32-byte lowercase hexadecimal nonce.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Auth-Connection-Proof
+        in: header
+        required: true
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceAuthProvisionalClose'
+      responses:
+        '200':
+          description: Exact provisional closure committed or confirmed. Signed response headers echo the request nonce; verify the response proof and expected identity before accepting success.
+          headers:
+            X-Concord-Auth-Connection-Response-Timestamp:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Connection-Response-Nonce:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Connection-Response-Proof:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceAuthProvisionalCloseResult'
+        '400':
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
+        '403':
+          description: Invalid service proof, denied family or resource authority, or retired boot. Empty body; no success proof.
+        '409':
+          description: Conflicting immutable connection or room identity. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Internal contract or persistence invariant failure. Empty body; no success proof.
+        '503':
+          description: Dependency unavailable or commit outcome unknown. Empty body; no success proof.
+  /internal/voice/auth-connections/retire-boot:
+    post:
+      tags:
+      - Voice
+      summary: Retire exact media boot
+      operationId: retireVoiceAuthBoot
+      description: >-
+        Service-only shutdown-owner assertion after native workers, live connections, renewals and retries have stopped. Retirement is irreversible and requires zero live connection and room evidence; an already-retired boot is idempotent. SQL absence alone does not prove cessation. The canonical POST path is /api/v1/internal/voice/auth-connections/retire-boot, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
+      security:
+      - AuthConnectionProofAuth: []
+      parameters:
+      - name: X-Concord-Auth-Connection-Timestamp
+        in: header
+        required: true
+        description: Canonical positive Unix seconds within the verifier proof window.
+        schema:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Connection-Nonce
+        in: header
+        required: true
+        description: Fresh 32-byte lowercase hexadecimal nonce.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Auth-Connection-Proof
+        in: header
+        required: true
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceAuthBootRetire'
+      responses:
+        '204':
+          description: Exact boot retired or already retired. Signed response headers echo the request nonce; verify the response proof and expected identity before accepting success.
+          headers:
+            X-Concord-Auth-Connection-Response-Timestamp:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Connection-Response-Nonce:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Connection-Response-Proof:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+        '400':
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
+        '403':
+          description: Invalid service proof, denied family or resource authority, or retired boot. Empty body; no success proof.
+        '409':
+          description: Conflicting immutable connection or room identity. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Internal contract or persistence invariant failure. Empty body; no success proof.
+        '503':
+          description: Dependency unavailable or commit outcome unknown. Empty body; no success proof.
   /voice/enforcement-sessions:
     post:
       tags:
       - Voice
-      summary: Register an exact media-plane voice session
-      description: 'Internal media-plane admission callback. The media plane registers the exact
-        provisional socket after A1 and before A2 promotion. The bearer token identifies the
-        authenticated user; the service-hop proof and registration HMAC bind the complete request
-        body to the media node and session generation. This row is durable enforcement evidence,
-        not a client-invokable admission operation.'
+      summary: Attach or renew exact room session
       operationId: registerVoiceEnforcementSession
+      description: >-
+        Protected media-plane callback, limited to 60 requests per user per minute. Attach binds a room generation to an existing exact connection under fresh family and resource authority; renew only confirms an existing association. The room result carries SQL-derived user/family binding and protocol 4. A legacy epoch-only request cannot create family registry evidence. The canonical POST path is /api/v1/voice/enforcement-sessions, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
       security:
       - BearerAuth: []
+        AuthRoomProofAuth: []
       parameters:
+      - name: X-Concord-Auth-Room-Timestamp
+        in: header
+        required: true
+        description: Canonical positive Unix seconds within the verifier proof window.
+        schema:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Room-Nonce
+        in: header
+        required: true
+        description: Fresh 32-byte lowercase hexadecimal nonce.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Auth-Room-Proof
+        in: header
+        required: true
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
       - name: X-Concord-Service-Timestamp
         in: header
         required: true
+        description: Media-plane service-hop timestamp.
         schema:
           type: integer
           format: int64
-        description: Unix timestamp bound into the service-hop proof.
       - name: X-Concord-Service-Proof
         in: header
         required: true
+        description: Media-plane service-hop proof; bearer identity is checked separately.
         schema:
           type: string
           pattern: '^[0-9a-f]{64}$'
-        description: Domain-separated service-hop HMAC proof.
-      - name: X-Concord-Voice-Enforcement-Registration-Timestamp
-        in: header
-        required: true
-        schema:
-          type: integer
-          format: int64
-        description: Unix timestamp bound into the body-bound registration HMAC.
-      - name: X-Concord-Voice-Enforcement-Registration-Proof
-        in: header
-        required: true
-        schema:
-          type: string
-          pattern: '^[0-9a-f]{64}$'
-        description: HMAC-SHA256 proof over the token digest and every immutable session field.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VoiceEnforcementRegistration'
+              $ref: '#/components/schemas/VoiceAuthRoomRegister'
       responses:
-        '204':
-          description: Exact session registered or idempotently confirmed.
+        '200':
+          description: Exact room attached or renewed. Signed response headers echo the request nonce; verify the response proof and expected identity before accepting success.
+          headers:
+            X-Concord-Auth-Room-Response-Timestamp:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Room-Response-Nonce:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Room-Response-Proof:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceAuthRoomRegistrationResult'
         '400':
-          description: Invalid session shape or proof-bound request body.
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
+        '401':
+          description: Bearer authentication rejected the request before protocol handling; JSON error envelope.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Invalid service-hop proof, credential epoch, or admission fence.
+          description: Protocol handler proof/authority refusal has an empty body. Earlier bearer/account or verified-email middleware returns its JSON error envelope instead. No success proof.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/Error'
         '409':
-          description: Session generation conflicts with a different immutable identity.
+          description: Conflicting immutable connection or room identity. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Protocol handler contract/invariant failure has an empty body. Earlier authentication middleware may return a JSON error envelope. No success proof.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          description: Durable registration could not be completed.
+          description: Protocol handler dependency/commit uncertainty has an empty body. Earlier authentication middleware may return a JSON error envelope, including a pending revocation. No success proof.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /internal/voice/enforcement/health:
     post:
       tags:
       - Voice
-      summary: Bootstrap the exact media-plane enforcement lease
-      description: 'Internal media-plane health bootstrap. The media plane sends a fresh
-        node boot ID and nonce with a body-bound HMAC. The control plane then challenges the
-        same exact `voice.enforce.session.<node_boot_id>` NATS request subscriber; only a
-        verified challenge receipt renews the media process''s monotonic 30-second lease.
-        The request body is capped at 4 KiB. This endpoint never mutates session-registry
-        rows or settles DM-block or credential-epoch parent obligations.'
+      summary: Bootstrap exact media boot capability
       operationId: bootstrapVoiceEnforcementHealth
+      description: >-
+        Service-only protocol-4 boot challenge. A verified signed NATS ACK establishes transportOK; admissionGranted additionally requires active rollout, the ACK grant and fresh SQL/security-round authority. Prepared transport can succeed with admissionGranted false. A signed 200 result is capability evidence, not a blanket admission grant. The canonical POST path is /api/v1/internal/voice/enforcement/health, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
       security:
-      - VoiceEnforcementProofAuth: []
+      - AuthConnectionProofAuth: []
       parameters:
-      - name: X-Concord-Voice-Enforcement-Timestamp
+      - name: X-Concord-Auth-Connection-Timestamp
         in: header
         required: true
+        description: Canonical positive Unix seconds within the verifier proof window.
         schema:
-          type: integer
-          format: int64
-        description: Unix timestamp bound into the bootstrap HMAC.
-      - name: X-Concord-Voice-Enforcement-Proof
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Connection-Nonce
         in: header
         required: true
+        description: Fresh 32-byte lowercase hexadecimal nonce.
         schema:
           type: string
           pattern: '^[0-9a-f]{64}$'
-        description: HMAC-SHA256 proof over the protocol version, timestamp, node boot ID, nonce, method, and path.
+      - name: X-Concord-Auth-Connection-Proof
+        in: header
+        required: true
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VoiceEnforcementHealthBootstrap'
+              $ref: '#/components/schemas/VoiceAuthHealthBootstrap'
       responses:
-        '204':
-          description: Challenge published to the exact media-plane subscriber.
+        '200':
+          description: Verified boot transport challenge and signed capability result. Signed response headers echo the request nonce; verify the response proof and expected identity before accepting success.
+          headers:
+            X-Concord-Auth-Connection-Response-Timestamp:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Connection-Response-Nonce:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Connection-Response-Proof:
+              required: true
+              description: Signed protocol-4 success receipt.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceAuthHealthBootstrapResult'
         '400':
-          description: Invalid or oversized bootstrap body.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
         '403':
-          description: Invalid bootstrap proof or node/nonce shape.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Invalid service proof, denied family or resource authority, or retired boot. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Internal contract or persistence invariant failure. Empty body; no success proof.
         '503':
-          description: Exact NATS challenge could not be published or completed.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Dependency unavailable or commit outcome unknown. Empty body; no success proof.
   /internal/voice/enforcement-sessions/release:
     post:
       tags:
       - Voice
-      summary: Release an exact media-plane voice session
-      description: 'Internal media-plane terminal callback. This endpoint intentionally does not
-        accept a bearer token: credential-epoch enforcement may invalidate that token before the
-        target socket tears down. The HMAC binds every immutable session field and deletes only
-        the matching registry row. A missing row is idempotent success; a mismatched row is a
-        conflict and remains pending. The JSON body is capped at 4 KiB.'
+      summary: Release exact room association
       operationId: releaseVoiceEnforcementSession
+      description: >-
+        Service-only protocol-4 release requires signed immutable connection binding and room identity, closes the exact association and keeps retained closure evidence. A schema-absent legacy request with the older X-Concord-Voice-Enforcement-Timestamp/Proof headers and VoiceEnforcementSession body remains accepted solely to drain unbound legacy rows; it cannot delete family-aware room evidence and returns an unsigned empty 204. The canonical POST path is /api/v1/internal/voice/enforcement-sessions/release, with no query or trailing slash. Protocol-4 request JSON is a closed, 4096-byte raw UTF-8 object: missing, duplicate (including escaped-equivalent), unknown, null, or noncanonical fields are refused. The proof signs the original body bytes and fixed ordered tuple; OpenAPI 3.0 cannot express duplicate-key rejection or positional HMAC tuples. See [internal]specs/2026-10-26-2272-logical-login-abi.md §§3–4 and services/control-plane/internal/voiceauthprotocol. A service proof is internal evidence, never end-user authentication.
       security:
+      - AuthRoomProofAuth: []
       - VoiceEnforcementProofAuth: []
       parameters:
-      - name: X-Concord-Voice-Enforcement-Timestamp
+      - name: X-Concord-Auth-Room-Timestamp
         in: header
-        required: true
+        required: false
+        description: Canonical positive Unix seconds within the verifier proof window.
         schema:
-          type: integer
-          format: int64
-        description: Unix timestamp bound into the release HMAC.
-      - name: X-Concord-Voice-Enforcement-Proof
+          type: string
+          pattern: '^[1-9][0-9]*$'
+      - name: X-Concord-Auth-Room-Nonce
         in: header
-        required: true
+        required: false
+        description: Fresh 32-byte lowercase hexadecimal nonce.
         schema:
           type: string
           pattern: '^[0-9a-f]{64}$'
-        description: HMAC-SHA256 proof over every immutable session field.
+      - name: X-Concord-Auth-Room-Proof
+        in: header
+        required: false
+        description: Domain-separated HMAC-SHA256 proof of the exact request tuple and raw body digest.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      - name: X-Concord-Voice-Enforcement-Timestamp
+        in: header
+        required: false
+        description: Legacy schema-absent drain proof timestamp; paired with X-Concord-Voice-Enforcement-Proof instead of protocol-4 headers.
+        schema:
+          type: integer
+          format: int64
+      - name: X-Concord-Voice-Enforcement-Proof
+        in: header
+        required: false
+        description: Legacy schema-absent drain proof, valid only for unbound legacy room evidence.
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VoiceEnforcementSession'
+              oneOf:
+              - $ref: '#/components/schemas/VoiceAuthRoomRelease'
+              - $ref: '#/components/schemas/VoiceEnforcementSession'
+              description: Protocol-4 signed room release, or schema-absent legacy drain with the old proof headers. The legacy shape cannot release family-aware evidence.
       responses:
         '204':
-          description: Exact session released or already absent.
+          description: Protocol-4 exact room association closed or previously closed; its signed headers echo the request nonce and must be verified. A schema-absent legacy drain returns an unsigned empty 204.
+          headers:
+            X-Concord-Auth-Room-Response-Timestamp:
+              required: false
+              description: Signed protocol-4 success receipt; absent on legacy room release.
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+            X-Concord-Auth-Room-Response-Nonce:
+              required: false
+              description: Signed protocol-4 success receipt; absent on legacy room release.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            X-Concord-Auth-Room-Response-Proof:
+              required: false
+              description: Signed protocol-4 success receipt; absent on legacy room release.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
         '400':
-          description: Invalid session shape or proof-bound request body.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Malformed closed request or noncanonical endpoint. Empty body; no success proof.
         '403':
-          description: Invalid release proof.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Invalid service proof, denied family or resource authority, or retired boot. Empty body; no success proof.
         '409':
-          description: Stored session identity does not match the release request.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Conflicting immutable connection or room identity. Empty body; no success proof.
+        '413':
+          description: Request exceeds 4096 bytes. Empty body; no success proof.
+        '500':
+          description: Internal contract or persistence invariant failure. Empty body; no success proof.
         '503':
-          description: Durable release could not be completed.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Dependency unavailable or commit outcome unknown. Empty body; no success proof.
+        '410':
+          description: Exact binding evidence was collected after boot retirement; empty body, no historical signed success.
   /channels/{id}/voice/join:
     post:
       tags:
@@ -12884,8 +13325,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required, or the requesting login was signed out or revoked before the erasure committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Account not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Account state changed while the erasure was prepared; retry the deletion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Authentication temporarily unavailable
           content:
             application/json:
               schema:
@@ -16901,7 +17360,7 @@ paths:
       tags:
       - Sessions
       summary: List sessions
-      description: 'List active and past sessions for the current user.
+      description: 'List active and past refresh-token rows for the current user. Each SID belongs to an immutable logical login family; revoking one SID terminates that whole family. This list counts refresh rows, not families.
 
         IP addresses are masked for privacy.
 
@@ -16928,6 +17387,10 @@ paths:
                       $ref: '#/components/schemas/PastSession'
                   total:
                     type: integer
+                    description: Number of active refresh-token rows.
+                  revocation_mode:
+                    type: string
+                    description: Server-authoritative session revocation mode.
   /sessions/revocation-mode:
     put:
       tags:
@@ -16970,21 +17433,21 @@ paths:
       tags:
       - Sessions
       summary: Revoke all sessions
-      description: 'Revoke the authenticated user''s active sessions after password
+      description: 'Revoke the authenticated user''s captured logical login families after password
 
         or MFA re-verification. A request with neither step-up credential returns a
 
         403 discovery response describing the required method. By default, the authenticated
 
-        active bearer session is preserved; if it is no longer active, the supplied
+        active bearer family is preserved; if it is no longer active, the supplied
 
-        refresh token session is preserved instead. A request that identifies no active
+        refresh-token family is preserved instead. A request that identifies no active
 
-        current session fails without revoking any sessions. When a bearer session is preserved, a different
+        current family fails without revocation. When a bearer family is preserved, a different
 
-        refresh-token cookie session is revoked and can no longer be used. Set `include_current` to `true` to revoke that
+        refresh-token cookie family is revoked. Set `include_current` to `true` to revoke the current
 
-        session too.
+        family too. Before success the control WebSockets of every revoked family are synchronously fenced and closed (a failed close is retried by the durable owner, never surfaced as an error); success also retains exact voice-disconnect delivery obligations. The count is changed refresh rows, not families or completed socket closures.
 
         Rate limit: 5 requests per minute (user-based).
 
@@ -17008,7 +17471,7 @@ paths:
                 include_current:
                   type: boolean
                   default: false
-                  description: Revoke the current refresh token as well as all other sessions
+                  description: Include the authenticated current logical login family in revocation.
       responses:
         '200':
           description: Sessions revoked
@@ -17026,7 +17489,7 @@ paths:
                   count:
                     type: integer
                     minimum: 0
-                    description: Number of refresh-token sessions revoked
+                    description: Number of refresh-token rows changed from unrevoked to revoked; zero is possible for already-terminal families.
                   include_current:
                     type: boolean
         '400':
@@ -17065,6 +17528,12 @@ paths:
                       description: Enabled MFA methods when MFA authentication is required
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Family authority or persistence is temporarily unavailable; no success or postcommit grant is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Password/MFA verification or session revocation failed
           content:
@@ -17076,7 +17545,7 @@ paths:
       tags:
       - Sessions
       summary: Revoke a specific session
-      description: 'Rate limit: 10 requests per minute.'
+      description: 'The owned SID selects its immutable logical login family. A successful revoke terminates the whole family, including other refresh rows and access tokens, synchronously fences and closes that family''s control WebSockets before responding (sibling families stay connected; a failed close is retried by the durable owner), and retains exact voice-disconnect delivery obligations. An already-terminal owned family is idempotent success. Rate limit: 10 requests per minute.'
       security:
       - BearerAuth: []
       parameters:
@@ -17099,8 +17568,32 @@ paths:
                   session_id:
                     type: string
                     format: uuid
+        '401':
+          description: Access token or current family authority is invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Password or MFA step-up required or failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Family authority or persistence is temporarily unavailable; no success or postcommit grant is claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal revocation or step-up verification failure.
           content:
             application/json:
               schema:
@@ -17262,7 +17755,8 @@ paths:
         current-password step-up (plus MFA when enabled) and explicit data-loss acknowledgement. The atomic
         reset deletes wrapped channel/DM keys, forces Custom Status Off, and deletes the encrypted exception
         preference plus materialized exclusions. After commit (or an ambiguous commit result), connected
-        clients receive a privacy clear and their WebSockets are disconnected fail closed.
+        clients receive a privacy clear and every WebSocket of the superseded login families is closed
+        before the response is written (the asynchronous epoch evictor remains the backstop).
 
         Rate limit: 3 requests per minute.
 
@@ -19089,12 +19583,22 @@ components:
       in: query
       name: token
       description: JWT access token for the WebSocket compatibility fallback; subject to the same live account and credential-epoch checks as bearer authentication.
+    AuthConnectionProofAuth:
+      type: apiKey
+      in: header
+      name: X-Concord-Auth-Connection-Proof
+      description: Per-attempt HMAC-SHA256, not a static API key. Timestamp and nonce headers are required; see the canonical protocol-4 ABI for domains, ordered tuple and raw-body binding.
+    AuthRoomProofAuth:
+      type: apiKey
+      in: header
+      name: X-Concord-Auth-Room-Proof
+      description: Per-attempt HMAC-SHA256, not a static API key. Timestamp and nonce headers are required; see the canonical protocol-4 ABI for domains, ordered tuple and raw-body binding.
     VoiceEnforcementProofAuth:
       type: apiKey
       in: header
       name: X-Concord-Voice-Enforcement-Proof
       description: >-
-        Per-request hex HMAC-SHA256 proof, not a static API key or user bearer token.
+        Legacy schema-absent room-release HMAC-SHA256 proof only, not a static API key or user bearer token. Protocol-4 routes use AuthConnectionProofAuth or AuthRoomProofAuth.
         Derive the signing key from the shared JWT secret using the endpoint's
         domain-separated context, and sign its version, timestamp, and canonical
         request fields. The required X-Concord-Voice-Enforcement-Timestamp header
@@ -20247,53 +20751,391 @@ components:
             oneOf:
             - $ref: '#/components/schemas/DeviceRecoveryPending'
             - $ref: '#/components/schemas/DeviceRecoveryOffered'
-    VoiceEnforcementHealthBootstrap:
+    VoiceAuthTarget:
       type: object
-      description: Body-bound bootstrap proof for the exact media-process NATS subscriber.
-      required:
-      - node_boot_id
-      - nonce
       additionalProperties: false
+      required:
+      - connectionGeneration
+      - nodeBootId
+      - socketId
+      - credentialEpoch
       properties:
-        node_boot_id:
+        connectionGeneration:
           type: string
           format: uuid
-          description: Random process boot identity and exact NATS subject suffix.
+        nodeBootId:
+          type: string
+          format: uuid
+        socketId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        credentialEpoch:
+          type: string
+          pattern: '^([0-9a-f]{32})?$'
+    VoiceAuthBinding:
+      type: object
+      additionalProperties: false
+      required:
+      - userId
+      - familyId
+      - target
+      properties:
+        userId:
+          type: string
+          format: uuid
+        familyId:
+          type: string
+          format: uuid
+        target:
+          $ref: '#/components/schemas/VoiceAuthTarget'
+    VoiceAuthRoom:
+      type: object
+      additionalProperties: false
+      required:
+      - sessionGeneration
+      - roomId
+      - roomKind
+      properties:
+        sessionGeneration:
+          type: string
+          format: uuid
+        roomId:
+          type: string
+          format: uuid
+        roomKind:
+          type: string
+          enum: [channel, dm]
+    VoiceAuthConnectionRegister:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - connectionGeneration
+      - nodeBootId
+      - socketId
+      - credentialEpoch
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        connectionGeneration:
+          type: string
+          format: uuid
+        nodeBootId:
+          type: string
+          format: uuid
+        socketId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        credentialEpoch:
+          type: string
+          pattern: '^([0-9a-f]{32})?$'
+    VoiceAuthRegistrationResult:
+      type: object
+      additionalProperties: false
+      required:
+      - userId
+      - familyId
+      - target
+      - version
+      - voiceEnforcementProtocol
+      properties:
+        userId:
+          type: string
+          format: uuid
+        familyId:
+          type: string
+          format: uuid
+        target:
+          $ref: '#/components/schemas/VoiceAuthTarget'
+        version:
+          type: integer
+          enum: [1]
+        voiceEnforcementProtocol:
+          type: integer
+          enum: [4]
+    VoiceAuthConnectionRelease:
+      type: object
+      additionalProperties: false
+      required:
+      - userId
+      - familyId
+      - target
+      - version
+      properties:
+        userId:
+          type: string
+          format: uuid
+        familyId:
+          type: string
+          format: uuid
+        target:
+          $ref: '#/components/schemas/VoiceAuthTarget'
+        version:
+          type: integer
+          enum: [1]
+    VoiceAuthProvisionalClose:
+      type: object
+      additionalProperties: false
+      required:
+      - schema
+      - version
+      - target
+      - registrationTokenDigest
+      - registrationBodyDigest
+      properties:
+        schema:
+          type: string
+          enum: [concord.auth-connection-provisional-close]
+        version:
+          type: integer
+          enum: [1]
+        target:
+          $ref: '#/components/schemas/VoiceAuthTarget'
+        registrationTokenDigest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        registrationBodyDigest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    VoiceAuthProvisionalCloseResult:
+      description: Closed signed disposition. A registered result contains the exact binding; unregistered and retired_boot contain no binding.
+      oneOf:
+      - type: object
+        additionalProperties: false
+        required:
+        - schema
+        - version
+        - target
+        - registrationTokenDigest
+        - registrationBodyDigest
+        - disposition
+        - binding
+        properties:
+          schema:
+            type: string
+            enum: [concord.auth-connection-provisional-close-result]
+          version:
+            type: integer
+            enum: [1]
+          target:
+            $ref: '#/components/schemas/VoiceAuthTarget'
+          registrationTokenDigest:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          registrationBodyDigest:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          disposition:
+            type: string
+            enum: [registered]
+          binding:
+            $ref: '#/components/schemas/VoiceAuthBinding'
+      - type: object
+        additionalProperties: false
+        required:
+        - schema
+        - version
+        - target
+        - registrationTokenDigest
+        - registrationBodyDigest
+        - disposition
+        properties:
+          schema:
+            type: string
+            enum: [concord.auth-connection-provisional-close-result]
+          version:
+            type: integer
+            enum: [1]
+          target:
+            $ref: '#/components/schemas/VoiceAuthTarget'
+          registrationTokenDigest:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          registrationBodyDigest:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          disposition:
+            type: string
+            enum: [unregistered]
+      - type: object
+        additionalProperties: false
+        required:
+        - schema
+        - version
+        - target
+        - registrationTokenDigest
+        - registrationBodyDigest
+        - disposition
+        properties:
+          schema:
+            type: string
+            enum: [concord.auth-connection-provisional-close-result]
+          version:
+            type: integer
+            enum: [1]
+          target:
+            $ref: '#/components/schemas/VoiceAuthTarget'
+          registrationTokenDigest:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          registrationBodyDigest:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          disposition:
+            type: string
+            enum: [retired_boot]
+    VoiceAuthRoomRegister:
+      type: object
+      additionalProperties: false
+      required:
+      - schema
+      - version
+      - mode
+      - connectionGeneration
+      - nodeBootId
+      - socketId
+      - credentialEpoch
+      - sessionGeneration
+      - roomId
+      - roomKind
+      properties:
+        schema:
+          type: string
+          enum: [concord.auth-room-binding]
+        version:
+          type: integer
+          enum: [1]
+        mode:
+          type: string
+          enum: [attach, renew]
+        connectionGeneration:
+          type: string
+          format: uuid
+        nodeBootId:
+          type: string
+          format: uuid
+        socketId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        credentialEpoch:
+          type: string
+          pattern: '^([0-9a-f]{32})?$'
+        sessionGeneration:
+          type: string
+          format: uuid
+        roomId:
+          type: string
+          format: uuid
+        roomKind:
+          type: string
+          enum: [channel, dm]
+    VoiceAuthRoomRegistrationResult:
+      type: object
+      additionalProperties: false
+      required:
+      - schema
+      - version
+      - voiceEnforcementProtocol
+      - binding
+      - room
+      properties:
+        schema:
+          type: string
+          enum: [concord.auth-room-binding]
+        version:
+          type: integer
+          enum: [1]
+        voiceEnforcementProtocol:
+          type: integer
+          enum: [4]
+        binding:
+          $ref: '#/components/schemas/VoiceAuthBinding'
+        room:
+          $ref: '#/components/schemas/VoiceAuthRoom'
+    VoiceAuthRoomRelease:
+      type: object
+      additionalProperties: false
+      required:
+      - schema
+      - version
+      - binding
+      - room
+      properties:
+        schema:
+          type: string
+          enum: [concord.auth-room-binding]
+        version:
+          type: integer
+          enum: [1]
+        binding:
+          $ref: '#/components/schemas/VoiceAuthBinding'
+        room:
+          $ref: '#/components/schemas/VoiceAuthRoom'
+    VoiceAuthHealthBootstrap:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - nodeBootId
+      - nonce
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        nodeBootId:
+          type: string
+          format: uuid
         nonce:
           type: string
           pattern: '^[0-9a-f]{64}$'
-          description: Fresh 32-byte random nonce, hex encoded.
-    VoiceEnforcementRegistration:
+    VoiceAuthHealthBootstrapResult:
       type: object
-      description: Immutable media-plane admission identity; the authenticated user is taken from the bearer token.
-      required:
-      - session_generation
-      - node_boot_id
-      - room_id
-      - room_kind
-      - credential_epoch
-      - socket_id
       additionalProperties: false
+      required:
+      - version
+      - voiceEnforcementProtocol
+      - nodeBootId
+      - activation
+      - transportOK
+      - admissionGranted
       properties:
-        session_generation:
+        version:
+          type: integer
+          enum: [1]
+        voiceEnforcementProtocol:
+          type: integer
+          enum: [4]
+        nodeBootId:
           type: string
           format: uuid
-        node_boot_id:
+        activation:
+          type: string
+          enum: [prepared, active]
+        transportOK:
+          type: boolean
+        admissionGranted:
+          type: boolean
+    VoiceAuthBootRetire:
+      type: object
+      additionalProperties: false
+      required:
+      - schema
+      - version
+      - nodeBootId
+      properties:
+        schema:
+          type: string
+          enum: [concord.auth-boot-retirement]
+        version:
+          type: integer
+          enum: [1]
+        nodeBootId:
           type: string
           format: uuid
-        room_id:
-          type: string
-          format: uuid
-        room_kind:
-          type: string
-          enum: [channel, dm]
-        credential_epoch:
-          type: string
-          pattern: '^([0-9a-f]{32})?$'
-        socket_id:
-          type: string
-          minLength: 1
-          maxLength: 255
     VoiceEnforcementSession:
       type: object
       description: Immutable identity of one exact media-plane Socket.IO session.
@@ -22387,6 +23229,9 @@ components:
           format: date-time
         remember_me:
           type: boolean
+        machine_id:
+          type: string
+          description: Machine identifier recorded on this refresh row, or empty when absent.
         is_current:
           type: boolean
     PastSession:

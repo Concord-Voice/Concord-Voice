@@ -80,7 +80,7 @@ func requireOutcome(
 	t.Helper()
 	g, tx := lockGate(t, db, serverID, actorID)
 	in.ActorID = actorID
-	return mfaenforce.Require(context.Background(), tx, g, in, fires)
+	return mfaenforce.Require(actorCtx(context.Background(), t, db, actorID), tx, g, in, fires)
 }
 
 func requireMFARequired(t *testing.T, e *stepup.Error) {
@@ -342,7 +342,7 @@ func TestWithGateTx_CommitsBoundsAndHoldsTheGate(t *testing.T) {
 	db := gateTestDB(t)
 	owner := createUser(t, db)
 	server := createServer(t, db, owner, true)
-	ctx := t.Context()
+	ctx := actorCtx(t.Context(), t, db, owner)
 	var baselineIdle string
 	require.NoError(t, db.QueryRow(`SELECT current_setting('idle_in_transaction_session_timeout')`).Scan(&baselineIdle))
 
@@ -412,7 +412,7 @@ func TestWithGateTx_RollsBackAndRestoresTheFactor(t *testing.T) {
 	enrollTOTP(t, db, ring, owner)
 	server := createServer(t, db, owner, true)
 	env := newGraceEnv(t, owner, server)
-	ctx := t.Context()
+	ctx := actorCtx(t.Context(), t, db, owner)
 	routeErr := errors.New("the route's own failure")
 
 	var outcome mfaenforce.Outcome
@@ -462,7 +462,7 @@ func TestWithGateTx_ReleasesTheGateWhenFnPanics(t *testing.T) {
 	server := createServer(t, db, owner, true)
 	spec := mfaenforce.GateSpec{ServerID: server, ActorID: owner, UserLock: stepup.LockForShare, ServerLock: mfaenforce.ServerForShare}
 	require.Panics(t, func() {
-		_ = mfaenforce.WithGateTx(t.Context(), db, spec, func(*sql.Tx, mfaenforce.Gate) error { panic("route bug") })
+		_ = mfaenforce.WithGateTx(actorCtx(t.Context(), t, db, owner), db, spec, func(*sql.Tx, mfaenforce.Gate) error { panic("route bug") })
 	})
 	blocked, err := toggleWaits(t.Context(), db, server)
 	require.NoError(t, err)
@@ -480,7 +480,7 @@ func TestWithGateTx_JoinsAFailedRollback(t *testing.T) {
 	server := createServer(t, db, owner, true)
 	routeErr := errors.New("the route's own failure")
 	spec := mfaenforce.GateSpec{ServerID: server, ActorID: owner, UserLock: stepup.LockForShare, ServerLock: mfaenforce.ServerForShare}
-	err := mfaenforce.WithGateTx(t.Context(), db, spec, func(tx *sql.Tx, _ mfaenforce.Gate) error {
+	err := mfaenforce.WithGateTx(actorCtx(t.Context(), t, db, owner), db, spec, func(tx *sql.Tx, _ mfaenforce.Gate) error {
 		terminateTxBackend(t, db, tx)
 		return routeErr
 	})
@@ -505,7 +505,7 @@ func TestWithGateTx_GateErrorsComeBackUnwrapped(t *testing.T) {
 	db := gateTestDB(t)
 	owner := createUser(t, db)
 	called := false
-	err := mfaenforce.WithGateTx(t.Context(), db, mfaenforce.GateSpec{
+	err := mfaenforce.WithGateTx(actorCtx(t.Context(), t, db, owner), db, mfaenforce.GateSpec{
 		ServerID: uuid.NewString(), ActorID: owner, UserLock: stepup.LockForShare, ServerLock: mfaenforce.ServerForShare,
 	}, func(*sql.Tx, mfaenforce.Gate) error { called = true; return nil })
 	require.ErrorIs(t, err, mfaenforce.ErrServerNotFound)

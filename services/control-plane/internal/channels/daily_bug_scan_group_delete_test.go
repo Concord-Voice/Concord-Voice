@@ -3,6 +3,7 @@ package channels_test
 import (
 	"context"
 	"database/sql"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -73,6 +74,7 @@ func TestDeleteChannelGroup_RetriesWhenVoiceChildSetChanges(t *testing.T) {
 	c.Params = gin.Params{{Key: "group_id", Value: groupID}}
 	c.Set("user_id", owner.ID)
 	c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+	testhelpers.AttachUserIdentity(t, c, owner.ID)
 	completed := make(chan struct{})
 	go func() {
 		h.DeleteChannelGroup(c)

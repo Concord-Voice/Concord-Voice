@@ -39,14 +39,19 @@ const (
 	otherFingerprint       = "//////////////////////////////////////////8="
 )
 
-func setupTS(t *testing.T) *testhelpers.TestServer {
+func setupTS(t *testing.T, supplied ...*testhelpers.TestServer) *testhelpers.TestServer {
 	t.Helper()
+	if len(supplied) != 0 {
+		require.Len(t, supplied, 1)
+		require.NotNil(t, supplied[0])
+		return supplied[0]
+	}
 	return testhelpers.SetupTestServer(t)
 }
 
 // Helper: create a user + server + channel combo
-func setupWithChannel(t *testing.T) (*testhelpers.TestServer, testhelpers.TestUser, string, string) {
-	ts := setupTS(t)
+func setupWithChannel(t *testing.T, supplied ...*testhelpers.TestServer) (*testhelpers.TestServer, testhelpers.TestUser, string, string) {
+	ts := setupTS(t, supplied...)
 	user := ts.CreateTestUser(t, "chanuser")
 	serverID := ts.CreateTestServer(t, user.ID, "Channel Test Server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
@@ -626,9 +631,9 @@ func TestGetServerUnreadStatusSuccess(t *testing.T) {
 // --- Channel Key Management (E2EE) ---
 
 // Helper: create encrypted channel via API (stores initial channel key)
-func setupEncryptedChannel(t *testing.T) (*testhelpers.TestServer, testhelpers.TestUser, string, string) {
+func setupEncryptedChannel(t *testing.T, supplied ...*testhelpers.TestServer) (*testhelpers.TestServer, testhelpers.TestUser, string, string) {
 	t.Helper()
-	ts := setupTS(t)
+	ts := setupTS(t, supplied...)
 	user := ts.CreateTestUser(t, "e2eeuser")
 	serverID := ts.CreateTestServer(t, user.ID, "E2EE Server")
 

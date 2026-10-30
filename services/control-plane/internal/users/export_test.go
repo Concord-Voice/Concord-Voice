@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 )
 
@@ -12,12 +13,18 @@ import (
 // session termination seam.
 type KeyResetSessionDisconnectorForTest interface {
 	DisconnectUser(uuid.UUID)
+	loginfamily.FamilyCloser
 }
 
 // SetKeyResetSessionDisconnectorForTest installs a deterministic session
 // termination test double.
 func SetKeyResetSessionDisconnectorForTest(h *Handler, disconnector KeyResetSessionDisconnectorForTest) {
 	h.sessionDisconnector = disconnector
+}
+
+// SetErasureFamilyCloserForTest replaces the post-commit erasure family fence.
+func SetErasureFamilyCloserForTest(s *AccountService, closer loginfamily.FamilyCloser) {
+	s.familyCloser = closer
 }
 
 // ReclaimErasedMediaForTest exposes the post-commit object-storage reclamation

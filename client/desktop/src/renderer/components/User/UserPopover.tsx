@@ -7,7 +7,7 @@ import { useNavigate } from 'react-router';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { UserProfile, useUserStore } from '../../stores/auth/userStore';
 import { useMemberStore, PresenceStatus } from '../../stores/chat/memberStore';
-import { getWebSocketService } from '../../services/messaging/websocketService';
+import { setOwnPresence } from '../../services/presence/setOwnPresence';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import './UserPopover.css';
@@ -126,8 +126,7 @@ const UserPopover: React.FC<UserPopoverProps> = ({
 
   const handleStatusChange = (status: PresenceStatus) => {
     if (status !== 'offline') {
-      const ws = getWebSocketService();
-      ws.sendSetStatus(status);
+      setOwnPresence(status);
     }
   };
 

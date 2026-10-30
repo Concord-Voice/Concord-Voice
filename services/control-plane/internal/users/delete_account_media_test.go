@@ -115,7 +115,7 @@ func TestDeleteAccountCapturesOwnMediaOnly(t *testing.T) {
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), uploader.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, uploader.ID), uploader.ID))
 	require.True(t, rec.called, "the reclaimer must run for a user who uploaded media")
 
 	assert.Empty(t, rec.tier1,
@@ -181,7 +181,7 @@ func TestDeleteAccountTier1ObligationsAreAtomicWithErasure(t *testing.T) {
 	})
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
-	err = svc.DeleteAccount(context.Background(), user.ID)
+	err = svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tier1 obligation atomicity sentinel",
 		"obligations must be visible before the user cascade reaches its trigger")
@@ -215,7 +215,7 @@ func TestDeleteAccountCaptureCarriesBackend(t *testing.T) {
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 	require.Len(t, rec.tier2, 1)
 	require.NotNil(t, rec.tier2[0].Backend, "a row naming a backend must not capture as NULL")
 	assert.Equal(t, "r2", *rec.tier2[0].Backend)
@@ -232,7 +232,7 @@ func TestDeleteAccountCapturesFeedbackScreenshotForErasure(t *testing.T) {
 	rec := &recordingReclaimer{}
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 	require.Len(t, rec.tier2, 1)
 	assert.Equal(t, key, rec.tier2[0].Key)
 	require.NotNil(t, rec.tier2[0].Backend)
@@ -254,7 +254,7 @@ func TestDeleteAccountClearsPublishedScreenshotBeforeOffload(t *testing.T) {
 	rec := &recordingReclaimer{}
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 	var state, backend string
 	var staged []byte
 	require.NoError(t, ts.DB.QueryRow(`SELECT state,storage_backend,staged_data FROM feedback_screenshot_uploads
@@ -276,7 +276,7 @@ func TestDeleteAccountWithoutReclaimerStillErases(t *testing.T) {
 	insertTier2Row(t, ts, user.ID, channelID, "attachments/"+user.ID)
 
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 
 	var rows int
 	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = $1`, user.ID).Scan(&rows))
@@ -306,7 +306,7 @@ func TestDeleteAccountSkipsAlreadySoftDeletedRows(t *testing.T) {
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 	assert.ElementsMatch(t, []string{live}, rec.keys(rec.tier2),
 		"soft-deleted rows are the orphan reaper's input, not the capture's")
 }
@@ -389,7 +389,7 @@ func TestDeleteAccountCapturesAttachmentsInItsOwnIncompleteChannels(t *testing.T
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), creator.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, creator.ID), creator.ID))
 
 	assert.Contains(t, rec.keys(rec.tier2), attachmentKey,
 		"the capture must run BEFORE deleteIncompleteChannelsTx: that call cascades "+
@@ -422,7 +422,7 @@ func TestDeleteAccountPersistsSoftDeletedProfileMediaObligations(t *testing.T) {
 	svc := users.NewAccountService(ts.DB, logger.New("test"))
 	svc.SetErasedMediaReclaimer(rec.reclaim)
 
-	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+	require.NoError(t, svc.DeleteAccount(testhelpers.ActorContextForDB(context.Background(), t, ts.DB, user.ID), user.ID))
 
 	assert.Empty(t, rec.tier1, "soft-deleted profile media must not be directly deleted by the callback")
 	var obligations []string

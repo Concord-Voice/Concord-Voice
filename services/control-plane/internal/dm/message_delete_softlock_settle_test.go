@@ -56,6 +56,7 @@ func (hs *softLockHarness) deleteWithContext(ctx context.Context, t *testing.T, 
 	router.DELETE(softLockDeleteRoute, func(c *gin.Context) {
 		c.Set("user_id", hs.actor)
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": hs.epoch})
+		hs.withIdentity(c, hs.actor)
 		hs.handler.DeleteMessage(c)
 	})
 	w := httptest.NewRecorder()

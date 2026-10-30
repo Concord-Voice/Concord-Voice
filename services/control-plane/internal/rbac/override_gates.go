@@ -127,7 +127,7 @@ func (h *Handler) authorizeOverrideUpsert(c *gin.Context, serverID, userID strin
 func (h *Handler) authorizeOverrideUpsertTx(
 	ctx context.Context, tx *sql.Tx, serverID, userID, tokenEpoch string, allow int64, confirm roleGateConfirm,
 ) (mfaenforce.Gate, error) {
-	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
 		return mfaenforce.Gate{}, err
 	}
 	g, err := lockRoleGateTx(ctx, tx, serverID, userID, stepup.LockForNoKeyUpdate, mfaenforce.ServerForUpdate, confirm)

@@ -23,7 +23,7 @@ func TestPreemptiveBanRecordsDurableBanWithoutMembershipFence(t *testing.T) {
 	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
 
 	h := &Handler{db: db, log: logger.New("coverage-preemptive-ban")}
-	require.NoError(t, h.execBanTx(context.Background(), serverID, target.String(), owner.String(), nil, false))
+	require.NoError(t, h.execBanTx(dbtest.ActorContext(context.Background(), t, db, owner.String()), serverID, target.String(), owner.String(), nil, false))
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM server_bans WHERE server_id = $1 AND user_id = $2`, serverID, target).Scan(&count))

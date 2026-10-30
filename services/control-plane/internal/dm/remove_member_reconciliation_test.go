@@ -38,6 +38,7 @@ func invokeRemoveMember(t *testing.T, h *Handler, convID, callerID, targetID str
 	c.Set("user_id", callerID)
 	c.Params = gin.Params{{Key: "id", Value: convID}, {Key: "userId", Value: targetID}}
 	c.Request = httptest.NewRequest("DELETE", "/", nil)
+	withActor(t, h.db, c, callerID)
 	h.RemoveMember(c)
 	return recorder
 }
@@ -254,13 +255,6 @@ func (deliveryFailureRail) CompleteAlreadyGated(context.Context, *sql.Tx, []acti
 	return activepresence.ErrDeliveryIncomplete
 }
 
-func signedRemoveMemberWSToken(t *testing.T, userID uuid.UUID, jwtSecret string) string {
-	t.Helper()
-	signed, err := auth.GenerateAccessToken(userID.String(), jwtSecret, true, "", "")
-	require.NoError(t, err)
-	return signed
-}
-
 func TestRemoveMemberDeliveryFailureStillQueuesEnforcementAndBroadcasts(t *testing.T) {
 	db, convID, creator, successor, h, _ := seedMemberRemovalFixture(t, true)
 	target := creator
@@ -302,7 +296,30 @@ func TestRemoveMemberDeliveryFailureStillQueuesEnforcementAndBroadcasts(t *testi
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
 	t.Cleanup(hub.Shutdown)
-	wsURL := "ws" + server.URL[len("http"):] + "/ws?token=" + signedRemoveMemberWSToken(t, successor, jwtSecret)
+	// Mint through the production owner so the websocket's signed SID and
+	// exact deadline have committed family authority before admission.
+	mintContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	mintContext.Request = httptest.NewRequest(http.MethodPost, "/mint", nil)
+	wsToken, _, sid, err := auth.NewHandler(db, wsRedis, logger.NewWithWriter(io.Discard), jwtSecret, nil).
+		IssueTokenPair(mintContext, successor.String(), "")
+	require.NoError(t, err)
+	claims, err := auth.ValidateAccessToken(wsToken, jwtSecret)
+	require.NoError(t, err)
+	require.Equal(t, successor.String(), claims.UserID)
+	require.Equal(t, sid, claims.SessionID)
+	require.NotNil(t, claims.ExpiresAt)
+	var exactAuthority bool
+	require.NoError(t, db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM login_family_sids s
+			JOIN login_families f ON f.family_id = s.family_id AND f.user_id = s.user_id
+			JOIN users u ON u.id = s.user_id
+			WHERE s.sid = $1 AND s.user_id = $2 AND s.access_expires_at = $3
+				AND f.credential_epoch = $4 AND COALESCE(u.credential_epoch, '') = $4
+				AND f.terminal_at IS NULL
+		)`, sid, successor, claims.ExpiresAt.Time, claims.CredentialEpoch).Scan(&exactAuthority))
+	require.True(t, exactAuthority, "the actual signed token must match committed live family authority")
+	wsURL := "ws" + server.URL[len("http"):] + "/ws?token=" + wsToken
 	conn, response, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
@@ -410,6 +427,7 @@ func TestRemoveMemberDoesNotDeadlockAgainstDMMessageEdit(t *testing.T) {
 func TestRemoveMemberDoesNotDeadlockAgainstVoiceIngress(t *testing.T) {
 	db, convID, creator, target, h, _ := seedMemberRemovalFixture(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	removalCtx := actorCtx(ctx, t, db, creator.String()) // before the test takes any lock
 	defer cancel()
 
 	voiceTx, err := db.BeginTx(ctx, nil)
@@ -431,7 +449,7 @@ func TestRemoveMemberDoesNotDeadlockAgainstVoiceIngress(t *testing.T) {
 
 	removeDone := make(chan error, 1)
 	go func() {
-		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), creator.String(), "")
+		_, _, removeErr := h.removeMemberTx(removalCtx, convID, target.String(), creator.String(), "")
 		removeDone <- removeErr
 	}()
 
@@ -499,14 +517,15 @@ func TestOpposingActiveMemberRemovalsDoNotDeadlockAfterPrivateVoiceScopes(t *tes
 
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
+	ctxA, ctxC := actorCtx(ctx, t, db, actorA.String()), actorCtx(ctx, t, db, actorC.String())
 	type removalResult struct{ err error }
 	results := make(chan removalResult, 2)
 	go func() {
-		_, _, removeErr := hA.removeActiveMemberTx(ctx, conversationID, targetB, actorA.String(), "", preflightA)
+		_, _, removeErr := hA.removeActiveMemberTx(ctxA, conversationID, targetB, actorA.String(), "", preflightA)
 		results <- removalResult{err: removeErr}
 	}()
 	go func() {
-		_, _, removeErr := hC.removeActiveMemberTx(ctx, conversationID, targetD, actorC.String(), "", preflightC)
+		_, _, removeErr := hC.removeActiveMemberTx(ctxC, conversationID, targetD, actorC.String(), "", preflightC)
 		results <- removalResult{err: removeErr}
 	}()
 
@@ -529,6 +548,7 @@ func TestOpposingActiveMemberRemovalsDoNotDeadlockAfterPrivateVoiceScopes(t *tes
 			}
 			var pqErr *pq.Error
 			require.False(t, errors.As(result.err, &pqErr) && string(pqErr.Code) == "40P01", "opposing removals must serialize, not deadlock: %v", result.err)
+			t.Logf("opposing removal refused: %v", result.err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("opposing member removals exceeded liveness bound")
 		}
@@ -542,6 +562,7 @@ func TestInactiveCreatorRemovalSerializesBeforeErasureLocks(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	removalCtx := actorCtx(ctx, t, db, creator.String()) // before the test takes any lock
 	defer cancel()
 	erasureTx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
@@ -557,7 +578,7 @@ func TestInactiveCreatorRemovalSerializesBeforeErasureLocks(t *testing.T) {
 
 	removalDone := make(chan error, 1)
 	go func() {
-		_, _, removeErr := h.removeMemberTx(ctx, convID, creator.String(), creator.String(), "")
+		_, _, removeErr := h.removeMemberTx(removalCtx, convID, creator.String(), creator.String(), "")
 		removalDone <- removeErr
 	}()
 
@@ -599,6 +620,7 @@ func TestAdminRemovalAgainstCallerErasureCompletesWithoutDeadlock(t *testing.T) 
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	removalCtx := actorCtx(ctx, t, db, caller.String()) // before the test takes any lock
 	defer cancel()
 	erasureTx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
@@ -615,7 +637,7 @@ func TestAdminRemovalAgainstCallerErasureCompletesWithoutDeadlock(t *testing.T) 
 
 	removalDone := make(chan error, 1)
 	go func() {
-		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), caller.String(), "")
+		_, _, removeErr := h.removeMemberTx(removalCtx, convID, target.String(), caller.String(), "")
 		removalDone <- removeErr
 	}()
 

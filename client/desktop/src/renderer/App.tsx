@@ -55,6 +55,8 @@ import { useChannelStore } from './stores/chat/channelStore';
 import { useDMStore } from './stores/chat/dmStore';
 import { useVoiceStore } from './stores/voice/voiceStore';
 import { startBadgeSync } from './services/system/badgeSync';
+import { startTraySync } from './services/system/traySync';
+import { startTrayActionDispatcher } from './services/system/trayActionDispatcher';
 import { usePendingRegistrationStore } from './stores/auth/pendingRegistrationStore';
 // resetService is eagerly registered by main.tsx; local dynamic imports resolve
 // from that loaded module while avoiding direct feature-module cycles.
@@ -467,6 +469,19 @@ function App() {
     if (isPipWindow || !accessToken) return;
     return startBadgeSync();
   }, [isPipWindow, accessToken]);
+
+  // Tray icon/menu status. Not gated on accessToken: signed-out is itself a
+  // tray state and the sync must observe the logout to report it. The PiP
+  // window never owns the tray.
+  useEffect(() => {
+    if (isPipWindow) return undefined;
+    const stopSync = startTraySync();
+    const stopActions = startTrayActionDispatcher();
+    return () => {
+      stopSync();
+      stopActions();
+    };
+  }, [isPipWindow]);
 
   useEffect(() => {
     if (deepLinkInviteCode && deepLinkSessionReady) {

@@ -1,12 +1,16 @@
 package presencehook_test
 
 import (
+	"bytes"
+	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -79,22 +83,94 @@ func TestGraphPresenceCarriesNoAcceptedEdgeSQLOfItsOwn(t *testing.T) {
 	}
 }
 
-// Guard 2 (C2) — no POOLED probe anywhere in internal/ takes a row lock.
-//
-// Scoped to a pooled receiver (`something.db.QueryRowContext`) because a *sql.Tx
-// read may legitimately lock. On the pool no SET LOCAL lock_timeout applies, so
-// a locking clause there can block indefinitely — the unbounded wait the probe
-// contract exists to keep out of the gated path.
+// Guard 2 (C2) forbids locking pooled probes, including SKIP LOCKED reads.
+// The one reviewed owner mutation is recognized by its complete function AST,
+// not its filename, package, statement prefix or presence of SKIP LOCKED.
+// Its row-contention avoidance does not prevent DDL, pool or transport waits;
+// the independently checked ten-second context bounds those via cancellation.
 func TestNoPooledProbeTakesARowLock(t *testing.T) {
 	root := controlPlaneInternal(t)
-	lockClauses := []string{"FOR UPDATE", "FOR NO KEY UPDATE", "FOR SHARE", "FOR KEY SHARE"}
-
+	recognized, callers, boundedRounds, timeoutConstants := 0, 0, 0, 0
 	for _, path := range nonTestGoFiles(t, root) {
 		fset := token.NewFileSet()
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		require.NoError(t, err)
+		violations, accepted := pooledLockViolations(t, fset, file)
+		recognized += accepted
+		require.Empty(t, violations, "C2: locking pooled probe(s) in %s: %v", path, violations)
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fn, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "claimAuthRevocation" {
+					return true
+				}
+				callers++
+				require.Equal(t, "drainDueAuthRevocations", fn.Name.Name)
+				require.Equal(t, "r.claimAuthRevocation(ctx, candidate.OperationID)", astText(t, call))
+				return true
+			})
+			if file.Name.Name == "dmblock" && fn.Name.Name == "reconcileSecurityRound" {
+				boundedRounds++
+				body := astText(t, fn)
+				for _, fragment := range []string{
+					"roundCtx, cancel := context.WithTimeout(ctx, securityEjectionDrainTimeout)",
+					"defer cancel()", "r.drainDueAuthRevocations", "drain(roundCtx, limit)",
+				} {
+					require.Contains(t, body, fragment, "reviewed claim must retain bounded caller context")
+				}
+			}
+		}
+		if file.Name.Name == "dmblock" {
+			ast.Inspect(file, func(n ast.Node) bool {
+				spec, ok := n.(*ast.ValueSpec)
+				if !ok {
+					return true
+				}
+				for i, name := range spec.Names {
+					if name.Name == "securityEjectionDrainTimeout" {
+						timeoutConstants++
+						require.Len(t, spec.Values, len(spec.Names))
+						require.Equal(t, "10 * time.Second", astText(t, spec.Values[i]))
+					}
+				}
+				return true
+			})
+		}
+	}
+	require.Equal(t, 1, boundedRounds, "bounded round must remain present")
+	require.Equal(t, 1, timeoutConstants, "actual ten-second timeout must remain present")
+	require.Equal(t, 1, recognized, "exact reviewed atomic claim must remain present")
+	require.Equal(t, 1, callers, "claim must retain its sole bounded production caller")
+}
 
-		ast.Inspect(file, func(n ast.Node) bool {
+func astText(t *testing.T, n ast.Node) string {
+	t.Helper()
+	var out bytes.Buffer
+	require.NoError(t, format.Node(&out, token.NewFileSet(), n))
+	return strings.Join(strings.Fields(out.String()), " ")
+}
+
+func pooledLockViolations(t *testing.T, fset *token.FileSet, file *ast.File) ([]string, int) {
+	t.Helper()
+	expected, err := parser.ParseFile(token.NewFileSet(), "reviewed.go", "package dmblock\n"+reviewedAtomicClaim, 0)
+	require.NoError(t, err)
+	var violations []string
+	accepted := 0
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		exactClaim := ok && file.Name.Name == "dmblock" && astText(t, fn) == astText(t, expected.Decls[0])
+		if exactClaim {
+			accepted++
+		}
+		ast.Inspect(decl, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -104,7 +180,7 @@ func TestNoPooledProbeTakesARowLock(t *testing.T) {
 				return true
 			}
 			recv, ok := sel.X.(*ast.SelectorExpr)
-			if !ok || recv.Sel.Name != "db" { // pooled handle only
+			if !ok || recv.Sel.Name != "db" {
 				return true
 			}
 			for _, arg := range call.Args {
@@ -112,14 +188,66 @@ func TestNoPooledProbeTakesARowLock(t *testing.T) {
 				if !ok || lit.Kind != token.STRING {
 					continue
 				}
-				upper := strings.ToUpper(lit.Value)
-				for _, clause := range lockClauses {
-					require.NotContains(t, upper, clause,
-						"C2: pooled read at %s takes %s — no lock_timeout applies on the pool, "+
-							"so it can block indefinitely", fset.Position(lit.Pos()), clause)
+				query, err := strconv.Unquote(lit.Value)
+				require.NoError(t, err)
+				upper := strings.ToUpper(strings.Join(strings.Fields(query), " "))
+				for _, clause := range []string{"FOR UPDATE", "FOR NO KEY UPDATE", "FOR SHARE", "FOR KEY SHARE"} {
+					if strings.Contains(upper, clause) && !exactClaim {
+						violations = append(violations, fmt.Sprintf("%s takes %s", fset.Position(lit.Pos()), clause))
+					}
 				}
 			}
 			return true
 		})
 	}
+	return violations, accepted
 }
+
+func TestPooledLockGuardRecognizesOnlyReviewedAtomicClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name, source         string
+		accepted, violations int
+	}{
+		{"reviewed claim", reviewedAtomicClaim, 1, 0},
+		{"claim without skip locked", strings.Replace(reviewedAtomicClaim, " SKIP LOCKED", "", 1), 0, 1},
+		{"claim without due predicate", strings.Replace(reviewedAtomicClaim, "reconcile_after<=clock_timestamp()", "TRUE", 1), 0, 1},
+		{"claim without sealed predicate", strings.Replace(reviewedAtomicClaim, "sealed_at IS NOT NULL", "TRUE", 1), 0, 1},
+		{"claim without incomplete predicate", strings.Replace(reviewedAtomicClaim, "completed_at IS NULL", "TRUE", 1), 0, 1},
+		{"claim without exact owner", strings.Replace(reviewedAtomicClaim, "operation_id=$1", "TRUE", 1), 0, 1},
+		{"claim updates different row", strings.Replace(reviewedAtomicClaim, "o.operation_id=due.operation_id", "TRUE", 1), 0, 1},
+		{"claim renamed receiver", strings.ReplaceAll(reviewedAtomicClaim, "r.", "other."), 0, 1},
+		{"ordinary pooled share probe", "func probe() { p.db.QueryRowContext(ctx, \"SELECT 1 FOR SHARE\") }", 0, 1},
+		{"ordinary pooled key share probe", "func probe() { p.db.QueryRowContext(ctx, \"SELECT 1 FOR KEY SHARE\") }", 0, 1},
+		{"ordinary pooled no key update probe", "func probe() { p.db.QueryRowContext(ctx, \"SELECT 1 FOR NO KEY UPDATE\") }", 0, 1},
+		{"claim with extra locking read", strings.Replace(reviewedAtomicClaim, "var o AuthRevocation", "r.db.QueryRowContext(ctx, \"SELECT 1 FOR SHARE\")\nvar o AuthRevocation", 1), 0, 2},
+		{"ordinary pooled skip locked probe", "func (r *Reconciler) probe(ctx context.Context) { r.db.QueryRowContext(ctx, \"SELECT EXISTS(SELECT 1 FROM login_family_revocations FOR UPDATE SKIP LOCKED)\") }", 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", "package dmblock\n"+tc.source, 0)
+			require.NoError(t, err)
+			violations, accepted := pooledLockViolations(t, fset, file)
+			require.Equal(t, tc.accepted, accepted)
+			require.Len(t, violations, tc.violations)
+		})
+	}
+}
+
+// Pinned to the task6a reviewed owner claim. Any body/receiver/query change
+// requires renewed review; no other query in this function is silently exempt.
+const reviewedAtomicClaim = `func (r *Reconciler) claimAuthRevocation(ctx context.Context, operationID uuid.UUID) (AuthRevocation, error) {
+	var o AuthRevocation
+	err := r.db.QueryRowContext(ctx, ` + "`" + `WITH due AS (
+ SELECT operation_id FROM login_family_revocations
+ WHERE operation_id=$1 AND completed_at IS NULL AND sealed_at IS NOT NULL
+ AND reconcile_after<=clock_timestamp() FOR UPDATE SKIP LOCKED
+ ) UPDATE login_family_revocations o SET attempts=LEAST(o.attempts,2147483646)+1,
+ reconcile_after=clock_timestamp()+INTERVAL '10 seconds',updated_at=clock_timestamp()
+ FROM due WHERE o.operation_id=due.operation_id
+ RETURNING o.operation_id,o.user_id,o.scope,o.reason,o.attempts,o.created_at` + "`" + `, operationID).Scan(
+		&o.OperationID, &o.UserID, &o.Scope, &o.Reason, &o.Attempts, &o.CreatedAt)
+	if err != nil {
+		return AuthRevocation{}, fmt.Errorf("claim auth revocation: %w", err)
+	}
+	return o, nil
+}`

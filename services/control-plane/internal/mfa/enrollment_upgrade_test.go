@@ -33,7 +33,7 @@ import (
 // (TestPreMFASessionBypassIsSessionBoundAndConsumedOnce). These cases pin the
 // other half: which session an enrollment writes that key for.
 
-const enrollUser = "user-fixture"
+const enrollUser = fixtureUserID
 
 // enrollConn answers the reads the shared fake does not: whether MFA was ever
 // on for the account, verify-setup's four-column TOTP row, and the inline
@@ -171,6 +171,7 @@ func enrollRequest(path, body, sessionID string) (*gin.Context, *httptest.Respon
 	c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("user_id", enrollUser)
+	attachFamily(c, enrollUser)
 	if sessionID != "" {
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": sessionID})
 	}

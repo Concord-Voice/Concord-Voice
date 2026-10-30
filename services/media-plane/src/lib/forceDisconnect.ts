@@ -6,6 +6,8 @@ import {
   releaseVoiceEnforcementSession,
   type VoiceEnforcementSession,
 } from './voiceEnforcementSession.js';
+import { createVoiceAuthReceiver } from './voiceAuthReceiver.js';
+import type { RawRequestReceiver, VoiceAuthReceiverAdapters } from './voiceAuthReceiver.js';
 
 const DM_BLOCK_DISCONNECT_VERSION = 2;
 const DM_BLOCK_DISCONNECT_PROOF_VERSION = 'v2';
@@ -450,9 +452,15 @@ export function createVoiceEnforcementSessionEjectionHandler(
   io: ForceDisconnectIO,
   sharedSecret: string,
   localNodeBootID: string,
-  renewHealth?: () => void | Promise<void>
-): (natsData: Record<string, unknown>) => Promise<Record<string, unknown> | undefined> {
-  return async (natsData) => {
+  renewHealth?: () => void | Promise<void>,
+  adapters: VoiceAuthReceiverAdapters = {}
+): ((natsData: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>) & {
+  receive: RawRequestReceiver;
+} {
+  const handler = async (natsData: Record<string, unknown>) => {
+    // Raw protocol-4 envelopes are handled only by the verified receiver. Never
+    // let a mixed/unknown schema reach legacy health or room teardown.
+    if (Object.hasOwn(natsData, 'schema')) return undefined;
     if (natsData.kind === 'health') {
       return handleVoiceEnforcementHealthCommand(
         natsData,
@@ -480,6 +488,41 @@ export function createVoiceEnforcementSessionEjectionHandler(
     }
     return handleVoiceEnforcementSessionEjection(roomManager, io, natsData, sharedSecret);
   };
+  const terminalKeys = [
+    'version', 'parentGeneration', 'sessionGeneration', 'nodeBootId', 'roomId',
+    'roomKind', 'userId', 'credentialEpoch', 'socketId', 'timestamp', 'nonce', 'proof',
+  ];
+  const healthKeys = ['version', 'kind', 'nodeBootId', 'challenge', 'timestamp', 'proof'];
+  const receive = createVoiceAuthReceiver(sharedSecret, localNodeBootID, {
+    verify(data) {
+      const health = data.kind === 'health';
+      const keys = health ? healthKeys : terminalKeys;
+      if (Object.keys(data).length !== keys.length || keys.some((key) => !Object.hasOwn(data, key)))
+        return undefined;
+      if (health) {
+        return data.version === 2 && data.nodeBootId === localNodeBootID &&
+          typeof data.timestamp === 'string' && typeof data.challenge === 'string' &&
+          /^[0-9a-f]{64}$/.test(data.challenge) && verifiesProof(
+            proofKey(sharedSecret, VOICE_ENFORCEMENT_HEALTH_REQUEST_PROOF),
+            data.proof, data.timestamp, [localNodeBootID, data.challenge, 'health'], 'v1'
+          ) ? 'health' : undefined;
+      }
+      return data.version === VOICE_ENFORCEMENT_SESSION_EJECT_VERSION &&
+        isVoiceEnforcementSessionCommandShape(data, localNodeBootID) &&
+        hasValidVoiceEnforcementSessionProof(data, sharedSecret) ? 'terminal' : undefined;
+    },
+    terminalKey: (data) => JSON.stringify(terminalKeys.filter(
+      (key) => !['timestamp', 'nonce', 'proof', 'parentGeneration'].includes(key)
+    ).map((key) => data[key])),
+    terminal: async (data) => {
+      const response = await handler(data);
+      if (response === undefined) throw new Error('Exact room termination unconfirmed');
+    },
+    acknowledge: (data) => isVoiceEnforcementSessionCommandShape(data, localNodeBootID)
+      ? createVoiceEnforcementSessionAcknowledgement(data, sharedSecret) : undefined,
+    health: (data) => handler(data),
+  }, adapters);
+  return Object.assign(handler, { receive });
 }
 
 /**

@@ -15,6 +15,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -85,10 +87,18 @@ func (h *Handler) EraseAccount(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
 			return
 		}
+		if errors.Is(err, credepoch.ErrEpochMismatch) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+			return
+		}
 		if errors.Is(err, users.ErrErasureCandidateSetDrifted) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "account state changed; retry the deletion",
 			})
+			return
+		}
+		if errors.Is(err, loginfamily.ErrUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Authentication temporarily unavailable"})
 			return
 		}
 		if !errors.Is(err, presencecapture.ErrPostCommitDelivery) {

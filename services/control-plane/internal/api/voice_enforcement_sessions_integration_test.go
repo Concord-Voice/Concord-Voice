@@ -7,24 +7,23 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	protocol "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voiceauthprotocol"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-var voiceEnforcementIntegrationEpoch = strings.Repeat("0", 32)
-
-func setupVoiceEnforcementDM(t *testing.T, db *sql.DB) (uuid.UUID, uuid.UUID, uuid.UUID) {
+func setupVoiceEnforcementDM(t *testing.T, db *sql.DB, first uuid.UUID) (uuid.UUID, uuid.UUID) {
 	t.Helper()
-	first, second := dbtest.CreateUser(t, db), dbtest.CreateUser(t, db)
+	second := dbtest.CreateUser(t, db)
 	conversation := uuid.New()
 	_, err := db.Exec(`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, 'accepted')`, first, second)
 	require.NoError(t, err)
@@ -32,18 +31,26 @@ func setupVoiceEnforcementDM(t *testing.T, db *sql.DB) (uuid.UUID, uuid.UUID, uu
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`, conversation, first, second)
 	require.NoError(t, err)
-	return first, second, conversation
+	return second, conversation
 }
 
-func integrationVoiceSessionRequest(userID, conversation uuid.UUID) voiceEnforcementSessionRequest {
-	return voiceEnforcementSessionRequest{
-		SessionGeneration: uuid.NewString(),
-		NodeBootID:        uuid.NewString(),
-		RoomID:            conversation.String(),
-		RoomKind:          "dm",
-		UserID:            userID.String(),
-		CredentialEpoch:   "",
-		SocketID:          "socket-" + uuid.NewString(),
+func integrationVoiceSessionRequest(r *voiceAuthRig, roomID uuid.UUID, kind string) protocol.RoomRegister {
+	return protocol.RoomRegister{Schema: "concord.auth-room-binding", Version: 1, Mode: "attach", ConnectionGeneration: r.target.ConnectionGeneration, NodeBootID: r.target.NodeBootID, SocketID: r.target.SocketID, CredentialEpoch: r.epoch, SessionGeneration: uuid.NewString(), RoomID: roomID.String(), RoomKind: kind}
+}
+
+func requireVoiceEnforcementRows(t *testing.T, r *voiceAuthRig, request protocol.RoomRegister, expected int) {
+	t.Helper()
+	var sessions, bindings int
+	require.NoError(t, r.db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation=$1`, request.SessionGeneration).Scan(&sessions))
+	require.NoError(t, r.db.QueryRow(`SELECT count(*) FROM voice_auth_room_bindings WHERE session_generation=$1 AND connection_generation=$2`, request.SessionGeneration, request.ConnectionGeneration).Scan(&bindings))
+	assert.Equal(t, expected, sessions)
+	assert.Equal(t, expected, bindings, "room evidence must remain associated with its exact connection")
+}
+
+func rollbackVoiceEnforcementTx(t *testing.T, tx *sql.Tx) {
+	t.Helper()
+	if err := tx.Rollback(); !errors.Is(err, sql.ErrTxDone) {
+		require.NoError(t, err)
 	}
 }
 
@@ -69,23 +76,6 @@ func setupVoiceEnforcementChannel(t *testing.T, db *sql.DB, userID uuid.UUID) (u
 	return serverID, channelID
 }
 
-func insertVoiceEnforcementSessionTx(ctx context.Context, tx *sql.Tx, request voiceEnforcementSessionRequest) error {
-	status, err := guardVoiceEnforcementRegistration(ctx, tx, request)
-	if err != nil {
-		return err
-	}
-	if status != http.StatusNoContent {
-		return errors.New("voice enforcement registration guard did not admit request")
-	}
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO voice_enforcement_sessions
-			(session_generation, node_boot_id, room_id, room_kind, user_id, credential_epoch, socket_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		request.SessionGeneration, request.NodeBootID, request.RoomID, request.RoomKind,
-		request.UserID, request.CredentialEpoch, request.SocketID)
-	return err
-}
-
 func openVoiceEnforcementBlockTx(ctx context.Context, db *sql.DB) (*sql.Tx, int64, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -93,7 +83,10 @@ func openVoiceEnforcementBlockTx(ctx context.Context, db *sql.DB) (*sql.Tx, int6
 	}
 	var txID int64
 	if err := tx.QueryRowContext(ctx, `SELECT txid_current()`).Scan(&txID); err != nil {
-		_ = tx.Rollback()
+		rollbackErr := tx.Rollback()
+		if !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, rollbackErr)
+		}
 		return nil, 0, err
 	}
 	return tx, txID, nil
@@ -113,7 +106,10 @@ func beginVoiceEnforcementBlockTx(ctx context.Context, db *sql.DB, first, second
 		return nil, 0, err
 	}
 	if err := finishVoiceEnforcementBlockTx(ctx, tx, first, second); err != nil {
-		_ = tx.Rollback()
+		rollbackErr := tx.Rollback()
+		if !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, rollbackErr)
+		}
 		return nil, 0, err
 	}
 	return tx, txID, nil
@@ -123,140 +119,93 @@ func startVoiceEnforcementBlockTx(t *testing.T, db *sql.DB, first, second uuid.U
 	t.Helper()
 	tx, txID, err := beginVoiceEnforcementBlockTx(context.Background(), db, first, second)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = tx.Rollback() })
+	t.Cleanup(func() { rollbackVoiceEnforcementTx(t, tx) })
 	return tx, txID
 }
 
-// A2 and a block transition use the same users-first lock prefix. Whichever
-// transaction wins is allowed to finish, but the loser must not create a
-// false zero-row success or an untracked session.
+// The signed HTTP owner and block writer serialize on complete user authority.
 func TestVoiceEnforcementRegistrationRacesDMBlockReconciliation(t *testing.T) {
-	db, cleanup := dbtest.SetupTestDB(t)
-	t.Cleanup(cleanup)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
 	t.Run("block commits first and denies registration", func(t *testing.T) {
-		first, second, conversation := setupVoiceEnforcementDM(t, db)
-		blockTx, blockTxID := startVoiceEnforcementBlockTx(t, db, first, second)
-		request := integrationVoiceSessionRequest(first, conversation)
-		registrationResult := make(chan error, 1)
-		go func() {
-			registrationTx, err := db.BeginTx(ctx, nil)
-			if err != nil {
-				registrationResult <- err
-				return
-			}
-			defer func() { _ = registrationTx.Rollback() }()
-			registrationResult <- insertVoiceEnforcementSessionTx(ctx, registrationTx, request)
-		}()
-
-		dbtest.WaitForRowLockWaiter(t, db, blockTxID)
+		r := newVoiceAuthRig(t)
+		r.register(t)
+		second, conversation := setupVoiceEnforcementDM(t, r.db, r.userID)
+		request := integrationVoiceSessionRequest(r, conversation, "dm")
+		blockTx, blockTxID := startVoiceEnforcementBlockTx(t, r.db, r.userID, second)
+		wire, _ := r.signed(t, protocol.EndpointRoomRegister, request, r.token)
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- r.do(wire) }()
+		dbtest.WaitForRowLockWaiter(t, r.db, blockTxID)
 		require.NoError(t, blockTx.Commit())
-		require.ErrorIs(t, <-registrationResult, dmblock.ErrUnavailable)
-
-		var sessions int
-		require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&sessions))
-		assert.Zero(t, sessions, "post-revocation registration must not leave a session row")
+		response := <-done
+		require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		requireVoiceEnforcementRows(t, r, request, 0)
 	})
-
 	t.Run("registration commits first and leaves pending evidence", func(t *testing.T) {
-		first, second, conversation := setupVoiceEnforcementDM(t, db)
-		request := integrationVoiceSessionRequest(first, conversation)
-		registrationTx, err := db.BeginTx(ctx, nil)
+		r := newVoiceAuthRig(t)
+		binding := r.register(t)
+		second, conversation := setupVoiceEnforcementDM(t, r.db, r.userID)
+		request := integrationVoiceSessionRequest(r, conversation, "dm")
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+		// Pause the handler at its connection row, after its users/family prefix.
+		gate, err := r.db.BeginTx(ctx, nil)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = registrationTx.Rollback() })
-		require.NoError(t, insertVoiceEnforcementSessionTx(ctx, registrationTx, request))
+		t.Cleanup(func() { rollbackVoiceEnforcementTx(t, gate) })
+		var generation string
+		require.NoError(t, gate.QueryRowContext(ctx, `SELECT connection_generation FROM voice_auth_connections WHERE connection_generation=$1 FOR UPDATE`, r.target.ConnectionGeneration).Scan(&generation))
+		var gateTxID int64
+		var gatePID int
+		require.NoError(t, gate.QueryRowContext(ctx, `SELECT txid_current(),pg_backend_pid()`).Scan(&gateTxID, &gatePID))
+		wire, signedRequest := r.signed(t, protocol.EndpointRoomRegister, request, r.token)
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- r.do(wire) }()
+		dbtest.WaitForRowLockWaiter(t, r.db, gateTxID)
 		var registrationTxID int64
-		require.NoError(t, registrationTx.QueryRowContext(ctx, `SELECT txid_current()`).Scan(&registrationTxID))
-
-		type blockResult struct {
-			tx  *sql.Tx
-			err error
-		}
-		blockStarted := make(chan blockResult, 1)
+		require.NoError(t, r.db.QueryRowContext(ctx, `SELECT l.transactionid::text::bigint FROM pg_locks l WHERE l.locktype='transactionid' AND l.granted AND $1=ANY(pg_blocking_pids(l.pid))`, gatePID).Scan(&registrationTxID))
+		blockTx, _, err := openVoiceEnforcementBlockTx(ctx, r.db)
+		require.NoError(t, err)
+		t.Cleanup(func() { rollbackVoiceEnforcementTx(t, blockTx) })
 		blockFinished := make(chan error, 1)
-		go func() {
-			blockTx, _, blockErr := openVoiceEnforcementBlockTx(ctx, db)
-			if blockErr != nil {
-				blockStarted <- blockResult{err: blockErr}
-				return
-			}
-			blockStarted <- blockResult{tx: blockTx}
-			blockFinished <- finishVoiceEnforcementBlockTx(ctx, blockTx, first, second)
-		}()
-		var blockTx *sql.Tx
-		select {
-		case result := <-blockStarted:
-			blockTx = result.tx
-			require.NoError(t, result.err)
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		}
-		t.Cleanup(func() { _ = blockTx.Rollback() })
-		dbtest.WaitForRowLockWaiter(t, db, registrationTxID)
-		require.NoError(t, registrationTx.Commit())
+		go func() { blockFinished <- finishVoiceEnforcementBlockTx(ctx, blockTx, r.userID, second) }()
+		dbtest.WaitForRowLockWaiter(t, r.db, registrationTxID)
+		require.NoError(t, gate.Commit())
+		response := <-done
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		r.verify(t, protocol.EndpointRoomRegister, response, signedRequest, protocol.ExpectedResponse{Binding: &binding})
 		require.NoError(t, <-blockFinished)
 		require.NoError(t, blockTx.Commit())
-
-		var sessions, obligations int
-		require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&sessions))
-		require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_block_reconciliations WHERE user_a_id = LEAST($1::uuid, $2::uuid) AND user_b_id = GREATEST($1::uuid, $2::uuid)`, first, second).Scan(&obligations))
-		assert.Equal(t, 1, sessions, "pre-revocation session evidence must remain targetable")
-		assert.Equal(t, 1, obligations, "the block obligation must remain pending until media acknowledgement")
+		requireVoiceEnforcementRows(t, r, request, 1)
+		var obligations int
+		require.NoError(t, r.db.QueryRow(`SELECT count(*) FROM dm_block_reconciliations WHERE user_a_id=LEAST($1::uuid,$2::uuid) AND user_b_id=GREATEST($1::uuid,$2::uuid)`, r.userID, second).Scan(&obligations))
+		assert.Equal(t, 1, obligations, "block obligation remains pending until media acknowledgement")
 	})
 }
 
-// The credential fence has the same binary contract independently of the DM
-// graph: an old-epoch registration may finish before rotation, or it waits and
-// is rejected after the new epoch commits.
 func TestVoiceEnforcementRegistrationRacesCredentialEpochRotation(t *testing.T) {
-	db, cleanup := dbtest.SetupTestDB(t)
-	t.Cleanup(cleanup)
-	userID := dbtest.CreateUser(t, db)
-	_, channelID := setupVoiceEnforcementChannel(t, db, userID)
-	conversation := uuid.New()
-	_, err := db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, voiceEnforcementIntegrationEpoch, userID)
-	require.NoError(t, err)
-	request := integrationVoiceSessionRequest(userID, conversation)
-	request.RoomKind = "channel"
-	request.RoomID = channelID.String()
-	request.CredentialEpoch = voiceEnforcementIntegrationEpoch
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	r := newVoiceAuthRig(t)
+	r.register(t)
+	_, channelID := setupVoiceEnforcementChannel(t, r.db, r.userID)
+	request := integrationVoiceSessionRequest(r, channelID, "channel")
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	rotationTx, err := db.BeginTx(ctx, nil)
+	rotationTx, err := r.db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = rotationTx.Rollback() })
-	var locked uuid.UUID
-	require.NoError(t, rotationTx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&locked))
-	require.NoError(t, rotationTx.QueryRowContext(ctx, `UPDATE users SET credential_epoch = $1 WHERE id = $2 RETURNING id`, strings.Repeat("f", 32), userID).Scan(&locked))
+	t.Cleanup(func() { rollbackVoiceEnforcementTx(t, rotationTx) })
+	_, err = rotationTx.ExecContext(ctx, `UPDATE users SET credential_epoch=$1 WHERE id=$2`, strings.Repeat("f", 32), r.userID)
+	require.NoError(t, err)
 	var rotationTxID int64
 	require.NoError(t, rotationTx.QueryRowContext(ctx, `SELECT txid_current()`).Scan(&rotationTxID))
-
-	registrationResult := make(chan error, 1)
-	go func() {
-		registrationTx, beginErr := db.BeginTx(ctx, nil)
-		if beginErr != nil {
-			registrationResult <- beginErr
-			return
-		}
-		defer func() { _ = registrationTx.Rollback() }()
-		registrationResult <- insertVoiceEnforcementSessionTx(ctx, registrationTx, request)
-	}()
-	dbtest.WaitForRowLockWaiter(t, db, rotationTxID)
+	wire, _ := r.signed(t, protocol.EndpointRoomRegister, request, r.token)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- r.do(wire) }()
+	dbtest.WaitForRowLockWaiter(t, r.db, rotationTxID)
 	require.NoError(t, rotationTx.Commit())
-	require.ErrorIs(t, <-registrationResult, credepoch.ErrEpochMismatch)
-
-	var sessions int
-	require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&sessions))
-	assert.Zero(t, sessions, "old-epoch registration must not leave a session row")
+	response := <-done
+	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	requireVoiceEnforcementRows(t, r, request, 0)
 }
 
 func TestVoiceEnforcementRegistrationRechecksChannelAuthority(t *testing.T) {
-	db, cleanup := dbtest.SetupTestDB(t)
-	t.Cleanup(cleanup)
-
 	tests := []struct {
 		name   string
 		revoke func(t *testing.T, db *sql.DB, serverID, channelID, userID uuid.UUID)
@@ -303,34 +252,21 @@ func TestVoiceEnforcementRegistrationRechecksChannelAuthority(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			userID := dbtest.CreateUser(t, db)
-			serverID, channelID := setupVoiceEnforcementChannel(t, db, userID)
-			request := integrationVoiceSessionRequest(userID, channelID)
-			request.RoomKind = "channel"
-
-			registrationTx, err := db.BeginTx(context.Background(), nil)
-			require.NoError(t, err)
-			require.NoError(t, insertVoiceEnforcementSessionTx(context.Background(), registrationTx, request))
-			require.NoError(t, registrationTx.Commit())
-
-			var recorded int
-			require.NoError(t, db.QueryRow(`SELECT count(*) FROM voice_enforcement_sessions WHERE session_generation = $1`, request.SessionGeneration).Scan(&recorded))
-			require.Equal(t, 1, recorded, "the authority change must follow a valid exact-session registration")
-
-			unchangedTx, err := db.BeginTx(context.Background(), nil)
-			require.NoError(t, err)
-			status, err := guardVoiceEnforcementRegistration(context.Background(), unchangedTx, request)
-			require.NoError(t, err)
-			assert.Equal(t, http.StatusNoContent, status, "unchanged exact-session re-registration remains admitted")
-			require.NoError(t, unchangedTx.Rollback())
-
-			tc.revoke(t, db, serverID, channelID, userID)
-
-			revokedTx, err := db.BeginTx(context.Background(), nil)
-			require.NoError(t, err)
-			status, err = guardVoiceEnforcementRegistration(context.Background(), revokedTx, request)
-			assert.Equal(t, http.StatusForbidden, status, "the current channel authority must fence a previous exact session")
-			require.NoError(t, revokedTx.Rollback())
+			r := newVoiceAuthRig(t)
+			binding := r.register(t)
+			serverID, channelID := setupVoiceEnforcementChannel(t, r.db, r.userID)
+			request := integrationVoiceSessionRequest(r, channelID, "channel")
+			response, signedRequest := r.request(t, protocol.EndpointRoomRegister, request, r.token)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			r.verify(t, protocol.EndpointRoomRegister, response, signedRequest, protocol.ExpectedResponse{Binding: &binding})
+			requireVoiceEnforcementRows(t, r, request, 1)
+			request.Mode = "renew"
+			unchanged, _ := r.request(t, protocol.EndpointRoomRegister, request, r.token)
+			require.Equal(t, http.StatusOK, unchanged.Code, unchanged.Body.String())
+			tc.revoke(t, r.db, serverID, channelID, r.userID)
+			revoked, _ := r.request(t, protocol.EndpointRoomRegister, request, r.token)
+			assert.Equal(t, http.StatusForbidden, revoked.Code, revoked.Body.String())
+			requireVoiceEnforcementRows(t, r, request, 1)
 		})
 	}
 }

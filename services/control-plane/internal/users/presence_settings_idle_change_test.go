@@ -7,14 +7,11 @@ package users_test
 // cleanup marker that made every later change fail the same way.
 
 import (
-	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -23,16 +20,7 @@ import (
 
 func dialPresenceObserver(t *testing.T, ts *testhelpers.TestServer, userID string) {
 	t.Helper()
-	ticket := "presence-idle-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:presence-idle::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
-	srv := httptest.NewServer(ts.Router)
-	t.Cleanup(srv.Close)
-	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+srv.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-	require.Eventually(t, func() bool {
-		return ts.Hub.GetUserClientCount(uuid.MustParse(userID)) > 0
-	}, 2*time.Second, 10*time.Millisecond)
+	dialProfileObserver(t, ts, userID)
 }
 
 func patchPresenceTier(t *testing.T, ts *testhelpers.TestServer, user testhelpers.TestUser, field string, tier int) {

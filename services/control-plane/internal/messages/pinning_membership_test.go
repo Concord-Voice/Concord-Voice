@@ -3,6 +3,7 @@ package messages
 import (
 	"context"
 	"database/sql"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -27,11 +28,13 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 	t.Run("pin mutation", func(t *testing.T) {
 		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 		c, _ := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		ctx, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
 		_, err := h.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actorID)
 		require.NoError(t, err)
 		c, w := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		h.pinDMMessage(c, messageID, actorID, ctx.conversationID)
 		assert.Equal(t, http.StatusNotFound, w.Code)
 		var pinnedAt sql.NullTime
@@ -42,6 +45,7 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 	t.Run("pin already-pinned fallback", func(t *testing.T) {
 		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 		c, _ := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		ctx, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
 		_, err := h.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $1 WHERE id = $2`, actorID, messageID)
@@ -52,6 +56,7 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 		_, err = h.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actorID)
 		require.NoError(t, err)
 		c, w := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		h.pinDMMessage(c, messageID, actorID, ctx.conversationID)
 		assert.Equal(t, http.StatusNotFound, w.Code)
 		var pinnedAt time.Time
@@ -64,6 +69,7 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 	t.Run("unpin mutation", func(t *testing.T) {
 		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 		c, _ := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		ctx, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
 		_, err := h.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $1 WHERE id = $2`, actorID, messageID)
@@ -74,6 +80,7 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 		_, err = h.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actorID)
 		require.NoError(t, err)
 		c, w := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		h.unpinDMMessage(c, messageID, ctx.conversationID)
 		assert.Equal(t, http.StatusNotFound, w.Code)
 		var pinnedAt time.Time
@@ -86,11 +93,13 @@ func TestDMPinBranchesRecheckParticipantAfterContextLookup(t *testing.T) {
 	t.Run("unpin already-unpinned fallback", func(t *testing.T) {
 		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 		c, _ := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		ctx, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
 		_, err := h.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actorID)
 		require.NoError(t, err)
 		c, w := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		h.unpinDMMessage(c, messageID, ctx.conversationID)
 		assert.Equal(t, http.StatusNotFound, w.Code)
 		var pinnedAt sql.NullTime
@@ -110,6 +119,7 @@ func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 	t.Run("pin", func(t *testing.T) {
 		messageID, actorID, _, conversationID := seedDMReactionForAggregateTest(t, h)
 		c, _ := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		_, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
 		_, err := h.db.Exec(`
@@ -119,6 +129,8 @@ func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 		require.NoError(t, err)
 
 		c, w := pinBranchContext()
+
+		testdb.AttachRememberedActor(c, actorID)
 		c.Set("user_id", actorID)
 		h.pinDMMessage(c, messageID, actorID, conversationID)
 
@@ -133,6 +145,7 @@ func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 		_, err := h.db.Exec(`UPDATE dm_messages SET pinned_at = NOW(), pinned_by = $1 WHERE id = $2`, actorID, messageID)
 		require.NoError(t, err)
 		c, _ := pinBranchContext()
+		testdb.AttachRememberedActor(c, actorID)
 		_, ok := h.lookupMessageContext(c, messageID, actorID)
 		require.True(t, ok)
 		_, err = h.db.Exec(`
@@ -142,6 +155,8 @@ func TestDMPinClearAfterLookupCannotMutateHiddenMessage(t *testing.T) {
 		require.NoError(t, err)
 
 		c, w := pinBranchContext()
+
+		testdb.AttachRememberedActor(c, actorID)
 		c.Set("user_id", actorID)
 		h.unpinDMMessage(c, messageID, conversationID)
 

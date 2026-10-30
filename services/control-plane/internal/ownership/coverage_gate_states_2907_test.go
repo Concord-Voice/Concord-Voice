@@ -33,7 +33,7 @@ func TestOwnershipStateGuardsPreserveState(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handler{db: db, log: logger.New("ownership-coverage"), authority: noOpOwnershipAuthority{}}
-		err = h.executeTransfer(context.Background(), serverID.String(), transferID.String(), from.String(), to.String())
+		err = h.executeTransfer(dbtest.ActorContext(context.Background(), t, db, from.String()), serverID.String(), transferID.String(), from.String(), to.String())
 		require.ErrorIs(t, err, errToUserNotMember)
 		assertOwnershipState(t, db, serverID, from, "pending", transferID)
 	})
@@ -52,7 +52,7 @@ func TestOwnershipStateGuardsPreserveState(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handler{db: db, log: logger.New("ownership-coverage")}
-		_, err = h.executeReversal(context.Background(), &reversalRecord{
+		_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, from.String()), &reversalRecord{
 			transferID: transferID.String(), serverID: serverID.String(), fromUserID: from.String(), toUserID: to.String(),
 			completedAt: time.Now().Add(-time.Hour),
 		})

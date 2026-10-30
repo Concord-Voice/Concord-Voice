@@ -28,6 +28,7 @@ import {
   RESOLVER_CONFIG,
 } from '../../utils/ui/effectiveFont';
 import type { GifPlaybackMode } from '../../utils/ui/gifPlayback';
+import { TRAY_ICON_STYLES, type TrayIconStyle } from '../../../shared/trayStatus';
 import {
   type SetZoomFactor,
   UI_ZOOM_EPSILON,
@@ -95,6 +96,12 @@ export interface AppearanceSettings {
   fontHeadings: AppFontId;
   fontNavigation: AppFontId;
   fontMessages: AppFontId;
+  /**
+   * Tray / menu-bar icon style (tray status spec §2a). 'auto' follows the OS bar and shows
+   * status colours. Read by `buildTraySnapshot`; REQUIRED so `preferencesSync`'s explicit
+   * blob literal fails to compile if the key is forgotten.
+   */
+  trayIconStyle: TrayIconStyle;
 }
 
 /** Lower + upper bound for the STORED uiScale — the zoom-bridge slider range.
@@ -169,6 +176,7 @@ interface SettingsState {
   setFontHeadings: (id: AppFontId) => void;
   setFontNavigation: (id: AppFontId) => void;
   setFontMessages: (id: AppFontId) => void;
+  setTrayIconStyle: (style: TrayIconStyle) => void;
   setClientBehavior: (value: ClientBehavior) => void;
   setSubscriptionResetAcknowledged: (acknowledged: boolean) => void;
   setAllowNsfwContent: (allowed: boolean) => void;
@@ -190,6 +198,7 @@ const defaultAppearance: AppearanceSettings = {
   fontHeadings: 'default',
   fontNavigation: 'default',
   fontMessages: 'default',
+  trayIconStyle: 'auto',
 };
 
 /**
@@ -340,6 +349,10 @@ function applyFontLayers(layers: FontLayers) {
   d.fontBrand = layers.brand;
 }
 
+function isTrayIconStyle(v: unknown): v is TrayIconStyle {
+  return typeof v === 'string' && (TRAY_ICON_STYLES as readonly string[]).includes(v);
+}
+
 /** Storage and sync are outside the setters' reach: an unknown id or mode falls back. */
 function sanitizeFontSettings(a: AppearanceSettings): AppearanceSettings {
   const font = (v: unknown): AppFontId => (isAppFontId(v) ? v : APP_DEFAULT_FONT);
@@ -350,6 +363,7 @@ function sanitizeFontSettings(a: AppearanceSettings): AppearanceSettings {
     fontNavigation: font(a.fontNavigation),
     fontMessages: font(a.fontMessages),
     fontMode: isFontMode(a.fontMode) ? a.fontMode : 'one',
+    trayIconStyle: isTrayIconStyle(a.trayIconStyle) ? a.trayIconStyle : 'auto',
   };
 }
 
@@ -444,6 +458,10 @@ export const useSettingsStore = wrapStore(
           set((state) => ({ appearance: { ...state.appearance, fontNavigation } })),
         setFontMessages: (fontMessages) =>
           set((state) => ({ appearance: { ...state.appearance, fontMessages } })),
+
+        // Name is load-bearing (draftSettingsStore derives set<Key>).
+        setTrayIconStyle: (trayIconStyle) =>
+          set((state) => ({ appearance: { ...state.appearance, trayIconStyle } })),
 
         setSubscriptionResetAcknowledged: (subscriptionResetAcknowledged) =>
           set({ subscriptionResetAcknowledged }),

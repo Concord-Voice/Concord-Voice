@@ -3,11 +3,13 @@ package auth_test
 import (
 	"context"
 	"database/sql"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -18,11 +20,11 @@ import (
 func TestStartTokenTheftRecoveryWorker_CompletesStartupRecoveryBeforeReturning(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "token-theft-recovery")
-	_, err := ts.DB.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
-		uuid.New(), user.ID, auth.HashRefreshToken("startup-recovery-session"),
-	)
+	minter := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, nil)
+	access, _, sid, err := minter.IssueAccessAndRefresh(t.Context(), user.ID)
 	require.NoError(t, err)
+	require.NotEmpty(t, access)
+
 	require.NoError(t, auth.EnqueueTokenTheftRevocation(context.Background(), ts.DB, user.ID))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -41,9 +43,22 @@ func TestStartTokenTheftRecoveryWorker_CompletesStartupRecoveryBeforeReturning(t
 
 	var revokedAt sql.NullTime
 	require.NoError(t, ts.DB.QueryRow(
-		`SELECT revoked_at FROM refresh_tokens WHERE user_id = $1`, user.ID,
+		`SELECT revoked_at FROM refresh_tokens WHERE id = $1 AND user_id=$2`, sid, user.ID,
 	).Scan(&revokedAt))
 	require.True(t, revokedAt.Valid)
+	var terminal, theftOwner bool
+	var owner string
+	require.NoError(t, ts.DB.QueryRow(`SELECT f.terminal_at IS NOT NULL, f.auth_operation_id,
+		o.reason='theft' AND o.scope='user' AND o.sealed_at IS NOT NULL
+		AND EXISTS (SELECT 1 FROM login_family_revocation_targets t WHERE t.operation_id=o.operation_id AND t.family_id=f.family_id AND t.user_id=f.user_id)
+		FROM login_family_sids s JOIN login_families f USING (family_id,user_id)
+		JOIN login_family_revocations o ON o.operation_id=f.auth_operation_id AND o.user_id=f.user_id
+		WHERE s.sid=$1 AND s.user_id=$2`, sid, user.ID).Scan(&terminal, &owner, &theftOwner))
+	assert.True(t, terminal)
+	assert.True(t, theftOwner)
+	assert.NotEmpty(t, owner)
+	denied := ts.DoRequest(http.MethodGet, pathUsersMe, nil, testhelpers.AuthHeaders(access))
+	require.Equal(t, http.StatusUnauthorized, denied.Code, denied.Body.String())
 }
 
 func TestProcessTokenTheftRevocation_SkipsCompletedRecord(t *testing.T) {
@@ -171,11 +186,10 @@ func TestRecoverPendingTokenTheftRevocations_RetiresSupersededLegacyFallback(t *
 	user := ts.CreateTestUser(t, "token-theft-superseded-legacy")
 	ctx := context.Background()
 	const legacyFallbackKey = "token_theft_pending_revocations:fallback"
-	_, err := ts.DB.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
-		uuid.New(), user.ID, auth.HashRefreshToken("pre-recovery-token"),
-	)
+	minter := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, nil)
+	access, _, sid, err := minter.IssueAccessAndRefresh(t.Context(), user.ID)
 	require.NoError(t, err)
+
 	require.NoError(t, auth.EnqueueTokenTheftRevocation(ctx, ts.DB, user.ID))
 	require.NoError(t, ts.Redis.SAdd(ctx, legacyFallbackKey, user.ID).Err())
 
@@ -186,11 +200,33 @@ func TestRecoverPendingTokenTheftRevocations_RetiresSupersededLegacyFallback(t *
 	legacyPending, err := ts.Redis.SIsMember(ctx, legacyFallbackKey, user.ID).Result()
 	require.NoError(t, err)
 	assert.False(t, legacyPending)
-	_, err = ts.DB.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
-		uuid.New(), user.ID, auth.HashRefreshToken("post-recovery-token"),
-	)
+
+	var terminal, theftOwner bool
+	var owner string
+	require.NoError(t, ts.DB.QueryRow(`SELECT f.terminal_at IS NOT NULL, f.auth_operation_id,
+		o.reason='theft' AND o.scope='user' AND o.sealed_at IS NOT NULL
+		AND EXISTS (SELECT 1 FROM login_family_revocation_targets t WHERE t.operation_id=o.operation_id AND t.family_id=f.family_id AND t.user_id=f.user_id)
+		FROM login_family_sids s JOIN login_families f USING (family_id,user_id)
+		JOIN login_family_revocations o ON o.operation_id=f.auth_operation_id AND o.user_id=f.user_id
+		WHERE s.sid=$1 AND s.user_id=$2`, sid, user.ID).Scan(&terminal, &owner, &theftOwner))
+	assert.True(t, terminal)
+	assert.True(t, theftOwner)
+	assert.NotEmpty(t, owner)
+	denied := ts.DoRequest(http.MethodGet, pathUsersMe, nil, testhelpers.AuthHeaders(access))
+	require.Equal(t, http.StatusUnauthorized, denied.Code, denied.Body.String())
+
+	var oldRevoked sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE id=$1 AND user_id=$2`, sid, user.ID).Scan(&oldRevoked))
+	require.True(t, oldRevoked.Valid)
+	freshAccess, freshRefresh, freshSID, err := minter.IssueAccessAndRefresh(t.Context(), user.ID)
 	require.NoError(t, err)
+	require.NotEqual(t, sid, freshSID)
+	var oldFamily, freshFamily string
+	require.NoError(t, ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1`, sid).Scan(&oldFamily))
+	require.NoError(t, ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1`, freshSID).Scan(&freshFamily))
+	require.NotEqual(t, oldFamily, freshFamily)
+	live := ts.DoRequest(http.MethodGet, pathUsersMe, nil, testhelpers.AuthHeaders(freshAccess))
+	require.Equal(t, http.StatusOK, live.Code, live.Body.String())
 
 	require.NoError(t, auth.RecoverPendingTokenTheftRevocations(ctx, ts.DB, ts.Redis, logger.New("test")))
 	require.NoError(t, ts.DB.QueryRow(`SELECT token_theft_generation FROM users WHERE id = $1`, user.ID).Scan(&generation))
@@ -200,6 +236,28 @@ func TestRecoverPendingTokenTheftRevocations_RetiresSupersededLegacyFallback(t *
 		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, user.ID,
 	).Scan(&active))
 	assert.Equal(t, 1, active)
+	var freshLive, freshUnrevoked bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT f.terminal_at IS NULL AND f.auth_operation_id IS NULL AND f.epoch_generation IS NULL, r.revoked_at IS NULL
+		FROM login_family_sids s JOIN login_families f USING (family_id,user_id)
+		JOIN refresh_tokens r ON r.id=s.sid AND r.user_id=s.user_id WHERE s.sid=$1 AND f.family_id=$2`, freshSID, freshFamily).Scan(&freshLive, &freshUnrevoked))
+	assert.True(t, freshLive)
+	assert.True(t, freshUnrevoked)
+	var replayOwner string
+	require.NoError(t, ts.DB.QueryRow(`SELECT auth_operation_id FROM login_families WHERE family_id=$1 AND terminal_at IS NOT NULL`, oldFamily).Scan(&replayOwner))
+	assert.Equal(t, owner, replayOwner)
+	var pending int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM token_theft_pending_revocations WHERE user_id=$1`, user.ID).Scan(&pending))
+	assert.Zero(t, pending)
+	legacyPending, err = ts.Redis.SIsMember(ctx, legacyFallbackKey, user.ID).Result()
+	require.NoError(t, err)
+	assert.False(t, legacyPending)
+	blocked, err := ts.Redis.Exists(ctx, middleware.TokenTheftBlockedKey(user.ID)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, blocked)
+	live = ts.DoRequest(http.MethodGet, pathUsersMe, nil, testhelpers.AuthHeaders(freshAccess))
+	require.Equal(t, http.StatusOK, live.Code, live.Body.String())
+	rotated := ts.DoRequest(http.MethodPost, pathRefresh, nil, http.Header{"X-Refresh-Token": {freshRefresh}})
+	require.Equal(t, http.StatusOK, rotated.Code, rotated.Body.String())
 }
 
 func TestRecoverPendingTokenTheftRevocations_FsyncsLegacyRetirementForCompletedRow(t *testing.T) {

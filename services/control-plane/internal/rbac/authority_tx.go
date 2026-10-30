@@ -13,6 +13,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -204,6 +205,11 @@ func (h *Handler) withAuthorityCapture(
 	var lifecyclePrincipalIDs []string
 	principalIDs, lifecyclePrincipalIDs = splitAuthorityLifecyclePrincipals(principalIDs)
 	if err := lockAuthorityLifecyclePrincipalsTx(ctx, tx, lifecyclePrincipalIDs); err != nil {
+		return nil, err
+	}
+	// #2272 lock contract amendment 7: the shared writer barrier precedes every
+	// users lock; the write callback's credepoch.GuardFamilyTx then reuses it.
+	if _, err := loginfamily.AcquireWriterBarrierTx(ctx, tx); err != nil {
 		return nil, err
 	}
 	// Users precede domain parents. Authority writes can insert revoked_by and
@@ -579,7 +585,7 @@ func (h *Handler) withServerChannelKeyAuthorityMutation(
 		}
 		plan, err := h.withAuthorityCapture(ctx, serverID, preflight.voice, nil,
 			func(ctx context.Context, tx *sql.Tx) error {
-				if err := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); err != nil {
+				if err := credepoch.GuardFamilyTx(ctx, tx, actorID, tokenEpoch); err != nil {
 					return err
 				}
 				var writeErr error

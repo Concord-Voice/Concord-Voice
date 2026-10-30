@@ -4,117 +4,168 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
+	"github.com/google/uuid"
 )
 
-// ErrNoActiveRefreshSession reports that no requested preserved session remains active.
+// ErrNoActiveRefreshSession reports that the requested preserved family cannot be verified.
 var ErrNoActiveRefreshSession = errors.New("no active refresh session")
 
-// RevokeAllRefreshTokensOptions controls a serialized bulk revocation.
+// RevokeAllRefreshTokensOptions controls a serialized captured-family revocation.
 type RevokeAllRefreshTokensOptions struct {
 	ExcludeTokenHash        string
 	ExcludeSessionID        string
+	ExcludeAccessExpiresAt  time.Time
 	ExpectedCredentialEpoch string
 	EnforceCredentialEpoch  bool
 }
 
-// RevokeAllRefreshTokens revokes a user's active refresh tokens. It serializes
-// with session mints on the users row and can preserve the authenticated session.
-func RevokeAllRefreshTokens(ctx context.Context, db *sql.DB, userID string, options RevokeAllRefreshTokensOptions) (result sql.Result, err error) {
+// RevokeAllRefreshTokens commits a fixed family frontier. Counts describe changed
+// refresh rows, including expired rows; Owners retain original delivery ownership.
+func RevokeAllRefreshTokens(ctx context.Context, db *sql.DB, userID string, options RevokeAllRefreshTokensOptions) (result loginfamily.RevocationResult, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("begin refresh-token revocation transaction: %w", err)
+		return result, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			err = errors.Join(err, fmt.Errorf("rollback refresh-token revocation transaction: %w", rollbackErr))
+			err = errors.Join(err, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, rollbackErr))
+			result = loginfamily.RevocationResult{}
 		}
 	}()
-	result, err = revokeAllRefreshTokensTx(ctx, tx, userID, options)
+	user, err := lockMintUserTx(ctx, tx, userID)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit refresh-token revocation transaction: %w", err)
+	if err = matchRevocationEpochTx(ctx, tx, userID, options); err != nil {
+		return result, err
+	}
+	preserve, err := preservedFamilyIdentityTx(ctx, tx, userID, options)
+	if err != nil {
+		return result, err
+	}
+	targets, err := loginfamily.CaptureUserTargetsTx(ctx, tx, user, preserve)
+	if err != nil {
+		var classified *loginfamily.Error
+		if errors.As(err, &classified) && classified.Reason() == loginfamily.ReasonPreserveUnknown {
+			return result, ErrNoActiveRefreshSession
+		}
+		return result, err
+	}
+	result, err = loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeUser, Reason: loginfamily.ReasonExplicitRevoke})
+	if err != nil {
+		return loginfamily.RevocationResult{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		// The revocation may be durable: keep only the owner locators, so the
+		// caller can fence whatever committed without reporting success.
+		return loginfamily.RevocationResult{Owners: result.Owners}, loginfamily.NewError(loginfamily.ReasonCommitUnknown, err)
 	}
 	return result, nil
 }
 
-// revokeAllRefreshTokensTx performs a serialized bulk refresh-token revocation
-// inside the caller's transaction.
-func revokeAllRefreshTokensTx(ctx context.Context, tx *sql.Tx, userID string, options RevokeAllRefreshTokensOptions) (result sql.Result, err error) {
-	var credentialEpoch sql.NullString
-	if err := tx.QueryRowContext(ctx,
-		`SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
-	).Scan(&credentialEpoch); err != nil {
-		return nil, fmt.Errorf("lock refresh-token revocation user: %w", err)
+func matchRevocationEpochTx(ctx context.Context, tx *sql.Tx, userID string, options RevokeAllRefreshTokensOptions) error {
+	if !options.EnforceCredentialEpoch {
+		return nil
 	}
-
-	if options.EnforceCredentialEpoch {
-		if err := credepoch.MatchEpoch(credentialEpoch, options.ExpectedCredentialEpoch); err != nil {
-			return nil, fmt.Errorf("match refresh-token revocation credential epoch: %w", err)
-		}
+	var epoch sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT credential_epoch FROM users WHERE id=$1`, userID).Scan(&epoch); err != nil {
+		return loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
 	}
+	if err := credepoch.MatchEpoch(epoch, options.ExpectedCredentialEpoch); err != nil {
+		return err
+	}
+	// Session revocation does not rotate the epoch, so the epoch alone cannot
+	// tell that the requesting login was revoked while this request waited.
+	// Revalidate the middleware-verified family under the user lock just taken.
+	identity, ok := loginfamily.AccessIdentityFromContext(ctx)
+	if !ok || identity.UserID.String() != userID || identity.CredentialEpoch != options.ExpectedCredentialEpoch {
+		return credepoch.ErrEpochMismatch
+	}
+	return loginfamily.GuardLockedActorFamilyTx(ctx, tx, identity)
+}
 
-	if options.ExcludeSessionID != "" || options.ExcludeTokenHash != "" {
-		excludeSessionID, resolveErr := activeRefreshSessionID(ctx, tx, userID, options)
-		if resolveErr != nil {
-			return nil, resolveErr
+// A selected bearer SID never falls through to an ambient cookie. Immutable SID
+// membership survives refresh rotation and refresh-row retention cleanup.
+func preservedFamilyIdentityTx(ctx context.Context, tx *sql.Tx, userID string, options RevokeAllRefreshTokensOptions) (*loginfamily.AccessIdentity, error) {
+	if options.ExcludeSessionID == "" && options.ExcludeTokenHash == "" {
+		return nil, nil
+	}
+	identity := &loginfamily.AccessIdentity{}
+	var err error
+	identity.UserID, err = uuid.Parse(userID)
+	if err != nil {
+		return nil, ErrNoActiveRefreshSession
+	}
+	query := `SELECT s.sid,s.access_expires_at,f.credential_epoch FROM login_family_sids s
+ JOIN login_families f ON f.family_id=s.family_id AND f.user_id=s.user_id
+ WHERE s.user_id=$1 AND s.sid=$2`
+	target := options.ExcludeSessionID
+	if target != "" {
+		if _, err := uuid.Parse(target); err != nil {
+			return nil, ErrNoActiveRefreshSession
 		}
-		result, err = tx.ExecContext(ctx,
-			`UPDATE refresh_tokens SET revoked_at = NOW()
-			 WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL`,
-			userID, excludeSessionID)
 	} else {
-		result, err = tx.ExecContext(ctx,
-			`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+		query = `SELECT s.sid,s.access_expires_at,f.credential_epoch FROM refresh_tokens r
+  JOIN login_family_sids s ON s.sid=r.id AND s.user_id=r.user_id
+  JOIN login_families f ON f.family_id=s.family_id AND f.user_id=s.user_id
+  WHERE r.user_id=$1 AND r.token_hash=$2 AND r.revoked_at IS NULL AND r.expires_at>clock_timestamp()`
+		target = options.ExcludeTokenHash
 	}
-	if err != nil {
-		return nil, fmt.Errorf("revoke refresh tokens: %w", err)
+	if err := tx.QueryRowContext(ctx, query, userID, target).Scan(&identity.SID, &identity.AccessExpiresAt, &identity.CredentialEpoch); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoActiveRefreshSession
+		}
+		return nil, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
 	}
-	return result, nil
+	if options.ExcludeSessionID != "" && !options.ExcludeAccessExpiresAt.IsZero() {
+		identity.AccessExpiresAt = options.ExcludeAccessExpiresAt
+	}
+	if options.EnforceCredentialEpoch {
+		identity.CredentialEpoch = options.ExpectedCredentialEpoch
+	}
+	return identity, nil
 }
 
-// activeRefreshSessionID resolves the active session that bulk revocation must preserve.
-// The caller already holds the user lock; this row lock also serializes individual
-// session revocation with the following bulk update.
-func activeRefreshSessionID(
-	ctx context.Context,
-	tx *sql.Tx,
-	userID string,
-	options RevokeAllRefreshTokensOptions,
-) (string, error) {
-	if options.ExcludeSessionID != "" {
-		var sessionID string
-		err := tx.QueryRowContext(ctx,
-			`SELECT id FROM refresh_tokens
-			 WHERE user_id = $1 AND id = $2 AND revoked_at IS NULL AND expires_at > NOW()
-			 FOR UPDATE`, userID, options.ExcludeSessionID,
-		).Scan(&sessionID)
-		if err == nil {
-			return sessionID, nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("resolve active bearer refresh session: %w", err)
-		}
+// RevokeRefreshSession terminalizes an owned SID's entire logical login, even
+// when the selected refresh row has rotated, expired, or already been purged.
+func RevokeRefreshSession(ctx context.Context, db *sql.DB, userID, sessionID, expectedEpoch string) (result loginfamily.RevocationResult, err error) {
+	sid, parseErr := uuid.Parse(sessionID)
+	if parseErr != nil || sid == uuid.Nil {
+		return result, loginfamily.NewError(loginfamily.ReasonTargetUnknown, nil)
 	}
-
-	if options.ExcludeTokenHash != "" {
-		var sessionID string
-		err := tx.QueryRowContext(ctx,
-			`SELECT id FROM refresh_tokens
-			 WHERE user_id = $1 AND token_hash = $2 AND revoked_at IS NULL AND expires_at > NOW()
-			 FOR UPDATE`, userID, options.ExcludeTokenHash,
-		).Scan(&sessionID)
-		if err == nil {
-			return sessionID, nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("resolve active cookie refresh session: %w", err)
-		}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
 	}
-
-	return "", ErrNoActiveRefreshSession
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, rollbackErr))
+			result = loginfamily.RevocationResult{}
+		}
+	}()
+	user, err := lockMintUserTx(ctx, tx, userID)
+	if err != nil {
+		return result, err
+	}
+	if err = matchRevocationEpochTx(ctx, tx, userID, RevokeAllRefreshTokensOptions{ExpectedCredentialEpoch: expectedEpoch, EnforceCredentialEpoch: true}); err != nil {
+		return result, err
+	}
+	targets, err := loginfamily.ResolveTargetSIDTx(ctx, tx, user, sid)
+	if err != nil {
+		return result, err
+	}
+	result, err = loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeSession, Reason: loginfamily.ReasonExplicitRevoke})
+	if err != nil {
+		return loginfamily.RevocationResult{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		// The revocation may be durable: keep only the owner locators, so the
+		// caller can fence whatever committed without reporting success.
+		return loginfamily.RevocationResult{Owners: result.Owners}, loginfamily.NewError(loginfamily.ReasonCommitUnknown, err)
+	}
+	return result, nil
 }

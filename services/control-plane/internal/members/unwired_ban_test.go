@@ -73,7 +73,8 @@ func TestExecBanTxOnAnUnwiredReplicaIsNotAStaleProbe(t *testing.T) {
 	// probedMember=false is what the probe reports for a target it could not
 	// confirm; on a wired replica that selects the ungated path. Unwired, it
 	// must make no difference at all.
-	err = h.execBanTx(context.Background(), serverID.String(), target.String(), owner.String(), nil, false)
+	// The family guard (#2272) needs the actor's signed identity below the router.
+	err = h.execBanTx(dbtest.ActorContext(context.Background(), t, db, owner.String()), serverID.String(), target.String(), owner.String(), nil, false)
 
 	require.NoError(t, err, "an unwired replica must ban normally; it is not a stale probe")
 	require.NotErrorIs(t, err, presencehook.ErrProbeStale)
@@ -97,7 +98,8 @@ func TestExecBanTxOnAnUnwiredReplicaAllowsPreemptiveBan(t *testing.T) {
 	h := &Handler{db: db, log: log, resolver: resolver}
 	h.SetAuthorityHandler(rbac.NewHandler(db, log, nil, nil, resolver, nil, nil))
 
-	err := h.execBanTx(context.Background(), serverID.String(), stranger.String(), owner.String(), nil, false)
+	// The family guard (#2272) needs the actor's signed identity below the router.
+	err := h.execBanTx(dbtest.ActorContext(context.Background(), t, db, owner.String()), serverID.String(), stranger.String(), owner.String(), nil, false)
 	require.NoError(t, err, "an unwired preemptive ban must not be treated as a stale member probe")
 
 	var bans int

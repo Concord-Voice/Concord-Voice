@@ -95,7 +95,7 @@ func (h *Handler) deleteDMMessageUnderSoftLock(
 // nothing else.
 func (h *Handler) deleteDMMessageUnconfirmed(c *gin.Context, t dmMessageDeleteTarget) (dmDeletedMessage, bool) {
 	deleted, err := h.deleteDMMessageTx(c.Request.Context(), t, func(ctx context.Context, tx *sql.Tx) error {
-		return credepoch.GuardTx(ctx, tx, t.userID, t.tokenEpoch)
+		return credepoch.GuardFamilyTx(ctx, tx, t.userID, t.tokenEpoch)
 	})
 	if err != nil {
 		// No step-up runs on this path, so no *stepup.Error can reach the
@@ -183,6 +183,10 @@ func (h *Handler) confirmDMDeleteTx(
 	subject, stepErr := stepup.LockSubjectTx(ctx, tx, t.userID, stepup.LockForShare, t.tokenEpoch)
 	if stepErr != nil {
 		return dmDeleteConfirmation{}, stepErr
+	}
+	// #2272: the same exact-family fence the ordinary delete path takes.
+	if err := credepoch.GuardFamilyTx(ctx, tx, t.userID, t.tokenEpoch); err != nil {
+		return dmDeleteConfirmation{}, err
 	}
 	if grace.Covers(stepup.PurposeDMMessageDelete, stepup.GraceOwnRule, subject) {
 		return dmDeleteConfirmation{outcome: mfaenforce.GraceCovered}, nil

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -139,8 +141,11 @@ func SetupTestServerWithRouterDB(t *testing.T, routerDB *sql.DB) *TestServer {
 	logBuf := &SyncBuffer{}
 	log := logger.NewWithWriter(io.MultiWriter(os.Stdout, logBuf))
 
+	if routerDB == nil {
+		routerDB = db
+	}
 	disclosure := presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: "saas"})
-	presenceHistoryService := presencehistory.NewService(db, disclosure, true)
+	presenceHistoryService := presencehistory.NewService(routerDB, disclosure, true)
 
 	// Register dependency cleanup first so LIFO execution closes Hub, operations
 	// metrics, the permission enforcer, and NATS before Redis/DB.
@@ -148,9 +153,6 @@ func SetupTestServerWithRouterDB(t *testing.T, routerDB *sql.DB) *TestServer {
 		redisCleanup()
 		dbCleanup()
 	})
-	if routerDB == nil {
-		routerDB = db
-	}
 	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, activePlanReconciler, completeExpiredTransfers, err := api.NewRouter(
 		t.Context(),
 		routerDB,
@@ -271,10 +273,8 @@ func (ts *TestServer) createTestUserWithVerification(t *testing.T, username stri
 
 	ts.insertE2EEKeys(t, userID)
 
-	accessToken, err := auth.GenerateAccessToken(userID, TestJWTSecret, emailVerified, "", "")
-	if err != nil {
-		t.Fatalf("testhelpers: failed to generate access token: %v", err)
-	}
+	accessToken := ts.createAccessOnlyFamilyFixture(t, userID, false)
+	issuedAccessTokens.Store(userID, accessToken)
 
 	return TestUser{
 		ID:          userID,
@@ -298,14 +298,73 @@ func (ts *TestServer) CreateTestUser(t *testing.T, username string) TestUser {
 func (ts *TestServer) VerifyUserEmail(t *testing.T, userID string) string {
 	t.Helper()
 
-	_, err := ts.DB.Exec(`UPDATE users SET email_verified = true WHERE id = $1`, userID)
-	if err != nil {
-		t.Fatalf("testhelpers: failed to verify user email: %v", err)
-	}
+	return ts.createAccessOnlyFamilyFixture(t, userID, true)
+}
 
-	token, err := auth.GenerateAccessToken(userID, TestJWTSecret, true, "", "")
+// createAccessOnlyFamilyFixture creates a fresh family and SID on every call.
+// These fixtures intentionally have no refresh row or cookie, preserving tests'
+// session counts. Verification never reuses or rewrites an immutable SID expiry.
+func (ts *TestServer) createAccessOnlyFamilyFixture(t *testing.T, userID string, verifyEmail bool) string {
+	t.Helper()
+	return createAccessOnlyFamilyFixtureDB(t, ts.DB, userID, verifyEmail)
+}
+
+func createAccessOnlyFamilyFixtureDB(t testing.TB, db *sql.DB, userID string, verifyEmail bool) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := uuid.Parse(userID)
 	if err != nil {
-		t.Fatalf("testhelpers: failed to generate verified token: %v", err)
+		t.Fatalf("testhelpers: invalid access-only fixture user: %v", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("testhelpers: begin access-only fixture: %v", err)
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("testhelpers: rollback access-only fixture: %v", err)
+		}
+	}()
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		t.Fatalf("testhelpers: access-only fixture writer barrier: %v", err)
+	}
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{id}, loginfamily.UserNoKeyUpdate)
+	if err != nil {
+		t.Fatalf("testhelpers: lock access-only fixture user: %v", err)
+	}
+	user, err := users.ForUser(id)
+	if err != nil {
+		t.Fatalf("testhelpers: access-only fixture user authority: %v", err)
+	}
+	if verifyEmail {
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET email_verified = true WHERE id = $1`, id); err != nil {
+			t.Fatalf("testhelpers: verify access-only fixture email: %v", err)
+		}
+	}
+	var epoch string
+	var verified bool
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(credential_epoch, ''), email_verified FROM users WHERE id = $1`, id).Scan(&epoch, &verified); err != nil {
+		t.Fatalf("testhelpers: read access-only fixture claims: %v", err)
+	}
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, user, epoch)
+	if err != nil {
+		t.Fatalf("testhelpers: create access-only fixture family: %v", err)
+	}
+	sid := uuid.New()
+	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{UserID: id, SID: sid, CredentialEpoch: epoch, EmailVerified: verified}, time.Now())
+	if err != nil {
+		t.Fatalf("testhelpers: prepare access-only fixture token: %v", err)
+	}
+	if err := loginfamily.BindSIDTx(ctx, tx, family, sid, prepared.ExpiresAt()); err != nil {
+		t.Fatalf("testhelpers: bind access-only fixture SID: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("testhelpers: commit access-only fixture: %v", err)
+	}
+	token, err := prepared.Sign(TestJWTSecret)
+	if err != nil {
+		t.Fatalf("testhelpers: sign access-only fixture token: %v", err)
 	}
 	return token
 }
@@ -675,30 +734,4 @@ func (ts *TestServer) CreateVoiceChannel(t *testing.T, serverID, name string) st
 		t.Fatalf("testhelpers: failed to create voice channel: %v", err)
 	}
 	return channelID
-}
-
-// SimulateStaleEpochWindow materializes the #2201 "admitted before the reset,
-// commits after it" race deterministically: the DB holds the POST-reset epoch
-// while the fence's Redis cache still serves the PRE-reset one (the real
-// post-crash TTL window), and the returned bearer claims the stale epoch. The
-// HTTP middleware therefore ADMITS the request from cache; only a sensitive
-// write's in-transaction credepoch.GuardTx (which reads the DB) can stop it.
-func (ts *TestServer) SimulateStaleEpochWindow(t *testing.T, userID string) (staleToken string) {
-	t.Helper()
-
-	const oldEpoch = "staleepochaaaaaaaaaaaaaaaaaaaaaa" // pragma: allowlist secret
-	const newEpoch = "rotatedepochbbbbbbbbbbbbbbbbbbbb" // pragma: allowlist secret
-
-	if _, err := ts.DB.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, newEpoch, userID); err != nil {
-		t.Fatalf("testhelpers: failed to set rotated epoch: %v", err)
-	}
-	if err := ts.Redis.Set(context.Background(), "cred_epoch:"+userID, "active:"+oldEpoch, 5*time.Minute).Err(); err != nil {
-		t.Fatalf("testhelpers: failed to seed stale epoch cache: %v", err)
-	}
-
-	token, err := auth.GenerateAccessToken(userID, TestJWTSecret, true, oldEpoch, "")
-	if err != nil {
-		t.Fatalf("testhelpers: failed to mint stale-epoch token: %v", err)
-	}
-	return token
 }

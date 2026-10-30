@@ -140,6 +140,7 @@ func TestDMExpiration_PinDeletionRunsInsideTheResponseBudget(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", alice.ID)
+		ts.AttachActorIdentity(t, c, alice.ID)
 		c.Next()
 	})
 	router.PATCH("/api/v1/dm/conversations/:id/expiration", handler.UpdateExpiration)
@@ -226,6 +227,7 @@ func TestDMExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld(t *testing
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", alice.ID)
+		ts.AttachActorIdentity(t, c, alice.ID)
 		c.Next()
 	})
 	router.PATCH("/api/v1/dm/conversations/:id/expiration", handler.UpdateExpiration)

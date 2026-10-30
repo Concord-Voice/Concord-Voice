@@ -56,6 +56,7 @@ func setupDB(t *testing.T) (*sql.DB, string) {
 	require.True(t, explicitDatabaseURL(os.Getenv("DATABASE_URL")), "DATABASE_URL must explicitly select an isolated database; the default developer concord database is refused")
 	db, _ := dbtest.SetupTestDB(t)
 	id := dbtest.CreateUser(t, db).String()
+	dbtest.RememberActor(t, db, id)
 	_, err := db.Exec(`INSERT INTO trusted_recovery_devices(user_id,device_name,machine_id) VALUES($1,'synthetic device',$2)`, id, uuid.NewString())
 	require.NoError(t, err)
 	return db, id
@@ -86,23 +87,24 @@ func TestDatabaseHappyPathOwnershipEpochAndCompletion(t *testing.T) {
 	r := newRequest(t, db, id)
 	o := offerBody(t, r)
 	other := dbtest.CreateUser(t, db).String()
+	dbtest.RememberActor(t, db, other)
 	_, err := Poll(ctx, db, other, "public-jti", r.RequestID, allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = Poll(ctx, db, id, "other-jti", r.RequestID, allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = Poll(ctx, db, id, "public-jti", "NOT-A-UUID", allowRecovery)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = Respond(ctx, db, other, "", r.RequestID, o)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, other), db, other, "", r.RequestID, o)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, approveBody(t, o))
 	require.ErrorIs(t, err, ErrConflict)
 	bad := o
 	bad.TranscriptHash = Encode(Hash("wrong"))
-	_, err = Respond(ctx, db, id, "", r.RequestID, bad)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, bad)
 	require.ErrorIs(t, err, ErrConflict)
-	_, err = Respond(ctx, db, id, "", r.RequestID, o)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
 	require.NoError(t, err)
-	_, err = Respond(ctx, db, id, "", r.RequestID, o)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
 	require.ErrorIs(t, err, ErrConflict)
 	polled, err := Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
@@ -116,13 +118,14 @@ func TestDatabaseHappyPathOwnershipEpochAndCompletion(t *testing.T) {
 	a := approveBody(t, o)
 	bad = a
 	bad.TranscriptHash = Encode(Hash("wrong"))
-	_, err = Respond(ctx, db, id, "", r.RequestID, bad)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, bad)
 	require.ErrorIs(t, err, ErrConflict)
-	_, err = db.Exec(`UPDATE users SET credential_epoch='new-epoch' WHERE id=$1`, id)
+	const rotated = "0123456789abcdef0123456789abcdef"
+	_, err = db.Exec(`UPDATE users SET credential_epoch=$2 WHERE id=$1`, id, rotated)
 	require.NoError(t, err)
-	_, err = Respond(ctx, db, id, "", r.RequestID, a)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, a)
 	require.ErrorIs(t, err, ErrUnauthorized)
-	_, err = Respond(ctx, db, id, "new-epoch", r.RequestID, a)
+	_, err = Respond(dbtest.ActorContext(ctx, t, db, id), db, id, rotated, r.RequestID, a)
 	require.NoError(t, err)
 	listed, err = List(ctx, db, id)
 	require.NoError(t, err)
@@ -169,15 +172,27 @@ func TestDatabaseConflictingWritersAndExactCAS(t *testing.T) {
 	ctx := context.Background()
 	r := newRequest(t, db, id)
 	o := offerBody(t, r)
-	runRace(t, func() error { _, e := Respond(ctx, db, id, "", r.RequestID, o); return e }, func() error { _, e := Respond(ctx, db, id, "", r.RequestID, o); return e })
+	runRace(t, func() error {
+		_, e := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
+		return e
+	}, func() error {
+		_, e := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
+		return e
+	})
 	a := approveBody(t, o)
 	reject := RespondBody{Action: "reject", ProtocolVersion: Version}
-	runRace(t, func() error { _, e := Respond(ctx, db, id, "", r.RequestID, a); return e }, func() error { _, e := Respond(ctx, db, id, "", r.RequestID, reject); return e })
+	runRace(t, func() error {
+		_, e := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, a)
+		return e
+	}, func() error {
+		_, e := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, reject)
+		return e
+	})
 	r = newRequest(t, db, id)
 	o = offerBody(t, r)
-	_, err := Respond(ctx, db, id, "", r.RequestID, o)
+	_, err := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
 	require.NoError(t, err)
-	_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, approveBody(t, o))
 	require.NoError(t, err)
 	runRace(t, func() error {
 		_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
@@ -209,9 +224,9 @@ func TestDatabaseLockWaitExpiresApprovedAndWithholdsCiphertext(t *testing.T) {
 	r, err = Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
 	o := offerBody(t, r)
-	_, err = Respond(ctx, db, id, "", r.RequestID, o)
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
 	require.NoError(t, err)
-	_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, approveBody(t, o))
 	require.NoError(t, err)
 	tx, err := db.Begin()
 	require.NoError(t, err)
@@ -232,7 +247,7 @@ func TestDatabaseLockWaitExpiresApprovedAndWithholdsCiphertext(t *testing.T) {
 	require.NotContains(t, marshal(t, p.Wire()), "encrypted_payload")
 	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
 	require.ErrorIs(t, err, ErrConflict)
-	_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, approveBody(t, o))
 	require.ErrorIs(t, err, ErrConflict)
 }
 func TestDatabaseExpiryListCreateAndDependencyErrors(t *testing.T) {
@@ -285,9 +300,9 @@ func TestDatabaseRequestLockExpiryPreventsOfferAndComplete(t *testing.T) {
 			require.NoError(t, err)
 			o := offerBody(t, r)
 			if action == "complete" {
-				_, err = Respond(ctx, db, id, "", r.RequestID, o)
+				_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
 				require.NoError(t, err)
-				_, err = Respond(ctx, db, id, "", r.RequestID, approveBody(t, o))
+				_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, approveBody(t, o))
 				require.NoError(t, err)
 			}
 			tx, err := db.Begin()
@@ -297,7 +312,7 @@ func TestDatabaseRequestLockExpiryPreventsOfferAndComplete(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				if action == "offer" {
-					_, e := Respond(ctx, db, id, "", r.RequestID, o)
+					_, e := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, o)
 					done <- e
 				} else {
 					_, e := Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{Version, o.TranscriptHash}, allowRecovery)
@@ -323,15 +338,15 @@ func TestDatabaseRejectedWireAndUnsupportedVersions(t *testing.T) {
 	db, id := setupDB(t)
 	ctx := context.Background()
 	r := newRequest(t, db, id)
-	_, err := Respond(ctx, db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 2})
+	_, err := Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 2})
 	require.NoError(t, err)
 	p, err := Poll(ctx, db, id, "public-jti", r.RequestID, allowRecovery)
 	require.NoError(t, err)
 	require.Equal(t, "rejected", p.Status)
 	require.NotContains(t, marshal(t, p.Wire()), "transcript_hash")
-	_, err = Respond(ctx, db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 2})
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 2})
 	require.ErrorIs(t, err, ErrConflict)
-	_, err = Respond(ctx, db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 1})
+	_, err = Respond(dbtest.WithRememberedActor(ctx, id), db, id, "", r.RequestID, RespondBody{Action: "reject", ProtocolVersion: 1})
 	require.Error(t, err)
 	_, err = Complete(ctx, db, id, "public-jti", r.RequestID, CompleteBody{1, fixture(t).Hash}, allowRecovery)
 	require.Error(t, err)

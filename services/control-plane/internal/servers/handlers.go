@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -981,6 +983,9 @@ func (h *Handler) respondServerDeleteError(c *gin.Context, err error, failureCla
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
 	case errors.Is(err, errServerDeleteNotOwner):
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can delete the server"})
+	case errors.Is(err, credepoch.ErrEpochMismatch), errors.Is(err, credepoch.ErrBlocked):
+		// A revoked login family or a rotated/blocked epoch (#2201, #2272).
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
 	case errors.Is(err, errServerVoiceCandidateConflict):
 		h.log.Warn(errMsgFailedDelete, "failure_class", serverVoiceCandidateFailureClass(err))
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgServerActivityChanged})
@@ -1095,8 +1100,20 @@ func (h *Handler) deleteServerWithActivePlans(
 			return fmt.Errorf("lock server voice lifecycle: %w", err)
 		}
 	}
+	// #2272 lock contract amendment 7: the shared writer barrier precedes every
+	// users lock; GuardFamilyTx below reuses it.
+	if _, err := loginfamily.AcquireWriterBarrierTx(ctx, tx); err != nil {
+		return err
+	}
 	survivingUsers, err := lockServerDeleteUsers(ctx, tx, preflight, userID)
 	if err != nil {
+		return err
+	}
+	// The gate's LockSubjectTx fences the epoch only; the family guard refuses
+	// a deletion from a login family terminalized after admission (#2272). The
+	// actor's users row is already held FOR NO KEY UPDATE, so GuardTx's FOR
+	// SHARE adds no edge.
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, confirm.tokenEpoch); err != nil {
 		return err
 	}
 	if outcome.confirmation, err = h.gateServerDeleteTx(ctx, tx, serverID, userID, confirm); err != nil {

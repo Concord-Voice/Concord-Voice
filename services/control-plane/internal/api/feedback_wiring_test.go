@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"image"
@@ -16,20 +15,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -310,65 +309,13 @@ func (s *feedbackScreenshotStore) counts() (int, int, int) {
 	return s.puts, s.gets, s.deletes
 }
 
-type feedbackScreenshotDB struct {
-	inserts atomic.Int64
-	writes  atomic.Int64
-}
-type feedbackScreenshotConnector struct{ state *feedbackScreenshotDB }
-type feedbackScreenshotDriver struct{}
-type feedbackScreenshotConn struct{ state *feedbackScreenshotDB }
-type feedbackScreenshotRows struct {
-	column string
-	value  driver.Value
-	done   bool
-}
-
-func (c feedbackScreenshotConnector) Connect(context.Context) (driver.Conn, error) {
-	return &feedbackScreenshotConn{state: c.state}, nil
-}
-func (feedbackScreenshotConnector) Driver() driver.Driver { return feedbackScreenshotDriver{} }
-func (feedbackScreenshotDriver) Open(string) (driver.Conn, error) {
-	return nil, errors.New("use fixture connector")
-}
-func (*feedbackScreenshotConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
-func (*feedbackScreenshotConn) Close() error                        { return nil }
-func (*feedbackScreenshotConn) Begin() (driver.Tx, error)           { return nil, driver.ErrSkip }
-func (c *feedbackScreenshotConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
-	c.state.writes.Add(1)
-	return nil, errors.New("unexpected persistence write")
-}
-func (c *feedbackScreenshotConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	query = strings.TrimSpace(query)
-	if strings.HasPrefix(query, "SELECT EXISTS (SELECT 1 FROM token_theft_pending_revocations") && len(args) == 1 {
-		return &feedbackScreenshotRows{column: "exists", value: false}, nil
-	}
-	if strings.HasPrefix(query, "INSERT INTO media_files") && len(args) == 8 {
-		c.state.inserts.Add(1)
-		return &feedbackScreenshotRows{column: "id", value: args[0].Value}, nil
-	}
-	if strings.HasPrefix(query, "SELECT storage_backend FROM media_files") && len(args) == 1 && args[0].Value == feedbackScreenshotObjectKey {
-		return &feedbackScreenshotRows{column: "storage_backend"}, nil
-	}
-	return nil, errors.New("query outside screenshot metadata boundary")
-}
-func (r *feedbackScreenshotRows) Columns() []string { return []string{r.column} }
-func (*feedbackScreenshotRows) Close() error        { return nil }
-func (r *feedbackScreenshotRows) Next(dest []driver.Value) error {
-	if r.done {
-		return io.EOF
-	}
-	r.done = true
-	dest[0] = r.value
-	return nil
-}
-
 type feedbackScreenshotRouterFixture struct {
-	router  http.Handler
-	db      *sql.DB
-	rdb     *redis.Client
-	store   *feedbackScreenshotStore
-	dbState *feedbackScreenshotDB
-	secret  string
+	router             http.Handler
+	db                 *sql.DB
+	rdb                *redis.Client
+	store              *feedbackScreenshotStore
+	initialPersistence string
+	secret             string
 }
 
 func newFeedbackScreenshotRouterFixture(t *testing.T, instance, repo string) *feedbackScreenshotRouterFixture {
@@ -385,21 +332,16 @@ func newFeedbackScreenshotRouterFixtureWithGitHubToken(t *testing.T, instance, r
 	mr := miniredis.RunT(t) // Private keyspace and frozen limiter clock; no shared Redis flush.
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { require.NoError(t, rdb.Close()) })
-	state := &feedbackScreenshotDB{}
-	var db *sql.DB
-	if config.IsSelfHostedInstance(instance) && strings.EqualFold(strings.TrimSpace(repo), "selfhost/disabled") {
-		db = sql.OpenDB(feedbackScreenshotConnector{state: state})
-		t.Cleanup(func() { require.NoError(t, db.Close()) })
-	} else {
-		db, _ = testdb.SetupTestDB(t)
-		_, err := db.Exec(`INSERT INTO users (id,email,username,password_hash,age_verified,email_verified)
-			VALUES ($1,'screenshot-router@test.local','screenshot_router','test-only-hash',TRUE,TRUE)`, feedbackScreenshotUserID)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO media_files
-			(uploader_id,file_type,media_tier,mime_type,file_size,storage_key)
-			VALUES ($1,'photo',1,'image/jpeg',25,$2)`, feedbackScreenshotUserID, feedbackScreenshotObjectKey)
-		require.NoError(t, err)
-	}
+	// Family admission needs real committed SQL authority, including in disabled
+	// mode. Observe screenshot persistence separately from authentication writes.
+	db, _ := testdb.SetupTestDB(t)
+	_, err := db.Exec(`INSERT INTO users (id,email,username,password_hash,age_verified,email_verified)
+		VALUES ($1,'screenshot-router@test.local','screenshot_router','test-only-hash',TRUE,TRUE)`, feedbackScreenshotUserID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO media_files
+		(uploader_id,file_type,media_tier,mime_type,file_size,storage_key)
+		VALUES ($1,'photo',1,'image/jpeg',25,$2)`, feedbackScreenshotUserID, feedbackScreenshotObjectKey)
+	require.NoError(t, err)
 	store := &feedbackScreenshotStore{objects: map[string][]byte{feedbackScreenshotObjectKey: []byte("owned-previous-screenshot")}}
 	cfg := &config.Config{
 		Environment: "test", InstanceType: instance,
@@ -439,7 +381,9 @@ func newFeedbackScreenshotRouterFixtureWithGitHubToken(t *testing.T, instance, r
 		require.NoError(t, opsRuntime.Stop(context.Background()))
 	})
 	require.NoError(t, rdb.Set(t.Context(), credepoch.Key(feedbackScreenshotUserID), "none", time.Minute).Err())
-	return &feedbackScreenshotRouterFixture{router: router, db: db, rdb: rdb, store: store, dbState: state, secret: cfg.JWTSecret}
+	f := &feedbackScreenshotRouterFixture{router: router, db: db, rdb: rdb, store: store, secret: cfg.JWTSecret}
+	f.initialPersistence = f.persistence(t)
+	return f
 }
 
 func TestNewRouter_FeedbackSubmissionPinsUploadedScreenshot(t *testing.T) {
@@ -483,12 +427,56 @@ func TestNewRouter_FeedbackSubmissionPinsUploadedScreenshot(t *testing.T) {
 
 func (f *feedbackScreenshotRouterFixture) token(t *testing.T, verified bool) string {
 	t.Helper()
-	value, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss": middleware.AccessTokenIssuer, "user_id": feedbackScreenshotUserID,
-		"email_verified": verified, "exp": time.Now().Add(time.Minute).Unix(), "jti": "owned-feedback-screenshot-token",
-	}).SignedString([]byte(f.secret))
+	userID := uuid.MustParse(feedbackScreenshotUserID)
+	var epoch string
+	require.NoError(t, f.db.QueryRow(`SELECT COALESCE(credential_epoch,'') FROM users WHERE id=$1`, userID).Scan(&epoch))
+	sid := uuid.New()
+	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{
+		UserID: userID, SID: sid, CredentialEpoch: epoch, EmailVerified: verified,
+	}, time.Now())
 	require.NoError(t, err)
+	tx, err := f.db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := tx.Rollback(); !errors.Is(rollbackErr, sql.ErrTxDone) {
+			require.NoError(t, rollbackErr)
+		}
+	}()
+	barrier, err := loginfamily.AcquireWriterBarrierTx(t.Context(), tx)
+	require.NoError(t, err)
+	users, err := loginfamily.LockUsersTx(t.Context(), tx, barrier, []uuid.UUID{userID}, loginfamily.UserNoKeyUpdate)
+	require.NoError(t, err)
+	user, err := users.ForUser(userID)
+	require.NoError(t, err)
+	family, err := loginfamily.CreateFamilyTx(t.Context(), tx, user, epoch)
+	require.NoError(t, err)
+	require.NoError(t, loginfamily.BindSIDTx(t.Context(), tx, family, sid, prepared.ExpiresAt()))
+	require.NoError(t, tx.Commit())
+	value, err := prepared.Sign(f.secret)
+	require.NoError(t, err)
+	claims, err := auth.ValidateAccessToken(value, f.secret)
+	require.NoError(t, err)
+	require.NotNil(t, claims.ExpiresAt)
+	grant, err := loginfamily.ResolveVerifiedAccess(t.Context(), f.db, loginfamily.AccessIdentity{
+		UserID: userID, SID: uuid.MustParse(claims.SessionID), CredentialEpoch: claims.CredentialEpoch,
+		AccessExpiresAt: claims.ExpiresAt.Time,
+	})
+	require.NoError(t, err, "actual signed JWT must resolve its committed family")
+	require.Equal(t, family.Binding().FamilyID, grant.FamilyID)
+	require.True(t, prepared.ExpiresAt().Equal(grant.AccessExpiresAt))
 	return value
+}
+
+// persistence captures both metadata and staged/pinned screenshot bytes. Family
+// and SID setup writes are deliberately outside this screenshot effect boundary.
+func (f *feedbackScreenshotRouterFixture) persistence(t *testing.T) string {
+	t.Helper()
+	var snapshot string
+	require.NoError(t, f.db.QueryRow(`SELECT json_build_object(
+		'media', (SELECT COALESCE(jsonb_agg(to_jsonb(m) ORDER BY m.id), '[]'::jsonb) FROM media_files m),
+		'uploads', (SELECT COALESCE(jsonb_agg(to_jsonb(u) ORDER BY u.object_key), '[]'::jsonb) FROM feedback_screenshot_uploads u)
+	)::text`).Scan(&snapshot))
+	return snapshot
 }
 
 func feedbackScreenshotMultipart(t *testing.T) (string, string) {
@@ -534,8 +522,7 @@ func TestNewRouter_FeedbackScreenshotDisabledBoundary(t *testing.T) {
 			assert.Zero(t, puts, "no plaintext screenshot may reach object storage")
 			assert.Zero(t, gets)
 			assert.Zero(t, deletes)
-			assert.Zero(t, f.dbState.inserts.Load(), "disabled upload must create no media metadata")
-			assert.Zero(t, f.dbState.writes.Load())
+			assert.JSONEq(t, f.initialPersistence, f.persistence(t), "disabled upload must leave screenshot metadata and staged bytes unchanged")
 
 			// Previously stored screenshot bytes must also stay behind the
 			// disabled boundary, even on the existing public proxy route.
@@ -546,6 +533,7 @@ func TestNewRouter_FeedbackScreenshotDisabledBoundary(t *testing.T) {
 			_, gets, _ = f.store.counts()
 			assert.Zero(t, gets, "disabled public proxy must not read an existing screenshot")
 			assert.NotContains(t, proxy.Body.String(), "owned-previous-screenshot")
+			assert.JSONEq(t, f.initialPersistence, f.persistence(t), "disabled proxy must leave screenshot persistence unchanged")
 		})
 	}
 }
@@ -635,7 +623,7 @@ func TestNewRouter_FeedbackScreenshotExistingGuards(t *testing.T) {
 			assert.Zero(t, puts)
 			assert.Zero(t, gets)
 			assert.Zero(t, deletes)
-			assert.Zero(t, f.dbState.inserts.Load())
+			assert.JSONEq(t, f.initialPersistence, f.persistence(t), "existing guards must leave screenshot persistence unchanged")
 		})
 	}
 }

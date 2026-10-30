@@ -532,10 +532,17 @@ func newRBACPresenceEnv(t *testing.T) *rbacPresenceEnv {
 	return env
 }
 
+// ownerCtx carries the owner's live signed identity, which the writers'
+// credepoch.GuardFamilyTx requires when a test calls them below the router.
+func (e *rbacPresenceEnv) ownerCtx() context.Context {
+	return dbtest.ActorContext(context.Background(), e.t, e.db, e.serverOwnerID)
+}
+
 func (e *rbacPresenceEnv) buildRouter() {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", e.serverOwnerID)
+		c.Request = c.Request.WithContext(dbtest.ActorContext(c.Request.Context(), e.t, e.db, e.serverOwnerID))
 		c.Next()
 	})
 	router.PUT("/channels/:id/overrides", e.handler.UpsertChannelOverride)

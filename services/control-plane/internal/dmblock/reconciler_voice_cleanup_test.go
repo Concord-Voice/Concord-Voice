@@ -179,6 +179,7 @@ func TestReconcileDue_SecurityEjectionDrainsStartConcurrently(t *testing.T) {
 	voiceStarted := make(chan context.Context, 1)
 	voiceReady := make(chan struct{})
 	releaseCredential := make(chan struct{})
+	releaseVoice := make(chan struct{})
 	reconciler := New(db, nil)
 	reconciler.SetCredentialEpochEject(func(ctx context.Context, _ uuid.UUID, _, _ string) error {
 		credentialStarted <- ctx
@@ -194,7 +195,12 @@ func TestReconcileDue_SecurityEjectionDrainsStartConcurrently(t *testing.T) {
 	reconciler.SetVoiceEject(func(ctx context.Context, _ string, _ uuid.UUID) error {
 		voiceStarted <- ctx
 		close(voiceReady)
-		return nil
+		select {
+		case <-releaseVoice:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	})
 
 	done := make(chan error, 1)
@@ -218,21 +224,38 @@ func TestReconcileDue_SecurityEjectionDrainsStartConcurrently(t *testing.T) {
 		voiceObserved = true
 	case <-time.After(time.Second):
 	}
-	close(releaseCredential)
-	if voiceObserved {
-		require.NotNil(t, voiceCtx)
-	}
-	if err := <-done; voiceObserved {
-		require.NoError(t, err)
-	}
 	require.True(t, voiceObserved, "DM voice ejection was blocked by credential delivery")
+	require.NotNil(t, voiceCtx)
+	require.True(t, reconciler.SecurityRoundCompletedAt().IsZero(), "an unfinished drain cannot advance whole-round progress")
+	select {
+	case err := <-done:
+		t.Fatalf("reconciliation returned before voice delivery completed: %v", err)
+	default:
+	}
+	close(releaseVoice)
+	close(releaseCredential)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-outer.Done():
+		t.Fatal("concurrent security round did not finish within the outer bound")
+	}
 	credentialDeadline, credentialHasDeadline := credentialCtx.Deadline()
 	voiceDeadline, voiceHasDeadline := voiceCtx.Deadline()
 	require.True(t, credentialHasDeadline, "credential drain must have a bounded context")
 	require.True(t, voiceHasDeadline, "DM voice drain must have a bounded context")
 	require.False(t, credentialDeadline.After(outerDeadline))
 	require.False(t, voiceDeadline.After(outerDeadline))
-	require.NotEqual(t, credentialCtx, voiceCtx, "security drains must not share a context")
+	require.Same(t, credentialCtx, voiceCtx, "security drains share the bounded round context")
+	require.Equal(t, credentialDeadline, voiceDeadline)
+	require.ErrorIs(t, credentialCtx.Err(), context.Canceled, "completed round releases its shared context")
+	require.ErrorIs(t, voiceCtx.Err(), context.Canceled)
+	require.False(t, reconciler.SecurityRoundCompletedAt().IsZero(), "all drains completed successfully")
+	var remainingCredential, remainingVoice int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id = $1`, credentialUser).Scan(&remainingCredential))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_block_voice_ejections WHERE conversation_id = $1 AND user_id = $2`, voiceConversation, voiceUser).Scan(&remainingVoice))
+	require.Zero(t, remainingCredential)
+	require.Zero(t, remainingVoice)
 }
 
 func TestReconcileDue_CanceledOuterContextSkipsSecurityEjections(t *testing.T) {

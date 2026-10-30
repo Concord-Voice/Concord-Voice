@@ -42,6 +42,7 @@ var serviceHopPaths = map[string]string{
 	"/api/v1/channels/:id/voice/join":              "channel_voice_join",
 	"/api/v1/dm/conversations/:id/voice/authorize": "dm_voice_authorize",
 	"/api/v1/voice/enforcement-sessions":           "voice_enforcement_session",
+	"/api/v1/internal/voice/auth-connections":      "voice_auth_connection",
 }
 
 // MediaPlaneServiceHop authenticates the media plane's server-to-server

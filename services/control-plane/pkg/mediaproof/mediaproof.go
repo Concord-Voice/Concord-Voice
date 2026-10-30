@@ -68,9 +68,8 @@ func TokenDigest(accessToken string) string {
 // yields a literal newline. Enforcing it is cheap and survives the next caller;
 // arguing about provenance does not.
 func payload(version, timestamp string, fields []string) ([]byte, bool) {
-	all := make([]string, 0, len(fields)+2)
-	all = append(all, version, timestamp)
-	all = append(all, fields...)
+	// append sizes the slice itself; no caller-influenced length arithmetic.
+	all := append([]string{version, timestamp}, fields...)
 	for _, f := range all {
 		if strings.Contains(f, "\n") {
 			return nil, false

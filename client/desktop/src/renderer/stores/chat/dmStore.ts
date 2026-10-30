@@ -8,6 +8,7 @@ import { fetchParticipantPublicKeys } from '../../services/e2ee/participantPubli
 import { removeScope } from '../../services/messaging/searchService';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useChatStore } from './chatStore';
+import { useUnreadStore, pushRecentUnreadTarget, removeRecentUnreadTarget } from './unreadStore';
 import type { CallEventPayload } from '../../types/chat';
 import {
   hasMalformedExpirationPolicyListRow,
@@ -1007,6 +1008,13 @@ export const useDMStore = wrapStore(
                 c.id === convId ? { ...c, unreadCount: c.unreadCount + by } : c
               ),
             }));
+            // Tray "unread" target (LIFO): this conversation is now the newest.
+            useUnreadStore.setState((u) => ({
+              recentUnreadTargets: pushRecentUnreadTarget(u.recentUnreadTargets, {
+                type: 'dm',
+                targetId: convId,
+              }),
+            }));
           },
 
           clearUnread: (convId: string) => {
@@ -1016,6 +1024,10 @@ export const useDMStore = wrapStore(
                 c.id === convId ? { ...c, unreadCount: 0 } : c
               ),
             }));
+            useUnreadStore.setState((u) => {
+              const next = removeRecentUnreadTarget(u.recentUnreadTargets, convId);
+              return next === u.recentUnreadTargets ? u : { recentUnreadTargets: next };
+            });
           },
 
           clearDMs: () => {

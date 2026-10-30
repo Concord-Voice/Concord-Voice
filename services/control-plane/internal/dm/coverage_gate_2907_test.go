@@ -23,7 +23,7 @@ func Test2907DMTopologyCreationAndRevalidation(t *testing.T) {
 		setTopologyPrivacy(t, db, user, dmPrivacyOpenToAll, false)
 	}
 	h := NewHandler(HandlerDeps{DB: db})
-	ctx := context.Background()
+	ctx := actorCtx(context.Background(), t, db, users[0].String())
 
 	_, _, err := h.createOneOnOneConversation(ctx, "bad", users[1].String(), "")
 	assert.Error(t, err)

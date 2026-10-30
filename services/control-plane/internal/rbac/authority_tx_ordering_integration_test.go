@@ -34,8 +34,12 @@ func openOrderingProbeDB(t *testing.T) *sql.DB {
 
 func seedOrderingServer(t *testing.T, db *sql.DB, serverID string) uuid.UUID {
 	t.Helper()
+	// The #2272 writer barrier needs the rollout singleton; this raw pool skips
+	// the testdb reset that reseeds it after a truncating test.
+	_, err := db.Exec(`INSERT INTO login_family_rollout (id) VALUES (TRUE) ON CONFLICT DO NOTHING`)
+	require.NoError(t, err)
 	owner := dbtest.CreateUser(t, db)
-	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'ordering-server', $2)`, serverID, owner)
+	_, err = db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'ordering-server', $2)`, serverID, owner)
 	require.NoError(t, err)
 	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
 	return owner

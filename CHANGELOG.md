@@ -9,7 +9,10 @@ the release channel that ships it first.
 
 To add an entry, write one line under the matching `###` category in
 `[Prerelease]`: Added, Changed, Deprecated, Removed, Fixed, or Security. Start
-the line with a bold area tag, such as `**Voice:**`. Keep one summary of 1-3
+the line with a bold area tag, such as `**Voice:**`. Mark a breaking change with
+`**BREAKING**` after the tag. The category sets the recommended version bump:
+Added, Deprecated and Removed suggest a minor, and the rest suggest a patch. A
+**BREAKING** entry suggests a major (a minor before 1.0). Keep one summary of 1-3
 sentences above the categories. The post-update dialog shows only that summary.
 Do not add a paragraph for each change. Edit the summary only when your change
 belongs in it, and write it if the section has none. Do not edit the
@@ -26,6 +29,8 @@ gate can learn from your voice.
 
 ### Added
 
+- **Tray:** The tray icon now shows both stars of the Concord Voice mark, and it reflects your status. It shows when you are in voice, muted, deafened, sharing your screen, reconnecting, or have unread messages or mentions. On macOS and Windows, click the icon to open a menu with Mute, Deafen, Leave voice, Stop sharing, your presence, and a shortcut to your newest unread conversation. On Linux, click the icon to open the window; the menu comes from your desktop's tray host.
+- **Settings:** Settings ▸ Appearance has a new Tray Icon setting (Menu Bar Icon on macOS). Choose Automatic, Light, Dark, or Colour to match your taskbar or menu bar.
 - **Billing:** Settings ▸ Subscription lists each plan with its monthly and yearly price and opens a secure Stripe page to subscribe or manage billing.
 - **Billing:** New subscribers get a 30-day free trial of Supersonic. The card is collected first, and billing starts when the trial ends. Wing has no trial.
 - **Billing:** Subscribers can change plans in Settings, see the amount due before an immediate switch, and withdraw a change that is booked for renewal.
@@ -37,6 +42,7 @@ gate can learn from your voice.
 - **Messages:** Message expiration timers can keep pinned messages, and new timers keep them by default. API: `include_pinned` and `features.expirationPinnedPolicySupported`.
 - **Messages:** Up Arrow in an empty message box edits your last message.
 - **Voice:** Auto Calibrate and Manual Calibrate can suggest a fixed microphone gate threshold from a room-and-voice check. Manual Calibrate also shows a live meter.
+- **Operations:** `provision-secrets.yml` now carries `APP_ATTEST_APP_IDS`, so production can turn on iOS App Attest from a GitHub variable (ADR-0010 D17).
 - **Operations:** Blue/green media deployment can move new voice rooms to a second instance while existing rooms drain. It is off by default.
 - **Operations:** A separate West staging deployment path is available. It stays off until its secrets, access, and checks are complete. West is not a production site.
 - **Operations:** Groundwork, off by default: managed ingress verification, managed egress, Redis credential rotation, TURN credential rotation, and shared media listeners. Each needs host checks and approval before activation.
@@ -46,6 +52,7 @@ gate can learn from your voice.
 - **Voice:** The desktop call library handles mixed audio and video RTP header extensions with mediasoup-client 3.25.3.
 - **Voice:** Updated server voice transport dependencies.
 - **Accessibility:** The desktop app follows the system's reduced-motion setting, hides decorative icons from screen readers, and shows text while bundled fonts load.
+- **Desktop:** Updated runtime and updater dependencies.
 - **Plans:** Every account can create any number of servers, search as far back as a subscriber, and customize theme colors. One account can create up to 10 servers in 24 hours.
 - **Desktop:** Updated navigation dependencies.
 - **Web:** Opening the web address in a browser shows a link to download the desktop app, not an "Update Required" prompt.
@@ -75,6 +82,7 @@ gate can learn from your voice.
 ### Fixed
 
 - **Voice:** Calling someone back in a DM joins the call still open there instead of silently stopping, a failed call start now shows an error, your camera comes back after a brief connection drop, and 1:1 DMs show Join voice call during a call.
+- **Voice:** Microphone processing failures now notify the existing error handler and release the failed audio node once.
 - **Billing:** Blocking someone ends a Wing seat between you, whichever side blocks. Unfriending or blocking also cancels a pending seat invite at once; unfriending alone keeps an active seat.
 - **Billing:** Switching from a monthly to a yearly plan works again. It credits the unused part of the month and keeps your billing date.
 - **Billing:** Subscribing twice at the same time no longer creates a second subscription.
@@ -128,6 +136,9 @@ gate can learn from your voice.
 
 ### Security
 
+- **Accounts:** A device signed out while its account-deletion request was still processing can no longer delete the account.
+- **Accounts:** Signing out a device or revoking a session cuts it off everywhere at once. Its open connection and any voice call end before the change is confirmed, and a signed-out device can no longer act on your account.
+- **Attestation:** iOS App Attest binds each attested key to the account that attested it, ties the attestation session header to the signed-in session, and caps the verify request size (ADR-0010 D17).
 - **Dependencies:** Updated golang.org/x/net and fast-uri for security fixes.
 - **Desktop:** Updated the URI parser security floor to address upstream normalization advisories.
 - **Accounts:** Sign-in protection accepts a key re-encryption only from the maintenance run that started it. It refuses to roll back while its state is unknown.

@@ -90,4 +90,15 @@ describe('preload sandbox contract (integration)', () => {
     expect(content).toContain('billing:open');
     expect(content).toMatch(/openBilling[\s\S]*ipcRenderer\.invoke\(['"]billing:open['"]/);
   });
+
+  it('exposes the tray status bridge with its guard inlined (IPC contract 33)', () => {
+    const content = readFileSync(preloadPath, 'utf-8');
+    expect(content).toContain('tray:setStatus');
+    expect(content).toContain('tray:action');
+    expect(content).toMatch(/traySetStatus[\s\S]*ipcRenderer\.invoke\(TRAY_SET_STATUS/);
+    expect(content).toContain('onTrayAction');
+    // The `tray:action` push is re-validated in the preload, so the closed-enum
+    // guard must ship inside the bundle rather than be required.
+    expect(content).toContain('isTrayAction');
+  });
 });

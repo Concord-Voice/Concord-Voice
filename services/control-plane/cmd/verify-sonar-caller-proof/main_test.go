@@ -80,7 +80,8 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	fixture.claims = map[string]any{
 		"iss": fixture.server.URL, "aud": audienceBase + hex.EncodeToString(digest[:]),
 		"sub": "repo:Concord-Voice/Concord-Voice-Alpha:pull_request",
-		"iat": now.Add(-time.Minute).Unix(), "nbf": now.Add(-time.Minute).Unix(),
+		// GitHub's live shape: nbf five minutes before iat, five-minute lifetime.
+		"iat": now.Add(-time.Minute).Unix(), "nbf": now.Add(-6 * time.Minute).Unix(),
 		"exp":           now.Add(4 * time.Minute).Unix(),
 		"repository_id": repositoryID, "repository": repository,
 		"event_name": "pull_request", "run_id": "12345", "run_attempt": "2",
@@ -160,6 +161,14 @@ func TestVerifyProofRejectsBadProofs(t *testing.T) {
 			delete(c, "nbf")
 			return f.key
 		}},
+		{"not-before after issued-at", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
+			c["nbf"] = f.now.Add(-30 * time.Second).Unix()
+			return f.key
+		}},
+		{"not-before too early", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
+			c["nbf"] = f.now.Add(-12 * time.Minute).Unix()
+			return f.key
+		}},
 		{"long lifetime", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
 			c["iat"] = f.now.Add(-20 * time.Minute).Unix()
 			return f.key
@@ -186,6 +195,14 @@ func TestVerifyProofRejectsBadProofs(t *testing.T) {
 		}},
 		{"workflow ref", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
 			c["workflow_ref"] = repository + "/.github/workflows/pr-ci.yml@refs/heads/main"
+			return f.key
+		}},
+		{"branch-form workflow ref", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
+			c["workflow_ref"] = repository + "/.github/workflows/required-pr-build.yml@refs/heads/main"
+			return f.key
+		}},
+		{"pull-request workflow ref", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
+			c["workflow_ref"] = repository + "/.github/workflows/required-pr-build.yml@refs/pull/7/merge"
 			return f.key
 		}},
 		{"workflow sha", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
@@ -274,7 +291,7 @@ func TestRunWritesBoundedVerifiedFileOnlyOnSuccess(t *testing.T) {
 	// run uses the real clock; issue a fixture at current time for this boundary.
 	f.now = time.Now()
 	f.claims["iat"] = f.now.Add(-time.Minute).Unix()
-	f.claims["nbf"] = f.now.Add(-time.Minute).Unix()
+	f.claims["nbf"] = f.now.Add(-6 * time.Minute).Unix()
 	f.claims["exp"] = f.now.Add(4 * time.Minute).Unix()
 	require.NoError(t, os.WriteFile(proofPath, f.proof(t, f.key, f.claims, f.raw), 0600))
 	require.NoError(t, run(context.Background(), proofPath, outPath, f.server.URL))

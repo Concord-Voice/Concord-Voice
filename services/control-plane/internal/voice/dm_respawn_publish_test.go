@@ -24,7 +24,7 @@ func TestHandleRoomEmpty_DMSummaryRespawnPublishesToHiddenParticipant(t *testing
 		WHERE conversation_id = $1 AND user_id = $2`, convID, callee.ID)
 	require.NoError(t, err)
 
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, callee)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, callee)
 	synchronizeVoiceWireClient(t, conn)
 
 	endedAt := time.Now().UTC()

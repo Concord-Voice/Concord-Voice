@@ -3,8 +3,8 @@ package channels_test
 // Codex's sixth review of #3508: both channel-group writes wrote their refusal
 // inside the transaction, and the deferred rollback only logged a failure, so
 // an unresolved transaction was reported as a clean 404. The hook ends the
-// hooked transaction's own backend (idle after the epoch guard) and answers the
-// server lock with no row; the control leaves the connection alive.
+// hooked transaction's own backend (idle after the login-family guard) and
+// answers the server lock with no row; the control leaves the connection alive.
 
 import (
 	"database/sql"
@@ -18,6 +18,10 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/stmthook"
 )
+
+// groupFamilyGuardFragment is credepoch.GuardFamilyTx's closing marker write,
+// the last statement before the server lock (#2272).
+const groupFamilyGuardFragment = `SELECT set_config($1, $2, true)`
 
 func TestChannelGroupWrites_FailedDiscardAfterServerGone_IsAFault(t *testing.T) {
 	hook, hookedDB := stmthook.Open(t)
@@ -61,7 +65,7 @@ func TestChannelGroupWrites_FailedDiscardAfterServerGone_IsAFault(t *testing.T) 
 				terminated := 0
 				var between func() error
 				if terminate {
-					between = stmthook.TerminateIdleBackend(ts.DB, groupEpochGuardFragment, &terminated)
+					between = stmthook.TerminateIdleBackend(ts.DB, groupFamilyGuardFragment, &terminated)
 				}
 				hook.Arm([]string{groupEpochGuardFragment, groupServerLockFragment}, between, sql.ErrNoRows)
 

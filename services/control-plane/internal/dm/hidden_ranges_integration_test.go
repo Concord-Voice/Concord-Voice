@@ -118,7 +118,7 @@ func TestApplyReceiverHideLocksParentsBeforeParticipant(t *testing.T) {
 				err    error
 			}, 1)
 			go func() {
-				hidden, hideErr := h.applyReceiverHide(hideCtx, actor, convID, nil, purge.Result{PurgeID: purgeID}, "")
+				hidden, hideErr := h.applyReceiverHide(actorCtx(hideCtx, t, db, actor), actor, convID, nil, purge.Result{PurgeID: purgeID}, "")
 				hideDone <- struct {
 					hidden int
 					err    error

@@ -18,6 +18,7 @@ func routeDMOutboxDeafen(t *testing.T, handler *Handler, actorID, convID, target
 	router := gin.New()
 	router.Use(func(ctx *gin.Context) {
 		ctx.Set("user_id", actorID)
+		withActor(t, handler.db, ctx, actorID)
 		ctx.Next()
 	})
 	router.POST("/conversations/:id/voice/:userId/deafen", handler.DMHardDeafen)

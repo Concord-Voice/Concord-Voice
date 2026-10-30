@@ -362,7 +362,7 @@ func (h *Handler) CancelTransfer(c *gin.Context) {
 		h.internalError(c, "Failed to lock transfer cancellation user", errMsgFailedCancelTransfer, err)
 		return
 	}
-	if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
 		h.respondCredentialEpochGuardError(c, err, errMsgFailedCancelTransfer)
 		return
 	}
@@ -673,7 +673,7 @@ func (h *Handler) insertTransferRecord(ctx context.Context, c *gin.Context, rec 
 		h.internalError(c, "Failed to lock transfer users", errMsgFailedInitiateTransfer, err)
 		return fmt.Errorf("lock transfer users: %w", err)
 	}
-	if err := credepoch.GuardTx(ctx, tx, rec.fromUserID, claimEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, rec.fromUserID, claimEpoch); err != nil {
 		h.respondCredentialEpochGuardError(c, err, errMsgFailedInitiateTransfer)
 		return fmt.Errorf("guard transfer credential epoch: %w", err)
 	}
@@ -1114,7 +1114,7 @@ func (h *Handler) withOwnershipCaptureGuardedOutcome(
 		return nil, ownershipWriteUnchanged, fmt.Errorf("lock ownership users: %w", err)
 	}
 	if actorUserID != "" {
-		if err := credepoch.GuardTx(ctx, tx, actorUserID, tokenEpoch); err != nil {
+		if err := credepoch.GuardFamilyTx(ctx, tx, actorUserID, tokenEpoch); err != nil {
 			return nil, ownershipWriteUnchanged, fmt.Errorf("guard ownership credential epoch: %w", err)
 		}
 	}

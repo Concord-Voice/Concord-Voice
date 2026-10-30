@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
 
@@ -57,9 +58,12 @@ func TestPersistMessage_GuardReadFailureIsSaveError(t *testing.T) {
 	db := setupHubTestDB(t)
 	hub := NewHub(db, nil)
 
+	// The frame identity agrees with the params, so the guard reaches the users read.
+	userID := uuid.New()
 	_, _, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
-		channelUUID: uuid.New(), userID: uuid.New(), credEpoch: "whatever",
-		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
+		channelUUID: uuid.New(), userID: userID, credEpoch: "whatever",
+		identity: loginfamily.AccessIdentity{UserID: userID, SID: uuid.New(), CredentialEpoch: "whatever"},
+		content:  "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
 	assert.Equal(t, "Failed to save message", errMsg,
 		"a store/read guard failure must be the retryable save error, not auth-shaped")
@@ -74,7 +78,7 @@ func TestPersistMessage_RemovedMemberRejected(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
-		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
 	assert.Equal(t, "Not a member of this server", errMsg)
@@ -95,7 +99,7 @@ func TestPersistMessage_RejoinedMemberRejected(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
-		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
 	assert.Equal(t, "Not a member of this server", errMsg)
@@ -117,7 +121,7 @@ func TestPersistMessage_MemberUpdateKeepsIncarnation(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
-		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
 	assert.Empty(t, errMsg)
@@ -179,7 +183,7 @@ func TestHandleMessage_TimedOutDuringPermissionCheckRejected(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		setup.hub.handleMessage(IncomingMessage{
+		setup.hub.handleMessage(setup.live(t, IncomingMessage{
 			Type:     "message",
 			UserID:   setup.user1,
 			ClientID: setup.client.ID,
@@ -188,7 +192,7 @@ func TestHandleMessage_TimedOutDuringPermissionCheckRejected(t *testing.T) {
 				keyContent:    "timed out member frame",
 				keyKeyVersion: float64(1),
 			},
-		})
+		}))
 		close(done)
 	}()
 
@@ -240,7 +244,7 @@ func TestPersistMessage_MembershipLockHonorsTimeout(t *testing.T) {
 	result := make(chan string, 1)
 	go func() {
 		_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
-			channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+			channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 			content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 		})
 		result <- errMsg
@@ -268,7 +272,7 @@ func TestPersistMessage_MembershipLockWriterFirstDefersRemoval(t *testing.T) {
 	sendResult := make(chan string, 1)
 	go func() {
 		_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
-			channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+			channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 			content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 		})
 		sendResult <- errMsg
@@ -369,10 +373,9 @@ func TestPersistDMMessage_AttachmentLockHonorsTimeout(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		_, _, _, _, persistErr := setup.hub.persistDMMessage(
-			uuid.MustParse(setup.convID), setup.user1, "", &dmMessageInput{
+			uuid.MustParse(setup.convID), setup.user1, "", &dmMessageInput{identity: setup.identity(t, setup.user1),
 				content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user", attachmentIDs: []string{fileID},
-			},
-		)
+			})
 		result <- persistErr
 	}()
 
@@ -410,8 +413,7 @@ func TestPersistDMMessageMembershipRemovalWinsRaceWithoutInsert(t *testing.T) {
 			conversationID,
 			setup.user1,
 			"",
-			&dmMessageInput{content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user"},
-		)
+			&dmMessageInput{identity: setup.identity(t, setup.user1), content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user"})
 		persistResult <- persistErr
 	}()
 
@@ -459,8 +461,7 @@ func TestPersistDMMessageRetriesMembershipSnapshotWithoutDuplicateInsert(t *test
 			conversationID,
 			setup.user1,
 			"",
-			&dmMessageInput{content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user"},
-		)
+			&dmMessageInput{identity: setup.identity(t, setup.user1), content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user"})
 		persistResult <- persistErr
 	}()
 

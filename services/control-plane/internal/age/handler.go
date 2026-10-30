@@ -11,6 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -22,8 +24,11 @@ var errAlreadyDisabled = errors.New("account already disabled")
 
 // SessionDisconnector forcefully disconnects a user's live WebSocket sessions.
 // Declared as an interface (satisfied by *websocket.Hub) to avoid an import cycle.
+// DisconnectFamilyContext fences each committed terminal family; DisconnectUser
+// is the user-wide fallback when no exact family close can be proven.
 type SessionDisconnector interface {
 	DisconnectUser(userID uuid.UUID)
+	loginfamily.FamilyCloser
 }
 
 // Handler serves PUT /api/v1/age/claim (#1623, child A).
@@ -143,6 +148,9 @@ func (h *Handler) SubmitClaim(c *gin.Context) {
 	// 7. persist (+ terminal disable if valid_age=false). NO nonce delete on failure.
 	lastChange, persistErr := h.persist(ctx, claim, req.Signature)
 	switch {
+	case errors.Is(persistErr, credepoch.ErrEpochMismatch):
+		fail(c, http.StatusUnauthorized, "unauthenticated")
+		return
 	case errors.Is(persistErr, errAlreadyDisabled):
 		// Atomic source-of-truth backstop: the account was already disabled but the
 		// step-2 denylist fast-path missed it (stale/missing key). Same reject as step 2.
@@ -212,16 +220,69 @@ func (h *Handler) isDisabled(ctx context.Context, userID string) (bool, error) {
 }
 
 // persist upserts the single age_verification_records row and, when valid_age=false,
-// terminally disables the account (spec §4.6): users.disabled + inlined refresh-token
-// revoke in one tx, then a SYNCHRONOUS denylist set + live-session disconnect before
+// terminally disables the account (spec §4.6): users.disabled and captured family
+// terminalization in one tx, then a synchronous denylist set before
 // returning. The denylist set completing before the 200 response is the invariant that
 // closes the disable/refresh race together with the disabled=FALSE-guarded refresh path.
-func (h *Handler) persist(ctx context.Context, claim Claim, sigB64 string) (time.Time, error) {
+func (h *Handler) persist(ctx context.Context, claim Claim, sigB64 string) (lastChange time.Time, err error) {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, rollbackErr))
+			lastChange = time.Time{}
+		}
+	}()
+	id, err := uuid.Parse(claim.UserID)
+	if err != nil {
+		return time.Time{}, loginfamily.NewError(loginfamily.ReasonAccessIdentity, err)
+	}
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{id}, loginfamily.UserNoKeyUpdate)
+	if err != nil {
+		return time.Time{}, err
+	}
+	user, err := users.ForUser(id)
+	if err != nil {
+		return time.Time{}, err
+	}
+	// Session revocation rotates neither the credential epoch nor the claim
+	// key, so revalidate the requesting login under the user lock: a family
+	// revoked while this request waited must not disable the account.
+	identity, ok := loginfamily.AccessIdentityFromContext(ctx)
+	if !ok || identity.UserID != id {
+		return time.Time{}, credepoch.ErrEpochMismatch
+	}
+	if err = loginfamily.GuardLockedActorFamilyTx(ctx, tx, identity); err != nil {
+		if errors.Is(err, loginfamily.ErrDenied) {
+			return time.Time{}, errors.Join(credepoch.ErrEpochMismatch, err)
+		}
+		return time.Time{}, err
+	}
+	var disabled bool
+	if err = tx.QueryRowContext(ctx, `SELECT disabled FROM users WHERE id=$1`, id).Scan(&disabled); err != nil {
+		return time.Time{}, err
+	}
+	if disabled {
+		return time.Time{}, errAlreadyDisabled
+	}
+	var owners []loginfamily.DeliveryOwner
+	if !claim.ValidAge {
+		targets, err := loginfamily.CaptureUserTargetsTx(ctx, tx, user, nil)
+		if err != nil {
+			return time.Time{}, err
+		}
+		revoked, err := loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeUser, Reason: loginfamily.ReasonDisablement})
+		if err != nil {
+			return time.Time{}, err
+		}
+		owners = revoked.Owners
+	}
 
 	// Atomic disabled-guard + RETURNING. The `WHERE NOT EXISTS (... disabled=TRUE)`
 	// makes the UPSERT a no-op for an account that is ALREADY disabled — the
@@ -230,7 +291,6 @@ func (h *Handler) persist(ctx context.Context, claim Claim, sigB64 string) (time
 	// NOT block the disabling claim itself (a not-yet-disabled user passes the guard,
 	// then the tx disables them below). RETURNING echoes the DB-authoritative
 	// last_change so the response can't drift from the stored clock.
-	var lastChange time.Time
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO age_verification_records
 		  (user_id, valid_age, nsfw_auth, jurisdiction_obligation, client_signature, client_version, signature_key_version, canonical_version, last_change)
@@ -255,14 +315,7 @@ func (h *Handler) persist(ctx context.Context, claim Claim, sigB64 string) (time
 			claim.UserID); err != nil {
 			return time.Time{}, err
 		}
-		// Inlined refresh-token revoke (revokeAllSessionsDB is a sessions.Handler
-		// method on its own *sql.DB, not callable inside this tx). Same statement as
-		// auth/handlers.go's ChangePassword / recovery-reset paths.
-		if _, err = tx.ExecContext(ctx,
-			`UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL`,
-			claim.UserID); err != nil {
-			return time.Time{}, err
-		}
+
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -280,13 +333,25 @@ func (h *Handler) persist(ctx context.Context, claim Claim, sigB64 string) (time
 		if setErr := h.redis.Set(bgCtx, middleware.UserDisabledKey(claim.UserID), "1", 0).Err(); setErr != nil {
 			h.log.Error("age: denylist set failed", "error", setErr)
 		}
-		if uid, parseErr := uuid.Parse(claim.UserID); parseErr == nil {
-			h.hub.DisconnectUser(uid)
-		} else {
-			// userID came from the auth middleware (always a valid UUID); a parse
-			// failure here is a should-never-happen invariant breach — log, don't drop.
-			h.log.Error("age: disconnect uuid parse failed", "error", parseErr)
-		}
+		h.closeDisabledSessions(ctx, id, owners)
 	}
 	return lastChange, nil
+}
+
+// closeDisabledSessions fences the disabled user's sockets before the 200. The
+// exact committed families are closed first; with no owner, or a failed exact
+// close, the whole (now disabled) user is disconnected. Neither path fails the
+// committed disablement, and the durable owner's reconciler stays the backstop.
+func (h *Handler) closeDisabledSessions(ctx context.Context, userID uuid.UUID, owners []loginfamily.DeliveryOwner) {
+	if h.hub == nil {
+		return
+	}
+	if len(owners) > 0 {
+		err := loginfamily.CloseCommittedFamilies(ctx, h.db, h.hub, owners)
+		if err == nil {
+			return
+		}
+		h.log.Warn("age: exact family close failed; disconnecting user")
+	}
+	h.hub.DisconnectUser(userID)
 }

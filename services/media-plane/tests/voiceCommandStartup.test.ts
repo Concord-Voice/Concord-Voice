@@ -6,8 +6,9 @@ import { createServer as tcpServer, type Socket as NetworkSocket } from 'node:ne
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHmac, createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import jwt from 'jsonwebtoken';
+import * as protocol from '../src/lib/voiceAuthProtocol.js';
 import {
   natsServerAcquisitionTimeoutMs,
   resolveNatsServerBinary,
@@ -324,50 +325,40 @@ async function redisFixture(placement = false) {
   };
 }
 
-function proof(context: string, fields: string[]) {
-  return createHmac('sha256', createHmac('sha256', fixtureSigner).update(context).digest())
-    .update(fields.join('\n'))
-    .digest('hex');
+const bootHealth = new Map<string, () => void>();
+const bootReadiness = new Map<string, () => Promise<{ status: number; body: unknown }>>();
+
+async function healthChallenge(connection: NatsConnection, boot: string) {
+  const key = Buffer.from(fixtureSigner);
+  const command = protocol.newHealthCommand(boot, randomBytes(32).toString('hex'), 'active', true,
+    String(Math.floor(Date.now() / 1000)));
+  const response = await connection.request(`voice.enforce.session.${boot}`,
+    protocol.signCommand(command, key), { timeout: 2000 });
+  const ack = protocol.verifyAck(response.data, command, key,
+    BigInt(Math.floor(Date.now() / 1000))).health();
+  expect(ack?.transportOK).toBe(true);
+  return ack!.admissionGranted;
 }
 
+// Only the production bootstrap caller may renew authority. A NATS challenge
+// alone must never turn a protocol-4 process ready.
 async function signedHealth(connection: NatsConnection, boot: string) {
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const challenge = randomBytes(32).toString('hex');
-  const request = {
-    version: 2,
-    kind: 'health',
-    nodeBootId: boot,
-    timestamp,
-    challenge,
-    proof: proof('concord/voice-enforcement-session/health/request/v1', [
-      'v1',
-      timestamp,
-      boot,
-      challenge,
-      'health',
-    ]),
-  };
-  const response = await connection.request(
-    `voice.enforce.session.${boot}`,
-    codec.encode(request),
-    { timeout: 2000 }
-  );
-  expect(codec.decode(response.data)).toEqual({
-    version: 2,
-    kind: 'health',
-    nodeBootId: boot,
-    timestamp,
-    challenge,
-    ok: true,
-    proof: proof('concord/voice-enforcement-session/health/ack/v1', [
-      'v1',
-      timestamp,
-      boot,
-      challenge,
-      'health',
-      'true',
-    ]),
-  });
+  await vi.waitFor(() => expect(bootHealth.has(boot)).toBe(true), { timeout: 3000 });
+  bootHealth.get(boot)!();
+  await healthChallenge(connection, boot);
+  // Placement adds fields to /readyz; the caller asserts those separately.
+  // The readiness witness is the actual process response after signature receipt.
+  await vi.waitFor(async () =>
+    expect(await bootReadiness.get(boot)!()).toMatchObject(readiness(boot, true)),
+  { timeout: 15000, interval: 20 });
+}
+
+function readiness(boot: string, ready: boolean, transport = true) {
+  return { status: ready ? 200 : 503, body: {
+    ready, voiceEnforcementProtocol: 4, nodeBootId: boot,
+    voiceEnforcementTransportOK: transport,
+    voiceEnforcementAdmissionGranted: ready,
+  } };
 }
 
 async function requestBody(request: IncomingMessage) {
@@ -382,34 +373,71 @@ async function controlPlane(connection: NatsConnection) {
   let releaseEnabled = true;
   let authorizations = 0;
   let releaseAttempts = 0;
+  let roomReleaseAttempts = 0;
+  const boundaryErrors: string[] = [];
   let revision = 0;
-  const registrations = new Map<string, Record<string, string>>();
+  const registrations = new Map<string, protocol.RoomRegister>();
+  const connections = new Map<string, protocol.Binding>();
+  const endpoints: Record<string, protocol.Endpoint> = {
+    '/api/v1/internal/voice/enforcement/health': 'health_bootstrap',
+    '/api/v1/internal/voice/auth-connections': 'connection_register',
+    '/api/v1/internal/voice/auth-connections/release': 'connection_release',
+    '/api/v1/internal/voice/auth-connections/retire-boot': 'boot_retire',
+    '/api/v1/voice/enforcement-sessions': 'room_register',
+    '/api/v1/internal/voice/enforcement-sessions/release': 'room_release',
+  };
   const server = httpServer(async (request, response) => {
     try {
       const path = request.url ?? '';
       const body = await requestBody(request);
-      const parsed = body ? (JSON.parse(body) as Record<string, string>) : {};
       response.setHeader('Content-Type', 'application/json');
-      if (path === '/api/v1/internal/voice/enforcement/health') {
-        const timestamp = request.headers['x-concord-voice-enforcement-timestamp'];
-        const expected = proof('concord/voice-enforcement-session/health/bootstrap/v1', [
-          'v1',
-          String(timestamp),
-          parsed.node_boot_id,
-          parsed.nonce,
-          'POST',
-          path,
-        ]);
-        if (request.headers['x-concord-voice-enforcement-proof'] !== expected) {
-          response.writeHead(401).end('{}');
-          return;
+      const endpoint = endpoints[path];
+      if (endpoint) {
+        const key = Buffer.from(fixtureSigner);
+        const now = String(Math.floor(Date.now() / 1000));
+        const headers = Object.entries(request.headers).flatMap(([name, value]) =>
+          Array.isArray(value) ? value.map(value => ({ name, value })) : value === undefined ? [] : [{ name, value }]);
+        const decoded = protocol.decodeHttpRequest(endpoint, {
+          method: request.method ?? '', path, headers, body: Buffer.from(body),
+        });
+        protocol.verifyHttpRequest(decoded, key, BigInt(now));
+        let payload: protocol.ResponsePayload = null;
+        const bootstrap = decoded.healthBootstrap();
+        const registration = decoded.connectionRegister();
+        const room = decoded.roomRegister();
+        if (bootstrap) {
+          bootHealth.set(bootstrap.nodeBootId, () => { healthEnabled = true; });
+          if (!healthEnabled) { response.writeHead(503).end('{}'); return; }
+          const granted = await healthChallenge(connection, bootstrap.nodeBootId);
+          payload = { version: 1, voiceEnforcementProtocol: 4, nodeBootId: bootstrap.nodeBootId,
+            activation: 'active', transportOK: true, admissionGranted: granted };
+        } else if (registration) {
+          const token = String(request.headers.authorization).replace(/^Bearer /, '');
+          const claims = jwt.verify(token, fixtureSigner, { issuer: 'concordvoice-control-plane', algorithms: ['HS256'] });
+          if (typeof claims === 'string' || claims.user_id !== userId) throw new Error('Invalid fixture bearer');
+          const binding: protocol.Binding = { userId, familyId: generation, target: {
+            connectionGeneration: registration.connectionGeneration, nodeBootId: registration.nodeBootId,
+            socketId: registration.socketId, credentialEpoch: registration.credentialEpoch } };
+          connections.set(registration.connectionGeneration, binding);
+          payload = { version: 1, voiceEnforcementProtocol: 4, ...binding };
+        } else if (room) {
+          const binding = connections.get(room.connectionGeneration);
+          if (!binding) throw new Error('Missing registered connection');
+          registrations.set(room.sessionGeneration, room);
+          payload = { schema: 'concord.auth-room-binding', version: 1, voiceEnforcementProtocol: 4,
+            binding, room: { sessionGeneration: room.sessionGeneration, roomId: room.roomId, roomKind: room.roomKind } };
+        } else if (endpoint === 'room_release' || endpoint === 'connection_release') {
+          releaseAttempts++;
+          if (endpoint === 'room_release') roomReleaseAttempts++;
+          if (!releaseEnabled) { response.writeHead(503).end('{}'); return; }
+          const released = decoded.roomRelease();
+          if (released) registrations.delete(released.room.sessionGeneration);
+          const releasedConnection = decoded.connectionRelease();
+          if (releasedConnection) connections.delete(releasedConnection.target.connectionGeneration);
         }
-        if (!healthEnabled) {
-          response.writeHead(503).end('{}');
-          return;
-        }
-        await signedHealth(connection, parsed.node_boot_id);
-        response.writeHead(204).end();
+        const signed = protocol.signHttpResponse(decoded, payload, now, key);
+        for (const header of signed.headers) response.setHeader(header.name, header.value);
+        response.writeHead(signed.status).end(Buffer.from(signed.body));
         return;
       }
       if (path.toLowerCase() === `/api/v1/channels/${roomId}/voice/join`) {
@@ -436,59 +464,9 @@ async function controlPlane(connection: NatsConnection) {
         );
         return;
       }
-      if (path === '/api/v1/voice/enforcement-sessions') {
-        const timestamp = String(
-          request.headers['x-concord-voice-enforcement-registration-timestamp']
-        );
-        const token = String(request.headers.authorization).replace(/^Bearer /, '');
-        const expected = proof('concord/voice-enforcement-session/register/v1', [
-          'v1',
-          timestamp,
-          createHash('sha256').update(token).digest('hex'),
-          parsed.session_generation,
-          parsed.node_boot_id,
-          parsed.room_id,
-          parsed.room_kind,
-          userId,
-          parsed.credential_epoch,
-          parsed.socket_id,
-        ]);
-        if (request.headers['x-concord-voice-enforcement-registration-proof'] !== expected) {
-          response.writeHead(401).end('{}');
-          return;
-        }
-        registrations.set(parsed.session_generation, parsed);
-        response.writeHead(204).end();
-        return;
-      }
-      if (path === '/api/v1/internal/voice/enforcement-sessions/release') {
-        releaseAttempts++;
-        const timestamp = String(request.headers['x-concord-voice-enforcement-timestamp']);
-        const expected = proof('concord/voice-enforcement-session/release/v1', [
-          'v1',
-          timestamp,
-          parsed.session_generation,
-          parsed.node_boot_id,
-          parsed.room_id,
-          parsed.room_kind,
-          parsed.user_id,
-          parsed.credential_epoch,
-          parsed.socket_id,
-        ]);
-        if (request.headers['x-concord-voice-enforcement-proof'] !== expected) {
-          response.writeHead(401).end('{}');
-          return;
-        }
-        if (!releaseEnabled) {
-          response.writeHead(503).end('{}');
-          return;
-        }
-        registrations.delete(parsed.session_generation);
-        response.writeHead(204).end();
-        return;
-      }
       response.writeHead(404).end('{}');
-    } catch {
+    } catch (error) {
+      boundaryErrors.push(`${request.url}: ${String(error)}`);
       if (!response.headersSent) response.writeHead(503).end('{}');
       else response.end();
     }
@@ -499,6 +477,9 @@ async function controlPlane(connection: NatsConnection) {
   return {
     url: `http://127.0.0.1:${address.port}`,
     registrations,
+    connections,
+    boundaryErrors,
+    get roomReleaseAttempts() { return roomReleaseAttempts; },
     get authorizations() {
       return authorizations;
     },
@@ -630,6 +611,12 @@ async function application(
         },
         { timeout: 10_000, interval: 20 }
       );
+      const ready = async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/readyz`, { signal: AbortSignal.timeout(1000) });
+        return { status: response.status, body: await response.json() };
+      };
+      const state = await ready();
+      bootReadiness.set(state.body.nodeBootId, ready);
     },
     async workers() {
       return [...workerPids];
@@ -785,10 +772,7 @@ describe('actual index voice-command runtime boundaries', () => {
       const owner = await f.resources.owner();
       expect(owner.phase).toBe('held');
       await signedHealth(f.broker.connection, owner.nodeBootId);
-      expect(await restarted.ready()).toEqual({
-        status: 200,
-        body: { ready: true, voiceEnforcementProtocol: 3 },
-      });
+      expect(await restarted.ready()).toEqual(readiness(owner.nodeBootId, true));
       // Legacy (placement off) still reports both conversion-gate counts.
       const health = await fetch(`${restarted.url}/health`).then((res) => res.json());
       expect(health).toMatchObject({ rooms: 0, creates_in_flight: 0 });
@@ -809,7 +793,10 @@ describe('actual index voice-command runtime boundaries', () => {
         status: 200,
         body: {
           ready: true,
-          voiceEnforcementProtocol: 3,
+          voiceEnforcementProtocol: 4,
+          nodeBootId: owner.nodeBootId,
+          voiceEnforcementTransportOK: true,
+          voiceEnforcementAdmissionGranted: true,
           colour: 'blue',
           generation: expect.stringMatching(
             /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -900,10 +887,7 @@ describe('actual index voice-command runtime boundaries', () => {
       await app.listening();
       const owner = await f.resources.owner();
       await signedHealth(f.broker.connection, owner.nodeBootId);
-      expect(await app.ready()).toEqual({
-        status: 200,
-        body: { ready: true, voiceEnforcementProtocol: 3 },
-      });
+      expect(await app.ready()).toEqual(readiness(owner.nodeBootId, true));
       const peer = await pollingPeer(app.url);
       expect((await peer.join()).error).toBeDefined();
       expect(f.cp.authorizations).toBe(1);
@@ -912,7 +896,7 @@ describe('actual index voice-command runtime boundaries', () => {
       await vi.waitFor(
         async () => {
           expect(f.broker.deniedSubscriptionObserved()).toBe(true);
-          expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+          expect(await app.ready()).toEqual(readiness(owner.nodeBootId, false, false));
         },
         { timeout: 5000, interval: 20 }
       );
@@ -927,12 +911,9 @@ describe('actual index voice-command runtime boundaries', () => {
       await vi.waitFor(
         async () => {
           await signedHealth(f.broker.connection, owner.nodeBootId);
-          expect(await app.ready()).toEqual({
-            status: 200,
-            body: { ready: true, voiceEnforcementProtocol: 3 },
-          });
+          expect(await app.ready()).toEqual(readiness(owner.nodeBootId, true));
         },
-        { timeout: 8000, interval: 100 }
+        { timeout: 18000, interval: 100 }
       );
       expect(await f.resources.owner()).toEqual(owner);
       expect((await peer.join()).error).toBeDefined();
@@ -956,6 +937,7 @@ describe('actual index voice-command runtime boundaries', () => {
       expect((await admitted.join()).rtpCapabilities).toBeDefined();
       const idle = await pollingPeer(app.url);
       expect(f.cp.registrations.size).toBe(1);
+      expect(f.cp.connections.size).toBe(2);
       const workers = await app.workers();
       expect(workers).toHaveLength(1);
       for (const pid of workers) {
@@ -974,7 +956,7 @@ describe('actual index voice-command runtime boundaries', () => {
       await vi.waitFor(
         async () => {
           expect(f.broker.deniedSubscriptionObserved()).toBe(true);
-          expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+          expect(await app.ready()).toEqual(readiness(owner.nodeBootId, false, false));
         },
         { timeout: 5000, interval: 20 }
       );
@@ -988,10 +970,11 @@ describe('actual index voice-command runtime boundaries', () => {
         totalParticipants: number;
       };
       expect(health.totalParticipants).toBe(0);
-      expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+      expect(await app.ready()).toEqual(readiness(owner.nodeBootId, false, false));
       expect(await f.resources.owner()).toEqual(owner);
       expect(f.cp.registrations.size).toBe(1);
-      expect(f.cp.releaseAttempts).toBe(0);
+      expect(f.cp.roomReleaseAttempts).toBe(0);
+      expect(f.cp.connections.size).toBe(1);
       for (const pid of pausedWorkers) {
         expect(await alive(pid)).toBe(true);
         expect(await processState(pid)).toBe('T');
@@ -1006,12 +989,9 @@ describe('actual index voice-command runtime boundaries', () => {
       await vi.waitFor(
         async () => {
           await signedHealth(f.broker.connection, owner.nodeBootId);
-          expect(await app.ready()).toEqual({
-            status: 200,
-            body: { ready: true, voiceEnforcementProtocol: 3 },
-          });
+          expect(await app.ready()).toEqual(readiness(owner.nodeBootId, true));
         },
-        { timeout: 8000, interval: 100 }
+        { timeout: 18000, interval: 100 }
       );
       expect(await admitted.transportStatus()).toBe(400);
       expect(await idle.transportStatus()).toBe(400);
@@ -1034,15 +1014,12 @@ describe('actual index voice-command runtime boundaries', () => {
     try {
       const app = await f.start();
       await app.listening();
-      expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
       const held = await f.resources.owner();
+      expect(await app.ready()).toEqual(readiness(held.nodeBootId, false, false));
       expect(held.phase).toBe('held');
       await signedHealth(f.broker.connection, held.nodeBootId);
       await vi.waitFor(async () =>
-        expect(await app.ready()).toEqual({
-          status: 200,
-          body: { ready: true, voiceEnforcementProtocol: 3 },
-        })
+        expect(await app.ready()).toEqual(readiness(held.nodeBootId, true))
       );
       const peer = await pollingPeer(app.url);
       const refused = await peer.join();
@@ -1050,15 +1027,17 @@ describe('actual index voice-command runtime boundaries', () => {
       expect(f.cp.authorizations).toBe(1);
       await f.resources.kv.delete('authoritative');
       await vi.waitFor(
-        async () => expect(await app.ready()).toEqual({ status: 503, body: { ready: false } }),
+        async () => expect(await app.ready()).toEqual(readiness(held.nodeBootId, false)),
         { timeout: 3500, interval: 20 }
       );
-      const afterLoss = await pollingPeer(app.url);
-      const gated = await afterLoss.join();
-      expect(gated).toEqual({ error: 'Voice service is shutting down' });
+      const afterLoss = await fetch(`${app.url}/socket.io/?EIO=4&transport=polling`, { signal: AbortSignal.timeout(2000) });
+      expect(afterLoss.status).toBe(403);
+      expect(await peer.waitForServerDisconnect(5000)).toBeDefined();
+      expect(await peer.transportStatus()).toBe(400);
       expect(f.cp.authorizations).toBe(1);
-      await expect(signedHealth(f.broker.connection, held.nodeBootId)).rejects.toThrow();
-      expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+      // A verified transport reply cannot revive lost ownership or productive authority.
+      expect(await healthChallenge(f.broker.connection, held.nodeBootId)).toBe(false);
+      expect(await app.ready()).toEqual(readiness(held.nodeBootId, false));
       expect((await f.resources.kv.get('authoritative'))?.operation).toBe('DEL');
     } finally {
       await f.close();
@@ -1175,9 +1154,9 @@ describe('actual index voice-command runtime boundaries', () => {
       expect(health.totalParticipants).toBe(1);
       f.cp.setRelease(false);
       app.child.kill('SIGTERM');
-      await vi.waitFor(() => expect(f.cp.releaseAttempts).toBeGreaterThan(0), { timeout: 5000 });
+      await vi.waitFor(() => expect(f.cp.releaseAttempts, `${f.cp.boundaryErrors.join("; ")}\n${app.output}`).toBeGreaterThan(0), { timeout: 5000 });
       expect(await f.resources.owner()).toEqual(before);
-      expect(await app.ready()).toEqual({ status: 503, body: { ready: false } });
+      expect(await app.ready()).toEqual(readiness(before.nodeBootId, false));
       await vi.waitFor(() => expect(app.result?.code, app.output).toBe(1), {
         timeout: 38_000,
         interval: 50,

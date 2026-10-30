@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
@@ -103,18 +104,50 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, db *sql.DB, fence
 		// credential operation is blocked-in-flight, on a superseded epoch, or
 		// when neither Redis nor the DB can answer.
 		if err := credentialEpochError(c, fence, claims, userID); err != nil {
-			if errors.Is(err, credepoch.ErrBlocked) || errors.Is(err, credepoch.ErrEpochMismatch) {
-				abortUnauthorized(c)
-			} else {
-				abortAuthDependency(c)
-			}
+			abortCredentialEpoch(c, err)
 			return
 		}
 
+		identity, err := accessIdentityFromClaims(claims, userID)
+		if err != nil {
+			abortUnauthorized(c)
+			return
+		}
+		grant, err := loginfamily.ResolveVerifiedAccess(c.Request.Context(), db, identity)
+		if err != nil {
+			abortVerifiedAccess(c, err)
+			return
+		}
+		c.Set(verifiedAccessContextKey, verifiedAccess{identity: identity, grant: grant, db: db})
+		// Writers' credepoch.GuardFamilyTx revalidates this claim under locks.
+		c.Request = c.Request.WithContext(loginfamily.WithAccessIdentity(c.Request.Context(), identity))
 		c.Set("user_id", userID)
 		c.Set(JWTClaimsContextKey, claims)
 		c.Set("email_verified", emailVerified)
 		c.Next()
+	}
+}
+
+// abortCredentialEpoch refuses a blocked or superseded epoch as 401 and an
+// unanswerable fence as a dependency failure.
+func abortCredentialEpoch(c *gin.Context, err error) {
+	if errors.Is(err, credepoch.ErrBlocked) || errors.Is(err, credepoch.ErrEpochMismatch) {
+		abortUnauthorized(c)
+		return
+	}
+	abortAuthDependency(c)
+}
+
+// abortVerifiedAccess maps a login-family resolution failure to its response.
+func abortVerifiedAccess(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, loginfamily.ErrDenied):
+		abortUnauthorized(c)
+	case errors.Is(err, loginfamily.ErrUnavailable):
+		abortAuthDependency(c)
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": authError})
+		c.Abort()
 	}
 }
 
@@ -501,4 +534,77 @@ func BlacklistToken(ctx context.Context, redisClient *redis.Client, jti string, 
 		return nil
 	}
 	return redisClient.Set(ctx, fmt.Sprintf("blacklist:%s", jti), "1", remainingTTL).Err()
+}
+
+const verifiedAccessContextKey = "verified_login_family_access"
+
+// Only AuthRequired installs this private carrier after all existing live gates.
+type verifiedAccess struct {
+	identity loginfamily.AccessIdentity
+	grant    loginfamily.AccessGrant
+	db       *sql.DB
+}
+
+func accessIdentityFromClaims(claims jwt.MapClaims, userID string) (loginfamily.AccessIdentity, error) {
+	user, err := uuid.Parse(userID)
+	if err != nil || user == uuid.Nil {
+		return loginfamily.AccessIdentity{}, loginfamily.NewError(loginfamily.ReasonAccessIdentity, nil)
+	}
+	rawSID, _ := claims["sid"].(string)
+	sid, err := uuid.Parse(rawSID)
+	if err != nil || sid == uuid.Nil {
+		return loginfamily.AccessIdentity{}, loginfamily.NewError(loginfamily.ReasonAccessIdentity, nil)
+	}
+	expiry, err := claims.GetExpirationTime()
+	if err != nil || expiry == nil || !time.Now().Before(expiry.Time) {
+		return loginfamily.AccessIdentity{}, loginfamily.NewError(loginfamily.ReasonAccessExpired, nil)
+	}
+	epoch, _ := claims["cred_epoch"].(string)
+	return loginfamily.AccessIdentity{UserID: user, SID: sid, CredentialEpoch: epoch, AccessExpiresAt: expiry.Time}, nil
+}
+
+// VerifiedAccessFromContext returns copied, consistent snapshots, never lock capabilities.
+func VerifiedAccessFromContext(c *gin.Context) (loginfamily.AccessIdentity, loginfamily.AccessGrant, bool) {
+	value, exists := c.Get(verifiedAccessContextKey)
+	verified, ok := value.(verifiedAccess)
+	if !exists || !ok {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, false
+	}
+	identity, grant := verified.identity, verified.grant
+	claimsValue, _ := c.Get(JWTClaimsContextKey)
+	claims, ok := claimsValue.(jwt.MapClaims)
+	if !ok {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, false
+	}
+	claimedUser, _, validUser := canonicalUserID(claims)
+	if !validUser || claimedUser != c.GetString("user_id") {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, false
+	}
+	current, err := accessIdentityFromClaims(claims, claimedUser)
+	if err != nil || current.UserID != identity.UserID || current.SID != identity.SID ||
+		current.CredentialEpoch != identity.CredentialEpoch || !current.AccessExpiresAt.Equal(identity.AccessExpiresAt) || identity.UserID == uuid.Nil || identity.SID == uuid.Nil ||
+		grant.FamilyID == uuid.Nil || grant.UserID != identity.UserID || grant.SID != identity.SID ||
+		grant.CredentialEpoch != identity.CredentialEpoch || !grant.AccessExpiresAt.Equal(identity.AccessExpiresAt) {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, false
+	}
+	return identity, grant, true
+}
+
+// RecheckVerifiedAccess re-resolves the middleware's private identity before ticket issuance.
+// The returned values are snapshots; callers still own any productive final SQL guard.
+func RecheckVerifiedAccess(c *gin.Context) (loginfamily.AccessIdentity, loginfamily.AccessGrant, error) {
+	identity, initial, ok := VerifiedAccessFromContext(c)
+	if !ok {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, loginfamily.NewError(loginfamily.ReasonAccessIdentity, nil)
+	}
+	value, _ := c.Get(verifiedAccessContextKey)
+	verified := value.(verifiedAccess)
+	grant, err := loginfamily.ResolveVerifiedAccess(c.Request.Context(), verified.db, identity)
+	if err != nil {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, err
+	}
+	if grant != initial {
+		return loginfamily.AccessIdentity{}, loginfamily.AccessGrant{}, loginfamily.NewError(loginfamily.ReasonAccessIdentity, nil)
+	}
+	return identity, grant, nil
 }

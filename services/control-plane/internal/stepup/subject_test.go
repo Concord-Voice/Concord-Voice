@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
 
@@ -36,6 +37,16 @@ func subjectTestUser(t *testing.T, db *sql.DB) string {
 		VALUES ($1, $2, $3, 'stored-hash-fixture', true, true)`, id, id+"@stepup-subject.test", "su"+id[:8])
 	require.NoError(t, err)
 	return id
+}
+
+// subjectTestActor returns a context carrying a live signed identity for
+// userID, as AuthRequired attaches, and that identity's credential epoch.
+func subjectTestActor(t *testing.T, db *sql.DB, userID string) (context.Context, string) {
+	t.Helper()
+	ctx := dbtest.ActorContext(context.Background(), t, db, userID)
+	identity, ok := loginfamily.AccessIdentityFromContext(ctx)
+	require.True(t, ok)
+	return ctx, identity.CredentialEpoch
 }
 
 func subjectTestTOTP(t *testing.T, db *sql.DB, userID string, enabled, confirmed bool) {
@@ -130,11 +141,12 @@ func TestLockSubjectTx_Refusals(t *testing.T) {
 	t.Run("both locks accept a matching epoch and carry the P1 set", func(t *testing.T) {
 		userID := subjectTestUser(t, db)
 		subjectTestWebAuthn(t, db, userID)
+		actor, epoch := subjectTestActor(t, db, userID)
 		for _, lock := range []Lock{LockForShare, LockForNoKeyUpdate} {
 			// Release each lock before taking the next: FOR SHARE conflicts
 			// with FOR NO KEY UPDATE, so holding both would self-deadlock.
 			tx := begin(t)
-			s, e := LockSubjectTx(ctx, tx, userID, lock, "")
+			s, e := LockSubjectTx(actor, tx, userID, lock, epoch)
 			require.NoError(t, tx.Rollback())
 			require.Nil(t, e)
 			require.Equal(t, []string{"webauthn"}, s.MFAMethods)
@@ -154,6 +166,31 @@ func TestLockSubjectTx_Refusals(t *testing.T) {
 		require.Equal(t, ErrMsgAuthenticationRequired, e.Body["error"])
 		require.True(t, e.EpochMismatch())
 		require.Nil(t, e.Cause)
+	})
+
+	t.Run("a session revoked after admission is the tagged 401", func(t *testing.T) {
+		userID := subjectTestUser(t, db)
+		actor, epoch := subjectTestActor(t, db, userID)
+		identity, ok := loginfamily.AccessIdentityFromContext(actor)
+		require.True(t, ok)
+		revoke := begin(t)
+		barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, revoke)
+		require.NoError(t, err)
+		users, err := loginfamily.LockUsersTx(ctx, revoke, barrier, []uuid.UUID{identity.UserID}, loginfamily.UserNoKeyUpdate)
+		require.NoError(t, err)
+		user, err := users.ForUser(identity.UserID)
+		require.NoError(t, err)
+		targets, err := loginfamily.ResolveTargetSIDTx(ctx, revoke, user, identity.SID)
+		require.NoError(t, err)
+		_, err = loginfamily.RevokeFamiliesTx(ctx, revoke, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeSession, Reason: loginfamily.ReasonLogout})
+		require.NoError(t, err)
+		require.NoError(t, revoke.Commit())
+
+		_, e := LockSubjectTx(actor, begin(t), userID, LockForNoKeyUpdate, epoch)
+
+		require.NotNil(t, e)
+		require.Equal(t, http.StatusUnauthorized, e.Status)
+		require.True(t, e.EpochMismatch())
 	})
 
 	t.Run("deleted account is an untagged 401", func(t *testing.T) {
@@ -188,6 +225,7 @@ func TestLockSubjectTx_SeesAFactorCommittedWhileItWaited(t *testing.T) {
 	db := subjectTestDB(t)
 	ctx := context.Background()
 	userID := subjectTestUser(t, db)
+	actor, epoch := subjectTestActor(t, db, userID)
 
 	writer, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	require.NoError(t, err)
@@ -206,7 +244,7 @@ func TestLockSubjectTx_SeesAFactorCommittedWhileItWaited(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		s, e := LockSubjectTx(ctx, gate, userID, LockForShare, "")
+		s, e := LockSubjectTx(actor, gate, userID, LockForShare, epoch)
 		done <- result{s, e}
 	}()
 

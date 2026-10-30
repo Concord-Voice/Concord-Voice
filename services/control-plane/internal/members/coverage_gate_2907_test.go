@@ -23,14 +23,15 @@ func TestModerationFenceRequiresAuthorityCoordinator(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'member')`, serverID, owner, target)
 	require.NoError(t, err)
 	h := &Handler{db: db, log: logger.New("coverage-moderation")}
+	ownerCtx := dbtest.ActorContext(context.Background(), t, db, owner.String())
 
 	t.Run("remove", func(t *testing.T) {
-		err := h.execRemovalTx(context.Background(), serverID, target.String(), owner.String())
+		err := h.execRemovalTx(ownerCtx, serverID, target.String(), owner.String())
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "authority coordinator unavailable")
 	})
 	t.Run("ban", func(t *testing.T) {
-		err := h.execBanTx(context.Background(), serverID, target.String(), owner.String(), nil, true)
+		err := h.execBanTx(ownerCtx, serverID, target.String(), owner.String(), nil, true)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "authority coordinator unavailable")
 	})

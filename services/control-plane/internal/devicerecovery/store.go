@@ -415,7 +415,7 @@ func Respond(ctx context.Context, db *sql.DB, userID, epoch, requestID string, b
 	if err = lockUser(ctx, tx, userID); err != nil {
 		return result, err
 	}
-	if err = credepoch.GuardTx(ctx, tx, userID, epoch); err != nil {
+	if err = credepoch.GuardFamilyTx(ctx, tx, userID, epoch); err != nil {
 		if errors.Is(err, credepoch.ErrEpochMismatch) {
 			return result, ErrUnauthorized
 		}

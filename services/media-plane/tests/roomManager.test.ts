@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createMockRouter,
@@ -2756,10 +2757,12 @@ describe('RoomManager', () => {
       expect(participant?.recvTransports.size).toBe(1);
     });
 
-    it('throws if room not found', async () => {
+    it('refuses an absent room at the participant ownership gate before native creation', async () => {
+      const nativeCreates = mockRouter.createWebRtcTransport.mock.calls.length;
       await expect(manager.createTransport('nonexistent', 'u-1', 'send')).rejects.toThrow(
-        'Room not found'
+        'Participant not found'
       );
+      expect(mockRouter.createWebRtcTransport).toHaveBeenCalledTimes(nativeCreates);
     });
 
     it('throws if participant not found', async () => {
@@ -5783,27 +5786,38 @@ describe('RoomManager', () => {
     it('closes the orphan and fails closed when the participant left mid-produce', async () => {
       const sendTransport = await manager.createTransport('room-1', 'u-1', 'send');
       const participant = manager.getParticipant('room-1', 'u-1')!;
-      const orphan = createMockProducer({ kind: 'audio' });
-
-      (participant.sendTransport as unknown as { produce: ReturnType<typeof vi.fn> }).produce = vi
-        .fn()
-        .mockImplementationOnce(async () => {
-          await manager.leaveRoom('room-1', 'u-1');
-          return orphan;
+      const observer = new EventEmitter();
+      const orphan = createMockProducer({ kind: 'audio', observer });
+      orphan.close.mockImplementation(() => {
+        orphan.closed = true;
+        observer.emit('close');
+      });
+      let leaving!: Promise<void>;
+      let leaveSettled = false;
+      let returnProducer!: (producer: typeof orphan) => void;
+      const nativeProduce = new Promise<typeof orphan>((resolve) => { returnProducer = resolve; });
+      const produceStarted = new Promise<void>((resolve) => {
+        participant.sendTransport!.produce = vi.fn().mockImplementationOnce(() => {
+          leaving = manager.leaveRoom('room-1', 'u-1');
+          void leaving.then(() => { leaveSettled = true; });
+          resolve();
+          return nativeProduce;
         });
-
-      await expect(
-        manager.produce(
-          'room-1',
-          'u-1',
-          sendTransport.id,
-          'audio',
-          createRtpParameters() as any,
-          'mic'
-        )
-      ).rejects.toThrow(/Participant left during producer creation/);
-
-      expect(orphan.close).toHaveBeenCalled();
+      });
+      const producing = manager.produce(
+        'room-1', 'u-1', sendTransport.id, 'audio', createRtpParameters() as any, 'mic'
+      );
+      const refusal = expect(producing).rejects.toThrow(/Participant left during producer creation/);
+      await produceStarted;
+      expect(manager.getParticipant('room-1', 'u-1')).toBeUndefined();
+      expect(leaveSettled).toBe(false);
+      expect(orphan.closed).toBe(false);
+      returnProducer(orphan);
+      await refusal;
+      await leaving;
+      expect(leaveSettled).toBe(true);
+      expect(orphan.close).toHaveBeenCalledOnce();
+      expect(orphan.closed).toBe(true);
       expect(participant.producers.size).toBe(0);
     });
   });

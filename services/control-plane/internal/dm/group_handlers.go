@@ -310,7 +310,7 @@ func (h *Handler) updateDMRoleTx(ctx context.Context, change dmRoleChange, crede
 	if _, err := dmblock.PrepareConversationTx(ctx, tx, change.conversationID, []uuid.UUID{change.actor, change.target}, dmblock.LockShare, dmblock.LockNoKeyUpdate); err != nil {
 		return err
 	}
-	if err := credepoch.GuardTx(ctx, tx, change.actorID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, change.actorID, credentialEpoch); err != nil {
 		return err
 	}
 	var isGroup bool
@@ -642,7 +642,7 @@ func (h *Handler) deleteGroupRows(
 	if err != nil {
 		return err
 	}
-	if err := credepoch.GuardTx(ctx, tx, actorUserID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, actorUserID, credentialEpoch); err != nil {
 		return err
 	}
 	if err := revalidateDeleteGroupAuthority(ctx, tx, convID, actorUserID); err != nil {
@@ -698,7 +698,7 @@ func (h *Handler) deleteGroupRowsTx(
 	if err != nil {
 		return groupDeleteResult{}, err
 	}
-	if err := credepoch.GuardTx(ctx, tx, actorUserID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, actorUserID, credentialEpoch); err != nil {
 		return groupDeleteResult{}, err
 	}
 	if h.afterUsersLockHook != nil {

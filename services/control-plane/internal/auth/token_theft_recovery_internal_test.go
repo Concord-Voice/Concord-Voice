@@ -84,38 +84,91 @@ func TestQueueTokenTheftRevocation_RedisStallStillCommitsPendingRow(t *testing.T
 }
 
 func TestRefreshMintsRejectPendingTheftInsideUserLock(t *testing.T) {
-	db, cleanup := dbtest.SetupTestDB(t)
-	t.Cleanup(cleanup)
-	redisClient := setupAuthAttemptRedis(t)
-	userID := dbtest.CreateUser(t, db)
-	require.NoError(t, EnqueueTokenTheftRevocation(t.Context(), db, userID.String()))
-	h := &Handler{db: db, redis: redisClient, log: logger.New("test")}
-	sourceID, revokedID, successorID := uuid.NewString(), uuid.NewString(), uuid.NewString()
-	_, err := db.Exec(`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at)
-		VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`, sourceID, userID, HashRefreshToken("pending-theft-source"))
-	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, revoked_at)
-		VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour', NOW())`, revokedID, userID, HashRefreshToken("pending-theft-revoked"))
-	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, predecessor_id)
-		VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour', $4)`, successorID, userID, HashRefreshToken("pending-theft-successor"), revokedID)
-	require.NoError(t, err)
+	for _, pending := range []bool{false, true} {
+		name := "unblocked control"
+		if pending {
+			name = "durable pending theft"
+		}
+		t.Run(name, func(t *testing.T) {
+			// The production constructor supplies the same entitlement cache that
+			// both mint paths consult before opening their transactions.
+			rig := newFamilyTestRig(t)
+			require.NotNil(t, rig.h.entCache)
+			access, _, sourceID, err := rig.h.IssueAccessAndRefresh(t.Context(), rig.user)
+			require.NoError(t, err)
+			sourceFamily, _ := assertFamilyAccess(t, rig, access)
+			var expiry time.Time
+			require.NoError(t, rig.db.QueryRow(`SELECT expires_at FROM refresh_tokens WHERE id=$1`, sourceID).Scan(&expiry))
+			graceAccess, graceSecret, revokedID, err := rig.h.IssueAccessAndRefresh(t.Context(), rig.user)
+			require.NoError(t, err)
+			graceFamily, _ := assertFamilyAccess(t, rig, graceAccess)
+			require.NotEqual(t, sourceFamily, graceFamily)
+			c, rec := familyTestContext()
+			c.Request.Header.Set("X-Refresh-Token", graceSecret)
+			rig.h.Refresh(c)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			rotated := familyResponse(t, rec)
+			rotatedFamily, _ := assertFamilyAccess(t, rig, rotated.Access)
+			require.Equal(t, graceFamily, rotatedFamily)
 
-	c, rec := newLoginContext()
-	h.rotateAndRespond(c, models.RefreshToken{
-		ID: sourceID, UserID: userID.String(), ExpiresAt: time.Now().Add(time.Hour),
-	}, "")
-	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-
-	c, rec = newLoginContext()
-	h.handleGracePeriodRefresh(c, userID.String(), revokedID, time.Now())
-	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-
-	var active, total int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID).Scan(&active))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1`, userID).Scan(&total))
-	assert.Equal(t, 2, active, "neither mint path may revoke a source while theft is pending")
-	assert.Equal(t, 3, total, "neither mint path may create a successor after theft enqueue")
+			// Only the durable SQL guard can refuse these otherwise valid inputs:
+			// no process-local hold or Redis deny marker is installed.
+			require.False(t, middleware.LocalTokenTheftPending(rig.user))
+			blocked, err := rig.h.redis.Exists(t.Context(), middleware.TokenTheftBlockedKey(rig.user)).Result()
+			require.NoError(t, err)
+			require.Zero(t, blocked)
+			if pending {
+				require.NoError(t, EnqueueTokenTheftRevocation(t.Context(), rig.db, rig.user))
+			}
+			// Include every column, so revocation timestamps, immutable SID expiry,
+			// family owners, and inserted successors are all covered by equality.
+			snapshot := func() string {
+				var state string
+				require.NoError(t, rig.db.QueryRow(`SELECT jsonb_build_object(
+					'refresh', (SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM refresh_tokens r WHERE user_id=$1),
+					'sids', (SELECT jsonb_agg(to_jsonb(s) ORDER BY sid) FROM login_family_sids s WHERE user_id=$1),
+					'families', (SELECT jsonb_agg(to_jsonb(f) ORDER BY family_id) FROM login_families f WHERE user_id=$1),
+					'owners', (SELECT jsonb_agg(to_jsonb(o) ORDER BY operation_id) FROM login_family_revocations o WHERE user_id=$1)
+				)::text`, rig.user).Scan(&state))
+				return state
+			}
+			before := snapshot()
+			c, rec = familyTestContext()
+			rig.h.rotateAndRespond(c, models.RefreshToken{ID: sourceID, UserID: rig.user, ExpiresAt: expiry}, "")
+			if pending {
+				require.Equal(t, http.StatusUnauthorized, rec.Code)
+				require.JSONEq(t, `{"error":"`+errMsgInvalidRefreshToken+`"}`, rec.Body.String())
+				require.Empty(t, rec.Header().Values("Set-Cookie"))
+				require.JSONEq(t, before, snapshot())
+			} else {
+				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+				pair := familyResponse(t, rec)
+				family, _ := assertFamilyAccess(t, rig, pair.Access)
+				require.Equal(t, sourceFamily, family)
+			}
+			c, rec = familyTestContext()
+			rig.h.handleGracePeriodRefresh(c, rig.user, revokedID, time.Now())
+			if pending {
+				require.Equal(t, http.StatusUnauthorized, rec.Code)
+				require.JSONEq(t, `{"error":"`+errMsgInvalidRefreshToken+`"}`, rec.Body.String())
+				require.Empty(t, rec.Header().Values("Set-Cookie"))
+				require.JSONEq(t, before, snapshot())
+			} else {
+				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+				pair := familyResponse(t, rec)
+				family, _ := assertFamilyAccess(t, rig, pair.Access)
+				require.Equal(t, graceFamily, family)
+			}
+			var active, total int
+			require.NoError(t, rig.db.QueryRow(`SELECT COUNT(*) FILTER (WHERE revoked_at IS NULL), COUNT(*) FROM refresh_tokens WHERE user_id=$1`, rig.user).Scan(&active, &total))
+			assert.Equal(t, 2, active)
+			if pending {
+				assert.Equal(t, 3, total, "both denied mints must leave the original source and grace chain intact")
+			} else {
+				assert.Equal(t, 5, total, "both unblocked controls must actually mint a successor")
+			}
+		})
+	}
 }
 
 func TestQueueTokenTheftRevocation_ConcurrentEventsKeepNewestFallback(t *testing.T) {
@@ -424,19 +477,17 @@ func TestProcessTokenTheftRevocation_NoPendingRecordIsNoop(t *testing.T) {
 }
 
 func TestProcessTokenTheftRevocation_CompletesLegacyPendingRecord(t *testing.T) {
-	db, cleanup := dbtest.SetupTestDB(t)
-	t.Cleanup(cleanup)
-	redisClient := setupAuthAttemptRedis(t)
-	userID := dbtest.CreateUser(t, db)
-	_, err := db.Exec(
-		`INSERT INTO token_theft_pending_revocations (user_id) VALUES ($1)`, userID,
-	)
+	rig := newFamilyTestRig(t)
+	db, redisClient := rig.db, rig.h.redis
+	userID := uuid.MustParse(rig.user)
+	access, _, sid, err := rig.h.IssueAccessAndRefresh(t.Context(), rig.user)
 	require.NoError(t, err)
-	_, err = db.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
-		uuid.New(), userID, HashRefreshToken("legacy-pending-token"),
-	)
+	assertFamilyAccess(t, rig, access)
+	_, err = db.Exec(`INSERT INTO token_theft_pending_revocations (user_id) VALUES ($1)`, userID)
 	require.NoError(t, err)
+	var legacyOperation sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT operation_id FROM token_theft_pending_revocations WHERE user_id=$1`, userID).Scan(&legacyOperation))
+	require.False(t, legacyOperation.Valid)
 
 	require.NoError(t, ProcessTokenTheftRevocation(t.Context(), db, redisClient, userID.String()))
 
@@ -452,6 +503,22 @@ func TestProcessTokenTheftRevocation_CompletesLegacyPendingRecord(t *testing.T) 
 	blocked, err := redisClient.Exists(t.Context(), middleware.TokenTheftBlockedKey(userID.String())).Result()
 	require.NoError(t, err)
 	assert.Zero(t, blocked)
+	var terminal, revoked, theftOwner bool
+	require.NoError(t, db.QueryRow(`SELECT f.terminal_at IS NOT NULL, r.revoked_at IS NOT NULL,
+		o.reason='theft' AND o.scope='user' AND o.sealed_at IS NOT NULL
+		AND EXISTS (SELECT 1 FROM login_family_revocation_targets t WHERE t.operation_id=o.operation_id AND t.family_id=f.family_id AND t.user_id=f.user_id)
+		FROM login_family_sids s JOIN login_families f USING (family_id,user_id)
+		JOIN refresh_tokens r ON r.id=s.sid AND r.user_id=s.user_id
+		JOIN login_family_revocations o ON o.operation_id=f.auth_operation_id AND o.user_id=f.user_id
+		WHERE s.sid=$1`, sid).Scan(&terminal, &revoked, &theftOwner))
+	assert.True(t, terminal)
+	assert.True(t, revoked)
+	assert.True(t, theftOwner)
+
+	require.NoError(t, ProcessTokenTheftRevocation(t.Context(), db, redisClient, rig.user))
+	var generation int64
+	require.NoError(t, db.QueryRow(`SELECT token_theft_generation FROM users WHERE id=$1`, userID).Scan(&generation))
+	assert.EqualValues(t, 1, generation)
 }
 
 func TestFinalizeTokenTheftRevocation_PreservesIncompleteRecord(t *testing.T) {
@@ -502,16 +569,26 @@ func TestRecoverPendingTokenTheftRevocations_PromotesRedisFallbacks(t *testing.T
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			db, cleanup := dbtest.SetupTestDB(t)
-			t.Cleanup(cleanup)
-			redisClient := setupAuthAttemptRedis(t)
-			userID := dbtest.CreateUser(t, db)
-			_, err := db.Exec(
-				`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
-				uuid.New(), userID, HashRefreshToken("fallback-token-"+test.name),
-			)
+			rig := newFamilyTestRig(t)
+			db, redisClient := rig.db, rig.h.redis
+			userID := uuid.MustParse(rig.user)
+			access, _, sid, err := rig.h.IssueAccessAndRefresh(t.Context(), rig.user)
 			require.NoError(t, err)
+			assertFamilyAccess(t, rig, access)
 			require.NoError(t, test.stage(t.Context(), redisClient, userID.String()))
+			marker, err := redisClient.Get(t.Context(), middleware.TokenTheftBlockedKey(rig.user)).Result()
+			require.NoError(t, err)
+			if test.name == "legacy fallback" {
+				require.Equal(t, tokenTheftLegacyStateValue, marker)
+				legacyMember, err := redisClient.SIsMember(t.Context(), tokenTheftLegacyFallbackSetKey, rig.user).Result()
+				require.NoError(t, err)
+				require.True(t, legacyMember)
+			} else {
+				operationID, err := redisClient.HGet(t.Context(), tokenTheftFallbackHashKey, rig.user).Result()
+				require.NoError(t, err)
+				require.Equal(t, operationID, marker)
+				require.NotEmpty(t, operationID)
+			}
 
 			require.NoError(t, RecoverPendingTokenTheftRevocations(t.Context(), db, redisClient, logger.New("test")))
 
@@ -527,6 +604,27 @@ func TestRecoverPendingTokenTheftRevocations_PromotesRedisFallbacks(t *testing.T
 			blocked, err := redisClient.Exists(t.Context(), middleware.TokenTheftBlockedKey(userID.String())).Result()
 			require.NoError(t, err)
 			assert.Zero(t, blocked)
+			var terminal, revoked, theftOwner bool
+			require.NoError(t, db.QueryRow(`SELECT f.terminal_at IS NOT NULL, r.revoked_at IS NOT NULL,
+				o.reason='theft' AND o.scope='user' AND o.sealed_at IS NOT NULL
+				AND EXISTS (SELECT 1 FROM login_family_revocation_targets t WHERE t.operation_id=o.operation_id AND t.family_id=f.family_id AND t.user_id=f.user_id)
+				FROM login_family_sids s JOIN login_families f USING (family_id,user_id)
+				JOIN refresh_tokens r ON r.id=s.sid AND r.user_id=s.user_id
+				JOIN login_family_revocations o ON o.operation_id=f.auth_operation_id AND o.user_id=f.user_id
+				WHERE s.sid=$1`, sid).Scan(&terminal, &revoked, &theftOwner))
+			assert.True(t, terminal)
+			assert.True(t, revoked)
+			assert.True(t, theftOwner)
+			require.NoError(t, RecoverPendingTokenTheftRevocations(t.Context(), db, redisClient, logger.New("test")))
+			var generation int64
+			require.NoError(t, db.QueryRow(`SELECT token_theft_generation FROM users WHERE id=$1`, userID).Scan(&generation))
+			assert.EqualValues(t, 1, generation)
+			fallback, err := redisClient.HExists(t.Context(), tokenTheftFallbackHashKey, rig.user).Result()
+			require.NoError(t, err)
+			assert.False(t, fallback)
+			legacy, err := redisClient.SIsMember(t.Context(), tokenTheftLegacyFallbackSetKey, rig.user).Result()
+			require.NoError(t, err)
+			assert.False(t, legacy)
 		})
 	}
 }
@@ -581,20 +679,21 @@ func TestRetryTokenTheftRecoveryOnce_JoinsQueueAndProcessingFailures(t *testing.
 	assert.ErrorContains(t, err, "revoke refresh tokens after token theft retry")
 }
 
-type tokenTheftRetryDisconnector struct{}
+// tokenTheftRetryDisconnector records the user-wide theft kill.
+type tokenTheftRetryDisconnector struct{ users []uuid.UUID }
 
-func (tokenTheftRetryDisconnector) DisconnectUser(uuid.UUID) {}
+func (d *tokenTheftRetryDisconnector) DisconnectUser(user uuid.UUID) { d.users = append(d.users, user) }
+func (*tokenTheftRetryDisconnector) DisconnectFamilyContext(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
 
 func TestHandleTokenTheft_RetriesWhenBothPersistenceStoresFail(t *testing.T) {
-	db, cleanup := dbtest.SetupTestDB(t)
-	t.Cleanup(cleanup)
-	redisClient := setupAuthAttemptRedis(t)
-	userID := dbtest.CreateUser(t, db)
-	_, err := db.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
-		uuid.New(), userID, HashRefreshToken("token-theft-retry-token"),
-	)
+	rig := newFamilyTestRig(t)
+	db, redisClient := rig.db, rig.h.redis
+	userID := uuid.MustParse(rig.user)
+	access, _, sid, err := rig.h.IssueAccessAndRefresh(t.Context(), rig.user)
 	require.NoError(t, err)
+	assertFamilyAccess(t, rig, access)
 	require.NoError(t, installTokenTheftRetryEnqueueFailure(db))
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DROP TRIGGER IF EXISTS token_theft_retry_enqueue_failure ON token_theft_pending_revocations`)
@@ -614,10 +713,15 @@ return 1
 `)
 	t.Cleanup(func() { persistTokenTheftRecoveryStateScript = originalScript })
 
-	h := &Handler{db: db, redis: redisClient, log: logger.New("test"), hub: tokenTheftRetryDisconnector{}}
+	h := rig.h
+	hub := &tokenTheftRetryDisconnector{}
+	h.hub = hub
 	c, rec := newLoginContext()
 	require.True(t, h.handleTokenTheft(c, models.RefreshToken{UserID: userID.String()}))
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	// No family is terminal on this deferred path, so only the immediate
+	// user-wide kill can stop the stolen session's open sockets.
+	assert.Equal(t, []uuid.UUID{userID}, hub.users, "theft must disconnect every socket before responding")
 	assert.NotContains(t, rec.Body.String(), "Session terminated")
 	require.ErrorIs(t, middleware.CheckTokenTheftBlocked(t.Context(), redisClient, db, userID.String()), middleware.ErrTokenTheftRevocationPending)
 	assert.True(t, middleware.LocalTokenTheftPending(userID.String()))
@@ -627,10 +731,21 @@ return 1
 
 	assert.Eventually(t, func() bool {
 		var active int
-		err := db.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID).Scan(&active)
+		err := db.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, sid).Scan(&active)
 		return err == nil && active == 0
 	}, 5*time.Second, 25*time.Millisecond)
 	assert.Eventually(t, func() bool { return !middleware.LocalTokenTheftPending(userID.String()) }, 5*time.Second, 25*time.Millisecond)
+	var terminal, revoked, theftOwner bool
+	require.NoError(t, db.QueryRow(`SELECT f.terminal_at IS NOT NULL, r.revoked_at IS NOT NULL,
+		o.reason='theft' AND o.scope='user' AND o.sealed_at IS NOT NULL
+		AND EXISTS (SELECT 1 FROM login_family_revocation_targets t WHERE t.operation_id=o.operation_id AND t.family_id=f.family_id AND t.user_id=f.user_id)
+		FROM login_family_sids s JOIN login_families f USING (family_id,user_id)
+		JOIN refresh_tokens r ON r.id=s.sid AND r.user_id=s.user_id
+		JOIN login_family_revocations o ON o.operation_id=f.auth_operation_id AND o.user_id=f.user_id
+		WHERE s.sid=$1`, sid).Scan(&terminal, &revoked, &theftOwner))
+	assert.True(t, terminal)
+	assert.True(t, revoked)
+	assert.True(t, theftOwner)
 }
 
 func installTokenTheftRetryEnqueueFailure(db *sql.DB) error {

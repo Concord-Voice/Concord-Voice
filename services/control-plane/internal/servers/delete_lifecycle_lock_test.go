@@ -131,7 +131,8 @@ func TestDeleteServerSerializesWithServerVoiceLifecycleWriter(t *testing.T) {
 
 	rail := &recordingServerDeleteRail{}
 	h := &Handler{db: db, activePlans: rail}
-	done := startServerDelete(ctx, db, h, serverID, owner, []serverVoiceCandidate{{
+	// The family guard (#2272) needs the actor's signed identity below the router.
+	done := startServerDelete(dbtest.ActorContext(ctx, t, db, owner.String()), db, h, serverID, owner, []serverVoiceCandidate{{
 		subjectID: sender, channelID: channelID, lifecycleEventAt: oldEventAt,
 	}})
 
@@ -231,7 +232,7 @@ func TestDeleteServerAllowsDepartedPreflightCandidate(t *testing.T) {
 	}()
 	waitForBackendBlockedBy(ctx, t, db, blockerPID)
 
-	done := startServerDelete(ctx, db, h, serverID, owner, preflight)
+	done := startServerDelete(dbtest.ActorContext(ctx, t, db, owner.String()), db, h, serverID, owner, preflight)
 	require.NoError(t, blocker.Commit())
 
 	var ready departureResult
@@ -279,7 +280,7 @@ func TestDeleteServerKeepsVoiceEvidenceAfterChannelTypeChanges(t *testing.T) {
 	require.NoError(t, err)
 	outcome := serverDeleteOutcome{}
 	require.NoError(t, h.deleteServerWithActivePlans(
-		context.Background(), tx, serverID.String(), owner.String(), preflight, serverDeleteConfirm{}, &outcome,
+		dbtest.ActorContext(context.Background(), t, db, owner.String()), tx, serverID.String(), owner.String(), preflight, serverDeleteConfirm{}, &outcome,
 	))
 	require.True(t, outcome.committed)
 	require.Len(t, rail.plans, 1)
@@ -305,7 +306,7 @@ func TestDeleteServerPreservesVoiceEvidenceAfterChannelDeletion(t *testing.T) {
 	require.NoError(t, err)
 	outcome := serverDeleteOutcome{}
 	require.NoError(t, h.deleteServerWithActivePlans(
-		context.Background(), tx, serverID.String(), owner.String(), preflight, serverDeleteConfirm{}, &outcome,
+		dbtest.ActorContext(context.Background(), t, db, owner.String()), tx, serverID.String(), owner.String(), preflight, serverDeleteConfirm{}, &outcome,
 	))
 	require.True(t, outcome.committed)
 	require.Len(t, rail.plans, 1)
@@ -338,7 +339,7 @@ func TestDeleteServerLocksCandidateUsersBeforeServer(t *testing.T) {
 	var blockerPID int
 	require.NoError(t, blocker.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID))
 
-	done := startServerDelete(ctx, db, h, serverID, owner, preflight)
+	done := startServerDelete(dbtest.ActorContext(ctx, t, db, owner.String()), db, h, serverID, owner, preflight)
 	waitForBackendBlockedBy(ctx, t, db, blockerPID)
 	var lockedUser uuid.UUID
 	err = db.QueryRowContext(ctx,
@@ -383,7 +384,7 @@ func TestDeleteServerLocksChannelParentsBeforeFinalReread(t *testing.T) {
 	var blockerPID int
 	require.NoError(t, blocker.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID))
 
-	done := startServerDelete(ctx, db, h, serverID, owner, preflight)
+	done := startServerDelete(dbtest.ActorContext(ctx, t, db, owner.String()), db, h, serverID, owner, preflight)
 	waitForBackendBlockedBy(ctx, t, db, blockerPID)
 	_, err = db.ExecContext(ctx, `
 		UPDATE voice_participants SET lifecycle_event_at = $3
@@ -442,7 +443,7 @@ func TestDeleteServerWithActivePlansFailsClosedBeforeDelete(t *testing.T) {
 			require.NoError(t, beginErr)
 			outcome := serverDeleteOutcome{}
 			deleteErr := (&Handler{db: db, activePlans: tc.rail}).deleteServerWithActivePlans(
-				context.Background(), tx, tc.serverID.String(), tc.userID.String(), tc.preflight, serverDeleteConfirm{}, &outcome)
+				dbtest.ActorContext(context.Background(), t, db, tc.userID.String()), tx, tc.serverID.String(), tc.userID.String(), tc.preflight, serverDeleteConfirm{}, &outcome)
 			require.ErrorIs(t, deleteErr, tc.want)
 			require.False(t, outcome.committed)
 			require.NoError(t, tx.Rollback())

@@ -101,7 +101,7 @@ func TestOpsMessageCounterWebSocketChannelCountsOnlySuccessfulInsert(t *testing.
 	counter := &opsCounterSpy{}
 	setup.hub.opsCounter = counter
 
-	setup.hub.handleMessage(IncomingMessage{
+	setup.hub.handleMessage(setup.live(t, IncomingMessage{
 		Type:     "message",
 		UserID:   setup.user1,
 		ClientID: setup.client.ID,
@@ -110,7 +110,7 @@ func TestOpsMessageCounterWebSocketChannelCountsOnlySuccessfulInsert(t *testing.
 			keyContent:    "successful message",
 			keyKeyVersion: float64(1),
 		},
-	})
+	}))
 	require.Equal(t, 1, counter.count(opsmetrics.MetricChannelMessagesTotal))
 
 	_, err := setup.db.Exec(`
@@ -129,7 +129,7 @@ func TestOpsMessageCounterWebSocketChannelCountsOnlySuccessfulInsert(t *testing.
 		require.NoError(t, cleanupErr)
 	})
 
-	setup.hub.handleMessage(IncomingMessage{
+	setup.hub.handleMessage(setup.live(t, IncomingMessage{
 		Type:     "message",
 		UserID:   setup.user1,
 		ClientID: setup.client.ID,
@@ -138,7 +138,7 @@ func TestOpsMessageCounterWebSocketChannelCountsOnlySuccessfulInsert(t *testing.
 			keyContent:    "failed message",
 			keyKeyVersion: float64(1),
 		},
-	})
+	}))
 	require.Equal(t, 1, counter.count(opsmetrics.MetricChannelMessagesTotal))
 }
 
@@ -158,7 +158,7 @@ func TestOpsMessageCounterWebSocketDMCountsClientSuppliedSystemType(t *testing.T
 	setup.hub.opsCounter = counter
 
 	for _, messageType := range []string{"user", "system"} {
-		setup.hub.handleDMMessage(IncomingMessage{
+		setup.hub.handleDMMessage(setup.live(t, IncomingMessage{
 			Type:     "dm_message",
 			UserID:   setup.user1,
 			ClientID: setup.client.ID,
@@ -168,7 +168,7 @@ func TestOpsMessageCounterWebSocketDMCountsClientSuppliedSystemType(t *testing.T
 				keyKeyVersion:     float64(1),
 				"type":            messageType,
 			},
-		})
+		}))
 	}
 
 	require.Equal(t, 2, counter.count(opsmetrics.MetricDMMessagesTotal))

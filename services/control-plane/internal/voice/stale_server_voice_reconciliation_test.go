@@ -572,7 +572,7 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 			)
 			require.NoError(t, err)
 			hub, baseURL := newVoiceReplicaHub(t, ts)
-			conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+			conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 			require.NoError(t, conn.WriteJSON(map[string]interface{}{
 				"type": "subscribe_server",
 				"data": map[string]interface{}{"server_id": serverID},

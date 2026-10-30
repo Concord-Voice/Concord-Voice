@@ -1,9 +1,11 @@
 package users_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -328,15 +330,36 @@ func TestUpdateMeLoneMatchingResendDoesNotBroadcast(t *testing.T) {
 
 func dialProfileObserver(t *testing.T, ts *testhelpers.TestServer, userID string) *gorillaWS.Conn {
 	t.Helper()
-	ticket := "inline-quiet-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:inline-quiet::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	// The token helper also verifies email: require that existing identity first,
+	// so observer admission cannot silently repair an unverified fixture.
+	var verified bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT email_verified FROM users WHERE id = $1`, userID).Scan(&verified))
+	require.True(t, verified, "observer must already have a verified identity")
+	accessToken := ts.VerifyUserEmail(t, userID) // A fresh family for every connection.
+	id := uuid.MustParse(userID)
+	priorClients := ts.Hub.GetUserClientCount(id)
 	srv := httptest.NewServer(ts.Router)
 	t.Cleanup(srv.Close)
-	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+srv.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/api/v1/auth/ws-ticket", nil)
+	require.NoError(t, err)
+	req.Header = testhelpers.AuthHeaders(accessToken)
+	client := srv.Client()
+	client.Timeout = 5 * time.Second
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	require.Equal(t, http.StatusOK, resp.StatusCode, "canonical observer ticket admission")
+	var body struct {
+		Ticket string `json:"ticket"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.NoError(t, resp.Body.Close())
+	require.NotEmpty(t, body.Ticket)
+	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+srv.URL[4:]+"/api/v1/ws?ticket="+url.QueryEscape(body.Ticket), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	require.Eventually(t, func() bool {
-		return ts.Hub.GetUserClientCount(uuid.MustParse(userID)) > 0
+		return ts.Hub.GetUserClientCount(id) == priorClients+1
 	}, 2*time.Second, 10*time.Millisecond)
 	return conn
 }

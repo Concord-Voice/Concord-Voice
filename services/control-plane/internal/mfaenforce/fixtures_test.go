@@ -15,14 +15,17 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
@@ -119,12 +122,30 @@ func beginTx(t *testing.T, db *sql.DB, level sql.IsolationLevel) *sql.Tx {
 	return tx
 }
 
+// actorCtx carries actorID's live signed identity, as AuthRequired attaches
+// it; LockSubjectTx's login-family guard (#2272) refuses a context without one.
+// One identity per actor and database is minted and reused: minting locks the
+// users row, which an earlier gate in the same test may still hold.
+func actorCtx(ctx context.Context, t *testing.T, db *sql.DB, actorID string) context.Context {
+	t.Helper()
+	key := fmt.Sprintf("%p/%s", db, actorID)
+	identity, ok := actorIdentities.Load(key)
+	if !ok {
+		minted, found := loginfamily.AccessIdentityFromContext(dbtest.ActorContext(context.Background(), t, db, actorID))
+		require.True(t, found)
+		identity, _ = actorIdentities.LoadOrStore(key, minted)
+	}
+	return loginfamily.WithAccessIdentity(ctx, identity.(loginfamily.AccessIdentity))
+}
+
+var actorIdentities sync.Map
+
 // lockGate opens a READ COMMITTED transaction and runs LockGateTx with the
 // weakest locks, which is all the confirmation tests need.
 func lockGate(t *testing.T, db *sql.DB, serverID, actorID string) (mfaenforce.Gate, *sql.Tx) {
 	t.Helper()
 	tx := beginTx(t, db, sql.LevelReadCommitted)
-	g, err := mfaenforce.LockGateTx(context.Background(), tx, serverID, actorID,
+	g, err := mfaenforce.LockGateTx(actorCtx(context.Background(), t, db, actorID), tx, serverID, actorID,
 		stepup.LockForShare, mfaenforce.ServerForShare, "")
 	require.NoError(t, err)
 	return g, tx

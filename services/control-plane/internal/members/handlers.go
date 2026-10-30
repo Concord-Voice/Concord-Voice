@@ -14,6 +14,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfaenforce"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -1404,12 +1405,19 @@ func (h *Handler) prepareRemovalFenceTx(
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, req.serverID); err != nil {
 		return fmt.Errorf("lock member removal server: %w", err)
 	}
+	// #2272 lock contract amendment 7: the shared writer barrier precedes every
+	// users lock; GuardFamilyTx below reuses it.
+	if _, err := loginfamily.AcquireWriterBarrierTx(ctx, tx); err != nil {
+		return err
+	}
 	if err := lockModerationUsersTx(ctx, tx, req.actorID, req.targetUserID); err != nil {
 		return err
 	}
 	// Take the sorted stronger pair before GuardTx's actor FOR SHARE read so
-	// concurrent cross-target removals cannot form a lock-upgrade cycle.
-	if err := credepoch.GuardTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
+	// concurrent cross-target removals cannot form a lock-upgrade cycle. The
+	// family guard (#2272) refuses a kick from a login family terminalized after
+	// admission even though the epoch is unchanged.
+	if err := credepoch.GuardFamilyTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
 		return err
 	}
 
@@ -1961,12 +1969,19 @@ func lockBanActorAndServerTx(ctx context.Context, tx *sql.Tx, req banFenceReques
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, req.serverID); err != nil {
 		return mfaenforce.Gate{}, fmt.Errorf("lock member ban server: %w", err)
 	}
+	// #2272 lock contract amendment 7: the shared writer barrier precedes every
+	// users lock; GuardFamilyTx below reuses it.
+	if _, err := loginfamily.AcquireWriterBarrierTx(ctx, tx); err != nil {
+		return mfaenforce.Gate{}, err
+	}
 	if err := lockModerationUsersTx(ctx, tx, req.actorID, req.targetUserID); err != nil {
 		return mfaenforce.Gate{}, banUsersLockError(ctx, tx, req.serverID, err)
 	}
 	// The stronger, sorted user-pair lock prevents GuardTx's actor FOR SHARE
-	// read from creating a lock-upgrade cycle before the target is locked.
-	if err := credepoch.GuardTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
+	// read from creating a lock-upgrade cycle before the target is locked. The
+	// family guard (#2272) refuses a ban from a login family terminalized after
+	// admission even though the epoch is unchanged.
+	if err := credepoch.GuardFamilyTx(ctx, tx, req.actorID, req.credentialEpoch); err != nil {
 		return mfaenforce.Gate{}, err
 	}
 	return lockBanServerOwnerTx(ctx, tx, req)

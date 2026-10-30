@@ -28,15 +28,18 @@ import (
 )
 
 func TestDMVisibility_ClearRejectsStaleCredentialEpoch(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	actor := ts.CreateTestUser(t, "visibility_stale_epoch")
 	peer := ts.CreateTestUser(t, "visibility_stale_peer")
 	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
-	stale := ts.SimulateStaleEpochWindow(t, actor.ID)
+	stale := actor.AccessToken
+	require.NoError(t, boundary.Arm(stale))
+	boundary.Hook.ArmArg([]string{`SELECT credential_epoch, COALESCE(password_hash, '') FROM users WHERE id = $1 FOR NO KEY UPDATE`}, actor.ID, nil, nil)
 
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/clear", map[string]string{}, testhelpers.AuthHeaders(stale))
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	requireDMStaleBoundary(t, boundary)
 	var ranges int
 	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_message_hidden_ranges WHERE user_id = $1 AND conversation_id = $2`, actor.ID, convID).Scan(&ranges))
 	assert.Zero(t, ranges, "stale credentials must not create a visibility range")
@@ -310,8 +313,8 @@ func TestDMVisibility_ClearAmbiguousCommitRecoversExactReceipt(t *testing.T) {
 			})
 			t.Cleanup(func() { dmhandler.SetDMClearCommitForTest(h, nil) })
 
-			actorConn := connectDMVisibilityWebSocket(t, ts, actor.ID, conversationID, "clear-ambiguous-"+uuid.NewString())
-			response := invokeDMVisibilityClearWithContext(requestCtx, h, strings.ToUpper(actor.ID), strings.ToUpper(conversationID))
+			actorConn := connectDMVisibilityWebSocket(t, ts, actor.AccessToken, conversationID)
+			response := invokeDMVisibilityClearWithContext(ts.ActorContext(requestCtx, t, actor.ID), h, strings.ToUpper(actor.ID), strings.ToUpper(conversationID))
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 
 			cutoff := dmVisibilityClearCutoff(t, ts, actor.ID, conversationID)
@@ -355,8 +358,8 @@ func TestDMVisibility_ClearRollbackDoesNotConfirmOlderReceipt(t *testing.T) {
 		return errors.New("injected rollback commit acknowledgement")
 	})
 	t.Cleanup(func() { dmhandler.SetDMClearCommitForTest(h, nil) })
-	actorConn := connectDMVisibilityWebSocket(t, ts, actor.ID, conversationID, "clear-rollback")
-	response := invokeDMVisibilityClear(h, actor.ID, conversationID)
+	actorConn := connectDMVisibilityWebSocket(t, ts, actor.AccessToken, conversationID)
+	response := invokeDMVisibilityClear(ts.ActorContext(context.Background(), t, actor.ID), h, actor.ID, conversationID)
 	assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
 
 	var ranges int
@@ -419,9 +422,15 @@ func TestDMVisibility_EventsAreActorOnlyAndStatePreserved(t *testing.T) {
 
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
-	connect := func(userID, suffix string) *gorillaWS.Conn {
-		ticket := "dm-visibility-" + suffix + "-" + uuid.NewString()
-		require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:%s::%d", userID, suffix, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	connect := func(accessToken string) *gorillaWS.Conn {
+		ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(accessToken))
+		require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+		var ticketBody struct {
+			Ticket string `json:"ticket"`
+		}
+		testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+		require.NotEmpty(t, ticketBody.Ticket)
+		ticket := ticketBody.Ticket
 		conn, _, dialErr := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 		require.NoError(t, dialErr)
 		t.Cleanup(func() { _ = conn.Close() })
@@ -430,9 +439,9 @@ func TestDMVisibility_EventsAreActorOnlyAndStatePreserved(t *testing.T) {
 		readVisibilityFrame(t, conn, "dm_subscribed")
 		return conn
 	}
-	actorOne := connect(actor.ID, "actor-one")
-	actorTwo := connect(actor.ID, "actor-two")
-	peerConn := connect(peer.ID, "peer")
+	actorOne := connect(actor.AccessToken)
+	actorTwo := connect(actor.AccessToken)
+	peerConn := connect(peer.AccessToken)
 
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/hide", nil, testhelpers.AuthHeaders(actor.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -480,7 +489,7 @@ func TestDMVisibility_PublicationGateOrdersUnhideThenHide(t *testing.T) {
 	_, err := ts.DB.Exec(`UPDATE dm_participants SET hidden_at = clock_timestamp() WHERE conversation_id = $1 AND user_id = $2`, conversationID, actor.ID)
 	require.NoError(t, err)
 
-	actorConn := connectDMVisibilityWebSocket(t, ts, actor.ID, conversationID, "publication-order")
+	actorConn := connectDMVisibilityWebSocket(t, ts, actor.AccessToken, conversationID)
 	h := dmhandler.NewHandler(dmhandler.HandlerDeps{DB: ts.DB, Log: logger.New("visibility-order"), Hub: ts.Hub})
 	firstCommitted, secondCommitted, release := installDMVisibilityPublicationPause(t, h)
 	var unhideFinished, hideFinished <-chan struct{}
@@ -493,15 +502,16 @@ func TestDMVisibility_PublicationGateOrdersUnhideThenHide(t *testing.T) {
 	// uuid.Parse canonicalizes both route values before lock selection. The first
 	// request deliberately uses equivalent non-canonical spellings to prove the
 	// later canonical request uses the same publication lock.
+	actorCtx := ts.ActorContext(context.Background(), t, actor.ID)
 	unhideResult, unhideDone := startDMVisibilityRequest(func() *httptest.ResponseRecorder {
-		return invokeDMVisibilityToggle(h, http.MethodDelete, strings.ToUpper(actor.ID), strings.ToUpper(conversationID))
+		return invokeDMVisibilityToggle(actorCtx, h, http.MethodDelete, strings.ToUpper(actor.ID), strings.ToUpper(conversationID))
 	})
 	unhideFinished = unhideDone
 	requireSignal(t, firstCommitted, "Unhide did not commit before publication pause")
 	assertDMVisibilityHiddenAt(t, ts, actor.ID, conversationID, false)
 
 	hideResult, hideDone := startDMVisibilityRequest(func() *httptest.ResponseRecorder {
-		return invokeDMVisibilityToggle(h, http.MethodPost, actor.ID, conversationID)
+		return invokeDMVisibilityToggle(actorCtx, h, http.MethodPost, actor.ID, conversationID)
 	})
 	hideFinished = hideDone
 	assertDMVisibilityDoesNotReachSecondCommit(t, secondCommitted, "Hide committed or published while Unhide still held the publication gate")
@@ -529,7 +539,7 @@ func TestDMVisibility_PublicationGateOrdersConcurrentClears(t *testing.T) {
 		VALUES ($1, FALSE) ON CONFLICT (user_id) DO UPDATE SET require_auth_before_purge = FALSE`, actor.ID)
 	require.NoError(t, err)
 
-	actorConn := connectDMVisibilityWebSocket(t, ts, actor.ID, conversationID, "clear-publication-order")
+	actorConn := connectDMVisibilityWebSocket(t, ts, actor.AccessToken, conversationID)
 	h := dmhandler.NewHandler(dmhandler.HandlerDeps{DB: ts.DB, Log: logger.New("clear-publication-order"), Hub: ts.Hub})
 	var commitCalls atomic.Int32
 	dmhandler.SetDMClearCommitForTest(h, func(tx *sql.Tx) error {
@@ -548,15 +558,16 @@ func TestDMVisibility_PublicationGateOrdersConcurrentClears(t *testing.T) {
 		waitDMVisibilityFinished(t, secondFinished, "second Clear")
 	}()
 
+	clearCtx := ts.ActorContext(context.Background(), t, actor.ID)
 	firstResult, firstDone := startDMVisibilityRequest(func() *httptest.ResponseRecorder {
-		return invokeDMVisibilityClear(h, strings.ToUpper(actor.ID), strings.ToUpper(conversationID))
+		return invokeDMVisibilityClear(clearCtx, h, strings.ToUpper(actor.ID), strings.ToUpper(conversationID))
 	})
 	firstFinished = firstDone
 	requireSignal(t, firstCommitted, "first Clear did not commit before publication pause")
 	firstCutoff := dmVisibilityClearCutoff(t, ts, actor.ID, conversationID)
 
 	secondResult, secondDone := startDMVisibilityRequest(func() *httptest.ResponseRecorder {
-		return invokeDMVisibilityClear(h, actor.ID, conversationID)
+		return invokeDMVisibilityClear(clearCtx, h, actor.ID, conversationID)
 	})
 	secondFinished = secondDone
 	assertDMVisibilityDoesNotReachSecondCommit(t, secondCommitted, "second Clear committed or published while first Clear held the publication gate")
@@ -655,10 +666,10 @@ func assertDMVisibilityDoesNotReachSecondCommit(t *testing.T, secondCommitted <-
 	}
 }
 
-func invokeDMVisibilityToggle(h *dmhandler.Handler, method, actorID, conversationID string) *httptest.ResponseRecorder {
+func invokeDMVisibilityToggle(ctx context.Context, h *dmhandler.Handler, method, actorID, conversationID string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(method, "/api/v1/dm/conversations/"+conversationID+"/hide", nil)
+	c.Request = httptest.NewRequest(method, "/api/v1/dm/conversations/"+conversationID+"/hide", nil).WithContext(ctx)
 	c.Params = gin.Params{{Key: "id", Value: conversationID}}
 	c.Set("user_id", actorID)
 	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"cred_epoch": ""})
@@ -670,8 +681,8 @@ func invokeDMVisibilityToggle(h *dmhandler.Handler, method, actorID, conversatio
 	return w
 }
 
-func invokeDMVisibilityClear(h *dmhandler.Handler, actorID, conversationID string) *httptest.ResponseRecorder {
-	return invokeDMVisibilityClearWithContext(context.Background(), h, actorID, conversationID)
+func invokeDMVisibilityClear(ctx context.Context, h *dmhandler.Handler, actorID, conversationID string) *httptest.ResponseRecorder {
+	return invokeDMVisibilityClearWithContext(ctx, h, actorID, conversationID)
 }
 
 func invokeDMVisibilityClearWithContext(requestCtx context.Context, h *dmhandler.Handler, actorID, conversationID string) *httptest.ResponseRecorder {
@@ -686,12 +697,18 @@ func invokeDMVisibilityClearWithContext(requestCtx context.Context, h *dmhandler
 	return w
 }
 
-func connectDMVisibilityWebSocket(t *testing.T, ts *testhelpers.TestServer, userID, conversationID, suffix string) *gorillaWS.Conn {
+func connectDMVisibilityWebSocket(t *testing.T, ts *testhelpers.TestServer, accessToken, conversationID string) *gorillaWS.Conn {
 	t.Helper()
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
-	ticket := "dm-visibility-" + suffix + "-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:%s::%d", userID, suffix, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(accessToken))
+	require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+	var ticketBody struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+	require.NotEmpty(t, ticketBody.Ticket)
+	ticket := ticketBody.Ticket
 	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })

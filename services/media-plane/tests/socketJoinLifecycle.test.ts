@@ -1,5 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { Script } from 'node:vm';
+import ts from 'typescript';
+import * as lifecycle from '../src/lib/socketJoinLifecycle.js';
+import * as protocol from '../src/lib/voiceAuthProtocol.js';
+import { VoiceAuthConnections } from '../src/lib/voiceAuthConnection.js';
+import type { MediasoupService } from '../src/lib/mediasoup.js';
+import { resolveParticipantIdentity } from '../src/middleware/auth.js';
+import { getIdentityAuthorityReasonCode } from '../src/lib/identityAuthority.js';
+import { mediaPolicyCooldownAck } from '../src/lib/mediaPolicyWire.js';
 import {
   cleanupEmptyDMJoin,
   DMJoinCallIdTracker,
@@ -11,7 +21,7 @@ import {
   withKeyedJoinFence,
   roomCreationRefusalAck,
 } from '../src/lib/socketJoinLifecycle.js';
-import { RoomCreationRefusedError } from '../src/lib/roomManager.js';
+import { RoomManager, RoomCreationRefusedError, CryptoVersionMismatchError, MediaPolicyCooldownError, parseMediaFrameCryptoVersion, SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION } from '../src/lib/roomManager.js';
 import { isCanonicalEnforcementUUID } from '../src/lib/enforcementCommand.js';
 
 describe('room creation refusal acknowledgement', () => {
@@ -41,22 +51,112 @@ describe('room creation refusal acknowledgement', () => {
     );
   });
 
-  it('preserves the DM authorization after a placement refusal (ADR-0042 V17)', () => {
-    const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
-    const registration = source.slice(
-      source.indexOf('function registerJoinRoomHandler'),
-      source.indexOf('async function main')
-    );
+  it.each(['room_draining', 'room_owner_mismatch', 'room_owner_unavailable'] as const)(
+    'preserves DM authorization after actual caller receives %s (ADR-0042 V17)', async (code) => {
+      const now = Date.now();
+      const boot = '11111111-1111-4111-8111-111111111111';
+      const user = '22222222-2222-4222-8222-222222222222';
+      const family = '33333333-3333-4333-8333-333333333333';
+      const roomId = '44444444-4444-4444-8444-444444444444';
+      const callId = '55555555-5555-4555-8555-555555555555';
+      const epoch = 'a'.repeat(32);
+      const secret = ['placement', 'fixture', 'only'].join('-');
+      const key = Buffer.from(secret);
+      const requests: protocol.Request[] = [];
+      const owners = new VoiceAuthConnections({ nodeBootId: boot, secret,
+        controlPlaneUrl: 'https://control.test.invalid', now: () => now,
+        fetch: async (input, init) => {
+          const path = new URL(String(input)).pathname;
+          const endpoint: protocol.Endpoint = path.endsWith('/auth-connections') ? 'connection_register'
+            : path.endsWith('/auth-connections/release') ? 'connection_release' : 'room_release';
+          const raw = init?.body;
+          if (typeof raw !== 'string' && !(raw instanceof Uint8Array)) throw new Error('Missing request body');
+          const request = protocol.decodeHttpRequest(endpoint, { method: init?.method ?? '', path,
+            body: Buffer.from(raw), headers: Array.from(new Headers(init?.headers), ([name, value]) => ({ name, value })) });
+          protocol.verifyHttpRequest(request, key, BigInt(Math.floor(now / 1000)));
+          requests.push(request);
+          const registration = request.connectionRegister();
+          const payload: protocol.ResponsePayload = registration ? { version: 1, voiceEnforcementProtocol: 4,
+            userId: user, familyId: family, target: { connectionGeneration: registration.connectionGeneration,
+              nodeBootId: boot, socketId: registration.socketId, credentialEpoch: epoch } } : null;
+          const signed = protocol.signHttpResponse(request, payload, String(Math.floor(now / 1000)), key);
+          return new Response(signed.body.length ? Buffer.from(signed.body) : null,
+            { status: signed.status, headers: signed.headers.map(({ name, value }) => [name, value]) });
+        } });
+      const token = 'test-placement-token';
+      const handle = owners.reserve({ socketId: 'placement-socket', userId: user, credentialEpoch: epoch,
+        token, tokenExpiresAt: now + 60_000, disconnect: () => {} });
+      await owners.register(handle);
+      const nativeService = { getOrCreateRouter: vi.fn(async () => { throw new Error('Unexpected native creation'); }) };
+      const manager = new RoomManager(nativeService as unknown as MediasoupService);
+      manager.setVoiceAuthConnections(owners);
+      const placement = vi.fn(async () => { throw new RoomCreationRefusedError(code); });
+      manager.setRoomCreationGuard(placement);
+      const closeEmpty = vi.spyOn(manager, 'closeEmptyDMRoom');
+      const remove = vi.spyOn(manager, 'removeProvisionalParticipantForEnforcement');
+      const releaseDMVoiceAuthorization = vi.fn();
+      const registerVoiceEnforcementSession = vi.fn();
+      const validateChannelAccess = vi.fn(async () => ({ allowed: true, callId, userTier: 'free' }));
+      const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+      const ast = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true);
+      const names = ['registerJoinRoomHandler', 'parseJoinMediaFrameCryptoVersion', 'joinErrorAck', 'emitJoinError',
+        'rollbackRegisteredRoomJoin', 'commitChannelAdmission', 'commitDMAdmission', 'rollbackSocketMembership'];
+      const declarations = names.map(name => {
+        const matches = ast.statements.filter(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+        if (matches.length !== 1) throw new Error(`Expected one actual function ${name}`);
+        return matches[0].getText(ast);
+      });
+      const compiled = ts.transpileModule(declarations.join('\n'), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+      }).outputText;
+      const register = new Script(`${compiled}\nregisterJoinRoomHandler;`).runInNewContext({
+        ...lifecycle, randomUUID, Date, Error, Promise,
+        getVoiceAuthConnection: () => handle, voiceEnforcementNodeBootId: boot,
+        validateChannelAccess, releaseDMVoiceAuthorization, registerVoiceEnforcementSession,
+        isCanonicalEnforcementUUID, parseMediaFrameCryptoVersion, resolveParticipantIdentity,
+        RoomCreationRefusedError, CryptoVersionMismatchError, MediaPolicyCooldownError, mediaPolicyCooldownAck,
+        getIdentityAuthorityReasonCode, logger: { info() {}, debug() {}, warn() {}, error() {} },
+      }) as (socket: unknown, data: unknown, deps: unknown) => void;
+      const socket = { id: 'placement-socket', connected: true, handshake: { auth: { token, room_kind: 'dm' } },
+        emit: vi.fn(), join: vi.fn(), leave: vi.fn(), to: () => ({ emit: vi.fn() }) };
+      type Handler = (request: object, callback: (value: unknown) => void) => Promise<void>;
+      let handler: Handler | undefined;
+      const data = { userId: user, username: 'placement-fixture', credentialEpoch: epoch, tokenExpiresAt: now + 60_000 };
+      register(socket, data, { roomManager: manager, voiceAuthConnections: owners,
+        dmJoinFence: new KeyedJoinFence(), channelAdmissionFence: new KeyedJoinFence(), isShuttingDown: () => false,
+        withRateLimit: (_socket: unknown, event: string, listener: Handler) => {
+          if (event !== 'join-room') throw new Error('Unexpected handler');
+          handler = listener;
+        } });
+      const callback = vi.fn();
+      try {
+        if (!handler) throw new Error('Actual handler was not registered');
+        await handler({ roomId, callId, rtpCapabilities: {}, mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION }, callback);
+        expect(validateChannelAccess).toHaveBeenCalledExactlyOnceWith(user, roomId, token, 'dm', callId, undefined);
+        expect(placement).toHaveBeenCalledExactlyOnceWith(roomId);
+        expect(callback).toHaveBeenCalledExactlyOnceWith({ error: code, code });
+        expect(closeEmpty).not.toHaveBeenCalled();
 
-    expect(registration).toContain(
-      'if (error instanceof RoomCreationRefusedError) placementRefused = true;'
-    );
-    expect(registration).toContain('if (placementRefused) return;');
-    expect(registration).toContain('if (!placementRefused) {');
-    expect(registration).toContain(
-      "await cleanupDMJoinSafely('Failed to clean up an errored DM room join');"
-    );
-  });
+        expect(releaseDMVoiceAuthorization).not.toHaveBeenCalled();
+        expect(registerVoiceEnforcementSession).not.toHaveBeenCalled();
+        expect(socket.join).not.toHaveBeenCalled();
+        expect(nativeService.getOrCreateRouter).not.toHaveBeenCalled();
+        expect(manager.getRoom(roomId)).toBeUndefined();
+        expect(owners.retainedIdentityCount()).toBe(1);
+        expect(owners.snapshot(handle).state).toBe('registered');
+        const releases = requests.filter(request => request.endpoint() === 'room_release');
+        expect(releases).toHaveLength(1);
+        const released = releases[0].roomRelease();
+        expect(remove).toHaveBeenCalledExactlyOnceWith(roomId, user, socket.id, released?.room.sessionGeneration);
+        expect(released).toMatchObject({
+          binding: { userId: user, familyId: family, target: owners.snapshot(handle).target },
+          room: { roomId, roomKind: 'dm', sessionGeneration: expect.any(String) },
+        });
+      } finally {
+        await owners.terminateAll();
+      }
+    }
+  );
 });
 
 describe('join-room placement identity', () => {

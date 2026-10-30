@@ -26,6 +26,7 @@ const { mockMainWindow, MockBrowserWindow, mockApp, mockTrayCtor } = vi.hoisted(
     setWindowOpenHandler: vi.fn(),
     send: vi.fn(),
     on: vi.fn(),
+    mainFrame: { frameTreeNodeId: 7 },
   };
   const mockMainWindow = {
     loadURL: vi.fn().mockResolvedValue(undefined),
@@ -43,6 +44,7 @@ const { mockMainWindow, MockBrowserWindow, mockApp, mockTrayCtor } = vi.hoisted(
     getBounds: vi.fn(() => ({ x: 0, y: 0, width: 1280, height: 800 })),
     restore: vi.fn(),
     setAlwaysOnTop: vi.fn(),
+    isDestroyed: vi.fn(() => false),
     webContents: mockWebContents,
   };
   const bw = vi.fn().mockImplementation(function () {
@@ -77,7 +79,11 @@ vi.mock('electron', () => ({
   autoUpdater: { on: vi.fn() },
   ipcMain: { handle: vi.fn(), on: vi.fn() },
   nativeImage: {
-    createFromPath: vi.fn(() => ({ isEmpty: () => false, toDataURL: () => '' })),
+    createFromPath: vi.fn(() => ({
+      isEmpty: () => false,
+      toDataURL: () => '',
+      setTemplateImage: vi.fn(),
+    })),
   },
   Tray: mockTrayCtor,
   Menu: { buildFromTemplate: vi.fn((template: unknown) => ({ template })) },
@@ -100,7 +106,14 @@ vi.mock('electron', () => ({
     },
   },
   shell: { openExternal: vi.fn(() => Promise.resolve()) },
-  powerMonitor: { on: vi.fn() },
+  powerMonitor: { on: vi.fn(), removeListener: vi.fn(), isOnBatteryPower: vi.fn(() => false) },
+  systemPreferences: {
+    getAnimationSettings: vi.fn(() => ({
+      shouldRenderRichAnimation: true,
+      scrollAnimationsEnabledBySystem: true,
+      prefersReducedMotion: false,
+    })),
+  },
 }));
 
 vi.mock('node:fs', () => ({
@@ -195,8 +208,11 @@ const originalPlatform = process.platform;
 async function importMain(platform: (typeof TRAYLESS_PLATFORMS)[number]): Promise<{
   closeHandlers: HandlerFn[];
   minimizeHandlers: HandlerFn[];
+  ipcHandlers: Map<string, HandlerFn>;
 }> {
   vi.resetModules();
+  const { ipcMain } = await import('electron');
+  (ipcMain.handle as Mock).mockClear();
   mockMainWindow.on.mockClear();
   mockApp.on.mockClear();
   // Make sure the original-error noise from initTray's catch is silenced.
@@ -212,7 +228,11 @@ async function importMain(platform: (typeof TRAYLESS_PLATFORMS)[number]): Promis
   const minimizeHandlers = (mockMainWindow.on as Mock).mock.calls
     .filter((c) => c[0] === 'minimize')
     .map((c) => c[1] as HandlerFn);
-  return { closeHandlers, minimizeHandlers };
+  const ipcHandlers = new Map<string, HandlerFn>();
+  for (const call of (ipcMain.handle as Mock).mock.calls) {
+    ipcHandlers.set(call[0] as string, call[1] as HandlerFn);
+  }
+  return { closeHandlers, minimizeHandlers, ipcHandlers };
 }
 
 function fireAll(handlers: HandlerFn[], event: unknown): void {
@@ -268,6 +288,45 @@ describe('trayless fallback (#1099): tray init failure must not strand the windo
         mockMainWindow.restore,
         `[${platform}] minimize must NOT restore+hide when tray init failed`
       ).not.toHaveBeenCalled();
+    });
+
+    // AC14: the status-aware tray (tray:setStatus, tray-status spec §4) is loaded and
+    // active in this session. A snapshot arriving while trayless is stored, never
+    // rendered, nothing throws, and the [X] fallback above still holds afterwards.
+    it(`[${platform}] tray:setStatus while trayless is a silent store; [X] still quits`, async () => {
+      const { closeHandlers, ipcHandlers } = await importMain(platform);
+      const setStatus = ipcHandlers.get('tray:setStatus');
+      expect(setStatus).toBeDefined();
+      const trusted = {
+        sender: mockMainWindow.webContents,
+        senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 7 },
+      };
+      const snapshot = {
+        v: 1,
+        auth: 'signed-in',
+        presence: 'online',
+        conn: 'ok',
+        voice: 'channel',
+        speaking: false,
+        muted: true,
+        deafened: false,
+        sharing: false,
+        micLocked: false,
+        deafenLocked: false,
+        unread: 2,
+        mention: false,
+        reducedMotion: false,
+        iconStyle: 'auto',
+      };
+      await expect(Promise.resolve(setStatus?.(trusted, snapshot))).resolves.toBe(true);
+      const tray = await import('../../../src/main/tray');
+      expect(tray.isTrayActive()).toBe(false);
+
+      (mockApp.quit as Mock).mockClear();
+      mockMainWindow.hide.mockClear();
+      fireAll(closeHandlers, { preventDefault: vi.fn() });
+      expect(mockMainWindow.hide).not.toHaveBeenCalled();
+      expect(mockApp.quit).toHaveBeenCalled();
     });
   }
 });

@@ -49,6 +49,7 @@ func TestPurgeConversationPostDeleteMembershipLossLeavesRecoveryAudit(t *testing
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Params = gin.Params{{Key: "id", Value: convID}}
 	ctx.Set("user_id", actorID)
+	withActor(t, h.db, ctx, actorID)
 	h.PurgeConversation(ctx)
 
 	require.Equal(t, http.StatusInternalServerError, recorder.Code, recorder.Body.String())

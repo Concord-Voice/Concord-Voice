@@ -2,8 +2,9 @@ package websocket
 
 import (
 	"context"
+	"database/sql"
 	"errors"
-	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,8 +21,11 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 var errDeadlineInjection = errors.New("injected deadline failure")
@@ -127,6 +131,36 @@ func startDeadlineFailureSocket(t *testing.T) (*Client, *deadlineFailureConn, *w
 	return client, wrapped, peer, func() { close(startReadPump) }
 }
 
+// Prepare the short lifetime before binding it, using the public canonical mint
+// sequence. The committed SID and signed bearer share exactly one deadline.
+func expiryCanonicalAccess(t *testing.T, db *sql.DB, userID uuid.UUID, deadline time.Time) admissionAccess {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { err := tx.Rollback(); require.True(t, err == nil || err == sql.ErrTxDone) }()
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	require.NoError(t, err)
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{userID}, loginfamily.UserNoKeyUpdate)
+	require.NoError(t, err)
+	user, err := users.ForUser(userID)
+	require.NoError(t, err)
+	var epoch string
+	var verified bool
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT COALESCE(credential_epoch, ''), email_verified FROM users WHERE id = $1`, userID).Scan(&epoch, &verified))
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, user, epoch)
+	require.NoError(t, err)
+	sid := uuid.New()
+	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{UserID: userID, SID: sid, CredentialEpoch: epoch, EmailVerified: verified}, deadline.Add(-auth.AccessTokenTTL))
+	require.NoError(t, err)
+	require.Equal(t, deadline, prepared.ExpiresAt())
+	require.NoError(t, loginfamily.BindSIDTx(ctx, tx, family, sid, prepared.ExpiresAt()))
+	require.NoError(t, tx.Commit())
+	token, err := prepared.Sign(testJWTSecret)
+	require.NoError(t, err)
+	return admissionAccess{userID: userID, sid: sid, epoch: epoch, expiresAt: prepared.ExpiresAt(), token: token}
+}
+
 func TestWebSocketClosesAtAccessTokenDeadline(t *testing.T) {
 	for _, rail := range []string{"jwt", "ticket"} {
 		t.Run(rail, func(t *testing.T) {
@@ -138,87 +172,173 @@ func TestWebSocketClosesAtAccessTokenDeadline(t *testing.T) {
 			router.GET("/ws", h.HandleWebSocket)
 			srv := httptest.NewServer(router)
 			t.Cleanup(srv.Close)
-			userID := uuid.NewString()
-			expires := time.Now().Add(3 * time.Second).Truncate(time.Second)
-			query := ""
+			userID := presenceTestUser(t, db)
+			expires := time.Now().UTC().Add(3 * time.Second).Truncate(time.Second)
+			access := expiryCanonicalAccess(t, db, userID, expires)
+			query := "?token=" + access.token
 			if rail == "ticket" {
-				require.NoError(t, rc.Set(context.Background(), wsTicketKeyPfx+"deadline",
-					fmt.Sprintf("%s:::%d", userID, expires.Unix()), 30*time.Second).Err())
-				query = "?ticket=deadline"
-			} else {
-				token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-					"iss": middleware.AccessTokenIssuer, "user_id": userID, "exp": expires.Unix(),
-				}).SignedString([]byte(testJWTSecret))
-				require.NoError(t, err)
-				query = "?token=" + token
+				query = "?ticket=" + admissionMintTicket(t, db, rc, access)
 			}
-			closed := make(chan struct{})
+			registered := make(chan *Client, 1)
+			unregistered := make(chan *Client, 1)
+			joined := make(chan struct{})
 			go func() {
-				client := <-hub.register
+				defer close(joined)
+				var client *Client
+				select {
+				case client = <-hub.register:
+				case <-hub.done:
+					return
+				}
+				defer client.releaseConnection() // The fixture owns the hub's reference.
+				defer client.closeOutbound()
+				defer client.stopTokenExpiry()
+				defer func() { _ = client.Conn.Close() }()
+				registered <- client
 				client.Send <- []byte(`{"type":"control"}`)
-				<-hub.unregister
-				close(client.Send)
-				close(closed)
+				select {
+				case removed := <-hub.unregister:
+					unregistered <- removed
+				case <-hub.done:
+				}
 			}()
+			t.Cleanup(func() {
+				// There is no Run loop in this fixture; cancel its channel receiver
+				// even if authentication fails before registration, then join it.
+				hub.closeOnce.Do(func() { close(hub.done) })
+				<-joined
+			})
 			peer, _, err := ws.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/ws"+query, nil)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = peer.Close() })
+			var client *Client
+			select {
+			case client = <-registered:
+			case <-time.After(time.Second):
+				t.Fatal("authenticated client did not reach registration")
+			}
+			require.Equal(t, userID, client.UserID)
+			require.Equal(t, access.sid.String(), client.SessionID)
+			require.True(t, expires.Equal(client.tokenDeadline()), "registered token deadline must equal the signed expiry instant")
 			require.NoError(t, peer.SetReadDeadline(expires.Add(time.Second)))
 			_, frame, err := peer.ReadMessage()
 			require.NoError(t, err)
 			require.JSONEq(t, `{"type":"control"}`, string(frame))
 			_, _, err = peer.ReadMessage()
 			require.True(t, ws.IsCloseError(err, ws.ClosePolicyViolation), "deadline must close the socket: %v", err)
+			var closeErr *ws.CloseError
+			require.ErrorAs(t, err, &closeErr)
+			require.Equal(t, "Access token expired", closeErr.Text)
 			select {
-			case <-closed:
+			case removed := <-unregistered:
+				require.Same(t, client, removed)
 			case <-time.After(time.Second):
 				t.Fatal("expired client was not unregistered")
 			}
+			require.Eventually(t, func() bool {
+				hub.admissionMu.Lock()
+				defer hub.admissionMu.Unlock()
+				return hub.admittedConnections == 0 && len(hub.admittedConnectionsByUser) == 0
+			}, time.Second, 10*time.Millisecond, "all admission owners must release the expired socket")
 		})
 	}
 }
 
 func TestExpiredTokenUnregistersWhilePostRegistrationFenceStalls(t *testing.T) {
 	db := setupHubTestDB(t)
-	rc, fence := newTestFence(t)
+	rc := setupHubTestRedis(t)
+	// The stalled Redis read can time out before release, requiring DB fallback.
+	fence := credepoch.New(db, rc, logger.NewWithWriter(io.Discard))
 	userID := presenceTestUser(t, db)
+	deadline := time.Now().UTC().Add(4 * time.Second).Truncate(time.Second)
+	access := expiryCanonicalAccess(t, db, userID, deadline)
+	ticket := admissionMintTicket(t, db, rc, access)
 	require.NoError(t, rc.Set(context.Background(), credepoch.Key(userID.String()), "none", time.Minute).Err())
 	hook := &stalledFenceCheckHook{
 		key: credepoch.Key(userID.String()), entered: make(chan struct{}), release: make(chan struct{}),
 	}
-	rc.AddHook(hook)
 	releaseFence := sync.OnceFunc(func() { close(hook.release) })
-	defer releaseFence()
 	hub := NewHub(db, rc)
 	go hub.Run()
 	handler := NewHandler(hub, db, rc, testJWTSecret, []string{"*"}, fence, nil)
-	srv := setupWSTestServer(t, handler, hub)
-	deadline := time.Now().Add(4 * time.Second).Truncate(time.Second)
-	require.NoError(t, rc.Set(context.Background(), wsTicketKeyPfx+"stalled-fence",
-		fmt.Sprintf("%s:::%d", userID, deadline.Unix()), 30*time.Second).Err())
-	peer, _, err := ws.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+wsTicketPath+"stalled-fence", nil)
+	handlerDone := make(chan struct{})
+	var handlerPanic any
+	router := gin.New()
+	router.GET("/ws", func(c *gin.Context) {
+		defer func() {
+			handlerPanic = recover()
+			close(handlerDone)
+		}()
+		handler.HandleWebSocket(c)
+	})
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+	t.Cleanup(hub.Shutdown)
+	// Producer authentication must finish before counting the two handler fence
+	// reads; the second read then belongs to the registered socket's recheck.
+	rc.AddHook(hook)
+	t.Cleanup(func() {
+		// Release and join before server/hub cleanup, including fatal paths.
+		releaseFence()
+		select {
+		case <-handlerDone:
+			require.Nil(t, handlerPanic, "WebSocket handler must return without panicking")
+		case <-time.After(2 * time.Second):
+			t.Error("WebSocket handler did not return after releasing the fence")
+		}
+	})
+	peer, response, err := ws.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+wsTicketPath+ticket, nil)
 	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
 	t.Cleanup(func() { _ = peer.Close() })
 	select {
 	case <-hook.entered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("post-registration credential check did not stall")
 	}
+	var registeredClient *Client
 	require.Eventually(t, func() bool {
 		hub.mu.RLock()
 		defer hub.mu.RUnlock()
-		return len(hub.clients) == 1
+		if len(hub.clients) != 1 || len(hub.userClients[userID]) != 1 {
+			return false
+		}
+		for _, client := range hub.clients {
+			if client.UserID == userID && client.SessionID == access.sid.String() {
+				registeredClient = client
+				return true
+			}
+		}
+		return false
 	}, 2*time.Second, 10*time.Millisecond, "client must be registered before expiry assertion")
+	require.True(t, deadline.Equal(registeredClient.tokenDeadline()), "registered token deadline must equal the signed expiry instant")
+	require.EqualValues(t, 2, hook.checks.Load(), "stall must be the post-registration fence check")
+	require.True(t, time.Now().Before(deadline), "registration ownership must be proven before expiry")
+	hub.admissionMu.Lock()
+	admitted := hub.admittedConnections
+	hub.admissionMu.Unlock()
+	require.Equal(t, 1, admitted, "the stalled registered socket must still own its admission reservation")
 	require.Eventually(t, func() bool {
 		hub.mu.RLock()
 		defer hub.mu.RUnlock()
 		return len(hub.clients) == 0 && len(hub.userClients) == 0
 	}, 6*time.Second, 10*time.Millisecond, "deadline must remove the registered socket before the fence returns")
+	select {
+	case <-hook.release:
+		t.Fatal("expiry assertion requires the post-registration fence to remain stalled")
+	default:
+	}
 	releaseFence()
+	select {
+	case <-handlerDone:
+		require.Nil(t, handlerPanic, "WebSocket handler must return without panicking")
+	case <-time.After(2 * time.Second):
+		t.Fatal("WebSocket handler did not return after releasing the fence")
+	}
 	require.Eventually(t, func() bool {
 		hub.admissionMu.Lock()
 		defer hub.admissionMu.Unlock()
-		return hub.admittedConnections == 0
+		return hub.admittedConnections == 0 && len(hub.admittedConnectionsByUser) == 0
 	}, 2*time.Second, 10*time.Millisecond)
 }
 

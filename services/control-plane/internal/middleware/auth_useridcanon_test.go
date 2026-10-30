@@ -79,7 +79,7 @@ func TestAuthRequired_DisabledDenylistIsSpellingInvariant(t *testing.T) {
 
 	for _, sp := range userIDSpellings(t, user.ID) {
 		t.Run(sp.name, func(t *testing.T) {
-			w := doAuthRequest(t, ts, bearerPrefix+epochToken(t, sp.claim, ""))
+			w := doAuthRequest(t, ts, bearerPrefix+epochToken(t, ts.DB, sp.claim, ""))
 
 			require.Equal(t, http.StatusForbidden, w.Code,
 				"a disabled account must be refused for every spelling of its id; got %d: %s",
@@ -105,9 +105,15 @@ func TestAuthRequired_CredentialEpochFenceIsSpellingInvariant(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "canonepoch")
 
-	const dbEpoch = "epochDB1"
+	const dbEpoch = "55555555555555555555555555555555"
 	_, err := ts.DB.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, dbEpoch, user.ID)
 	require.NoError(t, err)
+
+	// Prepare once so the post-marker control presents the exact same JWTs.
+	tokens := make(map[string]string)
+	for _, sp := range userIDSpellings(t, user.ID) {
+		tokens[sp.name] = epochToken(t, ts.DB, sp.claim, dbEpoch)
+	}
 
 	// A destructive credential operation is blocked-in-flight at the canonical id.
 	require.NoError(t, ts.Redis.Set(t.Context(),
@@ -118,7 +124,7 @@ func TestAuthRequired_CredentialEpochFenceIsSpellingInvariant(t *testing.T) {
 			// The claim carries the epoch the DB read-through would return, so a
 			// spelling that misses the blocked marker is ADMITTED rather than
 			// rejected on a mismatch — the bypass, not a near-miss.
-			w := doAuthRequest(t, ts, bearerPrefix+epochToken(t, sp.claim, dbEpoch))
+			w := doAuthRequest(t, ts, bearerPrefix+tokens[sp.name])
 
 			assert.Equal(t, http.StatusUnauthorized, w.Code,
 				"a blocked credential-epoch marker must fail closed for every spelling of its id; got %d: %s",
@@ -136,7 +142,7 @@ func TestAuthRequired_CredentialEpochFenceIsSpellingInvariant(t *testing.T) {
 	require.NoError(t, ts.Redis.Del(t.Context(), credepoch.Key(user.ID)).Err())
 	for _, sp := range userIDSpellings(t, user.ID) {
 		t.Run("admissible_without_marker/"+sp.name, func(t *testing.T) {
-			w := doAuthRequest(t, ts, bearerPrefix+epochToken(t, sp.claim, dbEpoch))
+			w := doAuthRequest(t, ts, bearerPrefix+tokens[sp.name])
 			assert.Equal(t, http.StatusOK, w.Code,
 				"with the blocked marker gone the same token must be admitted — otherwise the 401s above prove nothing; got %d: %s",
 				w.Code, w.Body.String())
@@ -158,7 +164,7 @@ func TestAuthRequired_URNSpellingIsCanonicalizedAndGated(t *testing.T) {
 	user := ts.CreateTestUser(t, "canonurn")
 	require.NoError(t, ts.Redis.Set(t.Context(), middleware.UserDisabledKey(user.ID), "1", 0).Err())
 
-	w := doAuthRequest(t, ts, bearerPrefix+epochToken(t, "urn:uuid:"+user.ID, ""))
+	w := doAuthRequest(t, ts, bearerPrefix+epochToken(t, ts.DB, "urn:uuid:"+user.ID, ""))
 
 	require.Equal(t, http.StatusForbidden, w.Code,
 		"the urn spelling must reach the denylist rather than die at the SQL cast; got %d: %s",

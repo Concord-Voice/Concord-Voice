@@ -32,6 +32,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
@@ -85,6 +86,9 @@ type softLockHarness struct {
 	// sid, when set, is the access token's session claim, which a step-up
 	// grace is keyed on (#3454).
 	sid string
+	// ids holds each seeded user's live access identity, minted before any
+	// test lock; withIdentity re-signs it with hs.epoch (#2272).
+	ids map[string]loginfamily.AccessIdentity
 }
 
 // newSoftLockHarness wires a DM handler to a real database and its own
@@ -97,6 +101,11 @@ func newSoftLockHarness(t *testing.T) *softLockHarness {
 	t.Cleanup(func() { _ = rdb.Close() })
 	hs := &softLockHarness{db: db, mr: mr, rdb: rdb, verifier: &softLockVerifier{good: softLockGoodCode}, logs: &bytes.Buffer{}}
 	hs.convID, hs.actor, hs.peer = seedHiddenConv(t, db)
+	hs.ids = map[string]loginfamily.AccessIdentity{}
+	for _, u := range []string{hs.actor, hs.peer} {
+		id, _ := loginfamily.AccessIdentityFromContext(actorCtx(context.Background(), t, db, u))
+		hs.ids[u] = id
+	}
 	hs.handler = hs.newHandler(db, rdb)
 	return hs
 }
@@ -124,12 +133,20 @@ func (hs *softLockHarness) deleteAs(t *testing.T, userID, messageID, body string
 			claims["sid"] = hs.sid
 		}
 		c.Set(middleware.JWTClaimsContextKey, claims)
+		hs.withIdentity(c, userID)
 		hs.handler.DeleteMessage(c)
 	})
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete,
 		"/dm/conversations/"+hs.convID+"/messages/"+messageID, strings.NewReader(body)))
 	return w
+}
+
+// withIdentity attaches userID's identity as the token carrying hs.epoch.
+func (hs *softLockHarness) withIdentity(c *gin.Context, userID string) {
+	id := hs.ids[userID]
+	id.CredentialEpoch = hs.epoch
+	c.Request = c.Request.WithContext(loginfamily.WithAccessIdentity(c.Request.Context(), id))
 }
 
 func (hs *softLockHarness) delete(t *testing.T, messageID, body string) *httptest.ResponseRecorder {

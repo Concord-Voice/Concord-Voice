@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/redemption"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
@@ -67,6 +68,15 @@ func issuePremiumCode(t *testing.T, db *sql.DB, batch string) string {
 // runProbeRound releases every operation of one round at once and returns each
 // one's result. It fails the test if any goroutine is still running after
 // deadlockProbeTimeout: a hung writer is a deadlock the server did not detect.
+// probeActor mints userID's signed identity before the round starts, so the
+// erasure carries the login AuthRequired would have verified.
+func probeActor(t *testing.T, db *sql.DB, userID uuid.UUID) func(context.Context) context.Context {
+	t.Helper()
+	identity, ok := loginfamily.AccessIdentityFromContext(dbtest.ActorContext(context.Background(), t, db, userID.String()))
+	require.True(t, ok)
+	return func(ctx context.Context) context.Context { return loginfamily.WithAccessIdentity(ctx, identity) }
+}
+
 func runProbeRound(t *testing.T, ops map[string]func(context.Context) error) []probeResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), deadlockProbeTimeout)
@@ -143,15 +153,16 @@ func TestDeadlockProbe_RedemptionReconcileErasure(t *testing.T) {
 		codeTwo := issuePremiumCode(t, env.DB, fmt.Sprintf("dl-%d-2", round))
 		codeThree := issuePremiumCode(t, env.DB, fmt.Sprintf("dl-%d-3", round))
 
+		eraserA, eraserC := probeActor(t, env.DB, userA), probeActor(t, env.DB, userC)
 		results := runProbeRound(t, map[string]func(context.Context) error{
 			"redeem-a":    redeemOp(engine, userA, codeOne),
 			"redeem-b":    redeemOp(engine, userB, codeTwo),
 			"redeem-a2":   redeemOp(engine, userA, codeThree),
 			"reconcile-a": func(ctx context.Context) error { _, err := env.Svc.Reconcile(ctx, subA, "", ""); return err },
 			"reconcile-b": func(ctx context.Context) error { _, err := env.Svc.Reconcile(ctx, subB, "", ""); return err },
-			"erase-a":     func(ctx context.Context) error { return accounts.DeleteAccount(ctx, userA.String()) },
+			"erase-a":     func(ctx context.Context) error { return accounts.DeleteAccount(eraserA(ctx), userA.String()) },
 			"reconcile-c": func(ctx context.Context) error { _, err := env.Svc.Reconcile(ctx, subC, "", ""); return err },
-			"erase-c":     func(ctx context.Context) error { return accounts.DeleteAccount(ctx, userC.String()) },
+			"erase-c":     func(ctx context.Context) error { return accounts.DeleteAccount(eraserC(ctx), userC.String()) },
 		})
 		for _, r := range results {
 			assert.Falsef(t, isDeadlock(r.err), "round %d: %s hit SQLSTATE %s: %v", round, r.name, pgDeadlockDetected, r.err)

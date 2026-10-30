@@ -13,6 +13,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -25,20 +28,35 @@ func TestBeginDMVoiceMembershipTxRejectsMissingConversationAndMember(t *testing.
 	h, _ := newDMHandlerWithRail(t, db, "")
 
 	t.Run("missing conversation", func(t *testing.T) {
-		ctx, recorder := voiceFenceTestContext()
-		tx, locked := h.beginDMVoiceMembershipTx(ctx, uuid.NewString(), uuid.NewString())
-		require.False(t, locked)
-		require.Nil(t, tx)
-		require.Equal(t, http.StatusForbidden, recorder.Code)
+		userID := dbtest.CreateUser(t, db).String()
+		recorder := serveAdmittedVoiceFenceRequest(t, db, userID, uuid.NewString(), func(ctx *gin.Context) {
+			tx, locked := h.beginDMVoiceMembershipTx(ctx, ctx.Param("id"), userID)
+			if tx != nil {
+				defer rollbackDMVoiceMembershipTx(tx, h.log)
+			}
+			require.False(t, locked)
+			require.Nil(t, tx)
+		})
+		require.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+		require.JSONEq(t, `{"error":"dm_unavailable"}`, recorder.Body.String())
 	})
 
 	t.Run("missing member", func(t *testing.T) {
 		conversationID := seedHiddenEmptyConversation(t, db, false, false, 2)
-		ctx, recorder := voiceFenceTestContext()
-		tx, locked := h.beginDMVoiceMembershipTx(ctx, conversationID, uuid.NewString())
-		require.False(t, locked)
-		require.Nil(t, tx)
-		require.Equal(t, http.StatusForbidden, recorder.Code)
+		userID := dbtest.CreateUser(t, db).String()
+		var memberships int
+		require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, userID).Scan(&memberships))
+		require.Zero(t, memberships, "the admitted actor must be a genuine nonmember")
+		recorder := serveAdmittedVoiceFenceRequest(t, db, userID, conversationID, func(ctx *gin.Context) {
+			tx, locked := h.beginDMVoiceMembershipTx(ctx, conversationID, userID)
+			if tx != nil {
+				defer rollbackDMVoiceMembershipTx(tx, h.log)
+			}
+			require.False(t, locked)
+			require.Nil(t, tx)
+		})
+		require.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+		require.JSONEq(t, `{"error":"dm_unavailable"}`, recorder.Body.String())
 	})
 }
 
@@ -48,22 +66,32 @@ func TestBeginDMVoiceMembershipTxAcceptsMemberAndRollsBackClosedDB(t *testing.T)
 	conversationID := seedHiddenEmptyConversation(t, db, false, false, 2)
 	userID := conversationCreatorID(t, db, conversationID)
 
-	ctx, recorder := voiceFenceTestContext()
-	tx, locked := h.beginDMVoiceMembershipTx(ctx, conversationID, userID)
-	require.True(t, locked)
-	require.NotNil(t, tx)
-	require.Equal(t, http.StatusOK, recorder.Code)
-	rollbackDMVoiceMembershipTx(tx, h.log)
+	recorder := serveAdmittedVoiceFenceRequest(t, db, userID, conversationID, func(ctx *gin.Context) {
+		tx, locked := h.beginDMVoiceMembershipTx(ctx, conversationID, userID)
+		if tx != nil {
+			defer rollbackDMVoiceMembershipTx(tx, h.log)
+		}
+		require.True(t, locked)
+		require.NotNil(t, tx)
+	})
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 
 	closed, err := sql.Open("postgres", dbtest.DatabaseURL())
 	require.NoError(t, err)
 	require.NoError(t, closed.Close())
 	closedHandler, _ := newDMHandlerWithRail(t, closed, "")
-	ctx, recorder = voiceFenceTestContext()
-	tx, locked = closedHandler.beginDMVoiceMembershipTx(ctx, conversationID, userID)
-	require.False(t, locked)
-	require.Nil(t, tx)
-	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	// Middleware admits on the live DB; only the productive membership pool is closed.
+	recorder = serveAdmittedVoiceFenceRequest(t, db, userID, conversationID, func(ctx *gin.Context) {
+		tx, locked := closedHandler.beginDMVoiceMembershipTx(ctx, conversationID, userID)
+		if tx != nil {
+			defer rollbackDMVoiceMembershipTx(tx, closedHandler.log)
+		}
+		require.False(t, locked)
+		require.Nil(t, tx)
+	})
+	// BeginTx unavailability is a dependency failure, not an authority contract error.
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
+	require.JSONEq(t, `{"error":"Failed to authorize"}`, recorder.Body.String())
 }
 
 func TestLockedDMVoiceStateLoadersReadMemberState(t *testing.T) {
@@ -198,14 +226,12 @@ func TestRingDMCallPublishesPendingRingAfterSharedFence(t *testing.T) {
 	t.Cleanup(func() { h.hub.Shutdown() })
 	t.Cleanup(func() { ResetPendingDMCallsForTest() })
 
-	ctx, recorder := voiceFenceTestContext()
-	ctx.Params = gin.Params{{Key: "id", Value: conversationID}}
-	ctx.Set("user_id", conversationCreatorID(t, db, conversationID))
-	h.RingDMCall(ctx)
-	require.Equal(t, http.StatusOK, recorder.Code)
+	userID := conversationCreatorID(t, db, conversationID)
+	recorder := serveAdmittedVoiceFenceRequest(t, db, userID, conversationID, h.RingDMCall)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	_, present := pendingDMCalls.Load(uuid.MustParse(conversationID))
 	require.True(t, present)
-	shared, err := HasDMPendingVoiceCall(ctx.Request.Context(), redisClient, uuid.MustParse(conversationID))
+	shared, err := HasDMPendingVoiceCall(context.Background(), redisClient, uuid.MustParse(conversationID))
 	require.NoError(t, err)
 	require.True(t, shared)
 }
@@ -218,11 +244,9 @@ func TestAuthorizeVoiceJoinFailsClosedWhenRedisLeaseIsUnavailable(t *testing.T) 
 	userID := conversationCreatorID(t, db, conversationID)
 	h.redis = closedRedisForTest(t)
 
-	ctx, recorder := voiceFenceTestContext()
-	ctx.Params = gin.Params{{Key: "id", Value: conversationID}}
-	ctx.Set("user_id", userID)
-	h.AuthorizeVoiceJoin(ctx)
-	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	recorder := serveAdmittedVoiceFenceRequest(t, db, userID, conversationID, h.AuthorizeVoiceJoin)
+	require.Equal(t, http.StatusInternalServerError, recorder.Code, recorder.Body.String())
+	require.JSONEq(t, `{"error":"Failed to authorize"}`, recorder.Body.String())
 }
 
 func TestRetirementWithoutPlansSkipsConversationRemovedBeforeLock(t *testing.T) {
@@ -404,6 +428,36 @@ func TestRetireOneRejectsMalformedConversationID(t *testing.T) {
 	retired, err := sweeper.retireOne(context.Background(), "malformed")
 	require.Error(t, err)
 	require.False(t, retired)
+}
+
+// Keep admission dependencies live even when the custom handler's DB or Redis is unavailable.
+func serveAdmittedVoiceFenceRequest(t *testing.T, db *sql.DB, userID, conversationID string, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	redisClient := redistest.Client(t)
+	log := logger.NewWithWriter(httptest.NewRecorder())
+	secret := uuid.NewString()
+	mintContext, _ := voiceFenceTestContext()
+	token, _, _, err := auth.NewHandler(db, redisClient, log, secret, nil).IssueTokenPair(mintContext, userID, "")
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(middleware.AuthRequired(secret, redisClient, db, credepoch.New(db, redisClient, log)))
+	entered := false
+	router.POST("/voice/:id", func(ctx *gin.Context) {
+		entered = true
+		require.Equal(t, userID, ctx.GetString("user_id"))
+		identity, _, verified := middleware.VerifiedAccessFromContext(ctx)
+		require.True(t, verified, "productive handler must receive real middleware authority")
+		require.Equal(t, userID, identity.UserID.String())
+		handler(ctx)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/voice/"+conversationID, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	require.True(t, entered, "request must reach the custom handler after real admission: %s", recorder.Body.String())
+	return recorder
 }
 
 func voiceFenceTestContext() (*gin.Context, *httptest.ResponseRecorder) {

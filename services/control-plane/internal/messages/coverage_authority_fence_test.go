@@ -171,11 +171,13 @@ func TestChannelMessageMutationFenceTakesMessageWriteLock(t *testing.T) {
 	require.NoError(t, err)
 
 	h := NewHandler(db, logger.New("test"), nil, rbac.NewResolver(db, nil, logger.New("test")), nil)
+	ownerCtx := dbtest.ActorContext(context.Background(), t, db, owner.String())
 	tx, err := db.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 	c, _ := authorityFenceContext()
 	c.Set("user_id", owner.String())
+	c.Request = c.Request.WithContext(ownerCtx)
 	_, _, _, allowed := h.lockChannelMessageMutationTx(c, tx, messageID, owner.String(), rbac.PermPinMessages, "pin failed")
 	require.True(t, allowed)
 
@@ -200,6 +202,7 @@ func TestChannelMessageMutationFenceTakesMessageWriteLock(t *testing.T) {
 		defer func() { _ = tx2.Rollback() }()
 		c2, w2 := authorityFenceContext()
 		c2.Set("user_id", owner.String())
+		c2.Request = c2.Request.WithContext(ownerCtx)
 		_, _, _, ok := h.lockChannelMessageMutationTx(c2, tx2, messageID, owner.String(), rbac.PermPinMessages, "pin failed")
 		if ok {
 			err = tx2.Commit()
@@ -221,6 +224,7 @@ func TestPreflightMessageDeleteFailClosedPaths(t *testing.T) {
 	log := logger.New("test")
 	owner := dbtest.CreateUser(t, db)
 	actor := dbtest.CreateUser(t, db)
+	dbtest.RememberActor(t, db, actor.String())
 	serverID := uuid.NewString()
 	channelID := uuid.NewString()
 	messageID := uuid.NewString()
@@ -290,6 +294,7 @@ func TestPreflightMessageDeleteFailClosedPaths(t *testing.T) {
 		_, err = db.Exec(`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`, serverID, actor, roleID)
 		require.NoError(t, err)
 		c, w := authorityFenceContext()
+		dbtest.AttachRememberedActor(c, actor.String())
 		_, ok := h.updateMessageCiphertext(c, messageID, channelID, actor.String(), UpdateMessageRequest{Content: "ciphertext", KeyVersion: 1})
 		assert.False(t, ok)
 		assert.Equal(t, http.StatusForbidden, w.Code)

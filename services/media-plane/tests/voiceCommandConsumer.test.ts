@@ -27,6 +27,7 @@ import {
   type VoiceCommandOwnerRecord,
 } from '../src/lib/voiceCommandOwner.js';
 import type { VoiceCommandDispatcher } from '../src/lib/voiceCommandDispatcher.js';
+import { createRecoveryCallerFixture } from './helpers/voiceEnforcementRecoveryCallers.js';
 
 const mocked = vi.hoisted(() => ({ connect: vi.fn(), url: 'nats://127.0.0.1:4222' }));
 vi.mock('nats', async (actual) => ({
@@ -198,7 +199,7 @@ function fixture() {
     applyDurable: vi.fn(async (_data: unknown) => 'target_absent'),
     handleCompatibility: vi.fn(),
   };
-  const quarantine = vi.fn(async (_reason: string) => undefined);
+  const quarantine = vi.fn(async (_reason: string, _episode: object) => undefined);
   const deleteConsumer = vi.fn();
   const birth = { ...resourceBirth };
   const manager = {
@@ -268,6 +269,7 @@ function fixture() {
   });
   const bindOwner = vi.fn(async () => kv);
   const statusQueue = deferred<void>();
+  let statusSignal = deferred<{ type: string; data: string }>();
   const nc = {
     isClosed: vi.fn(() => false),
     jetstreamManager: vi.fn(async () => manager),
@@ -277,7 +279,12 @@ function fixture() {
     })),
     status: vi.fn(() => ({
       async *[Symbol.asyncIterator]() {
-        await statusQueue.promise;
+        for (;;) {
+          const status = await Promise.race([statusSignal.promise, statusQueue.promise.then(() => undefined)]);
+          if (!status) return;
+          statusSignal = deferred<{ type: string; data: string }>();
+          yield status;
+        }
       },
     })),
     drain: vi.fn(async () => undefined),
@@ -300,6 +307,7 @@ function fixture() {
     kv,
     bindOwner,
     birth,
+    status: (type: string) => statusSignal.resolve({ type, data: 'fixture' }),
     start: async () => {
       await service.connect();
       await service.startVoiceCommandConsumer({
@@ -395,7 +403,7 @@ describe('voice command ownership renewal lifecycle regressions for #2624', () =
       await f.start();
       await vi.advanceTimersByTimeAsync(0);
       expect(malformed.term).toHaveBeenCalledOnce();
-      expect(f.quarantine).toHaveBeenCalledExactlyOnceWith('schema_rejected');
+      expect(f.quarantine).toHaveBeenCalledExactlyOnceWith('schema_rejected', expect.any(Object));
       expect(f.actualOwner.valid()).toBe(true);
       expect(f.service.voiceCommandReady()).toBe(false);
 
@@ -438,7 +446,7 @@ describe('voice command ownership renewal lifecycle regressions for #2624', () =
         if (ending === 'invalidation') {
           f.consumerInfo.mockRejectedValue(new Error('fixture continuity unavailable'));
           await vi.advanceTimersByTimeAsync(1500);
-          expect(f.quarantine).toHaveBeenCalledWith('continuity_unavailable');
+          expect(f.quarantine).toHaveBeenCalledWith('continuity_unavailable', expect.any(Object));
           expect(f.actualOwner.valid()).toBe(false);
         } else {
           await f.close();
@@ -568,8 +576,10 @@ describe('voice command ownership renewal lifecycle regressions for #2624', () =
     try {
       await f.start();
       await vi.advanceTimersByTimeAsync(0);
-      expect(f.quarantine).toHaveBeenCalledWith('schema_rejected');
-      expect(f.quarantine).toHaveBeenCalledWith('schema_teardown_unavailable');
+      expect(f.quarantine).toHaveBeenCalledWith('schema_rejected', expect.any(Object));
+      // The failure transition retains the rejected episode attempt; only
+      // explicit recovery may retry teardown, under that same episode.
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
       expect(f.actualOwner.valid()).toBe(false);
       expect(f.service.voiceCommandReady()).toBe(false);
       expect(f.record().phase).toBe('held');
@@ -582,6 +592,173 @@ describe('voice command ownership renewal lifecycle regressions for #2624', () =
     } finally {
       await f.close();
     }
+  });
+});
+
+describe('voice command quarantine recovery episodes', () => {
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(0); });
+  afterEach(() => { vi.clearAllTimers(); });
+
+  it('does not attach another observer to the retained attempt for each actual transport notification', async () => {
+    const f = await ownershipLifecycleFixture();
+    const native = deferred<void>();
+    f.quarantine.mockImplementationOnce(() => native.promise);
+    await f.start();
+    const catches = vi.spyOn(Promise.prototype, 'catch');
+    try {
+      f.status('disconnect'); await vi.advanceTimersByTimeAsync(0);
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+      expect(catches.mock.contexts.length).toBeGreaterThan(0);
+      // The first observer belongs to the task installed before quarantine is
+      // invoked. Observe its actual identity without inspecting private state.
+      const retained = catches.mock.contexts[0];
+      catches.mockClear();
+      for (const notification of ['reconnecting', 'disconnect', 'reconnecting']) {
+        f.status(notification); await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+      expect(f.service.voiceCommandReady()).toBe(false);
+      expect(catches.mock.contexts.filter(task => task === retained),
+        'a hung episode must not gain one retained rejection reaction per status notification').toHaveLength(0);
+    } finally { catches.mockRestore(); native.resolve(); await f.close(); }
+  });
+
+  it('actual NATS episodes invalidate the actual index fence once across retry and again after completed recovery', async () => {
+    const f = await ownershipLifecycleFixture();
+    const callers = await createRecoveryCallerFixture(f.service);
+    const invalidations = vi.spyOn(callers.fence, 'invalidate');
+    const quarantine = vi.fn(callers.quarantine);
+    f.next.mockResolvedValueOnce(message({ ...command(), version: 99 }));
+    try {
+      await f.service.startVoiceCommandConsumer({ owner: callers.owner,
+        dispatcher: f.dispatcher as unknown as VoiceCommandDispatcher, quarantine });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(callers.proofs).toHaveLength(1);
+      expect(invalidations).toHaveBeenCalledTimes(1);
+      expect(callers.owner.valid()).toBe(true); // schema needs no owner notification
+      const episode = quarantine.mock.calls[0][1];
+      callers.proofs[0].reject(new Error('actual native teardown unavailable'));
+      await vi.advanceTimersByTimeAsync(0);
+      // The genuine owner notification adds one separate finite obligation.
+      expect(callers.owner.valid()).toBe(false);
+      expect(invalidations).toHaveBeenCalledTimes(2);
+      expect(callers.proofs).toHaveLength(2);
+      const recovery = f.service.recoverVoiceCommandConsumerAfterTeardown();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(quarantine.mock.calls[1]).toEqual(['recovery_teardown', episode]);
+      expect(invalidations).toHaveBeenCalledTimes(2);
+      await callers.finish(); await recovery;
+      expect(f.service.voiceCommandReady()).toBe(true);
+      expect(callers.fence.ready()).toBe(true);
+      f.idle.resolve(message({ ...command('2'), version: 99 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(quarantine).toHaveBeenCalledTimes(3);
+      expect(quarantine.mock.calls[2][1]).not.toBe(episode);
+      expect(invalidations).toHaveBeenCalledTimes(3);
+      expect(callers.fence.ready()).toBe(false);
+      expect(callers.proofs).toHaveLength(3);
+      await callers.finish();
+      expect(callers.fence.ready()).toBe(true);
+      expect(f.service.voiceCommandReady()).toBe(false); // teardown grants no consumer authority
+    } finally { await callers.finish(); callers.availability.stop(); await f.close(); }
+  });
+
+  it('retains failed schema teardown through invalidation and retries once under the same episode', async () => {
+    const f = await ownershipLifecycleFixture();
+    const malformed = message({ ...command(), version: 99 });
+    const native = deferred<void>();
+    f.next.mockResolvedValueOnce(malformed);
+    f.quarantine.mockRejectedValueOnce(new Error('native unavailable'))
+      .mockImplementationOnce(() => native.promise);
+    try {
+      await f.start(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+      expect(f.quarantine.mock.calls[0][0]).toBe('schema_rejected');
+      const episode = f.quarantine.mock.calls[0][1];
+      expect(episode).toBeDefined();
+      // Real invalidation follows schema_teardown_unavailable. It must not
+      // duplicate the failed schema callback or acknowledge the delivery.
+      expect(f.actualOwner.valid()).toBe(false);
+      expect(f.invalidated).toHaveBeenCalledTimes(1);
+      expect(f.service.voiceCommandReady()).toBe(false);
+      expect(malformed.term).not.toHaveBeenCalled();
+      expect(malformed.ackAck).not.toHaveBeenCalled();
+      // Real transport notifications advance runtime epoch repeatedly, but
+      // must retain the same failed attempt and episode without new waiters.
+      for (let i = 0; i < 10; i++) {
+        f.status(i % 2 ? 'disconnect' : 'reconnecting');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(f.quarantine).toHaveBeenCalledTimes(1);
+      }
+      f.status('reconnect'); await vi.advanceTimersByTimeAsync(0);
+      const recovery = f.service.recoverVoiceCommandConsumerAfterTeardown();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.quarantine).toHaveBeenCalledTimes(2);
+      expect(f.quarantine.mock.calls[1]).toEqual(['recovery_teardown', episode]);
+      for (let i = 0; i < 30; i++) {
+        expect(f.service.voiceCommandReady()).toBe(false);
+        expect(f.service.recoverVoiceCommandConsumerAfterTeardown()).toBe(recovery);
+      }
+      expect(f.quarantine).toHaveBeenCalledTimes(2);
+      native.resolve(); await recovery;
+      expect(f.service.voiceCommandReady()).toBe(true);
+      expect(f.actualOwner.valid()).toBe(true);
+      expect(f.record().phase).toBe('held');
+
+      // A distinct actual schema delivery after successful recovery starts a
+      // fresh episode, even though the first episode's teardown succeeded.
+      f.idle.resolve(message({ ...command('2'), version: 99 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.quarantine).toHaveBeenCalledTimes(3);
+      expect(f.quarantine.mock.calls[2][0]).toBe('schema_rejected');
+      expect(f.quarantine.mock.calls[2][1]).not.toBe(episode);
+      expect(f.service.voiceCommandReady()).toBe(false);
+    } finally { native.resolve(); await f.close(); }
+  });
+
+  it('does not invalidate the owner for a successful schema quarantine before consumer recovery', async () => {
+    const f = await ownershipLifecycleFixture();
+    const malformed = message({ ...command(), version: 99 });
+    f.next.mockResolvedValueOnce(malformed);
+    try {
+      await f.start(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.invalidated).not.toHaveBeenCalled();
+      expect(f.actualOwner.valid()).toBe(true);
+      expect(f.service.voiceCommandReady()).toBe(false);
+      expect(malformed.term).toHaveBeenCalledTimes(1);
+      expect(malformed.ackAck).not.toHaveBeenCalled();
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+      await f.service.recoverVoiceCommandConsumerAfterTeardown();
+      expect(f.service.voiceCommandReady()).toBe(true);
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+    } finally { await f.close(); }
+  });
+
+  it('rejects stale recovery after a newer actual owner invalidation and retains the episode for retry', async () => {
+    const f = await ownershipLifecycleFixture();
+    f.next.mockResolvedValueOnce(message({ ...command(), version: 99 }));
+    try {
+      await f.start(); await vi.advanceTimersByTimeAsync(0);
+      const episode = f.quarantine.mock.calls[0][1];
+      const info = deferred<Awaited<ReturnType<typeof f.consumerInfo>>>();
+      const originalInfo = await f.consumerInfo();
+      f.consumerInfo.mockImplementationOnce(() => info.promise);
+      const recovery = f.service.recoverVoiceCommandConsumerAfterTeardown();
+      const rejected = expect(recovery).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(0);
+      // Invalidate through the actual status consumer while recovery is
+      // awaiting a healthy broker response, then restore only transport.
+      f.status('disconnect'); await vi.advanceTimersByTimeAsync(0);
+      f.status('reconnect'); await vi.advanceTimersByTimeAsync(0);
+      info.resolve(originalInfo); await rejected;
+      expect(f.service.voiceCommandReady()).toBe(false);
+      expect(f.actualOwner.valid()).toBe(false);
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+      await f.service.recoverVoiceCommandConsumerAfterTeardown();
+      expect(f.service.voiceCommandReady()).toBe(true);
+      expect(f.quarantine.mock.calls[0][1]).toBe(episode);
+      expect(f.quarantine).toHaveBeenCalledTimes(1);
+    } finally { await f.close(); }
   });
 });
 

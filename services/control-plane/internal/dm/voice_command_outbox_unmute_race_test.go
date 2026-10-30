@@ -35,6 +35,7 @@ func TestVoiceCommandOutbox_DMUnmuteRechecksConcurrentDeafen(t *testing.T) {
 	ctx.Set("user_id", admin.String())
 	ctx.Params = gin.Params{{Key: "id", Value: convID}, {Key: "userId", Value: target.String()}}
 	ctx.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+	withActor(t, handler.db, ctx, admin.String())
 	handler.DMHardUnmute(ctx)
 
 	require.True(t, hookRan, "deafen must commit after the HTTP preflight and before the unmute transaction")

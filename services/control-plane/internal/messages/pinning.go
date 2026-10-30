@@ -79,7 +79,7 @@ func runDMMessageMutationTx(
 	if _, guardErr := dmblock.PrepareConversationTx(ctx, tx, conversationID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockNoKeyUpdate); guardErr != nil {
 		return guardErr
 	}
-	if guardErr := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, userID, credentialEpoch); guardErr != nil {
 		return guardErr
 	}
 	var participantID string
@@ -152,7 +152,7 @@ func (h *Handler) lockChannelMessageMutationTx(c *gin.Context, tx *sql.Tx, messa
 		}
 		return "", "", "", false
 	}
-	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondGuardTxError(c, guardErr, genericMsg)
 		return "", "", "", false
 	}

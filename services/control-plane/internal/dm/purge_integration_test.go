@@ -8,7 +8,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
-	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -161,11 +159,22 @@ func purgeUnderTableLock(t *testing.T, ts *testhelpers.TestServer, lockQuery str
 // dialDMObserver opens a WebSocket for userID subscribed to convID.
 func dialDMObserver(t *testing.T, ts *testhelpers.TestServer, userID, convID string) *gorillaWS.Conn {
 	t.Helper()
-	ticket := "dm-purge-observer-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:purge-observer::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	// Existing callers provide an already verified actor. Mint a fresh fixture
+	// family/SID, then obtain the same single-use ticket a client would consume.
+	var emailVerified bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT email_verified FROM users WHERE id = $1`, userID).Scan(&emailVerified))
+	require.True(t, emailVerified, "DM observer requires an already verified fixture actor")
+	token := ts.VerifyUserEmail(t, userID)
+	w := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(token))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var ticketResponse struct {
+		Ticket string `json:"ticket"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &ticketResponse))
+	require.NotEmpty(t, ticketResponse.Ticket)
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
-	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
+	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticketResponse.Ticket, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	readUntilDMEvent(t, conn, "connected")
@@ -508,7 +517,7 @@ func TestPurgeConversation_P1EmailOnlyAccountPasswordAlone(t *testing.T) {
 // by the real Plan.Guard without deleting the message. Engine.Run leaves the
 // recovery audit in progress so the failure is observable and retryable.
 func TestPurgeConversationRejectsStaleCredentialWithoutDeleting(t *testing.T) {
-	ts := testhelpers.SetupTestServer(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	alice := ts.CreateTestUser(t, "purge_stale_epoch")
 	bob := ts.CreateTestUser(t, "purge_stale_peer")
 	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
@@ -517,11 +526,14 @@ func TestPurgeConversationRejectsStaleCredentialWithoutDeleting(t *testing.T) {
 		INSERT INTO privacy_settings (user_id, require_auth_before_purge)
 		VALUES ($1, FALSE) ON CONFLICT (user_id) DO UPDATE SET require_auth_before_purge = FALSE`, alice.ID)
 	require.NoError(t, err)
-	staleToken := ts.SimulateStaleEpochWindow(t, alice.ID)
+	staleToken := alice.AccessToken
+	require.NoError(t, boundary.Arm(staleToken))
+	boundary.Hook.ArmArg([]string{dmEpochGuardSQL}, alice.ID, nil, nil)
 
 	w := ts.DoRequest(http.MethodDelete, purgeConvPath(convID), map[string]any{"range": "all"},
 		testhelpers.AuthHeaders(staleToken))
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	requireDMStaleBoundary(t, boundary)
 	require.Equal(t, 1, countDMMessages(t, ts, convID))
 	var status string
 	var deleted int

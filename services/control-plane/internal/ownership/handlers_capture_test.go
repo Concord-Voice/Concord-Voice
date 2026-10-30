@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"io"
 	"strings"
 	"sync"
@@ -229,6 +230,7 @@ type ambiguousConnector struct {
 	auditCalled     *bool
 	auditErr        *error
 	auditUntil      *time.Time
+	guard           *dbtest.FakeFamilyGuard
 }
 
 func (c ambiguousConnector) Connect(context.Context) (driver.Conn, error) {
@@ -251,6 +253,7 @@ type ambiguousConn struct {
 	auditCalled     *bool
 	auditErr        *error
 	auditUntil      *time.Time
+	guard           *dbtest.FakeFamilyGuard
 }
 
 func (c ambiguousConn) Prepare(string) (driver.Stmt, error) {
@@ -260,7 +263,10 @@ func (c ambiguousConn) Close() error { return nil }
 func (c ambiguousConn) Begin() (driver.Tx, error) {
 	return ambiguousTx{trace: c.trace, rollbackErr: c.rollbackErr, onCommit: c.onCommit, commitErr: c.commitErr, commitOK: c.commitOK}, nil
 }
-func (c ambiguousConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+func (c ambiguousConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.guard != nil && c.guard.Exec(query, args) {
+		return driver.RowsAffected(1), nil
+	}
 	query = strings.ToLower(query)
 	if strings.Contains(query, "insert into audit_log") {
 		*c.auditCalled = true
@@ -279,6 +285,11 @@ func (c ambiguousConn) ExecContext(ctx context.Context, query string, _ []driver
 func (c ambiguousConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if c.queryErr != nil {
 		return nil, c.queryErr
+	}
+	if c.guard != nil {
+		if rows, ok := c.guard.Query(query, args); ok {
+			return rows, nil
+		}
 	}
 	*c.trace = append(*c.trace, "server-row")
 	value := uuid.NewString()
@@ -377,7 +388,7 @@ func TestExecuteTransfer_AuditsAfterCommitWhenRequestContextIsCanceled(t *testin
 	transferID := uuid.NewString()
 	fromUserID := uuid.NewString()
 	toUserID := uuid.NewString()
-	const credentialEpoch = "ownership-test-epoch"
+	const credentialEpoch = "0123456789abcdef0123456789abcdef"
 	auditCalled := false
 	var auditCtxErr error
 	var auditDeadline time.Time
@@ -386,6 +397,7 @@ func TestExecuteTransfer_AuditsAfterCommitWhenRequestContextIsCanceled(t *testin
 		ownerID:         fromUserID,
 		queryID:         transferID,
 		credentialEpoch: credentialEpoch,
+		guard:           &dbtest.FakeFamilyGuard{Epoch: credentialEpoch},
 		execRows:        1,
 		commitOK:        true,
 		commitErr:       nil,
@@ -405,7 +417,7 @@ func TestExecuteTransfer_AuditsAfterCommitWhenRequestContextIsCanceled(t *testin
 		authority: noOpOwnershipAuthority{},
 	}
 
-	require.NoError(t, h.executeTransfer(ctx, serverID, transferID, fromUserID, toUserID, credentialEpoch))
+	require.NoError(t, h.executeTransfer(dbtest.WithFakeFamily(ctx, fromUserID, credentialEpoch), serverID, transferID, fromUserID, toUserID, credentialEpoch))
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.True(t, auditCalled, "post-commit ownership audit must use a live context")
 	require.NoError(t, auditCtxErr, "post-commit ownership audit must not inherit the canceled request context")
@@ -552,24 +564,25 @@ func TestWithOwnershipCapture_RollbackFailureIsReturned(t *testing.T) {
 
 func TestExecuteTransfer_StaleClaimReturnsAlreadyCompleted(t *testing.T) {
 	trace := []string{}
-	const credentialEpoch = "ownership-test-epoch"
-	db := sql.OpenDB(ambiguousConnector{trace: &trace, credentialEpoch: credentialEpoch})
+	const credentialEpoch = "0123456789abcdef0123456789abcdef"
+	db := sql.OpenDB(ambiguousConnector{trace: &trace, credentialEpoch: credentialEpoch, guard: &dbtest.FakeFamilyGuard{Epoch: credentialEpoch}})
 	t.Cleanup(func() {
 		require.NoError(t, db.Close())
 	})
 	h := &Handler{db: db, log: logger.New("ownership-test")}
 
+	fromUserID := uuid.NewString()
 	err := h.executeTransfer(
-		context.Background(),
+		dbtest.WithFakeFamily(context.Background(), fromUserID, credentialEpoch),
 		uuid.NewString(),
 		uuid.NewString(),
-		uuid.NewString(),
+		fromUserID,
 		uuid.NewString(),
 		credentialEpoch,
 	)
 
 	require.ErrorIs(t, err, errTransferAlreadyCompleted)
-	require.Equal(t, []string{"lock", "server-row", "server-row", "server-row", "server-row", "server-row", "write"}, trace)
+	require.Equal(t, []string{"lock", "server-row", "server-row", "server-row", "server-row", "write"}, trace)
 }
 
 func TestCompleteExpiredTransfers_QueryFailureIsLogged(t *testing.T) {

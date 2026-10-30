@@ -18,6 +18,7 @@ package rbac_test
 // already gives a non-member.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -169,7 +170,13 @@ func invokeAuthorityWriter(t *testing.T, h *rbac.Handler, w authorityWriter, f a
 func invokeAuthorityWriterAs(t *testing.T, h *rbac.Handler, w authorityWriter, f authorityFixture, actorID string) string {
 	t.Helper()
 	params, body := w.request(f)
-	rec := <-invokeStaleRBACMutation(t, actorID, params, body, w.call, h)
+	ctx := context.Background()
+	for _, user := range []testhelpers.TestUser{f.owner, f.actor, f.member} {
+		if user.ID == actorID {
+			ctx = testhelpers.WithAccessIdentity(ctx, t, user)
+		}
+	}
+	rec := <-invokeStaleRBACMutation(ctx, t, actorID, params, body, w.call, h)
 	code, got := rec.Code, rec.Body.String()
 	switch {
 	case code >= 200 && code < 300:

@@ -504,7 +504,7 @@ func (h *Handler) createChannelTx(c *gin.Context, tx *sql.Tx, req CreateChannelR
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
 		return result, false
 	}
-	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondCreateChannelGuardError(c, guardErr)
 		return result, false
 	}
@@ -1431,7 +1431,7 @@ func (h *Handler) executeOrdinaryChannelUpdate(ctx context.Context, serverID, us
 	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return channel, err
 	}
-	if err := credepoch.GuardTx(ctx, tx, userID, tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
 		return channel, err
 	}
 	actorPerms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
@@ -1596,7 +1596,7 @@ func (h *Handler) moveSyncedChannelTx(ctx context.Context, tx *sql.Tx, request s
 }
 
 func (h *Handler) prepareSyncedChannelMoveTx(ctx context.Context, tx *sql.Tx, request syncedChannelMoveRequest) (syncedChannelMoveState, error) {
-	if err := credepoch.GuardTx(ctx, tx, request.userID, request.tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, request.userID, request.tokenEpoch); err != nil {
 		return syncedChannelMoveState{}, err
 	}
 	if err := lockChannelGroupsTx(ctx, tx, request.serverID, moveChannelGroupIDs(request.preflight.GroupID, request.target.groupID)); err != nil {
@@ -1878,7 +1878,7 @@ type deleteChannelInput struct {
 // (A-1), so a client's own retry after a 409 re-verifies rather than finding
 // its code consumed.
 func (h *Handler) deleteChannelTx(ctx context.Context, tx *sql.Tx, in deleteChannelInput) (mfaenforce.Outcome, error) {
-	if err := credepoch.GuardTx(ctx, tx, in.userID, in.tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, in.userID, in.tokenEpoch); err != nil {
 		return mfaenforce.Unconfirmed, err
 	}
 	g, err := mfaenforce.LockGateTx(ctx, tx, in.serverID, in.userID,
@@ -2851,7 +2851,7 @@ type channelKeyDistributionState struct {
 
 func (h *Handler) prepareChannelKeyDistribution(ctx context.Context, tx *sql.Tx, req channelKeyDistributionRequest) (channelKeyDistributionState, error) {
 	var state channelKeyDistributionState
-	if guardErr := credepoch.GuardTx(ctx, tx, req.actorID, req.tokenEpoch); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, req.actorID, req.tokenEpoch); guardErr != nil {
 		return state, guardErr
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = $1 FOR UPDATE`, req.channelID).Scan(&state.serverID); err != nil {

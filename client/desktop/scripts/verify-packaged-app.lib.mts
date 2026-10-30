@@ -2,6 +2,7 @@
 //
 //   npx tsx scripts/verify-packaged-app.mts fuses       [--out out]
 //   npx tsx scripts/verify-packaged-app.mts asar-digest [--out out]    (macOS only)
+//   npx tsx scripts/verify-packaged-app.mts tray-assets [--out out]
 //
 // Run from client/desktop after `electron-forge make|package`, from both
 // .github/workflows/desktop-pr-smoke.yml (pr-smoke-build) and build-desktop.yml
@@ -24,7 +25,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { open, readdir, stat } from 'node:fs/promises';
+import { open, readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { FuseV1Options, getCurrentFuseWire } from '@electron/fuses';
 
@@ -569,7 +570,7 @@ const defaultDeps: Deps = {
   log: (line) => console.log(line),
 };
 
-const USAGE = 'usage: verify-packaged-app.mts <fuses|asar-digest> [--out <dir>]';
+const USAGE = 'usage: verify-packaged-app.mts <fuses|asar-digest|tray-assets> [--out <dir>]';
 
 function report(violations: string[], ok: string, deps: Deps): number {
   if (violations.length === 0) {
@@ -620,6 +621,75 @@ async function runAsarDigest(outDir: string, deps: Deps): Promise<number> {
   );
 }
 
+// ─── Tray sprites ───────────────────────────────────────────────────────────────────────────
+
+// forge.config.ts ships assets/tray through extraResource, a plain copy that no ignore pattern
+// governs, so a sprite that is missing from the artifact fails nowhere else: the tray resolver
+// would fall back to a blank icon at runtime. The manifest lists the frame keys and modes; this
+// reads it back from the PRODUCED app and checks every file the platform loads.
+
+/** `<Resources>` of a packaged app: inside the bundle on macOS, next to the executable elsewhere. */
+export function resourcesDirOf(app: PackagedApp): string {
+  return app.platform === 'darwin' || app.platform === 'mas'
+    ? path.join(app.target, 'Contents', 'Resources')
+    : path.join(path.dirname(app.target), 'resources');
+}
+
+interface TrayManifest {
+  keys: string[];
+  modes: string[];
+}
+
+function isTrayManifest(value: unknown): value is TrayManifest {
+  if (typeof value !== 'object' || value === null) return false;
+  const { keys, modes } = value as Record<string, unknown>;
+  const strings = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'string' && x.length > 0);
+  return strings(keys) && strings(modes);
+}
+
+export async function verifyTrayAssets(resourcesDir: string, platform: string): Promise<string[]> {
+  const trayDir = path.join(resourcesDir, 'tray');
+  const manifestPath = path.join(trayDir, 'manifest.json');
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  } catch (err) {
+    return [`tray manifest is missing or unreadable: ${manifestPath} (${(err as Error).message})`];
+  }
+  if (!isTrayManifest(manifest)) {
+    return [`tray manifest has no usable keys/modes lists: ${manifestPath}`];
+  }
+  const suffixes = platform === 'linux' ? ['-22.png'] : ['.png', '@2x.png'];
+  const violations: string[] = [];
+  for (const mode of manifest.modes) {
+    for (const key of manifest.keys) {
+      for (const suffix of suffixes) {
+        const rel = path.join(mode, `${key}${suffix}`);
+        const size = await stat(path.join(trayDir, rel)).then(
+          (s) => (s.isFile() ? s.size : -1),
+          () => -1
+        );
+        if (size < 0) violations.push(`tray sprite missing from the package: tray/${rel}`);
+        else if (size === 0) violations.push(`tray sprite is empty: tray/${rel}`);
+      }
+    }
+  }
+  return violations;
+}
+
+async function runTrayAssets(outDir: string, deps: Deps): Promise<number> {
+  const config = await deps.loadForgeConfig();
+  const app = await locatePackagedApp(outDir, config.packagerConfig?.executableName);
+  const resources = resourcesDirOf(app);
+  deps.log(`Verifying tray sprites in ${resources}`);
+  return report(
+    await verifyTrayAssets(resources, app.platform),
+    'Packaged tray manifest and every sprite it implies for this platform are present',
+    deps
+  );
+}
+
 export async function main(argv: string[], deps: Deps = defaultDeps): Promise<number> {
   try {
     const [mode, ...flags] = argv;
@@ -630,6 +700,7 @@ export async function main(argv: string[], deps: Deps = defaultDeps): Promise<nu
     }
     if (mode === 'fuses') return await runFuses(outDir, deps);
     if (mode === 'asar-digest') return await runAsarDigest(outDir, deps);
+    if (mode === 'tray-assets') return await runTrayAssets(outDir, deps);
     throw new CheckError(USAGE);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

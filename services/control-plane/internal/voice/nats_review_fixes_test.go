@@ -1556,7 +1556,7 @@ func TestPrivateHeartbeatExactDuplicateReconnectsReplicaWithLostRemovalEvidence(
 	require.NoError(t, err)
 	seedPrivateVoiceGeneration(t, ts, callerID, callID, oldAt)
 	seedPrivateVoiceGeneration(t, ts, peerID, callID, oldAt)
-	connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, peer)
+	connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, peer)
 
 	payload := mustJSON(t, map[string]interface{}{
 		"channelId": conversationID.String(), "callId": callID.String(),

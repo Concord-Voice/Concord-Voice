@@ -52,6 +52,7 @@ func TestDMHardMuteRevalidatesAdminInsideGuardedTransaction(t *testing.T) {
 	ctx.Set("user_id", admin.String())
 	ctx.Params = gin.Params{{Key: "id", Value: convID}, {Key: "userId", Value: target.String()}}
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	withActor(t, handler.db, ctx, admin.String())
 	handler.DMHardMute(ctx)
 
 	require.Equal(t, http.StatusForbidden, recorder.Code)

@@ -50,7 +50,7 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 			h.log.Error("Failed to roll back DM expiration transaction", "error", rollbackErr)
 		}
 	}()
-	if guardErr := credepoch.GuardTx(mutationCtx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(mutationCtx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondGuardTxError(c, guardErr, errMsgFailedUpdateConversation)
 		return
 	}

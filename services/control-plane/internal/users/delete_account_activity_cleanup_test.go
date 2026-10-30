@@ -50,7 +50,7 @@ func TestDeleteAccountResumesPendingActivityCleanupBeforeErasure(t *testing.T) {
 	suppressor := &replayActivitySettingsSuppressor{}
 	service := configuredAccountServiceForCleanup(t, db, suppressor)
 
-	require.NoError(t, service.DeleteAccount(context.Background(), userID.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String()))
 
 	assert.Equal(t, 1, suppressor.callCount())
 	assert.Equal(t, 1, suppressor.accountCallCount())
@@ -72,7 +72,7 @@ func TestDeleteAccountCleanupFailureRetainsUserAndMarker(t *testing.T) {
 	}
 	service := configuredAccountServiceForCleanup(t, db, suppressor)
 
-	err := service.DeleteAccount(context.Background(), userID.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 
 	require.Error(t, err)
 	assert.Equal(t, 1, suppressor.callCount())
@@ -87,7 +87,7 @@ func TestDeleteAccountSuppressesActiveActivityWithoutPendingMarker(t *testing.T)
 	suppressor := &replayActivitySettingsSuppressor{}
 	service := configuredAccountServiceForCleanup(t, db, suppressor)
 
-	require.NoError(t, service.DeleteAccount(context.Background(), userID.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String()))
 
 	assert.Zero(t, suppressor.callCount())
 	assert.Equal(t, 1, suppressor.accountCallCount())
@@ -120,7 +120,7 @@ func TestDeleteAccountDeletesActiveActivityStateWithoutPendingMarker(t *testing.
 	)
 	service := configuredAccountServiceForCleanup(t, db, activityService)
 
-	require.NoError(t, service.DeleteAccount(ctx, userID.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(ctx, t, db, userID.String()), userID.String()))
 
 	for _, category := range []presence.Category{
 		presence.CategoryServerVoice,
@@ -153,7 +153,7 @@ func TestDeleteAccountActivitySuppressionFailureRetainsUser(t *testing.T) {
 	suppressor := &replayActivitySettingsSuppressor{accountErr: suppressErr}
 	service := configuredAccountServiceForCleanup(t, db, suppressor)
 
-	err := service.DeleteAccount(context.Background(), userID.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 
 	require.ErrorIs(t, err, suppressErr)
 	assert.Zero(t, suppressor.callCount())
@@ -168,7 +168,7 @@ func TestDeleteAccountRestrictPreservesDirectDeleteRaceWithPendingMarker(t *test
 	_ = insertPendingAccountActivityCleanup(t, db, userID)
 	service := NewAccountService(db, logger.New("test"))
 
-	err := service.DeleteAccount(context.Background(), userID.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 
 	require.Error(t, err)
 	assertAccountActivityCleanupRows(t, db, userID, 1, 1)
@@ -187,8 +187,9 @@ func TestDeleteAccountRetainsUserWhenConcurrentCleanupMarkerWins(t *testing.T) {
 	}}
 	service := configuredAccountServiceForCleanup(t, db, suppressor)
 	deleteDone := make(chan error, 1)
+	actor := testdb.ActorContext(context.Background(), t, db, userID.String())
 	go func() {
-		deleteDone <- service.DeleteAccount(context.Background(), userID.String())
+		deleteDone <- service.DeleteAccount(actor, userID.String())
 	}()
 	select {
 	case <-suppressionEntered:

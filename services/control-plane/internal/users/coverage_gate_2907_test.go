@@ -33,7 +33,7 @@ func TestCoverageGate2907_DeleteAccountFailsClosedWhenBlockMarkerDrainFails(t *t
 		}
 	})
 
-	err = NewAccountService(db, logger.New("test")).DeleteAccount(context.Background(), userID.String())
+	err = NewAccountService(db, logger.New("test")).DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 	require.ErrorContains(t, err, "drain DM block reconciliation")
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM users WHERE id = $1`, userID).Scan(&count))

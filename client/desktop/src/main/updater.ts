@@ -84,6 +84,30 @@ let pendingDownloadedFile: string | null = null;
 let pendingGeneration = 0;
 let installInFlight = false;
 let downloadsInFlight = 0;
+// Status-aware tray (tray-status spec §4): the update phase is main-owned and reaches
+// the tray through this callback, injected by main.ts at init. `announcedUpdateVersion`
+// remembers an `update-available` that has not been downloaded yet, so an unrelated
+// error does not drop the tray's "Download update" row (autoDownload is off, so
+// "available" is a lasting state).
+export type TrayUpdateState = 'none' | 'available' | 'downloading' | 'ready';
+let onTrayUpdateState: ((state: TrayUpdateState, percent?: number) => void) | null = null;
+let announcedUpdateVersion: string | null = null;
+
+function notifyTray(state: TrayUpdateState, percent?: number): void {
+  if (onTrayUpdateState === null) return;
+  try {
+    if (percent === undefined) onTrayUpdateState(state);
+    else onTrayUpdateState(state, percent);
+  } catch {
+    // The tray is optional chrome: it can never break an updater event.
+  }
+}
+
+/** The phase the tray should show when no event names a newer one. */
+function settledTrayState(): TrayUpdateState {
+  if (pendingUpdateVersion) return 'ready';
+  return announcedUpdateVersion ? 'available' : 'none';
+}
 
 type WindowsVerification = 'verified' | 'rejected' | 'unavailable';
 
@@ -211,12 +235,18 @@ function ensureUpdaterReady(): void {
       releaseNotes: info.releaseNotes,
       releaseDate: info.releaseDate,
     });
+    announcedUpdateVersion = info.version;
+    notifyTray(settledTrayState());
   });
 
   autoUpdater.on('update-not-available', (info: UpdateInfo) => {
     requireLogger().info(`Up to date (v${info.version})`);
     updateSplashStatus('All systems go');
     sendToRenderer('update:not-available', { version: info.version });
+    if (!pendingUpdateVersion) {
+      announcedUpdateVersion = null;
+      notifyTray('none');
+    }
   });
 
   autoUpdater.on('download-progress', (progress: ProgressInfo) => {
@@ -230,6 +260,7 @@ function ensureUpdaterReady(): void {
       total: progress.total,
       bytesPerSecond: progress.bytesPerSecond,
     });
+    notifyTray('downloading', progress.percent);
   });
 
   autoUpdater.on('update-downloaded', (event: UpdateDownloadedEvent) => {
@@ -240,6 +271,7 @@ function ensureUpdaterReady(): void {
     showSplashProgress(100);
     updateSplashStatus('Ready for liftoff');
     sendToRenderer('update:downloaded', { version: event.version });
+    notifyTray('ready');
   });
 
   autoUpdater.on('error', (error: Error) => {
@@ -276,6 +308,9 @@ function ensureUpdaterReady(): void {
       securityEvent: isSecurityEvent,
       subtype,
     });
+    // 'none' only when no version is pending: a downloaded update stays ready, an
+    // announced one stays downloadable.
+    notifyTray(settledTrayState());
   });
 }
 
@@ -294,10 +329,12 @@ function startScheduledChecks(): void {
 
 export function initAutoUpdater(
   mainWindowGetter: () => BrowserWindow | null,
-  releaseUpdateQuitVeto?: () => void
+  releaseUpdateQuitVeto?: () => void,
+  trayUpdateState?: (state: TrayUpdateState, percent?: number) => void
 ): void {
   getWindow = mainWindowGetter;
   releaseQuitVetoForUpdate = releaseUpdateQuitVeto ?? null;
+  onTrayUpdateState = trayUpdateState ?? null;
 
   if (!app.isPackaged) {
     // No logger yet in dev mode — use console directly
@@ -368,10 +405,13 @@ async function verifyLinuxUpdateBeforeInstall(file: string | null): Promise<Linu
 
 /** Refuse a Windows installer whose trust could not be re-established this session. */
 function refuseUnverifiedWindowsInstaller(verdict: Exclude<WindowsVerification, 'verified'>): void {
+  announcedUpdateVersion ??= pendingUpdateVersion;
   pendingUpdateVersion = null;
   pendingDownloadedFile = null;
   pendingGeneration += 1;
   discardPreparedUpdate(requireLogger());
+  // The installer was discarded; the user must download again.
+  notifyTray(settledTrayState());
   updateSplashError('Update could not be verified');
   sendToRenderer(
     'update:error',

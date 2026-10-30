@@ -13,6 +13,8 @@ type AppAttestKey struct {
 	PublicKey   []byte
 	SignCount   uint32
 	Environment string
+	// FirstUserHash is HashUserID of the account that attested the key.
+	FirstUserHash string
 }
 
 // InsertAppAttestKey records a freshly attested key. A key is attested once,
@@ -39,10 +41,10 @@ func (r *Repository) InsertAppAttestKey(ctx context.Context, k AppAttestKey, fir
 
 // GetAppAttestKey returns the key or nil if it is not on record.
 func (r *Repository) GetAppAttestKey(ctx context.Context, keyID []byte) (*AppAttestKey, error) {
-	const q = `SELECT key_id, public_key, sign_count, environment FROM app_attest_keys WHERE key_id = $1`
+	const q = `SELECT key_id, public_key, sign_count, environment, first_user_hash FROM app_attest_keys WHERE key_id = $1`
 	k := &AppAttestKey{}
 	var count int64
-	err := r.db.QueryRowContext(ctx, q, keyID).Scan(&k.KeyID, &k.PublicKey, &count, &k.Environment)
+	err := r.db.QueryRowContext(ctx, q, keyID).Scan(&k.KeyID, &k.PublicKey, &count, &k.Environment, &k.FirstUserHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

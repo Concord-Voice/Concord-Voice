@@ -140,7 +140,7 @@ func TestInsertTransferRecordRejectsPreflightAfterProductionReversal(t *testing.
 	require.NoError(t, h.requireMembership(ctx, nil, serverID.String(), targetC.String()))
 	require.NoError(t, h.requireNoPendingTransfer(ctx, nil, serverID.String()))
 
-	_, err = h.executeReversal(ctx, &reversalRecord{
+	_, err = h.executeReversal(dbtest.ActorContext(ctx, t, db, ownerB.String()), &reversalRecord{
 		transferID: transferID.String(), serverID: serverID.String(),
 		fromUserID: ownerB.String(), toUserID: ownerA.String(), completedAt: time.Now(),
 	})
@@ -151,7 +151,7 @@ func TestInsertTransferRecordRejectsPreflightAfterProductionReversal(t *testing.
 		toUserID: targetC.String(), reversalToken: uuid.NewString(),
 		requestedAt: time.Now(), expiresAt: time.Now().Add(time.Hour),
 	}
-	err = h.insertTransferRecord(ctx, testContext, record)
+	err = h.insertTransferRecord(dbtest.ActorContext(ctx, t, db, record.fromUserID), testContext, record)
 	require.ErrorIs(t, err, errTransferOwnershipChanged, "stale initiation must be rejected after reversal")
 	require.Equal(t, 409, recorder.Code)
 	var pending int
@@ -175,8 +175,9 @@ func TestExecuteReversalCaptureLimitAfterOwnershipChangeIsReclassified(t *testin
 	recheck := &reversalCaptureLimitRace{entered: make(chan struct{}), release: make(chan struct{})}
 	h := &Handler{db: db, log: logger.New("ownership-race"), presenceRecheck: recheck}
 	done := make(chan error, 1)
+	actorCtx := dbtest.ActorContext(context.Background(), t, db, ownerA.String())
 	go func() {
-		_, err := h.executeReversal(context.Background(), &reversalRecord{
+		_, err := h.executeReversal(actorCtx, &reversalRecord{
 			transferID: transferID.String(), serverID: serverID.String(),
 			fromUserID: ownerA.String(), toUserID: targetC.String(), completedAt: time.Now(),
 		})
@@ -226,7 +227,7 @@ func TestExecuteReversalCaptureLimitPreservesCancellationAndOwnershipChange(t *t
 		db: db, log: logger.New("ownership-race"),
 		presenceRecheck: &captureLimitRecheck{beforeReturn: cancel},
 	}
-	_, err = h.executeReversal(ctx, &reversalRecord{
+	_, err = h.executeReversal(dbtest.ActorContext(ctx, t, db, ownerA.String()), &reversalRecord{
 		transferID: transferID.String(), serverID: serverID.String(),
 		fromUserID: ownerA.String(), toUserID: targetC.String(), completedAt: time.Now(),
 	})
@@ -251,7 +252,7 @@ func TestExecuteReversalPreservesCaptureLimitForCurrentTransfer(t *testing.T) {
 		transferID: transferID.String(), serverID: serverID.String(),
 		fromUserID: ownerA.String(), toUserID: targetC.String(),
 	}
-	_, err = h.executeReversal(context.Background(), record)
+	_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, record.fromUserID), record)
 	require.ErrorIs(t, err, rbac.ErrPresenceCaptureLimited)
 	require.NotErrorIs(t, err, errReversalOwnershipChanged)
 }
@@ -273,7 +274,7 @@ func TestExecuteReversalCaptureLimitRejectsOriginalOwnerWhoLeftServer(t *testing
 	require.NoError(t, err)
 
 	h := &Handler{db: db, log: logger.New("ownership-race"), presenceRecheck: &captureLimitRecheck{}}
-	_, err = h.executeReversal(context.Background(), &reversalRecord{
+	_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, ownerA.String()), &reversalRecord{
 		transferID: transferID.String(), serverID: serverID.String(),
 		fromUserID: ownerA.String(), toUserID: targetC.String(),
 	})
@@ -305,7 +306,7 @@ func TestExecuteReversalCaptureLimitClassifiesDisappearingState(t *testing.T) {
 			_, updateErr = db.Exec(`UPDATE ownership_transfers SET status = 'cancelled' WHERE id = $1`, transferID)
 		},
 	}}
-	_, err = h.executeReversal(context.Background(), record)
+	_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, record.fromUserID), record)
 	require.NoError(t, updateErr)
 	require.ErrorIs(t, err, errReversalOwnershipChanged)
 
@@ -326,7 +327,7 @@ func TestExecuteReversalCaptureLimitClassifiesDisappearingState(t *testing.T) {
 	h.presenceRecheck = &captureLimitRecheck{beforeReturn: func() {
 		_, updateErr = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID)
 	}}
-	_, err = h.executeReversal(context.Background(), record)
+	_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, record.fromUserID), record)
 	require.NoError(t, updateErr)
 	require.ErrorIs(t, err, errReversalOwnershipChanged)
 }
@@ -348,7 +349,7 @@ func TestInsertTransferRecordRejectsExistingPendingTransfer(t *testing.T) {
 		toUserID: targetC.String(), reversalToken: uuid.NewString(),
 		requestedAt: time.Now(), expiresAt: time.Now().Add(time.Hour),
 	}
-	err = h.insertTransferRecord(ctx, testContext, record)
+	err = h.insertTransferRecord(dbtest.ActorContext(ctx, t, db, record.fromUserID), testContext, record)
 	require.ErrorIs(t, err, errTransferAlreadyPending)
 	require.Equal(t, 409, recorder.Code)
 	var pending int
@@ -387,7 +388,7 @@ func TestInsertTransferRecordRejectsMissingServer(t *testing.T) {
 		toUserID: toUserID.String(), reversalToken: uuid.NewString(),
 		requestedAt: time.Now(), expiresAt: time.Now().Add(time.Hour),
 	}
-	err := h.insertTransferRecord(ctx, testContext, record)
+	err := h.insertTransferRecord(dbtest.ActorContext(ctx, t, db, record.fromUserID), testContext, record)
 
 	require.ErrorIs(t, err, errTransferOwnershipChanged)
 	require.Equal(t, 409, recorder.Code)
@@ -411,7 +412,7 @@ func TestExecuteTransferRejectsStalePendingTransferWithoutSuccessEffects(t *test
 	effects := &ownershipRaceEffects{}
 	h := &Handler{db: db, log: logger.New("ownership-race"), audit: rbac.NewAuditWriter(db, logger.New("ownership-race")), voiceEnforcer: effects}
 	h.SetPresenceRecheck(effects)
-	err = h.executeTransfer(context.Background(), serverID.String(), transferID.String(), ownerA.String(), targetC.String())
+	err = h.executeTransfer(dbtest.ActorContext(context.Background(), t, db, ownerA.String()), serverID.String(), transferID.String(), ownerA.String(), targetC.String())
 	require.ErrorIs(t, err, errTransferOwnershipChanged)
 
 	var status, owner string
@@ -438,8 +439,9 @@ func TestExecuteTransferClassifiesStaleOwnerBeforeCaptureLimit(t *testing.T) {
 	recheck := &reversalCaptureLimitRace{entered: make(chan struct{}), release: make(chan struct{})}
 	h := &Handler{db: db, log: logger.New("ownership-race"), presenceRecheck: recheck}
 	done := make(chan error, 1)
+	actorCtx := dbtest.ActorContext(context.Background(), t, db, ownerA.String())
 	go func() {
-		done <- h.executeTransfer(context.Background(), serverID.String(), transferID.String(), ownerA.String(), targetC.String())
+		done <- h.executeTransfer(actorCtx, serverID.String(), transferID.String(), ownerA.String(), targetC.String())
 	}()
 	<-recheck.entered
 
@@ -469,7 +471,7 @@ func TestExecuteTransferPreservesCaptureLimitForCurrentOwner(t *testing.T) {
 	require.NoError(t, err)
 
 	h := &Handler{db: db, log: logger.New("ownership-race"), presenceRecheck: &captureLimitRecheck{}}
-	err = h.executeTransfer(context.Background(), serverID.String(), transferID.String(), ownerA.String(), targetC.String())
+	err = h.executeTransfer(dbtest.ActorContext(context.Background(), t, db, ownerA.String()), serverID.String(), transferID.String(), ownerA.String(), targetC.String())
 	require.ErrorIs(t, err, rbac.ErrPresenceCaptureLimited)
 
 	var status string
@@ -605,11 +607,11 @@ func TestExpiredPendingTransferCannotReviveAcrossOwnershipEpochs(t *testing.T) {
 	require.False(t, changed)
 	h.presenceRecheck = nil
 
-	_, err = h.executeReversal(context.Background(), &reversalRecord{
+	_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, ownerB.String()), &reversalRecord{
 		transferID: transferBA.String(), serverID: serverID.String(), fromUserID: ownerB.String(), toUserID: ownerA.String(),
 	})
 	require.NoError(t, err)
-	_, err = h.executeReversal(context.Background(), &reversalRecord{
+	_, err = h.executeReversal(dbtest.ActorContext(context.Background(), t, db, ownerA.String()), &reversalRecord{
 		transferID: transferAB.String(), serverID: serverID.String(), fromUserID: ownerA.String(), toUserID: ownerB.String(),
 	})
 	require.NoError(t, err)
@@ -638,6 +640,7 @@ func TestCancelTransferStaleOwnerCannotCancelNewOwnerTransfer(t *testing.T) {
 		transferID, serverID, ownerA, targetC, uuid.NewString())
 	require.NoError(t, err)
 
+	cancelActorCtx := dbtest.ActorContext(context.Background(), t, db, ownerA.String())
 	// Lock the server before the transfer row, matching the ownership write
 	// order. Cancellation must wait on the server row and recheck the owner
 	// after this transaction changes both the owner and pending transfer.
@@ -661,6 +664,7 @@ func TestCancelTransferStaleOwnerCannotCancelNewOwnerTransfer(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest("DELETE", "/", nil)
 	c.Set("user_id", ownerA.String())
+	c.Request = c.Request.WithContext(cancelActorCtx)
 	c.Params = gin.Params{{Key: "id", Value: serverID.String()}}
 	done := make(chan struct{})
 	go func() {

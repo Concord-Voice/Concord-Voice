@@ -29,51 +29,40 @@ const renewalTestToken = "test-renewal-token-123-DO-NOT-LOG" //nolint:gosec // t
 
 var errRenewalInjected = errors.New("injected renewal failure")
 
-// fakeRenewalAuthority records every call and returns canned answers.
+// fakeRenewalAuthority separates the initial credential check from the final
+// SQL authority recheck, including failures that happen only after Run rebinds.
 type fakeRenewalAuthority struct {
-	mu sync.Mutex
-
-	verified    accessTokenAuth
-	validateErr error
-
-	predecessor    string
-	predecessorErr error
-
-	revoked    bool
-	revokedErr error
-
-	validateCalls    int
-	predecessorCalls int
-	revokedCalls     int
-	predecessorSIDs  []string
+	mu            sync.Mutex
+	verified      accessTokenAuth
+	validateErr   error
+	revoked       bool
+	revokedErr    error
+	validateCalls int
 }
 
 func (f *fakeRenewalAuthority) validateAccessToken(_ context.Context, _ string) (accessTokenAuth, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.validateCalls++
+	if f.validateCalls > 1 {
+		if f.revokedErr != nil {
+			return accessTokenAuth{}, f.revokedErr
+		}
+		if f.revoked {
+			return accessTokenAuth{}, errors.New("test family terminal")
+		}
+	}
 	return f.verified, f.validateErr
 }
-
-func (f *fakeRenewalAuthority) sessionPredecessor(_ context.Context, _ uuid.UUID, sessionID string) (string, error) {
+func (f *fakeRenewalAuthority) calls() (initial, obsoleteLineage, final int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.predecessorCalls++
-	f.predecessorSIDs = append(f.predecessorSIDs, sessionID)
-	return f.predecessor, f.predecessorErr
-}
-
-func (f *fakeRenewalAuthority) sessionRevoked(_ context.Context, _ uuid.UUID, _ string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.revokedCalls++
-	return f.revoked, f.revokedErr
-}
-
-func (f *fakeRenewalAuthority) calls() (validate, predecessor, revoked int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.validateCalls, f.predecessorCalls, f.revokedCalls
+	initial = f.validateCalls
+	if initial > 1 {
+		final = initial - 1
+		initial = 1
+	}
+	return initial, 0, final
 }
 
 // syncLogBuffer is a goroutine-safe log sink.
@@ -181,6 +170,7 @@ func newRenewalFixture(hub *Hub, conn *ws.Conn) *renewalFixture {
 	client := &Client{
 		ID:             uuid.New(),
 		UserID:         uuid.New(),
+		FamilyID:       uuid.New(),
 		SessionID:      uuid.NewString(),
 		CredEpoch:      "epoch-1",
 		TokenExpiresAt: deadline,
@@ -192,6 +182,7 @@ func newRenewalFixture(hub *Hub, conn *ws.Conn) *renewalFixture {
 	authority := &fakeRenewalAuthority{
 		verified: accessTokenAuth{
 			UserID:    client.UserID,
+			FamilyID:  client.FamilyID,
 			SessionID: client.SessionID,
 			CredEpoch: client.CredEpoch,
 			ExpiresAt: renewedTo,
@@ -260,11 +251,10 @@ func TestRenewToken_RefusalsLeaveDeadlineUnchanged(t *testing.T) {
 			want:   expect{},
 		},
 		{
-			name: "legacy socket with no session (lineage of a NULL-predecessor sid would otherwise match)",
+			name: "socket with no session",
 			mutate: func(f *renewalFixture) {
 				f.client.SessionID = ""
 				f.authority.verified.SessionID = uuid.NewString()
-				f.authority.predecessor = "" // a row with NULL predecessor_id
 			},
 			want: expect{reason: "mismatch_session"},
 		},
@@ -284,39 +274,22 @@ func TestRenewToken_RefusalsLeaveDeadlineUnchanged(t *testing.T) {
 			want:   expect{validate: 1, reason: "mismatch_epoch"},
 		},
 		{
-			name: "token carries no sid (lineage lookup would otherwise vouch for it)",
+			name: "token carries no sid",
 			mutate: func(f *renewalFixture) {
 				f.authority.verified.SessionID = ""
-				f.authority.predecessor = f.client.SessionID
 			},
 			want: expect{validate: 1, reason: "mismatch_session"},
 		},
 		{
-			name: "rotated sid whose predecessor is a sibling session",
+			name: "rotated sid belongs to a different family",
 			mutate: func(f *renewalFixture) {
 				f.authority.verified.SessionID = uuid.NewString()
-				f.authority.predecessor = uuid.NewString()
+				f.authority.verified.FamilyID = uuid.New()
 			},
-			want: expect{validate: 1, predecessor: 1, reason: "mismatch_session"},
+			want: expect{validate: 1, reason: "mismatch_family"},
 		},
-		{
-			name: "rotated sid not found (a stale predecessor value is never trusted)",
-			mutate: func(f *renewalFixture) {
-				f.authority.verified.SessionID = uuid.NewString()
-				f.authority.predecessor = f.client.SessionID
-				f.authority.predecessorErr = errSessionNotFound
-			},
-			want: expect{validate: 1, predecessor: 1, reason: "mismatch_session"},
-		},
-		{
-			name: "rotated sid lineage lookup unavailable",
-			mutate: func(f *renewalFixture) {
-				f.authority.verified.SessionID = uuid.NewString()
-				f.authority.predecessor = f.client.SessionID
-				f.authority.predecessorErr = errRenewalInjected
-			},
-			want: expect{validate: 1, predecessor: 1, reason: "unavailable"},
-		},
+		{name: "socket has no family", mutate: func(f *renewalFixture) { f.client.FamilyID = uuid.Nil }, want: expect{validate: 1, reason: "mismatch_family"}},
+		{name: "token has no resolved family", mutate: func(f *renewalFixture) { f.authority.verified.FamilyID = uuid.Nil }, want: expect{validate: 1, reason: "mismatch_family"}},
 		{
 			name:   "exp equal to current deadline",
 			mutate: func(f *renewalFixture) { f.authority.verified.ExpiresAt = f.deadline },
@@ -421,10 +394,8 @@ func TestRenewToken_RotatedSessionRebindsThroughHubRun(t *testing.T) {
 	t.Run("rebinds SessionID and a revocation of the NEW sid evicts the socket", func(t *testing.T) {
 		hub := runningHub(t)
 		f := newRenewalFixture(hub, nil)
-		oldSID := f.client.SessionID
 		newSID := uuid.NewString()
 		f.authority.verified.SessionID = newSID
-		f.authority.predecessor = oldSID
 		// Registered before Run starts, so no lock is needed for the seed.
 		hub.clients[f.client.ID] = f.client
 		startHub(t, hub)
@@ -433,8 +404,7 @@ func TestRenewToken_RotatedSessionRebindsThroughHubRun(t *testing.T) {
 		assert.Equal(t, f.renewedTo, f.client.tokenDeadline())
 		assert.Equal(t, newSID, f.client.SessionID, "Run must rebind the socket to its successor session")
 		_, predecessor, revoked := f.authority.calls()
-		assert.Equal(t, 1, predecessor)
-		assert.Equal(t, []string{newSID}, f.authority.predecessorSIDs, "lineage is looked up by the TOKEN's sid")
+		assert.Zero(t, predecessor)
 		assert.Equal(t, 1, revoked, "the new sid is re-checked for revocation after the rebind")
 
 		// The consumer of the rebind: revoking the NEW sid evicts the socket.
@@ -456,7 +426,6 @@ func TestRenewToken_RotatedSessionRebindsThroughHubRun(t *testing.T) {
 		f := newRenewalFixture(hub, nil)
 		oldSID := f.client.SessionID
 		f.authority.verified.SessionID = uuid.NewString()
-		f.authority.predecessor = oldSID
 		hub.clients[f.client.ID] = f.client
 		startHub(t, hub)
 
@@ -493,7 +462,6 @@ func TestRenewToken_PostRebindRevocationClosesConnection(t *testing.T) {
 			f := newRenewalFixture(hub, conn)
 			newSID := uuid.NewString()
 			f.authority.verified.SessionID = newSID
-			f.authority.predecessor = f.client.SessionID
 			f.authority.revoked = tc.revoked
 			f.authority.revokedErr = tc.revokedErr
 			// Registered before Run starts; Run's unregister arm removes it.
@@ -528,7 +496,6 @@ func TestRenewToken_PostRebindRevocationClosesConnection(t *testing.T) {
 		hub := NewHub(nil, nil) // Run never starts
 		f := newRenewalFixture(hub, nil)
 		f.authority.verified.SessionID = uuid.NewString()
-		f.authority.predecessor = f.client.SessionID
 		hub.closeOnce.Do(func() { close(hub.done) })
 		result := make(chan bool, 1)
 		go func() { result <- f.client.renewToken(renewalTestToken) }()
@@ -834,7 +801,6 @@ func TestRenewToken_StalledHubRunIsBoundedByTimeout(t *testing.T) {
 		f := newRenewalFixture(stoppedHub(t), nil) // Run never starts, done stays open
 		oldSID := f.client.SessionID
 		f.authority.verified.SessionID = uuid.NewString()
-		f.authority.predecessor = oldSID
 
 		start := time.Now()
 		assert.False(t, f.client.renewToken(renewalTestToken))
@@ -854,7 +820,6 @@ func TestRenewToken_StalledHubRunIsBoundedByTimeout(t *testing.T) {
 		events := peerReader(peer)
 		f := newRenewalFixture(hub, conn)
 		f.authority.verified.SessionID = uuid.NewString()
-		f.authority.predecessor = f.client.SessionID
 
 		done := make(chan bool, 1)
 		go func() { done <- f.client.renewToken(renewalTestToken) }()
@@ -882,12 +847,10 @@ func TestRenewToken_SessionIDsAreCanonicalized(t *testing.T) {
 		f := newRenewalFixture(hub, nil)
 		newSID := uuid.NewString()
 		f.authority.verified.SessionID = strings.ToUpper(newSID)
-		f.authority.predecessor = strings.ToUpper(f.client.SessionID)
 		startHub(t, hub)
 
 		require.True(t, f.client.renewToken(renewalTestToken))
 		assert.Equal(t, newSID, f.client.SessionID, "DisconnectSession(canonical) must match the rebound socket")
-		assert.Equal(t, []string{newSID}, f.authority.predecessorSIDs, "lineage is looked up by the canonical sid")
 	})
 
 	t.Run("an uppercase spelling of the same sid is not a rotation", func(t *testing.T) {

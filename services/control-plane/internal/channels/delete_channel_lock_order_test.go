@@ -18,7 +18,7 @@ func TestDeleteChannel_LocksBeforeAuthoritativeRereadAndDelete(t *testing.T) {
 	end := strings.Index(body[start:], "\nfunc ")
 	require.Greater(t, end, 0)
 	body = body[start : start+end]
-	guard := strings.Index(body, "credepoch.GuardTx(")
+	guard := strings.Index(body, "credepoch.GuardFamilyTx(")
 	reread := strings.Index(body, "SELECT server_id, type = 'voice' FROM channels WHERE id = $1 FOR UPDATE")
 	deleteStatement := strings.Index(body, "DELETE FROM channels")
 	require.GreaterOrEqual(t, guard, 0)
@@ -53,7 +53,7 @@ func TestCreateChannel_RechecksGroupOwnershipInsideCreationTransaction(t *testin
 	require.Greater(t, end, 0)
 	body = body[start : start+end]
 	assert.Contains(t, body, "rbac.LockAuthorityPrincipalsTx(c.Request.Context(), tx, preflightMembers)")
-	assert.Contains(t, body, "credepoch.GuardTx(c.Request.Context(), tx, userID")
+	assert.Contains(t, body, "credepoch.GuardFamilyTx(c.Request.Context(), tx, userID")
 	assert.Contains(t, body, "SELECT id FROM servers WHERE id = $1 FOR UPDATE")
 	assert.Contains(t, body, "h.insertChannel(tx, channelID, req, nextPos)")
 	assert.NotContains(t, body, "channel_groups")

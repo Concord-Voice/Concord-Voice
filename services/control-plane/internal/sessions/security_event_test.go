@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
@@ -48,39 +50,31 @@ func requireSerializedEventPrivacy(t *testing.T, events []securityevent.Event, s
 	}
 }
 
+// Both arms use the same live family: the successful retry cannot be an
+// idempotent no-op if the failing commit accidentally persisted its writes.
 func TestExecuteRevocationEmitsOnlyAfterDurableUpdate(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
-
-	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
-		response := httptest.NewRecorder()
-		ginContext, _ := gin.CreateTestContext(response)
-		ginContext.Request = httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/session", nil)
-		return ginContext, response
-	}
-
-	failureDB := sql.OpenDB(execConnector{err: errors.New("commit failed")})
-	t.Cleanup(func() { require.NoError(t, failureDB.Close()) })
-	failureHandler := NewHandler(failureDB, redisClient, logger.New("test"), testDisconnector{}, nil)
-	failureRecorder := &securityEventRecorder{}
-	failureHandler.SetSecurityEvents(failureRecorder)
-	failureContext, failureResponse := newContext()
-	failureHandler.executeRevocation(context.Background(), failureContext, privacyUserID, privacySessionID, false)
-	require.Equal(t, http.StatusInternalServerError, failureResponse.Code)
-	require.Empty(t, failureRecorder.events)
-
-	successDB := sql.OpenDB(execConnector{rows: 1})
-	t.Cleanup(func() { require.NoError(t, successDB.Close()) })
-	successHandler := NewHandler(successDB, redisClient, logger.New("test"), testDisconnector{}, nil)
-	successRecorder := &securityEventRecorder{}
-	successHandler.SetSecurityEvents(successRecorder)
-	successContext, successResponse := newContext()
-	successHandler.executeRevocation(context.Background(), successContext, privacyUserID, privacySessionID, false)
-	require.Equal(t, http.StatusOK, successResponse.Code)
-	require.Equal(t, []securityevent.Event{{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionDelete}}, successRecorder.events)
-	requireSerializedEventPrivacy(t, successRecorder.events, privacyUserID, privacySessionID)
+	rig := newSecurityEventFamilyRig(t)
+	rig.router.DELETE("/api/v1/sessions/:id", func(c *gin.Context) {
+		rig.handler.executeRevocation(c.Request.Context(), c, c.GetString("user_id"), c.Param("id"))
+	})
+	removeFault := installSecurityEventCommitFault(t, rig.db)
+	failed := rig.request(http.MethodDelete, "/api/v1/sessions/"+rig.sid, "")
+	require.Equal(t, http.StatusServiceUnavailable, failed.Code, failed.Body.String())
+	require.JSONEq(t, `{"error":"Authentication temporarily unavailable"}`, failed.Body.String())
+	rig.requireFailedCommit(t, failed)
+	tracking, err := rig.redis.Exists(context.Background(), revokeTrackingKey(rig.user), simpleAuthWindowKey(rig.user)).Result()
+	require.NoError(t, err)
+	require.Zero(t, tracking)
+	removeFault()
+	succeeded := rig.request(http.MethodDelete, "/api/v1/sessions/"+rig.sid, "")
+	require.Equal(t, http.StatusOK, succeeded.Code, succeeded.Body.String())
+	require.JSONEq(t, `{"message":"Session revoked successfully","session_id":"`+rig.sid+`"}`, succeeded.Body.String())
+	require.Equal(t, []securityevent.Event{{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionDelete}}, rig.recorder.events)
+	rig.requireCommittedOwner(t)
+	requireSerializedEventPrivacy(t, rig.recorder.events, rig.user, rig.sid, rig.access, rig.refresh)
+	members, err := rig.redis.ZRange(context.Background(), revokeTrackingKey(rig.user), 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{rig.sid}, members)
 }
 
 func TestUpdateRevocationModeEmitsOnlyAfterDurableUpdate(t *testing.T) {
@@ -123,46 +117,166 @@ func TestUpdateRevocationModeEmitsOnlyAfterDurableUpdate(t *testing.T) {
 }
 
 func TestRevokeAllSessionsEmitsOnlyAfterCommittedBulkRevoke(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
-	passwordHash, err := auth.HashPasswordWithParams(privacyPassword, &auth.Argon2Params{Memory: 8, Iterations: 1, Parallelism: 1, SaltLength: 8, KeyLength: 16})
+	rig := newSecurityEventFamilyRig(t)
+	rig.router.POST("/api/v1/sessions/revoke-all", rig.handler.RevokeAllSessions)
+	ctx := context.Background()
+	require.NoError(t, rig.redis.ZAdd(ctx, revokeTrackingKey(rig.user), redis.Z{Score: 1, Member: "existing-revoke"}).Err())
+	require.NoError(t, rig.redis.Set(ctx, simpleAuthWindowKey(rig.user), "1", 0).Err())
+	removeFault := installSecurityEventCommitFault(t, rig.db)
+	body := `{"password":"` + privacyPassword + `","include_current":true}`
+	failed := rig.request(http.MethodPost, "/api/v1/sessions/revoke-all", body)
+	require.Equal(t, http.StatusServiceUnavailable, failed.Code, failed.Body.String())
+	require.JSONEq(t, `{"error":"Authentication temporarily unavailable"}`, failed.Body.String())
+	rig.requireFailedCommit(t, failed)
+	members, err := rig.redis.ZRange(ctx, revokeTrackingKey(rig.user), 0, -1).Result()
 	require.NoError(t, err)
+	require.Equal(t, []string{"existing-revoke"}, members)
+	window, err := rig.redis.Get(ctx, simpleAuthWindowKey(rig.user)).Result()
+	require.NoError(t, err)
+	require.Equal(t, "1", window)
+	removeFault()
+	succeeded := rig.request(http.MethodPost, "/api/v1/sessions/revoke-all", body)
+	require.Equal(t, http.StatusOK, succeeded.Code, succeeded.Body.String())
+	require.JSONEq(t, `{"message":"All sessions revoked successfully","count":1,"include_current":true}`, succeeded.Body.String())
+	require.Equal(t, []securityevent.Event{{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionsRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionsRevokeAll}}, rig.recorder.events)
+	rig.requireCommittedOwner(t)
+	requireSerializedEventPrivacy(t, rig.recorder.events, rig.user, rig.sid, privacyPassword, rig.access, rig.refresh)
+	remaining, err := rig.redis.Exists(ctx, revokeTrackingKey(rig.user), simpleAuthWindowKey(rig.user)).Result()
+	require.NoError(t, err)
+	require.Zero(t, remaining)
+	cookies := succeeded.Result().Cookies()
+	require.Len(t, cookies, 1)
+	require.Equal(t, "refresh_token", cookies[0].Name)
+	require.Equal(t, -1, cookies[0].MaxAge)
+}
 
-	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
-		response := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(response)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/sessions/revoke-all", strings.NewReader(`{"password":"`+privacyPassword+`","include_current":true}`))
-		c.Request.Header.Set("Content-Type", "application/json")
-		c.Set("user_id", privacyUserID)
-		return c, response
+type securityEventDisconnector struct {
+	users    []uuid.UUID
+	sessions []string
+	families []uuid.UUID
+}
+
+func (d *securityEventDisconnector) DisconnectFamilyContext(_ context.Context, _, family uuid.UUID) error {
+	d.families = append(d.families, family)
+	return nil
+}
+
+func (d *securityEventDisconnector) DisconnectUser(user uuid.UUID) { d.users = append(d.users, user) }
+func (d *securityEventDisconnector) DisconnectSession(sid string) {
+	d.sessions = append(d.sessions, sid)
+}
+
+type securityEventFamilyRig struct {
+	db                         *sql.DB
+	redis                      *redis.Client
+	router                     *gin.Engine
+	handler                    *Handler
+	recorder                   *securityEventRecorder
+	disconnector               *securityEventDisconnector
+	user, sid, access, refresh string
+}
+
+func newSecurityEventFamilyRig(t *testing.T) securityEventFamilyRig {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	db, _ := dbtest.SetupTestDB(t)
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { require.NoError(t, rdb.Close()) })
+	user := dbtest.CreateUser(t, db).String()
+	hash, err := auth.HashPasswordWithParams(privacyPassword, &auth.Argon2Params{Memory: 8, Iterations: 1, Parallelism: 1, SaltLength: 8, KeyLength: 16})
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE users SET password_hash=$2 WHERE id=$1`, user, hash)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO user_keys(user_id,wrapped_private_key,key_derivation_salt,key_version,key_derivation_alg) VALUES($1,$2,$3,1,'argon2id')`, user, []byte{1}, []byte{2})
+	require.NoError(t, err)
+	const secret = "security-event-family-test-signing-secret"
+	minter := auth.NewHandler(db, rdb, logger.New("test"), secret, testDisconnector{})
+	access, refresh, sid, err := minter.IssueAccessAndRefresh(context.Background(), user)
+	require.NoError(t, err)
+	disconnector := &securityEventDisconnector{}
+	handler := NewHandler(db, rdb, logger.New("test"), disconnector, nil)
+	recorder := &securityEventRecorder{}
+	handler.SetSecurityEvents(recorder)
+	router := gin.New()
+	router.Use(middleware.AuthRequired(secret, rdb, db, nil))
+	return securityEventFamilyRig{db: db, redis: rdb, router: router, handler: handler, recorder: recorder, disconnector: disconnector, user: user, sid: sid, access: access, refresh: refresh}
+}
+
+func (r securityEventFamilyRig) request(method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+r.access)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "refresh_token", Value: r.refresh, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	response := httptest.NewRecorder()
+	r.router.ServeHTTP(response, req)
+	return response
+}
+
+// A deferred trigger runs at COMMIT after the refresh and family mutations.
+// Sequence advancement survives rollback and proves this exact fault was reached.
+func installSecurityEventCommitFault(t *testing.T, db *sql.DB) func() {
+	t.Helper()
+	_, err := db.Exec(`CREATE SEQUENCE security_event_commit_fault_seq;
+ CREATE FUNCTION security_event_commit_fault() RETURNS trigger AS $$
+ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM login_families f JOIN login_family_revocations o ON o.operation_id=f.auth_operation_id
+    JOIN refresh_tokens r ON r.user_id=f.user_id JOIN login_family_sids s ON s.sid=r.id AND s.family_id=f.family_id
+    WHERE f.family_id=NEW.family_id AND f.terminal_at IS NOT NULL AND o.sealed_at IS NOT NULL AND r.revoked_at IS NOT NULL) THEN
+   RAISE EXCEPTION 'commit fault reached before complete family mutation';
+  END IF;
+  PERFORM nextval('security_event_commit_fault_seq');
+  RAISE EXCEPTION 'raw-error-fixture';
+ END; $$ LANGUAGE plpgsql;
+ CREATE CONSTRAINT TRIGGER security_event_commit_fault AFTER INSERT ON login_family_revocation_targets
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION security_event_commit_fault()`)
+	require.NoError(t, err)
+	removed := false
+	remove := func() {
+		if removed {
+			return
+		}
+		_, err := db.Exec(`DROP TRIGGER security_event_commit_fault ON login_family_revocation_targets; DROP FUNCTION security_event_commit_fault(); DROP SEQUENCE security_event_commit_fault_seq`)
+		require.NoError(t, err)
+		removed = true
 	}
+	t.Cleanup(remove)
+	return remove
+}
 
-	failureDB := sql.OpenDB(execConnector{passwordHash: passwordHash, rows: 1, commitErr: errors.New("bulk revoke commit failed")})
-	t.Cleanup(func() { require.NoError(t, failureDB.Close()) })
-	failureHandler := NewHandler(failureDB, redisClient, logger.New("test"), testDisconnector{}, nil)
-	failureRecorder := &securityEventRecorder{}
-	failureHandler.SetSecurityEvents(failureRecorder)
-	failureContext, failureResponse := newContext()
-	failureHandler.RevokeAllSessions(failureContext)
-	require.Equal(t, http.StatusInternalServerError, failureResponse.Code)
-	require.Empty(t, failureRecorder.events, "a failed bulk-revoke commit must not emit sessions_revoked")
+func (r securityEventFamilyRig) requireFailedCommit(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	var called bool
+	require.NoError(t, r.db.QueryRow(`SELECT is_called FROM security_event_commit_fault_seq`).Scan(&called))
+	require.True(t, called, "must reach deferred commit fault after family and refresh mutations")
+	require.Empty(t, r.recorder.events)
+	require.Empty(t, r.disconnector.users)
+	require.Empty(t, r.disconnector.sessions)
+	require.Empty(t, r.disconnector.families, "a failed commit must not fence any family")
+	require.Empty(t, response.Header().Values("Set-Cookie"))
+	var count int
+	for _, query := range []string{
+		`SELECT count(*) FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NOT NULL`,
+		`SELECT count(*) FROM login_families WHERE user_id=$1 AND (terminal_at IS NOT NULL OR auth_operation_id IS NOT NULL OR epoch_generation IS NOT NULL)`,
+		`SELECT count(*) FROM login_family_revocations WHERE user_id=$1`,
+		`SELECT count(*) FROM login_family_revocation_targets WHERE user_id=$1`,
+	} {
+		require.NoError(t, r.db.QueryRow(query, r.user).Scan(&count))
+		require.Zero(t, count, query)
+	}
+}
 
-	successDB := sql.OpenDB(execConnector{passwordHash: passwordHash, rows: 1})
-	t.Cleanup(func() { require.NoError(t, successDB.Close()) })
-	successHandler := NewHandler(successDB, redisClient, logger.New("test"), testDisconnector{}, nil)
-	successRecorder := &securityEventRecorder{}
-	successHandler.SetSecurityEvents(successRecorder)
-	successContext, successResponse := newContext()
-	successHandler.RevokeAllSessions(successContext)
-	require.Equal(t, http.StatusOK, successResponse.Code)
-	require.Equal(t, []securityevent.Event{{
-		EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess,
-		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionsRevoked,
-		AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionsRevokeAll,
-	}}, successRecorder.events)
-	requireSerializedEventPrivacy(t, successRecorder.events, privacyUserID, privacyPassword)
+func (r securityEventFamilyRig) requireCommittedOwner(t *testing.T) {
+	t.Helper()
+	var count int
+	require.NoError(t, r.db.QueryRow(`SELECT count(*) FROM refresh_tokens r
+ JOIN login_family_sids s ON s.sid=r.id AND s.user_id=r.user_id
+ JOIN login_families f ON f.family_id=s.family_id AND f.user_id=s.user_id
+ JOIN login_family_revocation_targets t ON t.family_id=f.family_id AND t.user_id=f.user_id AND t.operation_id=f.auth_operation_id
+ JOIN login_family_revocations o ON o.operation_id=t.operation_id AND o.user_id=t.user_id
+ WHERE r.id=$1 AND r.user_id=$2 AND r.revoked_at IS NOT NULL AND f.terminal_at IS NOT NULL
+ AND f.epoch_generation IS NULL AND o.sealed_at IS NOT NULL`, r.sid, r.user).Scan(&count))
+	require.Equal(t, 1, count, "committed refresh revocation must have its exact sealed durable family owner")
 }
 
 type revokeMFAVerifier struct{ enabled bool }
@@ -236,6 +350,9 @@ type testDisconnector struct{}
 
 func (testDisconnector) DisconnectUser(uuid.UUID) {}
 func (testDisconnector) DisconnectSession(string) {}
+func (testDisconnector) DisconnectFamilyContext(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
 
 type execConnector struct {
 	err          error

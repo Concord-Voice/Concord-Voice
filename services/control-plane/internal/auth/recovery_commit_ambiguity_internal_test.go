@@ -35,14 +35,19 @@ const recoveryPredecessorCredentialEpoch = "0123456789abcdef0123456789abcdef" //
 const recoveryTestPublicKeyBase64 = "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA2qM/seYPo49k6tRZvNCVl0A7jKbVTGWwsPYSfX6MWd7/VU4ocUh6v/au02rvDIXoCyHHHAP/YCN+SLgZBJnSd77KqzWBoXczEd3uZhr/rHIfPAewHKYICj2tKXKAr6KduK42I0guEODiHXwWT4vHfzUEk7dJRALhNnKc6utjBjD9fyeasC/m12hw9b007NoyA9xUIeVT0/n+Yy+BmJSmhlgEXywQ0NCXQtJnW3Vj6iZiDhORt7udauPYlzdf1N7YCM0rMs/BtdgNE8m+/mj4OazKasRn8hOCPDOuHfprbDhW6yaACugsjtX3chE7TeXzg+q41+zARuC/YgkPZy7FgNuUsOONSvkHefi0b646+CzUcXE8I4oJQ7MIpjGb7n+h52TH4VO9GWdLwHAOd1A19XyniI7+NeH/D5pJNW6HJqbq5CTAhYAWXvEymnow2nX4MBNtin5fNovmIsh3Z9mGhvl2e3D3kBfgtMO+n6PW4c0k1g6qBhGwMwrx+f0nLKDii/tXN2GBLM3URPxjob55O4YJk+6FyGUNekfw1IFcf4mp0klytHaIEHQFBxpnYf+/0rTO1a59m98nVxY8LBjBFuzFAhFNB1nCSL0P1T5G1AkLbIE2myKOIsksDVo7WNyqvbwaqk4B7zKXkOUUXIhJLgX8oLduD74OgMqGXhZDTXUCAwEAAQ==" // pragma: allowlist secret -- public RSA-4096 SPKI test fixture
 
 type recoveryForcedEventRecorder struct {
-	events []string
-	plans  []presencehistory.DeliveryPlan
+	events         []string
+	families       []uuid.UUID
+	plans          []presencehistory.DeliveryPlan
+	beforeDelivery func()
 }
 
 func (h *recoveryForcedEventRecorder) DeliverCustomText(
 	_ context.Context,
 	plan presencehistory.DeliveryPlan,
 ) (presencehistory.DeliveryAck, error) {
+	if h.beforeDelivery != nil {
+		h.beforeDelivery()
+	}
 	h.plans = append(h.plans, plan)
 	h.events = append(h.events, "delivery_ack")
 	return presencehistory.DeliveryAck{OperationID: plan.OperationID}, nil
@@ -50,6 +55,13 @@ func (h *recoveryForcedEventRecorder) DeliverCustomText(
 
 func (h *recoveryForcedEventRecorder) DisconnectUser(uuid.UUID) {
 	h.events = append(h.events, "disconnect")
+}
+
+// DisconnectFamilyContext records exact post-commit family fences apart from
+// the broad user disconnect the events assertions forbid.
+func (h *recoveryForcedEventRecorder) DisconnectFamilyContext(_ context.Context, _, family uuid.UUID) error {
+	h.families = append(h.families, family)
+	return nil
 }
 
 type ambiguousRecoveryMFAChecker struct {
@@ -93,8 +105,9 @@ func (c *ambiguousRecoveryMFAChecker) ValidateRecoveryToken(context.Context, str
 }
 
 type recoveryCommitDelivery struct {
-	plans []presencehistory.DeliveryPlan
-	err   error
+	plans          []presencehistory.DeliveryPlan
+	err            error
+	beforeDelivery func()
 }
 
 type recoveryCredentialEpochEviction struct {
@@ -140,6 +153,9 @@ func (d *recoveryCommitDelivery) DeliverCustomText(
 	_ context.Context,
 	plan presencehistory.DeliveryPlan,
 ) (presencehistory.DeliveryAck, error) {
+	if d.beforeDelivery != nil {
+		d.beforeDelivery()
+	}
 	d.plans = append(d.plans, plan)
 	if d.err != nil {
 		return presencehistory.DeliveryAck{}, d.err
@@ -197,8 +213,11 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 			seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 			seedRecoveryCommitKeyRows(t, db, senderID)
 			rdb := setupAuthAttemptRedis(t)
+			frontier := mintRecoveryPredecessorFamilies(t, db, rdb, senderID)
 			claims := &RecoveryClaims{UserID: senderID.String(), JTI: uuid.NewString()}
-			observer := &recoveryForcedEventRecorder{}
+			observer := &recoveryForcedEventRecorder{beforeDelivery: func() {
+				assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
+			}}
 			service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 			require.NoError(t, service.BindDelivery(observer))
 			commitCalls := 0
@@ -233,6 +252,8 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 			test.handler(handler, c)
 
 			assert.Equal(t, http.StatusInternalServerError, response.Code)
+			assert.Equal(t, 2, commitCalls, "real commit and delivery acknowledgement must both commit")
+			assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
 			exists, err := rdb.Exists(
 				context.Background(), "recovery_token_used:"+claims.JTI,
 			).Result()
@@ -241,7 +262,11 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 			require.Len(t, observer.plans, 1)
 			assert.Equal(t, presencehistory.DeliveryConservativeReset, observer.plans[0].Mode)
 			assert.Equal(t, senderID, observer.plans[0].SenderID)
-			assert.Equal(t, []string{"delivery_ack", "disconnect"}, observer.events)
+			assert.Equal(t, []string{"delivery_ack"}, observer.events, "captured families must never trigger a broad user disconnect")
+			// The physically committed reset fences each predecessor family's
+			// sockets synchronously instead of waiting for the reconciler.
+			assert.ElementsMatch(t, []uuid.UUID{uuid.MustParse(frontier[0].familyID), uuid.MustParse(frontier[1].familyID)}, observer.families,
+				"a durable reset must fence every superseded family before responding")
 			var pending int
 			require.NoError(t, db.QueryRow(
 				`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`, senderID,
@@ -279,11 +304,10 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 		name       string
 		outcome    presencehistory.ForcedClearOutcome
 		deliveries int
-		disconnect bool
 	}{
 		{name: "rollback", outcome: presencehistory.ForcedClearRolledBack},
-		{name: "superseded", outcome: presencehistory.ForcedClearSuperseded, disconnect: true},
-		{name: "unresolved", outcome: presencehistory.ForcedClearUnresolved, deliveries: 1, disconnect: true},
+		{name: "superseded", outcome: presencehistory.ForcedClearSuperseded},
+		{name: "unresolved", outcome: presencehistory.ForcedClearUnresolved, deliveries: 1},
 	}
 
 	for _, flow := range recoveryForcedFlows() {
@@ -295,8 +319,11 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 				seedRecoveryCommitKeyRows(t, db, senderID)
 				seedRecoveryForcedPresence(t, db, senderID)
 				rdb := setupAuthAttemptRedis(t)
+				frontier := mintRecoveryPredecessorFamilies(t, db, rdb, senderID)
 				claims := &RecoveryClaims{UserID: senderID.String(), JTI: uuid.NewString()}
-				delivery := &recoveryCommitDelivery{}
+				delivery := &recoveryCommitDelivery{beforeDelivery: func() {
+					assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
+				}}
 				hub := &recoveryForcedEventRecorder{}
 
 				serviceDB := db
@@ -310,8 +337,10 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 				service := newRecoveryForcedService(t, serviceDB, delivery)
 				laterService := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 				var laterOperationID uuid.UUID
+				commitCalls := 0
 				restore := service.SetTransactionTestHooks(presencehistory.TransactionTestHooks{
 					Commit: func(tx *sql.Tx) error {
+						commitCalls++
 						switch test.outcome {
 						case presencehistory.ForcedClearRolledBack:
 							return commitCause
@@ -345,6 +374,15 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 				response := invokeRecoveryForcedFlow(flow, handler)
 
 				assert.Equal(t, http.StatusInternalServerError, response.Code)
+				assert.Equal(t, 1, commitCalls, "each ambiguity branch must attempt the actual recovery commit")
+				assertRecoveryFamilyFrontier(t, db, senderID, frontier, test.outcome != presencehistory.ForcedClearRolledBack)
+				marker, markerErr := rdb.Get(context.Background(), credepoch.Key(senderID.String())).Result()
+				if test.outcome == presencehistory.ForcedClearRolledBack {
+					assert.ErrorIs(t, markerErr, redis.Nil, "proven rollback clears its own blocked marker")
+				} else {
+					require.NoError(t, markerErr)
+					assert.True(t, strings.HasPrefix(marker, "blocked:"), marker)
+				}
 				assert.Contains(t, logs.String(), recoveryForcedClearClass(test.outcome))
 				exists, err := rdb.Exists(
 					context.Background(), "recovery_token_used:"+claims.JTI,
@@ -352,11 +390,11 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 				require.NoError(t, err)
 				assert.Equal(t, int64(1), exists, "any attempted ambiguous commit consumes the token")
 				assert.Len(t, delivery.plans, test.deliveries)
-				if test.disconnect {
-					assert.Equal(t, []string{"disconnect"}, hub.events)
-				} else {
-					assert.Empty(t, hub.events)
+				for _, plan := range delivery.plans {
+					assert.Equal(t, presencehistory.DeliveryConservativeReset, plan.Mode)
+					assert.Equal(t, senderID, plan.SenderID)
 				}
+				assert.Empty(t, hub.events, "captured families must never trigger a broad user disconnect")
 
 				var pendingCount int
 				var pendingID uuid.UUID
@@ -396,20 +434,25 @@ func TestRecoveryForcedClearArchivesHistoryBeforeSuccess(t *testing.T) {
 			seedRecoveryCommitKeyRows(t, db, senderID)
 			historyID := seedRecoveryForcedPresence(t, db, senderID)
 			rdb := setupAuthAttemptRedis(t)
+			frontier := mintRecoveryPredecessorFamilies(t, db, rdb, senderID)
 			claims := &RecoveryClaims{UserID: senderID.String(), JTI: uuid.NewString()}
 			delivery := &recoveryCommitDelivery{}
 			hub := &recoveryForcedEventRecorder{}
+			delivery.beforeDelivery = func() {
+				assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
+			}
 			service := newRecoveryForcedService(t, db, delivery)
 			handler := newRecoveryForcedHandler(db, rdb, hub, service, claims)
 			evictions := &recoveryCredentialEpochEvictionRecorder{}
 			evictions.bind(t, handler)
 
 			response := invokeRecoveryForcedFlow(test, handler)
+			assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			require.Len(t, delivery.plans, 1)
 			assert.Equal(t, presencehistory.DeliveryConservativeReset, delivery.plans[0].Mode)
 			assert.Equal(t, senderID, delivery.plans[0].SenderID)
-			assert.Equal(t, []string{"disconnect"}, hub.events)
+			assert.Empty(t, hub.events, "captured families must never trigger a broad user disconnect")
 			var endedAt sql.NullTime
 			var pending int
 			require.NoError(t, db.QueryRow(
@@ -441,9 +484,11 @@ func TestRecoveryForcedClearRecorderFailureReleasesTokenAndRollsBack(t *testing.
 		t.Run(test.name, func(t *testing.T) {
 			db, _ := dbtest.SetupTestDB(t)
 			senderID := dbtest.CreateUser(t, db)
+			seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 			seedRecoveryCommitKeyRows(t, db, senderID)
 			seedRecoveryForcedPresence(t, db, senderID)
 			rdb := setupAuthAttemptRedis(t)
+			frontier := mintRecoveryPredecessorFamilies(t, db, rdb, senderID)
 			claims := &RecoveryClaims{UserID: senderID.String(), JTI: uuid.NewString()}
 			delivery := &recoveryCommitDelivery{}
 			service := newRecoveryForcedService(t, db, delivery)
@@ -470,6 +515,8 @@ func TestRecoveryForcedClearRecorderFailureReleasesTokenAndRollsBack(t *testing.
 			assert.Equal(t, 1, tier)
 			assert.Equal(t, "recovery visible", text)
 			assert.Empty(t, delivery.plans)
+			assertRecoveryFamilyFrontier(t, db, senderID, frontier, false)
+			assertRecoveryCredentialEpochRollback(t, db, senderID, recoveryPredecessorCredentialEpoch)
 		})
 	}
 }
@@ -479,16 +526,22 @@ func TestRecoveryForcedClearDeliveryFailureKeepsTokenAndQuarantine(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			db, _ := dbtest.SetupTestDB(t)
 			senderID := dbtest.CreateUser(t, db)
+			seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 			seedRecoveryCommitKeyRows(t, db, senderID)
 			seedRecoveryForcedPresence(t, db, senderID)
 			rdb := setupAuthAttemptRedis(t)
+			frontier := mintRecoveryPredecessorFamilies(t, db, rdb, senderID)
 			claims := &RecoveryClaims{UserID: senderID.String(), JTI: uuid.NewString()}
 			delivery := &recoveryCommitDelivery{err: errors.New("recovery delivery unavailable")}
 			hub := &recoveryForcedEventRecorder{}
+			delivery.beforeDelivery = func() {
+				assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
+			}
 			service := newRecoveryForcedService(t, db, delivery)
 			handler := newRecoveryForcedHandler(db, rdb, hub, service, claims)
 
 			response := invokeRecoveryForcedFlow(test, handler)
+			assertRecoveryFamilyFrontier(t, db, senderID, frontier, true)
 			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 			exists, err := rdb.Exists(
 				context.Background(), "recovery_token_used:"+claims.JTI,
@@ -500,7 +553,10 @@ func TestRecoveryForcedClearDeliveryFailureKeepsTokenAndQuarantine(t *testing.T)
 				`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`, senderID,
 			).Scan(&pending))
 			assert.Equal(t, 1, pending)
-			assert.Equal(t, []string{"disconnect"}, hub.events)
+			require.Len(t, delivery.plans, 1)
+			assert.Equal(t, presencehistory.DeliveryConservativeReset, delivery.plans[0].Mode)
+			assert.Equal(t, senderID, delivery.plans[0].SenderID)
+			assert.Empty(t, hub.events, "captured families must never trigger a broad user disconnect")
 		})
 	}
 }
@@ -953,4 +1009,72 @@ func assertRecoveryCredentialEpochRollback(
 
 func (*ambiguousRecoveryMFAChecker) ValidateRecoveryClaimsTx(context.Context, *sql.Tx, *RecoveryClaims) error {
 	return nil
+}
+
+// Canonical production minting proves these are usable predecessor sessions,
+// rather than raw refresh rows that family capture cannot own.
+type recoveryPredecessorFamily struct {
+	familyID        string
+	sid             string
+	tokenHash       string
+	accessExpiresAt time.Time
+}
+
+func mintRecoveryPredecessorFamilies(t *testing.T, db *sql.DB, rdb *redis.Client, userID uuid.UUID) []recoveryPredecessorFamily {
+	t.Helper()
+	minter := NewHandler(db, rdb, logger.NewWithWriter(io.Discard), familyTestSecret, nil)
+	frontier := make([]recoveryPredecessorFamily, 0, 2)
+	for range 2 {
+		access, refresh, sid, err := minter.IssueAccessAndRefresh(context.Background(), userID.String())
+		require.NoError(t, err, "canonical predecessor mint must succeed before recovery")
+		claims, err := ValidateAccessToken(access, familyTestSecret)
+		require.NoError(t, err)
+		require.Equal(t, userID.String(), claims.UserID)
+		require.Equal(t, recoveryPredecessorCredentialEpoch, claims.CredentialEpoch)
+		require.Equal(t, sid, claims.SessionID)
+		family := recoveryPredecessorFamily{sid: sid, tokenHash: HashRefreshToken(refresh), accessExpiresAt: claims.ExpiresAt.Time}
+		require.NoError(t, db.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1 AND user_id=$2`, sid, userID).Scan(&family.familyID))
+		frontier = append(frontier, family)
+	}
+	require.NotEqual(t, frontier[0].familyID, frontier[1].familyID)
+	assertRecoveryFamilyFrontier(t, db, userID, frontier, false)
+	return frontier
+}
+
+// SQL establishes committed capture and ownership only. The delivery spies and
+// epoch eviction recorder separately establish their respective local calls;
+// none of these assertions claims a remote transport receipt.
+func assertRecoveryFamilyFrontier(t *testing.T, db *sql.DB, userID uuid.UUID, frontier []recoveryPredecessorFamily, committed bool) {
+	t.Helper()
+	require.Len(t, frontier, 2)
+	var expectedOwner string
+	if committed {
+		require.NoError(t, db.QueryRow(`SELECT e.generation FROM credential_epoch_voice_ejections e JOIN users u ON u.id=e.user_id AND u.credential_epoch=e.credential_epoch WHERE e.user_id=$1 AND e.superseded_credential_epoch=$2`, userID, recoveryPredecessorCredentialEpoch).Scan(&expectedOwner))
+	}
+	for _, family := range frontier {
+		var terminal, revoked bool
+		var epoch, storedFamily, tokenHash string
+		var epochOwner, authOwner sql.NullString
+		var expiresAt time.Time
+		require.NoError(t, db.QueryRow(`SELECT f.terminal_at IS NOT NULL,f.credential_epoch,f.epoch_generation,f.auth_operation_id,s.family_id,s.access_expires_at,r.token_hash,r.revoked_at IS NOT NULL
+   FROM login_families f JOIN login_family_sids s ON s.family_id=f.family_id AND s.user_id=f.user_id
+   JOIN refresh_tokens r ON r.id=s.sid AND r.user_id=s.user_id
+   WHERE f.family_id=$1 AND f.user_id=$2 AND s.sid=$3`, family.familyID, userID, family.sid).Scan(&terminal, &epoch, &epochOwner, &authOwner, &storedFamily, &expiresAt, &tokenHash, &revoked))
+		assert.Equal(t, committed, terminal)
+		assert.Equal(t, committed, revoked)
+		assert.Equal(t, recoveryPredecessorCredentialEpoch, epoch)
+		assert.Equal(t, family.familyID, storedFamily)
+		assert.True(t, expiresAt.Equal(family.accessExpiresAt), "immutable signed SID expiry must survive recovery")
+		assert.Equal(t, family.tokenHash, tokenHash)
+		assert.False(t, authOwner.Valid, "epoch capture must not create a parallel auth owner")
+		if committed {
+			require.True(t, epochOwner.Valid)
+			assert.Equal(t, expectedOwner, epochOwner.String, "capture must reuse the actual credential epoch parent generation")
+		} else {
+			assert.False(t, epochOwner.Valid, "rollback must leave the predecessor live and unowned")
+		}
+	}
+	var duplicateOwners int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM login_family_revocations WHERE user_id=$1`, userID).Scan(&duplicateOwners))
+	assert.Zero(t, duplicateOwners, "epoch recovery must never allocate a separate auth operation")
 }

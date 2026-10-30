@@ -12,9 +12,11 @@ vi.mock('@/config/index.js', () => ({
 }));
 import { createAuthMiddleware, createSocketTokenRenewal } from '../src/middleware/auth.js';
 import {
-  renewVoiceEnforcementSession,
   type VoiceEnforcementSession,
 } from '../src/lib/voiceEnforcementSession.js';
+
+import { VoiceAuthConnections } from '../src/lib/voiceAuthConnection.js';
+import * as protocol from '../src/lib/voiceAuthProtocol.js';
 
 const userId = 'd8fe119d-a28c-4573-be19-7847469aa59e';
 const signingKey = ['vitest', 'mock', 'jwt'].join('-');
@@ -54,14 +56,14 @@ function connectedSocket(validateRenewal = vi.fn(async (_token: string) => {})) 
   };
 }
 
-function enforcementSession(sessionGeneration = 'refresh-generation'): VoiceEnforcementSession {
+function enforcementSession(sessionGeneration = '55555555-5555-4555-8555-555555555555'): VoiceEnforcementSession {
   return {
     sessionGeneration,
-    nodeBootId: 'node-boot',
-    roomId: 'dm-room',
+    nodeBootId: '33333333-3333-4333-8333-333333333333',
+    roomId: '44444444-4444-4444-8444-444444444444',
     roomKind: 'dm',
     userId,
-    credentialEpoch: 'epoch-1',
+    credentialEpoch: 'a'.repeat(32),
     socketId: 'expiry-socket',
   };
 }
@@ -144,52 +146,49 @@ describe('socket access-token lifetime', () => {
     expect(socket.connected).toBe(false);
   });
 
-  it('does not re-register a session that left before refresh starts', async () => {
-    const release = vi.fn(async () => {});
-    vi.stubGlobal('fetch', vi.fn());
-
-    await expect(
-      renewVoiceEnforcementSession(token(20), enforcementSession(), () => false, release)
-    ).rejects.toThrow('Session changed during renewal');
-
-    expect(fetch).not.toHaveBeenCalled();
-    expect(release).not.toHaveBeenCalled();
+  it('does not renew an admitted session that left before refresh starts', async () => {
+    const f = await admittedFixture();
+    await expect(f.api.renewVoiceEnforcementSession(token(20), f.session, () => false, f.legacyRelease))
+      .rejects.toThrow('No admitted voice session');
+    expect(f.requests).toHaveLength(2);
+    expect(f.legacyRelease).not.toHaveBeenCalled();
+    await f.owners.terminate(f.owner);
   });
 
   it.each(['leave', 'disconnect'] as const)(
-    'releases the exact durable session when %s races refresh registration',
-    async (race) => {
-      const session = enforcementSession();
-      const successor = enforcementSession('successor-generation');
-      let resolveRegistration!: (response: Response) => void;
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(
-          () =>
-            new Promise<Response>((resolve) => {
-              resolveRegistration = resolve;
-            })
-        )
-      );
-      let connected = true;
-      let roomOwnsSession = true;
-      const socketSession = session;
-      const release = vi.fn(async () => {});
-      const pending = renewVoiceEnforcementSession(
-        token(20),
-        session,
-        () => connected && socketSession === session && roomOwnsSession,
-        release
-      );
-
-      expect(fetch).toHaveBeenCalledOnce();
-      if (race === 'leave') roomOwnsSession = false;
-      else connected = false;
-      resolveRegistration({ ok: true } as Response);
-
-      await expect(pending).rejects.toThrow('Session changed during renewal');
-      expect(release).toHaveBeenCalledExactlyOnceWith(session);
-      expect(release).not.toHaveBeenCalledWith(successor);
+    'releases the exact durable session when %s races admitted renewal',
+    async race => {
+      const f = await admittedFixture();
+      let finish!: () => void;
+      const reply = new Promise<void>(resolve => { finish = resolve; });
+      f.hold.value = reply;
+      let current = true;
+      const pending = f.api.renewVoiceEnforcementSession(token(20), f.session, () => current, f.legacyRelease);
+      // Observe the rejection before the terminal operation can settle the renewal.
+      const denied = expect(pending).rejects.toThrow('Terminal voice room');
+      expect(f.requests).toHaveLength(3);
+      expect(f.requests[2].roomRegister()).toEqual({ ...f.requests[1].roomRegister(), mode: 'renew' });
+      current = false;
+      const terminal = race === 'leave'
+        ? f.api.releaseVoiceEnforcementSession(f.session, f.legacyVerifier)
+        : f.owners.terminate(f.owner);
+      expect(() => f.owners.assertRoomProductive(f.session.sessionGeneration)).toThrow('Terminal voice room');
+      expect(f.closeNative).not.toHaveBeenCalled();
+      expect(f.requests.filter(request => request.roomRelease())).toHaveLength(0);
+      finish();
+      await denied;
+      await terminal;
+      expect(f.closeNative).toHaveBeenCalledOnce();
+      expect(f.legacyVerifier).not.toHaveBeenCalled();
+      expect(f.legacyRelease).not.toHaveBeenCalled();
+      expect(f.requests.filter(request => request.roomRelease()).map(request => request.roomRelease())).toEqual([{
+        schema: 'concord.auth-room-binding', version: 1,
+        binding: f.owners.snapshot(f.owner).binding,
+        room: { sessionGeneration: f.session.sessionGeneration, roomId: f.session.roomId, roomKind: f.session.roomKind },
+      }]);
+      expect(f.owners.snapshot(f.owner).tokenExpiresAt).toBe(start + 60_000);
+      if (race === 'leave') await f.owners.terminate(f.owner);
+      expect(f.owners.retainedIdentityCount()).toBe(0);
     }
   );
 
@@ -266,3 +265,53 @@ describe('socket access-token lifetime', () => {
     expect(socket.connected).toBe(false);
   });
 });
+
+async function admittedFixture() {
+  vi.resetModules();
+  const api = await import('../src/lib/voiceEnforcementSession.js');
+  const session = enforcementSession();
+  const key = Buffer.from(signingKey);
+  const requests: protocol.Request[] = [];
+  const hold: { value?: Promise<void> } = {};
+  const closeNative = vi.fn(async () => undefined);
+  const legacyVerifier = vi.fn(async () => undefined);
+  const legacyRelease = vi.fn(async () => undefined);
+  const originalToken = token(60);
+  const owners = new VoiceAuthConnections({ nodeBootId: session.nodeBootId,
+    secret: signingKey, controlPlaneUrl: 'http://control-plane.test', now: () => Date.now(),
+    fetch: vi.fn<typeof fetch>(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const endpoint = path.endsWith('/auth-connections') ? 'connection_register'
+        : path.endsWith('/auth-connections/release') ? 'connection_release'
+          : path.endsWith('/enforcement-sessions/release') ? 'room_release' : 'room_register';
+      const raw = init?.body;
+      if (typeof raw !== 'string' && !(raw instanceof Uint8Array)) throw new Error('Missing exact request bytes');
+      const request = protocol.decodeHttpRequest(endpoint, { method: init?.method ?? '', path,
+        headers: Array.from(new Headers(init?.headers), ([name, value]) => ({ name, value })), body: Buffer.from(raw) });
+      protocol.verifyHttpRequest(request, key, BigInt(Math.floor(Date.now() / 1000)));
+      requests.push(request);
+      if (request.roomRegister()?.mode === 'renew') await hold.value;
+      const target = request.connectionRegister() ?? request.roomRegister();
+      const binding = target && { userId, familyId: '22222222-2222-4222-8222-222222222222',
+        target: { connectionGeneration: target.connectionGeneration, nodeBootId: target.nodeBootId,
+          socketId: target.socketId, credentialEpoch: target.credentialEpoch } };
+      const payload: protocol.ResponsePayload = request.connectionRegister() && binding
+        ? { ...binding, version: 1, voiceEnforcementProtocol: 4 }
+        : request.roomRegister() && binding ? { schema: 'concord.auth-room-binding', version: 1,
+          voiceEnforcementProtocol: 4, binding, room: { sessionGeneration: session.sessionGeneration,
+            roomId: session.roomId, roomKind: session.roomKind } } : null;
+      const wire = protocol.signHttpResponse(request, payload, String(Math.floor(Date.now() / 1000)), key);
+      return new Response(wire.status === 204 ? null : Buffer.from(wire.body), {
+        status: wire.status, headers: wire.headers.map(({ name, value }) => [name, value]),
+      });
+    }),
+  });
+  api.setVoiceAuthConnections(owners);
+  const owner = owners.reserve({ socketId: session.socketId, userId, credentialEpoch: session.credentialEpoch,
+    token: originalToken, tokenExpiresAt: start + 60_000, disconnect: vi.fn() });
+  await owners.register(owner);
+  session.connectionGeneration = owners.snapshot(owner).target.connectionGeneration;
+  owners.reserveRoom(owner, session, closeNative);
+  await api.registerVoiceEnforcementSession(originalToken, session);
+  return { api, owners, owner, session, requests, hold, closeNative, legacyRelease, legacyVerifier };
+}

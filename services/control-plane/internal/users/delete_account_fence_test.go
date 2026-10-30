@@ -49,7 +49,7 @@ func TestDeleteAccountBracketsTheFenceEvenWhenTheErasureRollsBack(t *testing.T) 
 	require.Zero(t, hub.PresenceAuthzOpenForTest(),
 		"precondition: no revocation may be in flight before the erasure")
 
-	err := service.DeleteAccount(context.Background(), userID.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 	require.ErrorIs(t, err, drainErr, "control: the erasure must actually have failed")
 	require.Equal(t, 1, countUsers(t, db, userID),
 		"control: a rolled-back erasure must leave the user in place")
@@ -75,6 +75,6 @@ func TestDeleteAccountToleratesAnUnwiredFence(t *testing.T) {
 	require.False(t, service.AudienceFenceWired())
 
 	assert.NotPanics(t, func() {
-		_ = service.DeleteAccount(context.Background(), userID.String())
+		_ = service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, userID.String()), userID.String())
 	})
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 )
 
 // ErrMsgSessionNoLongerValid is the 401 body for a valid JWT whose users row
@@ -131,6 +132,11 @@ func LoadSubject(ctx context.Context, q RowQuerier, userID string) (Subject, *Er
 //     GuardTx would issue a second locking read of it.
 //  3. Read the P1 predicate in a SEPARATE statement, after the lock.
 //
+// #2272: the login-family writer barrier is taken before step 1 and the
+// actor's exact login family is share-locked after step 2
+// (credepoch.GuardFamilyTx), so a write admitted before its session was
+// revoked does not commit. Both are idempotent within one transaction.
+//
 // Step 3 being its own statement is load-bearing, not tidiness. Under READ
 // COMMITTED a statement's snapshot is taken when it starts; if the lock in
 // step 1 had to wait for a concurrent factor write (every such write locks
@@ -157,6 +163,9 @@ func LoadSubject(ctx context.Context, q RowQuerier, userID string) (Subject, *Er
 //     actor's users row at the requested strength or stronger, where taking
 //     it again adds no edge: rbac's withAuthorityCapture locks every principal
 //     FOR NO KEY UPDATE before its servers lock.
+//   - The login-family writer barrier (a FOR SHARE on the rollout singleton)
+//     MAY precede it and MUST precede every users lock; a caller that locks
+//     users before this gate takes the barrier itself first.
 //   - Advisory locks and SET LOCAL (lock_timeout) MAY precede it. Under READ
 //     COMMITTED neither leaves a snapshot that a later statement reads
 //     through, and neither takes a row lock.
@@ -182,6 +191,9 @@ func LockSubjectTx(ctx context.Context, tx *sql.Tx, userID string, lock Lock, to
 		return Subject{}, verificationFailed(fmt.Errorf("lock step-up subject: unknown lock %d", lock))
 	}
 
+	if err := loginfamily.EnsureWriterBarrierTx(ctx, tx); err != nil {
+		return Subject{}, verificationFailed(fmt.Errorf("lock step-up subject: writer barrier: %w", err))
+	}
 	var s Subject
 	var epoch sql.NullString
 	err := tx.QueryRowContext(ctx, query, userID).Scan(&epoch, &s.PasswordHash)
@@ -192,11 +204,15 @@ func LockSubjectTx(ctx context.Context, tx *sql.Tx, userID string, lock Lock, to
 		return Subject{}, verificationFailed(fmt.Errorf("lock step-up subject: %w", err))
 	}
 	if credepoch.MatchEpoch(epoch, tokenEpoch) != nil {
-		return Subject{}, &Error{
-			Status: http.StatusUnauthorized,
-			Body:   gin.H{"error": ErrMsgAuthenticationRequired},
-			reason: reasonEpochMismatch,
+		return Subject{}, epochMismatch()
+	}
+	// The users row is already held at lock strength, so GuardFamilyTx's FOR
+	// SHARE re-read adds no edge.
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, tokenEpoch); err != nil {
+		if errors.Is(err, credepoch.ErrEpochMismatch) {
+			return Subject{}, epochMismatch()
 		}
+		return Subject{}, verificationFailed(fmt.Errorf("lock step-up subject: family guard: %w", err))
 	}
 
 	methods, err := InlineMFAMethods(ctx, tx, userID)
@@ -206,6 +222,14 @@ func LockSubjectTx(ctx context.Context, tx *sql.Tx, userID string, lock Lock, to
 	s.MFAMethods = methods
 	s.MFAEnabled = len(methods) > 0
 	return s, nil
+}
+
+func epochMismatch() *Error {
+	return &Error{
+		Status: http.StatusUnauthorized,
+		Body:   gin.H{"error": ErrMsgAuthenticationRequired},
+		reason: reasonEpochMismatch,
+	}
 }
 
 func subjectGone() *Error {

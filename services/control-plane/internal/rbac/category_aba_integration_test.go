@@ -37,10 +37,11 @@ func TestDeleteCategoryOverride_DoesNotCascadeStaleParentAfterABA(t *testing.T) 
 	require.NoError(t, LockServerVisibilityCapture(context.Background(), tx, env.serverID))
 	defer tx.Rollback() //nolint:errcheck // cleanup after commit is a no-op
 
+	ownerCtx := env.ownerCtx()
 	result := make(chan error, 1)
 	go func() {
 		_, _, deleteErr := env.handler.deleteCategoryOverrideWithCapture(
-			context.Background(), categoryAuthorityRequest{
+			ownerCtx, categoryAuthorityRequest{
 				serverID: env.serverID, categoryID: categoryA, userID: env.serverOwnerID,
 			}, overrideID, "role", env.viewRole,
 			&[]keyrotation.Rotation{}, &map[string][]string{},

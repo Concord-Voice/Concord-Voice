@@ -8,6 +8,7 @@ import { ClientBehaviorSection } from './ClientBehaviorSection';
 import ToggleSwitch from './ToggleSwitch';
 import SettingsPreviewPanel from './SettingsPreviewPanel';
 import FontSection from './FontSection';
+import TrayIconSection from './TrayIconSection';
 
 // Module-scope constants — declared outside the component so they're not
 // re-allocated on every render. SCHEME_TUPLES is the flat tuple form produced
@@ -271,6 +272,8 @@ const AppearanceSection: React.FC = () => {
       </CollapsibleSection>
 
       <FontSection />
+
+      <TrayIconSection />
 
       {/* Display settings (font size, compact mode, reduce animations) +
           UI scale + high contrast moved to Accessibility per #489. They

@@ -40,10 +40,34 @@ npx @redocly/cli lint docs/api/admin-metrics.openapi.yaml
 
 ## Public Authentication Flow
 
-1. **Register** or **Login** creates a refresh session and returns `access_token` plus its `session_id`. A login response that mints a session sets `X-Concord-Session-Issued: true`. It exposes that exact row as `X-Concord-Session-ID`, so a client can clean up even when a successful response body is malformed.
+1. **Register** or **Login** creates a logical login family and refresh session and returns `access_token` plus its `session_id`. A login response that mints a session sets `X-Concord-Session-Issued: true`. It exposes that exact row as `X-Concord-Session-ID`, so a client can clean up even when a successful response body is malformed.
 2. Pass `Authorization: Bearer <access_token>` on protected endpoints.
-3. **Refresh** with the HttpOnly `refresh_token` cookie, or `X-Refresh-Token` for non-browser clients. Rotation returns the successor `session_id` and the replaced `previous_session_id`. Clients must accept the result only for that exact lineage.
-4. **Logout** revokes credentials in this precedence order: explicit `X-Refresh-Token`, then bearer-owned `X-Session-ID`. After those come `X-Session-ID` bound atomically to the presented refresh-token cookie, then the cookie alone. Explicit credentials never clear an ambient cookie. A cookie expires only when its database row matched, so stale cleanup cannot erase a successor session.
+3. **Refresh** with the HttpOnly `refresh_token` cookie, or `X-Refresh-Token` for non-browser clients. Rotation returns the successor `session_id` and the replaced `previous_session_id`, retaining the same family through normal and grace recovery. Clients must accept the result only for that exact lineage.
+4. **Logout** selects explicit `X-Refresh-Token`, then `X-Session-ID` authorized by its owning bearer or exact refresh cookie, then the cookie alone. With no selected target, a valid bearer may select its live family. Invalid explicit targets refuse without fallback. Logout terminalizes the whole selected family, including rotating predecessor/successor SIDs. Explicit credentials never clear an ambient cookie; cookie cleanup still requires the exact matched row. An unrelated bearer family survives selection of another family.
+
+Selected-session revocation uses the selected SID's server-owned family. Revoke
+all-other preserves the entire validated current family; delayed delivery uses
+the captured frontier and cannot revoke a later fresh login. Family identity is
+resolved from signed SID membership, not a new client/JWT family claim. Terminal
+state denies new productive authority. Before revoke-one, revoke-all, logout,
+recovery reset or account erasure responds, the server synchronously fences and
+closes the control WebSockets of every family that commit made terminal; other
+families stay connected. That close is bounded, and a failure never turns the
+committed revocation into an error: the durable owner retries it. Native media
+closes through the same durable exact delivery, so success does not promise
+instantaneous media packet cessation. Suspected refresh-token theft disconnects
+every socket of the user immediately, even while its revocation is deferred. Redis-dependent auth fences still apply and may
+return 503 before the handler during an outage; #2271's separate budget and
+availability work is not delivered by #2272.
+
+Internal media ownership uses strict signed protocol 4 with exact boot,
+connection and room generations. Prepared transport capability is distinct from
+productive admission, and signed release/boot-retirement receipts require their
+retained native/inflight owners. See the
+[implemented contract](../reference/as-built-ledger.md) and
+[cutover/rollback procedure](../runbooks/deploys.md#logical-login-session-cutover-and-rollback-2272).
+Broad validation remains pending; these crosslinks do not claim complete
+generated-schema coverage or live commissioning.
 
 The response bodies, security alternatives, header requirements, and error
 shapes are canonical in [openapi.yaml](./openapi.yaml). Keep client integrations

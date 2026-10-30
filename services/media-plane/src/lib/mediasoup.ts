@@ -97,6 +97,20 @@ export class MediasoupService {
     return closure.observed || worker.subprocessClosed;
   }
 
+  private async awaitClosedWorker(worker: Worker, deadlineMs: number): Promise<boolean> {
+    if (!Number.isFinite(deadlineMs) || performance.now() >= deadlineMs)
+      throw nativeTerminationUnavailable();
+    if (this.workerStopped(worker)) return true;
+    if (!worker.closed) return false;
+    const closure = this.nativeWorkers.get(worker);
+    if (!closure) throw nativeTerminationUnavailable();
+    // Mediasoup's signal handler closes IPC before subprocessclose. Local close
+    // only selects the retained physical-exit witness; it is never that proof.
+    await awaitNativeDeadline(() => closure.closed, deadlineMs);
+    if (!this.workerStopped(worker)) throw nativeTerminationUnavailable();
+    return true;
+  }
+
   captureNativeTermination(
     router: Router,
     transportIds?: readonly string[]
@@ -122,8 +136,14 @@ export class MediasoupService {
     target: NativeTerminationTarget,
     deadlineMs: number
   ): Promise<boolean> {
-    if (this.workerStopped(target.worker)) return true;
-    const dump = await awaitNativeDeadline(() => target.worker.dump(), deadlineMs);
+    if (await this.awaitClosedWorker(target.worker, deadlineMs)) return true;
+    let dump;
+    try {
+      dump = await awaitNativeDeadline(() => target.worker.dump(), deadlineMs);
+    } catch {
+      if (await this.awaitClosedWorker(target.worker, deadlineMs)) return true;
+      throw nativeTerminationUnavailable();
+    }
     if (this.workerStopped(target.worker)) return true;
     if (dump.pid !== target.worker.pid || !Array.isArray(dump.routerIds))
       throw nativeTerminationUnavailable();
@@ -167,8 +187,14 @@ export class MediasoupService {
     if (this.routerCreations !== 0) throw nativeTerminationUnavailable();
     await Promise.all(
       this.workers.map(async (worker) => {
-        if (this.workerStopped(worker)) return;
-        const dump = await awaitNativeDeadline(() => worker.dump(), deadlineMs);
+        if (await this.awaitClosedWorker(worker, deadlineMs)) return;
+        let dump;
+        try {
+          dump = await awaitNativeDeadline(() => worker.dump(), deadlineMs);
+        } catch {
+          if (await this.awaitClosedWorker(worker, deadlineMs)) return;
+          throw nativeTerminationUnavailable();
+        }
         if (this.workerStopped(worker)) return;
         if (
           dump.pid !== worker.pid ||

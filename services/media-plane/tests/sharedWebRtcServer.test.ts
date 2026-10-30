@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
+import { Script } from 'node:vm';
+import ts from 'typescript';
+import * as protocol from '../src/lib/voiceAuthProtocol.js';
+import { VoiceEnforcementLease, VoiceEnforcementHealth } from '../src/lib/voiceEnforcementLease.js';
 import type { Router } from 'mediasoup/types';
-import { createMockTransport, createMockWorker } from './mocks/mediasoup.js';
+import { createMockTransport, createMockWorker, createMockProducer, createRtpParameters } from './mocks/mediasoup.js';
 import './mocks/logger.js';
 
 const { createWorker, config } = vi.hoisted(() => ({
@@ -367,6 +371,49 @@ describe('shared worker WebRTC listeners', () => {
     await expect(manager.awaitNativeTermination('await-room', 'user', 'socket')).resolves.toBeUndefined();
   });
 
+  it('retains native absence proof after an orphan producer returns during legacy unbound leave', async () => {
+    const manager = new RoomManager(service);
+    service.setRoomConsumerCounts(() => manager.getRoomConsumerCounts());
+    await service.init();
+    for (const user of ['leaver', 'keeper']) {
+      await manager.joinRoom('orphan-room', user, `${user}-socket`, { username: 'native-fixture' }, undefined,
+        { mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION });
+    }
+    const router = manager.getRoom('orphan-room')!.router;
+    const transport = createMockTransport();
+    transport.close.mockImplementation(() => { transport.closed = true; });
+    const nativeIds = new Set([transport.id]);
+    Object.assign(router, { dump: vi.fn(async () => ({ id: router.id, transportIds: [...nativeIds] })) });
+    vi.mocked(router.createWebRtcTransport).mockResolvedValueOnce(transport as never);
+    await manager.createTransport('orphan-room', 'leaver', 'send');
+    const observer = new EventEmitter();
+    const orphan = createMockProducer({ observer });
+    const closed = vi.fn();
+    observer.on('close', closed);
+    orphan.close.mockImplementation(() => { orphan.closed = true; observer.emit('close'); });
+    let returnProducer!: (value: typeof orphan) => void;
+    transport.produce.mockImplementationOnce(() => new Promise(resolve => { returnProducer = resolve; }));
+    const producing = manager.produce('orphan-room', 'leaver', transport.id, 'audio', createRtpParameters() as never, 'mic');
+    const refusal = expect(producing).rejects.toThrow('Participant left during producer creation');
+    await turn();
+    const leaving = observe(manager.leaveRoom('orphan-room', 'leaver'));
+    const absenceRefusal = expect(leaving.promise).rejects.toThrow('Native media termination unavailable');
+    await turn();
+    expect(leaving.status).toBe('pending');
+    expect(transport.closed).toBe(true);
+    returnProducer(orphan);
+    await refusal;
+    await absenceRefusal;
+    expect(orphan.closed).toBe(true);
+    expect(closed).toHaveBeenCalledOnce();
+    expect(manager.getParticipant('orphan-room', 'keeper')).toBeDefined();
+    expect(workers[0].dump).toHaveBeenCalled();
+    expect(router.dump).toHaveBeenCalled();
+    nativeIds.clear();
+    await expect(manager.awaitNativeTermination('orphan-room', 'leaver', 'leaver-socket')).resolves.toBeUndefined();
+    await manager.leaveRoom('orphan-room', 'keeper');
+  });
+
   it('still closes every worker when a listener close request throws', async () => {
     await service.init();
     workers[0].server.close.mockImplementationOnce(() => { throw new Error('test listener close failed'); });
@@ -396,17 +443,92 @@ describe('shared worker WebRTC listeners', () => {
   });
 });
 
+// Execute the actual route and availability consumer without starting main.
+// AST selection avoids assertions about a particular implementation spelling.
 describe('shared listener readiness wiring', () => {
-  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
-
-  it('requires media readiness in the protocol-3 readiness route', () => {
-    const start = source.indexOf("app.get('/readyz'");
-    const end = source.indexOf('// Express error handler', start);
-    expect(source.slice(start, end)).toContain('!mediasoupService.isReady()');
-    expect(source.slice(start, end)).toContain('voiceEnforcementProtocol: 3');
-  });
-
-  it('requires media readiness at the connection and admission availability gate', () => {
-    expect(source).toMatch(/function enforcementAvailable\(\)[\s\S]*?return[^;]*mediasoupService\.isReady\(\)/);
+  it('consumes listener readiness and protocol-4 health in readyz and admission availability', async () => {
+    createWorker.mockReset();
+    const workers = [worker(0), worker(1), worker(2)];
+    workers.forEach((current) => createWorker.mockResolvedValueOnce(current));
+    const service = new MediasoupService();
+    service.setRoomConsumerCounts(() => new Map());
+    await service.init();
+    const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+    const ast = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true);
+    const selected: string[] = [];
+    const visit = (node: ts.Node) => {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === 'enforcementAvailable') selected.push(node.getText(ast));
+      if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)) {
+        const call = node.expression;
+        if (ts.isPropertyAccessExpression(call.expression) && call.expression.expression.getText(ast) === 'app' &&
+            call.expression.name.text === 'get' && ts.isStringLiteral(call.arguments[0]) && call.arguments[0].text === '/readyz') {
+          selected.push(node.getText(ast));
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    expect(selected).toHaveLength(2);
+    const lease = new VoiceEnforcementLease(() => 0);
+    lease.renew();
+    const health = new VoiceEnforcementHealth({
+      lease, now: () => 0, nodeBootId: '11111111-1111-4111-8111-111111111111',
+      localReady: () => service.isReady(), transportReady: () => true,
+      poll: async () => {
+        const key = Buffer.from(['readiness', 'fixture', 'only'].join('-'));
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const nonce = 'b'.repeat(64);
+        const body = Buffer.from(JSON.stringify({ version: 1, nodeBootId: '11111111-1111-4111-8111-111111111111', nonce }));
+        const { request } = protocol.signHttpRequest('health_bootstrap', body, '', { timestamp, nonce }, key);
+        protocol.verifyHttpRequest(request, key, BigInt(timestamp));
+        const response = protocol.signHttpResponse(request, { version: 1, voiceEnforcementProtocol: 4,
+          nodeBootId: '11111111-1111-4111-8111-111111111111', activation: 'active', transportOK: true, admissionGranted: true }, timestamp, key);
+        const result = protocol.verifyHttpResponse('health_bootstrap', response,
+          protocol.newRequestContext(request, {}), key, BigInt(timestamp)).healthBootstrap();
+        if (!result) throw new Error('Missing verified health result');
+        return result;
+      },
+      recover: async () => {}, onTransport: () => {},
+    });
+    await health.poll();
+    expect(health.status()).toMatchObject({ voiceEnforcementTransportOK: true, voiceEnforcementAdmissionGranted: true });
+    let route: ((_request: object, response: object) => Promise<void>) | undefined;
+    const compiled = ts.transpileModule(selected.join('\n'), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+    }).outputText;
+    const available = new Script(`${compiled}\nenforcementAvailable;`).runInNewContext({
+      app: { get: (_path: string, handler: typeof route) => { route = handler; } },
+      config: { roomPlacementEnabled: false, redisCredentialMode: 'legacy' },
+      redisService: { refreshAcceptingNewRooms: async () => true, healthState: () => ({ redisReachable: true }) },
+      roomManager: { getRoomIds: () => [], getCreatesInFlightCount: () => 0 },
+      mediasoupService: service, shuttingDown: false,
+      voiceEnforcementReleaseQueue: { saturated: () => false },
+      enforcementAvailability: { isReady: () => true },
+      voiceEnforcementLease: lease, voiceEnforcementHealth: health,
+      voiceEnforcementExpiryFence: { ready: () => true }, voiceEnforcementSubscriptionReady: true,
+      voiceEnforcementSubject: 'test-subject',
+      natsService: { requiredSubscriptionsReady: () => true, voiceCommandReady: () => true,
+        isRequestSubscriptionHealthy: () => true },
+    }) as () => boolean;
+    const readReady = async () => {
+      if (!route) throw new Error('Actual readyz route was not registered');
+      let status = 200;
+      let body: unknown;
+      const response = { status(code: number) { status = code; return response; }, json(value: unknown) { body = value; } };
+      await route({}, response);
+      return { status, body };
+    };
+    try {
+      expect(available()).toBe(true);
+      expect(await readReady()).toEqual({ status: 200, body: { ready: true, ...health.status() } });
+      expect(health.status().voiceEnforcementProtocol).toBe(4);
+      workers[0].server.close();
+      expect(service.isReady()).toBe(false);
+      expect(available()).toBe(false);
+      expect(health.status()).toMatchObject({ voiceEnforcementTransportOK: true, voiceEnforcementAdmissionGranted: false });
+      expect(await readReady()).toEqual({ status: 503, body: { ready: false, ...health.status() } });
+    } finally {
+      await service.close(performance.now() + 1000);
+    }
   });
 });

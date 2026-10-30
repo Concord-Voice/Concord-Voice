@@ -291,7 +291,7 @@ describe('Packaging Identity (#382)', () => {
       '/build/installer.nsh',
       '/build/icons/512x512.png',
       '/build/icon.ico',
-      '/assets/tray/icon.png',
+      '/assets/tray/template/full.full.star.png',
       '/coverage/index.html',
       '/playwright-report/index.html',
       '/test-results/results.json',

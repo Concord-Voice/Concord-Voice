@@ -10,20 +10,25 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
-	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// connectVisibilityWS opens a WebSocket for userID and, when subscribe is set,
+// connectVisibilityWS opens a WebSocket using the actor token and, when subscribe is set,
 // subscribes it to convID. A hidden thread's client is NOT subscribed.
-func connectVisibilityWS(t *testing.T, ts *testhelpers.TestServer, userID, convID string, subscribe bool) *gorillaWS.Conn {
+func connectVisibilityWS(t *testing.T, ts *testhelpers.TestServer, accessToken, convID string, subscribe bool) *gorillaWS.Conn {
 	t.Helper()
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
-	ticket := "dm-respawn-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:%s::%d", userID, ticket, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(accessToken))
+	require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+	var ticketBody struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+	require.NotEmpty(t, ticketBody.Ticket)
+	ticket := ticketBody.Ticket
 	conn, _, dialErr := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
 	require.NoError(t, dialErr)
 	t.Cleanup(func() { _ = conn.Close() })
@@ -39,7 +44,7 @@ func connectVisibilityWS(t *testing.T, ts *testhelpers.TestServer, userID, convI
 // connection with the hide's own (non-null) frame already consumed.
 func hideForActor(t *testing.T, ts *testhelpers.TestServer, actor testhelpers.TestUser, convID string) *gorillaWS.Conn {
 	t.Helper()
-	conn := connectVisibilityWS(t, ts, actor.ID, convID, false)
+	conn := connectVisibilityWS(t, ts, actor.AccessToken, convID, false)
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/hide", nil, testhelpers.AuthHeaders(actor.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 	hidden := readVisibilityFrame(t, conn, "dm_conversation_hidden")
@@ -64,7 +69,7 @@ func TestDMVisibility_PeerMessageRespawnPublishesNullHiddenEventToActorOnly(t *t
 	actor := ts.CreateTestUser(t, "respawn_event_actor")
 	peer := ts.CreateTestUser(t, "respawn_event_peer")
 	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
-	peerConn := connectVisibilityWS(t, ts, peer.ID, convID, true)
+	peerConn := connectVisibilityWS(t, ts, peer.AccessToken, convID, true)
 	actorConn := hideForActor(t, ts, actor, convID)
 
 	require.NoError(t, peerConn.WriteJSON(map[string]interface{}{
@@ -127,7 +132,7 @@ func TestDMVisibility_RolledBackMessagePublishesNoRespawn(t *testing.T) {
 	actor := ts.CreateTestUser(t, "respawn_rollback_actor")
 	peer := ts.CreateTestUser(t, "respawn_rollback_peer")
 	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
-	peerConn := connectVisibilityWS(t, ts, peer.ID, convID, true)
+	peerConn := connectVisibilityWS(t, ts, peer.AccessToken, convID, true)
 	actorConn := hideForActor(t, ts, actor, convID)
 	fileID := insertDMMediaFile(t, ts, peer.ID, convID, "file", "application/octet-stream", 1)
 

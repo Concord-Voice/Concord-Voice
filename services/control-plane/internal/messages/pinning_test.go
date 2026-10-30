@@ -136,6 +136,7 @@ func TestPinMessageAlreadyPinnedUsesOpenTransactionConnection(t *testing.T) {
 		c.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, pinAPIMsg+msgID+pinPath, nil)
 		c.Params = gin.Params{{Key: "id", Value: msgID}}
 		c.Set("user_id", user.ID)
+		testhelpers.AttachUserIdentity(t, c, user.ID)
 		handler.PinMessage(c)
 		return response
 	}

@@ -271,7 +271,8 @@ func TestP1Equivalence(t *testing.T) {
 			require.Nil(t, se)
 			tx, err := db.BeginTx(ctx, nil)
 			require.NoError(t, err)
-			ls, le := LockSubjectTx(ctx, tx, userID, LockForShare, "")
+			actor, epoch := subjectTestActor(t, db, userID)
+			ls, le := LockSubjectTx(actor, tx, userID, LockForShare, epoch)
 			require.NoError(t, tx.Rollback())
 			require.Nil(t, le)
 

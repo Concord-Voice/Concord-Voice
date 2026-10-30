@@ -357,7 +357,7 @@ func (r *Rotator) StartManualRotation(
 			r.log.Error("Failed to rollback key revocation", "error", rbErr)
 		}
 	}()
-	if err := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, actorID, tokenEpoch); err != nil {
 		return nil, fmt.Errorf("guard manual key rotation credential epoch: %w", err)
 	}
 	if admit != nil {

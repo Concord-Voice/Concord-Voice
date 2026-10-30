@@ -99,7 +99,7 @@ func TestIssueAccessAndRefreshSucceedsAfterCommittedReset(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := db.ExecContext(ctx,
-		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "epoch-after-reset")
+		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "33333333333333333333333333333333")
 	require.NoError(t, err)
 
 	access, refresh, sessionID, err := h.IssueAccessAndRefresh(ctx, userID.String())
@@ -107,6 +107,18 @@ func TestIssueAccessAndRefreshSucceedsAfterCommittedReset(t *testing.T) {
 	require.NotEmpty(t, access)
 	require.NotEmpty(t, refresh)
 	require.NotEmpty(t, sessionID)
+	claims, err := ValidateAccessToken(access, h.jwtSecret)
+	require.NoError(t, err)
+	require.Equal(t, "33333333333333333333333333333333", claims.CredentialEpoch)
+	require.Equal(t, sessionID, claims.SessionID)
+	var owner, epoch string
+	var exact bool
+	require.NoError(t, db.QueryRow(`SELECT s.user_id, f.credential_epoch, s.access_expires_at=$2
+ FROM login_family_sids s JOIN login_families f USING(family_id,user_id)
+ WHERE s.sid=$1 AND f.terminal_at IS NULL`, sessionID, claims.ExpiresAt.Time).Scan(&owner, &epoch, &exact))
+	require.Equal(t, userID.String(), owner)
+	require.Equal(t, claims.CredentialEpoch, epoch)
+	require.True(t, exact, "committed SID expiry must equal the delivered JWT NumericDate")
 
 	var live int
 	require.NoError(t, db.QueryRow(

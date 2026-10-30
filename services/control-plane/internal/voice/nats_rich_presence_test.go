@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -25,7 +26,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
@@ -70,32 +70,70 @@ func connectVoiceWireClient(
 	t.Helper()
 	httpServer := httptest.NewServer(ts.Router)
 	t.Cleanup(httpServer.Close)
-	return connectVoiceWireClientAtURL(t, ts.Redis, ts.Hub, httpServer.URL, user)
+	return connectVoiceWireClientAtURL(t, ts, ts.Hub, httpServer.URL, user)
 }
 
 func connectVoiceWireClientAtURL(
 	t *testing.T,
-	redisClient *redis.Client,
+	ts *testhelpers.TestServer,
 	hub *concordws.Hub,
 	baseURL string,
 	user testhelpers.TestUser,
 ) *gorillaWS.Conn {
 	t.Helper()
-	ticket := "voice-rich-presence-" + uuid.NewString()
-	require.NoError(t, redisClient.Set(
-		context.Background(), "ws_ticket:"+ticket,
-		fmt.Sprintf("%s:test-session::%d", user.ID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second,
-	).Err())
-	conn, _, err := gorillaWS.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(baseURL, "http")+
-			"/api/v1/ws?ticket="+ticket+"&activity_rich_presence=1",
-		nil,
-	)
+	// Issue on the primary router; replica URLs intentionally expose only WS.
+	claims, err := auth.ValidateAccessToken(user.AccessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	require.Equal(t, user.ID, claims.UserID)
+	require.NotEmpty(t, claims.SessionID)
+	require.NotNil(t, claims.ExpiresAt)
+	issued := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil,
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, issued.Code)
+	var body struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, issued, &body)
+	require.NotEmpty(t, body.Ticket)
+
+	ctx := context.Background()
+	key := "ws_ticket:" + body.Ticket
+	stored, err := ts.Redis.Get(ctx, key).Result()
+	require.NoError(t, err)
+	parts := strings.Split(stored, ":")
+	require.Len(t, parts, 4)
+	require.Equal(t, claims.UserID, parts[0])
+	require.Equal(t, claims.SessionID, parts[1])
+	require.Equal(t, claims.CredentialEpoch, parts[2])
+	require.Equal(t, strconv.FormatInt(claims.ExpiresAt.Unix(), 10), parts[3])
+	ttl, err := ts.Redis.PTTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+	require.LessOrEqual(t, ttl, 30*time.Second)
+
+	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") +
+		"/api/v1/ws?ticket=" + body.Ticket + "&activity_rich_presence=1"
+	conn, response, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
+	require.NotNil(t, response)
+	require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
 	require.Eventually(t, func() bool {
 		return hub.GetUserClientCount(uuid.MustParse(user.ID)) == 1
 	}, time.Second, 10*time.Millisecond)
+
+	// Replay only after the intended admission, without creating another client.
+	replay, replayResponse, replayErr := gorillaWS.DefaultDialer.Dial(wsURL, nil)
+	if replay != nil {
+		t.Cleanup(func() { _ = replay.Close() })
+	}
+	if replayResponse != nil && replayResponse.Body != nil {
+		t.Cleanup(func() { require.NoError(t, replayResponse.Body.Close()) })
+	}
+	require.ErrorIs(t, replayErr, gorillaWS.ErrBadHandshake)
+	require.NotNil(t, replayResponse)
+	require.Equal(t, http.StatusUnauthorized, replayResponse.StatusCode)
+	require.Equal(t, 1, hub.GetUserClientCount(uuid.MustParse(user.ID)))
 	return conn
 }
 
@@ -837,8 +875,8 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergeServerMoveAndTerminal(t *testing.T
 	`, sender.ID, presence.TierServers)
 	require.NoError(t, err)
 
-	oldConn := connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, oldViewer)
-	newConn := connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, newViewer)
+	oldConn := connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, oldViewer)
+	newConn := connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, newViewer)
 	for _, conn := range []*gorillaWS.Conn{oldConn, newConn} {
 		synchronizeVoiceWireClient(t, conn)
 	}
@@ -866,7 +904,7 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergeServerMoveAndTerminal(t *testing.T
 		"the losing replica must reconnect its unknown old audience after replaying a move")
 
 	reconnectedNew := connectVoiceWireClientAtURL(
-		t, ts.Redis, replicaHub, replicaURL, newViewer,
+		t, ts, replicaHub, replicaURL, newViewer,
 	)
 	newSnapshot := waitForVoiceWireType(t, reconnectedNew, "presence_snapshot")
 	replayedNew, found := voiceSnapshotRichPresenceEntry(
@@ -877,7 +915,7 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergeServerMoveAndTerminal(t *testing.T
 	require.True(t, ok)
 	require.Equal(t, newChannelID, replayedPayload["channel_id"])
 	reconnectedOld := connectVoiceWireClientAtURL(
-		t, ts.Redis, replicaHub, replicaURL, oldViewer,
+		t, ts, replicaHub, replicaURL, oldViewer,
 	)
 	oldSnapshot := waitForVoiceWireType(t, reconnectedOld, "presence_snapshot")
 	_, found = voiceSnapshotRichPresenceEntry(
@@ -897,7 +935,7 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergeServerMoveAndTerminal(t *testing.T
 	}, time.Second, 10*time.Millisecond,
 		"an exact terminal duplicate must converge the losing replica locally")
 	terminalReconnect := connectVoiceWireClientAtURL(
-		t, ts.Redis, replicaHub, replicaURL, newViewer,
+		t, ts, replicaHub, replicaURL, newViewer,
 	)
 	terminalSnapshot := waitForVoiceWireType(t, terminalReconnect, "presence_snapshot")
 	_, found = voiceSnapshotRichPresenceEntry(
@@ -932,8 +970,8 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergePrivateRoomTerminal(t *testing.T) 
 	winner.HandleJoined(callerJoined)
 	loser.HandleJoined(callerJoined)
 
-	callerConn := connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, caller)
-	peerConn := connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, peer)
+	callerConn := connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, caller)
+	peerConn := connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, peer)
 	for _, conn := range []*gorillaWS.Conn{callerConn, peerConn} {
 		synchronizeVoiceWireClient(t, conn)
 	}
@@ -968,7 +1006,7 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergePrivateRoomTerminal(t *testing.T) 
 	require.Equal(t, 0, countDMVoiceParticipants(t, ts.DB, conversationID))
 
 	reconnectedPeer := connectVoiceWireClientAtURL(
-		t, ts.Redis, replicaHub, replicaURL, peer,
+		t, ts, replicaHub, replicaURL, peer,
 	)
 	snapshot := waitForVoiceWireType(t, reconnectedPeer, "presence_snapshot")
 	for _, senderID := range []string{caller.ID, peer.ID} {
@@ -995,7 +1033,7 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergeServerRoomEmpty(t *testing.T) {
 		VALUES ($1, TRUE, $2, TRUE)
 	`, sender.ID, presence.TierServers)
 	require.NoError(t, err)
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, viewer)
 	synchronizeVoiceWireClient(t, conn)
 	joinedAt := time.Date(2026, 7, 16, 1, 20, 0, 123456000, time.UTC)
 	joined := mustJSON(t, map[string]interface{}{
@@ -1015,7 +1053,7 @@ func TestVoiceLifecycle_TwoReplicaHubsConvergeServerRoomEmpty(t *testing.T) {
 		return replicaHub.GetUserClientCount(uuid.MustParse(viewer.ID)) == 0
 	}, time.Second, 10*time.Millisecond)
 	require.Equal(t, 0, countVoiceParticipants(t, ts.DB, channelID))
-	reconnected := connectVoiceWireClientAtURL(t, ts.Redis, replicaHub, replicaURL, viewer)
+	reconnected := connectVoiceWireClientAtURL(t, ts, replicaHub, replicaURL, viewer)
 	snapshot := waitForVoiceWireType(t, reconnected, "presence_snapshot")
 	_, found := voiceSnapshotRichPresenceEntry(
 		t, snapshot, sender.ID, presence.CategoryServerVoice,

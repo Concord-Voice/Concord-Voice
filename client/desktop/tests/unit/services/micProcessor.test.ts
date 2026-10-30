@@ -14,24 +14,20 @@ type MockPort = {
   close: ReturnType<typeof vi.fn>;
 };
 
-class MockNode {
+class MockNode extends EventTarget {
   port: MockPort = {
     onmessage: null,
     postMessage: vi.fn(),
     close: vi.fn(),
   };
-  addEventListener = vi.fn((event: string, listener: EventListener) => {
-    if (event === 'processorerror') this.processorError = listener;
-  });
   disconnect = vi.fn();
-  processorError: EventListener | undefined;
 
   emit(data: unknown) {
     this.port.onmessage?.({ data });
   }
 
   fail() {
-    this.processorError?.(new Event('processorerror'));
+    this.dispatchEvent(new Event('processorerror'));
   }
 }
 
@@ -251,6 +247,50 @@ describe('createMicProcessor', () => {
     expect(onWindow).not.toHaveBeenCalled();
     expect(mockNode.disconnect).toHaveBeenCalled();
     close();
+  });
+
+  // Regression for #4147. Oracle: When an AudioWorkletNode emits an error event,
+  // the microphone host invokes its existing error callback once and closes the
+  // port and disconnects the node once, including when both event names occur.
+  it.each([
+    { order: 'error only', events: ['error'] },
+    { order: 'processorerror only', events: ['processorerror'] },
+    { order: 'error then processorerror', events: ['error', 'processorerror'] },
+    { order: 'processorerror then error', events: ['processorerror', 'error'] },
+  ])('terminates the microphone once for native event order $order', async ({ events }) => {
+    const onWindow = vi.fn();
+    const onProcessorError = vi.fn();
+    const handle = await createMicProcessor(context, initial, onWindow, onProcessorError);
+    expect(constructed).toHaveLength(1);
+    const mockNode = constructed[0];
+    expect(handle.node).toBe(mockNode);
+    mockNode.emit({ peak: 0.2, frames: 960, valid: true, overloaded: false });
+    expect(onWindow).toHaveBeenCalledOnce();
+    onWindow.mockClear();
+    expect(onProcessorError).not.toHaveBeenCalled();
+    expect(mockNode.port.close).not.toHaveBeenCalled();
+    expect(mockNode.disconnect).not.toHaveBeenCalled();
+
+    for (const event of events) {
+      mockNode.dispatchEvent(new Event(event));
+      expect(
+        {
+          errorCallbackCalls: onProcessorError.mock.calls.length,
+          portCloseCalls: mockNode.port.close.mock.calls.length,
+          nodeDisconnectCalls: mockNode.disconnect.mock.calls.length,
+        },
+        `#4147: native ${event} must notify once, close the port once and disconnect once`
+      ).toEqual({ errorCallbackCalls: 1, portCloseCalls: 1, nodeDisconnectCalls: 1 });
+    }
+    mockNode.emit({ peak: 0.2, frames: 960, valid: true, overloaded: false });
+    expect(
+      onWindow,
+      '#4147: terminal worklet errors must fence later peak reports'
+    ).not.toHaveBeenCalled();
+    handle.close();
+    expect(onProcessorError).toHaveBeenCalledOnce();
+    expect(mockNode.port.close).toHaveBeenCalledOnce();
+    expect(mockNode.disconnect).toHaveBeenCalledOnce();
   });
 
   it('accepts the exact 20 ms silence report without requiring a finite dBFS value', async () => {

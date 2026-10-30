@@ -228,6 +228,7 @@ describe('preferencesSyncService', () => {
           fontHeadings: 'lexend',
           fontNavigation: 'inter',
           fontMessages: 'lato',
+          trayIconStyle: 'dark',
         },
       }));
       server.use(
@@ -242,6 +243,7 @@ describe('preferencesSyncService', () => {
           fontHeadings: 'lexend',
           fontNavigation: 'inter',
           fontMessages: 'lato',
+          trayIconStyle: 'dark',
         },
       });
       expect((encryptedBlob as { v: number }).v).toBe(1);
@@ -506,6 +508,7 @@ describe('preferencesSyncService', () => {
           fontHeadings: 'lexend',
           fontNavigation: 'inter',
           fontMessages: 'lato',
+          trayIconStyle: 'colour',
         },
       });
       server.use(
@@ -526,6 +529,7 @@ describe('preferencesSyncService', () => {
         'fontHeadings',
         'fontNavigation',
         'fontMessages',
+        'trayIconStyle',
       ] as const) {
         expect(after[key]).toBe(before[key]);
       }

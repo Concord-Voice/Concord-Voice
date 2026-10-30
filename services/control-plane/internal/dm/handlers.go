@@ -21,6 +21,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/joinpause"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	messagehandlers "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -37,6 +38,8 @@ import (
 	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
+
+const authRequiredMessage = "Authentication required"
 
 const (
 	errMsgInvalidConversationID      = "Invalid conversation ID"
@@ -828,7 +831,7 @@ func (h *Handler) beginDMTopologyEffectWithCredential(ctx context.Context, convI
 			err = lockPreparedDMParticipantsTx(ctx, tx, convID, prepared)
 		}
 		if err == nil && userID != "" {
-			err = credepoch.GuardTx(ctx, tx, userID, credentialEpoch)
+			err = credepoch.GuardFamilyTx(ctx, tx, userID, credentialEpoch)
 		}
 		if err == nil {
 			return tx, nil
@@ -1023,7 +1026,7 @@ func (h *Handler) createOneOnOneConversation(ctx context.Context, userID, target
 	if err := dmblock.PrepareNewConversationTx(ctx, tx, users, dmblock.LockShare); err != nil {
 		return "", false, err
 	}
-	if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, credentialEpoch); err != nil {
 		return "", false, err
 	}
 	if err := recheckDMTopologyTx(ctx, tx, creator, users); err != nil {
@@ -1204,7 +1207,7 @@ func (h *Handler) insertGroupConversation(ctx context.Context, name *string, cre
 	if err := dmblock.PrepareNewConversationTx(ctx, tx, users, dmblock.LockShare); err != nil {
 		return "", err
 	}
-	if err := credepoch.GuardTx(ctx, tx, creatorID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, creatorID, credentialEpoch); err != nil {
 		return "", err
 	}
 	if err := recheckDMTopologyTx(ctx, tx, users[0], users); err != nil {
@@ -1389,7 +1392,7 @@ func (h *Handler) updateConversationTx(ctx context.Context, convID, userID strin
 	if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockNoKeyUpdate); err != nil {
 		return err
 	}
-	if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, credentialEpoch); err != nil {
 		return err
 	}
 	var isGroup bool
@@ -1591,7 +1594,7 @@ func (h *Handler) addMemberTx(ctx context.Context, convID, targetUserID, callerU
 	if _, err := dmblock.PrepareConversationAfterUserLocksTx(ctx, tx, convID, lockedSubjects, dmblock.LockNoKeyUpdate); err != nil {
 		return 0, err
 	}
-	if err := credepoch.GuardTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
 		return 0, err
 	}
 	currentParticipants, err := fetchParticipantIDsTx(ctx, tx, convID)
@@ -1950,7 +1953,7 @@ func (h *Handler) removeActiveMemberTx(
 		if _, err := dmblock.PrepareResolutionConversationAfterUserLocksTx(ctx, tx, convID, lockedSubjects, dmblock.LockNoKeyUpdate); err != nil {
 			return err
 		}
-		if err := credepoch.GuardTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
+		if err := credepoch.GuardFamilyTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
 			return err
 		}
 		if h.afterUsersLockHook != nil {
@@ -2012,7 +2015,7 @@ func (h *Handler) removeInactiveMemberTx(
 	if _, err := dmblock.PrepareResolutionConversationAfterUserLocksTx(ctx, tx, convID, lockedSubjects, dmblock.LockNoKeyUpdate); err != nil {
 		return "", 0, err
 	}
-	if err := credepoch.GuardTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, callerUserID, credentialEpoch); err != nil {
 		return "", 0, err
 	}
 
@@ -2545,7 +2548,7 @@ func (h *Handler) readDMKeyTx(ctx context.Context, convID, userID, credentialEpo
 	if _, err := dmblock.PrepareConversationTx(ctx, tx, convID, []uuid.UUID{actor}, dmblock.LockShare, dmblock.LockShare); err != nil {
 		return err
 	}
-	if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, userID, credentialEpoch); err != nil {
 		return err
 	}
 	var participant string
@@ -2573,7 +2576,7 @@ func (h *Handler) readDMKeyTx(ctx context.Context, convID, userID, credentialEpo
 // not "re-authenticate" (Codex #2397 review). Mirrors messages.respondGuardTxError.
 func (h *Handler) respondGuardTxError(c *gin.Context, guardErr error, genericMsg string) {
 	if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": authRequiredMessage})
 		return
 	}
 	h.log.Error("credential-epoch guard read failed", "error", guardErr)
@@ -2633,33 +2636,111 @@ func (h *Handler) loadVoiceJoinState(c *gin.Context, convID, userID string) (voi
 	return state, true
 }
 
+// dmVoiceAdmission retains authority only for the exact transaction that took
+// the complete users/family prefix. It is never installed in request context.
+type dmVoiceAdmission struct {
+	tx       *sql.Tx
+	user     loginfamily.UserAuthority
+	identity loginfamily.AccessIdentity
+}
+
+func (admission dmVoiceAdmission) recheck(ctx context.Context) error {
+	_, err := loginfamily.GuardAfterUserLockTx(ctx, admission.tx, admission.user, admission.identity, loginfamily.FamilyShare)
+	return err
+}
+
 // beginDMVoiceMembershipTx holds the parent and caller membership through a
 // Redis voice-state mutation. Retirement's FOR UPDATE waits on this key-share
 // lock, so a successful voice transition cannot lose its conversation parent.
 func (h *Handler) beginDMVoiceMembershipTx(c *gin.Context, convID, userID string) (*sql.Tx, bool) {
-	userUUID, err := uuid.Parse(userID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCallerID})
-		return nil, false
+	admission, ok := h.beginDMVoiceMembershipAuthorityTx(c, convID, userID)
+	return admission.tx, ok
+}
+
+func (h *Handler) beginDMVoiceMembershipAuthorityTx(c *gin.Context, convID, userID string) (dmVoiceAdmission, bool) {
+	identity, _, verified := middleware.VerifiedAccessFromContext(c)
+	if !verified || identity.UserID.String() != userID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": authRequiredMessage})
+		return dmVoiceAdmission{}, false
 	}
-	tx, err := h.beginDMTopologyEffectWithCredential(
-		c.Request.Context(), convID, userID, middleware.TokenCredentialEpoch(c),
-		[]uuid.UUID{userUUID}, dmblock.LockShare,
-	)
+	admission, err := h.beginDMVoiceAdmissionTx(c.Request.Context(), convID, identity)
 	if err == nil {
-		return tx, true
+		return admission, true
 	}
-	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
-		h.respondGuardTxError(c, err, errMsgFailedAuthorize)
-		return nil, false
+	h.respondDMVoiceAdmissionError(c, err)
+	return dmVoiceAdmission{}, false
+}
+
+func (h *Handler) respondDMVoiceAdmissionError(c *gin.Context, err error) {
+	if errors.Is(err, loginfamily.ErrDenied) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": authRequiredMessage})
+		return
 	}
 	if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "dm_unavailable"})
-		return nil, false
+		return
 	}
-	h.log.Error("Failed to begin guarded DM voice membership transaction", "error", err)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-	return nil, false
+	h.log.Error("Failed to validate guarded DM voice admission", "failure_class", "authority")
+	status := http.StatusServiceUnavailable
+	if errors.Is(err, loginfamily.ErrContract) {
+		status = http.StatusInternalServerError
+	}
+	c.JSON(status, gin.H{"error": errMsgFailedAuthorize})
+}
+
+// beginDMVoiceAdmissionTx retains the existing Redis-effect transaction owner.
+// Every retry starts from a new rollout barrier and complete participant-plus-
+// actor user set; family authority is acquired before conversation children.
+func (h *Handler) beginDMVoiceAdmissionTx(ctx context.Context, convID string, identity loginfamily.AccessIdentity) (dmVoiceAdmission, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			return dmVoiceAdmission{}, fmt.Errorf("begin DM family admission: %w", err)
+		}
+		user, err := prepareDMVoiceAdmissionTx(ctx, tx, convID, identity)
+		if err == nil {
+			return dmVoiceAdmission{tx: tx, user: user, identity: identity}, nil
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			return dmVoiceAdmission{}, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, errors.Join(err, rollbackErr))
+		}
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return dmVoiceAdmission{}, err
+	}
+	return dmVoiceAdmission{}, dmblock.ErrMembershipChanged
+}
+
+func prepareDMVoiceAdmissionTx(ctx context.Context, tx *sql.Tx, convID string, identity loginfamily.AccessIdentity) (loginfamily.UserAuthority, error) {
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	subjects, users, err := dmblock.LockConversationAuthorityUsersTx(ctx, tx, barrier, convID, []uuid.UUID{identity.UserID}, loginfamily.UserShare)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	user, err := users.ForUser(identity.UserID)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	if _, err := loginfamily.GuardAfterUserLockTx(ctx, tx, user, identity, loginfamily.FamilyShare); err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	prepared, err := dmblock.PrepareConversationAfterUserLocksTx(ctx, tx, convID, subjects, dmblock.LockShare)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	if err := lockPreparedDMParticipantsTx(ctx, tx, convID, prepared); err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	if !slices.Contains(prepared, identity.UserID) {
+		return loginfamily.UserAuthority{}, dmblock.ErrUnavailable
+	}
+	// Child-lock waits must not let a token outlive its signed authority.
+	_, err = loginfamily.GuardAfterUserLockTx(ctx, tx, user, identity, loginfamily.FamilyShare)
+	return user, err
 }
 
 func lockDMVoiceMembership(ctx context.Context, tx *sql.Tx, convID, userID string) error {
@@ -2771,6 +2852,10 @@ func (h *Handler) acceptPendingDMVoiceCall(
 		return onAccepted(ring)
 	})
 	if err != nil {
+		if errors.Is(err, loginfamily.ErrDenied) || errors.Is(err, loginfamily.ErrUnavailable) || errors.Is(err, loginfamily.ErrContract) {
+			h.respondDMVoiceAdmissionError(c, err)
+			return nil, uuid.Nil, false, false
+		}
 		h.log.Error("Failed to establish accepted DM call lease", "error", err,
 			"conversation_id", sanitizeLogValue(c.Param("id")), "ring_id", ring.RingID.String())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
@@ -2789,11 +2874,18 @@ func (h *Handler) acceptPendingDMVoiceCall(
 func (h *Handler) resolveVoiceJoinCallID(
 	c *gin.Context,
 	convUUID, userUUID, requestedRingID uuid.UUID,
+	admission dmVoiceAdmission,
 	onAccepted func(*PendingCall) error,
 ) (uuid.UUID, bool, *PendingCall, bool) {
 	ring, callID, accepted, ok := h.acceptPendingDMVoiceCall(c, convUUID, userUUID, requestedRingID, onAccepted)
 	if !ok || accepted {
 		return callID, accepted, ring, ok
+	}
+	// An inactive ring can skip onAccepted after waiting for ring.mu. Recheck
+	// before fallback effects, but never revisit an accepted, committed tx.
+	if err := admission.recheck(c.Request.Context()); err != nil {
+		h.respondDMVoiceAdmissionError(c, err)
+		return uuid.Nil, false, nil, false
 	}
 	if requestedRingID == uuid.Nil {
 		callID, leaseOwned, ok := h.resolveDirectVoiceJoinCallID(c, convUUID, userUUID)
@@ -2863,10 +2955,11 @@ func (h *Handler) authorizeVoiceJoinTx(
 	convID, userID string,
 	convUUID, userUUID, requestedRingID uuid.UUID,
 ) (voiceJoinState, uuid.UUID, bool) {
-	tx, started := h.beginDMVoiceMembershipTx(c, convID, userID)
+	admission, started := h.beginDMVoiceMembershipAuthorityTx(c, convID, userID)
 	if !started {
 		return voiceJoinState{}, uuid.Nil, false
 	}
+	tx := admission.tx
 	committed := false
 	var callID uuid.UUID
 	var leaseRingID uuid.UUID
@@ -2903,11 +2996,19 @@ func (h *Handler) authorizeVoiceJoinTx(
 	// cancellation and media-plane authorization.
 	unlockLifecycle := LockDMCallLifecycle(convUUID)
 	defer unlockLifecycle()
+	if err := admission.recheck(c.Request.Context()); err != nil {
+		h.respondDMVoiceAdmissionError(c, err)
+		return voiceJoinState{}, uuid.Nil, false
+	}
 	var acceptedRing *PendingCall
 	var resolved bool
 	callID, leaseOwned, acceptedRing, resolved = h.resolveVoiceJoinCallID(
-		c, convUUID, userUUID, requestedRingID,
+		c, convUUID, userUUID, requestedRingID, admission,
 		func(ring *PendingCall) error {
+			// tryAccept acquired ring.mu after the lifecycle guard.
+			if err := admission.recheck(c.Request.Context()); err != nil {
+				return err
+			}
 			callID = ring.RingID
 			leaseRingID = ring.RingID
 			if err := h.reservePendingDMVoiceCall(c.Request.Context(), convUUID, ring); err != nil {
@@ -3423,7 +3524,7 @@ func (h *Handler) prepareDMMessageCiphertextAttempt(c *gin.Context, tx *sql.Tx, 
 	}
 	// Guard only after the complete users-first topology fence. This prevents
 	// stale credentials from writing ciphertext after a destructive reset.
-	if err := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+	if err := credepoch.GuardFamilyTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
 		h.respondGuardTxError(c, err, errMsgFailedUpdateMessage)
 		return false, false
 	}

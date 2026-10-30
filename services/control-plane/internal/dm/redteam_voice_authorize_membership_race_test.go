@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,7 +23,10 @@ func TestAuthorizeVoiceJoinSerializesInjectedMemberRemoval(t *testing.T) {
 	peer := ts.CreateTestUser(t, "redteam_stale_authorization_peer")
 	conversationID := ts.CreateDMConversation(t, caller.ID, peer.ID)
 	handler := crossStoreVoiceHandler(ts)
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
 	dm.SetDMTopologyCommitHookForTest(handler, func(tx *sql.Tx) error {
+		commitReached.Store(true)
 		removed := make(chan error, 1)
 		go func() {
 			_, err := ts.DB.ExecContext(context.Background(),
@@ -48,11 +53,11 @@ func TestAuthorizeVoiceJoinSerializesInjectedMemberRemoval(t *testing.T) {
 	})
 
 	request, response := crossStoreVoiceContext(
-		t, http.MethodPost, "/voice/join", caller.ID, conversationID, nil,
+		t, ts, http.MethodPost, "/voice/join", caller.AccessToken, conversationID, nil,
 	)
 	handler.AuthorizeVoiceJoin(request)
 
-	require.NotEqual(t, http.StatusOK, response.Code)
+	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
 	require.NotContains(t, response.Body.String(), `"allowed":true`)
 	var participants int
 	require.NoError(t, ts.DB.QueryRow(

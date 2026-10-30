@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -347,6 +348,7 @@ func (ss *sessionSetup) doInit(userID string, body map[string]any) *httptest.Res
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	ss.handler.InitUploadSession(c)
 	return w
 }
@@ -399,6 +401,7 @@ func (ss *sessionSetup) doPutChunk(
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	c.Params = gin.Params{
 		{Key: "session_id", Value: sessionID},
 		{Key: "index", Value: strconv.Itoa(index)},
@@ -414,6 +417,7 @@ func (ss *sessionSetup) getAttachment(t *testing.T, userID, fileID string) *http
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	c.Params = gin.Params{{Key: "file_id", Value: fileID}}
 	ss.handler.DownloadAttachment(c)
 	return w
@@ -426,6 +430,7 @@ func (ss *sessionSetup) doCommit(userID, sessionID string) *httptest.ResponseRec
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	c.Params = gin.Params{{Key: "session_id", Value: sessionID}}
 	ss.handler.CommitUploadSession(c)
 	return w
@@ -438,6 +443,7 @@ func (ss *sessionSetup) doCancel(userID, sessionID string) *httptest.ResponseRec
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	c.Set("user_id", userID)
+	testdb.AttachRememberedActor(c, userID)
 	c.Params = gin.Params{{Key: "session_id", Value: sessionID}}
 	ss.handler.CancelUploadSession(c)
 	return w
@@ -1282,7 +1288,7 @@ func postureEngine(t *testing.T, ss *sessionSetup, userID string) *gin.Engine {
 
 	engine := gin.New()
 	group := engine.Group("/api/v1/media")
-	group.Use(func(c *gin.Context) { c.Set("user_id", userID) })
+	group.Use(func(c *gin.Context) { c.Set("user_id", userID); testdb.AttachRememberedActor(c, userID) })
 	RegisterUploadSessionRoutes(group, ss.handler, dead)
 	return engine
 }
@@ -1377,7 +1383,7 @@ func TestUploadSession_ChunkRouteNeverMultipartParses(t *testing.T) {
 	// One byte. Any ParseMultipartForm on this engine spills to disk at once.
 	engine.MaxMultipartMemory = 1
 	group := engine.Group("/api/v1/media")
-	group.Use(func(c *gin.Context) { c.Set("user_id", userID) })
+	group.Use(func(c *gin.Context) { c.Set("user_id", userID); testdb.AttachRememberedActor(c, userID) })
 	RegisterUploadSessionRoutes(group, ss.handler, ss.rdb)
 
 	parts := sliceParts(t, fakeCiphertext(4096), 4096)

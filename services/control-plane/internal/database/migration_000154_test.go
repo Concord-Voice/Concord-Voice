@@ -5,17 +5,19 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
-
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 )
 
 func TestMigration000154_VoiceEnforcementSessionsContract(t *testing.T) {
-	db, cleanup := testhelpers.SetupTestDB(t)
-	defer cleanup()
+	// Exercise the historical migration in a disposable database: later
+	// migrations retain foreign keys to its evidence table, so a head schema
+	// cannot represent the pre-000154 rollback boundary.
+	db := openMigration159IsolatedDB(t)
 
 	up := migrationReadFile(t, "../../migrations/000154_add_voice_enforcement_sessions.up.sql")
 	down := migrationReadFile(t, "../../migrations/000154_add_voice_enforcement_sessions.down.sql")
 	ctx := t.Context()
+	_, err := db.ExecContext(ctx, up)
+	require.NoError(t, err)
 
 	var tableExists bool
 	require.NoError(t, db.QueryRowContext(ctx, `
@@ -63,7 +65,7 @@ func TestMigration000154_VoiceEnforcementSessionsContract(t *testing.T) {
 
 	userID, nodeBootID, roomID, sessionGeneration := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	epoch := "0123456789abcdef0123456789abcdef" // pragma: allowlist secret
-	_, err := db.ExecContext(ctx, `INSERT INTO voice_enforcement_sessions
+	_, err = db.ExecContext(ctx, `INSERT INTO voice_enforcement_sessions
 		(session_generation, node_boot_id, room_id, room_kind, user_id, credential_epoch, socket_id)
 		VALUES ($1, $2, $3, 'dm', $4, $5, 'socket-1')`,
 		sessionGeneration, nodeBootID, roomID, userID, epoch)
@@ -86,7 +88,7 @@ func TestMigration000154_VoiceEnforcementSessionsContract(t *testing.T) {
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	_, err = tx.ExecContext(ctx, down)
-	require.Error(t, err)
+	require.ErrorContains(t, err, "cannot drop voice_enforcement_sessions while exact session evidence remains")
 	require.NoError(t, tx.Rollback())
 
 	// Once evidence drains, down/up must work and restore the trigger contract.
@@ -97,7 +99,7 @@ func TestMigration000154_VoiceEnforcementSessionsContract(t *testing.T) {
 	_, err = tx.ExecContext(ctx, `UPDATE voice_enforcement_rollout SET activated_at = NOW() WHERE id = TRUE`)
 	require.NoError(t, err)
 	_, err = tx.ExecContext(ctx, down)
-	require.Error(t, err, "rollback must refuse after rollout activation")
+	require.ErrorContains(t, err, "cannot drop voice_enforcement_rollout after voice enforcement rollout activation")
 	require.NoError(t, tx.Rollback())
 
 	tx, err = db.BeginTx(ctx, nil)

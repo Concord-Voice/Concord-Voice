@@ -129,7 +129,7 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 			if err := guardDMPurgeTx(guardCtx, tx, convID, userID, author); err != nil {
 				return err
 			}
-			if err := credepoch.GuardTx(guardCtx, tx, userID, credentialEpoch); err != nil {
+			if err := credepoch.GuardFamilyTx(guardCtx, tx, userID, credentialEpoch); err != nil {
 				return fmt.Errorf("guard DM purge credential epoch: %w", err)
 			}
 			return nil
@@ -215,7 +215,7 @@ func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, 
 			if err := guardDMPurgeTx(ctx, tx, convID, userID, &userID); err != nil {
 				return err
 			}
-			if err := credepoch.GuardTx(ctx, tx, userID, credentialEpoch); err != nil {
+			if err := credepoch.GuardFamilyTx(ctx, tx, userID, credentialEpoch); err != nil {
 				return fmt.Errorf("guard DM hide credential epoch: %w", err)
 			}
 			var err error

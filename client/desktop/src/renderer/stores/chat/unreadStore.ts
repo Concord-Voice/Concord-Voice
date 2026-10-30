@@ -7,7 +7,40 @@ import {
   isChannelMuted,
 } from '../ui/notificationPrefsStore';
 
+export interface RecentUnreadTarget {
+  type: 'channel' | 'dm';
+  targetId: string;
+  serverId?: string;
+}
+
+/** Cap of the LIFO stack the tray's "unread" item resolves against. */
+export const RECENT_UNREAD_TARGETS_MAX = 20;
+
+/** Newest first, de-duplicated by `targetId`, capped. Pure. */
+export function pushRecentUnreadTarget(
+  list: RecentUnreadTarget[],
+  target: RecentUnreadTarget
+): RecentUnreadTarget[] {
+  const rest = list.filter((t) => t.targetId !== target.targetId);
+  return [target, ...rest].slice(0, RECENT_UNREAD_TARGETS_MAX);
+}
+
+/** Drops the entry for `targetId`; returns the same array when absent. */
+export function removeRecentUnreadTarget(
+  list: RecentUnreadTarget[],
+  targetId: string
+): RecentUnreadTarget[] {
+  return list.some((t) => t.targetId === targetId)
+    ? list.filter((t) => t.targetId !== targetId)
+    : list;
+}
+
 interface UnreadState {
+  // Conversations that most recently received a NEW unread message, newest
+  // first (cap 20, unique by targetId). Backs the tray's "N unread messages"
+  // item, which opens the most recent still-unread conversation (LIFO). Never
+  // persisted. DM entries are pushed/removed by dmStore's unread actions.
+  recentUnreadTargets: RecentUnreadTarget[];
   // Channel ID -> unread count (per-channel, active server only)
   unreadCounts: Map<string, number>;
 
@@ -244,6 +277,7 @@ export const useUnreadStore = wrapStore(
   create<UnreadState>()(
     devtools(
       (set) => ({
+        recentUnreadTargets: [],
         unreadCounts: new Map(),
         unreadCountsServerId: null,
         unreadCountsSnapshotIds: new Set<string>(),
@@ -285,7 +319,14 @@ export const useUnreadStore = wrapStore(
           set((state) => {
             const current = state.unreadCounts.get(channelId) || 0;
             state.unreadCounts.set(channelId, current + 1);
-            return { unreadCounts: new Map(state.unreadCounts) };
+            return {
+              unreadCounts: new Map(state.unreadCounts),
+              recentUnreadTargets: pushRecentUnreadTarget(state.recentUnreadTargets, {
+                type: 'channel',
+                targetId: channelId,
+                ...(state.unreadCountsServerId ? { serverId: state.unreadCountsServerId } : {}),
+              }),
+            };
           }),
 
         clearUnread: (channelId: string) =>
@@ -295,7 +336,12 @@ export const useUnreadStore = wrapStore(
             // The cross-server map must follow the read too, or a BACKGROUND
             // channel's entry survives being read and keeps the badge lit (#2403).
             const hasAll = state.allUnreadCounts.has(channelId);
-            if (!hasUnread && !hasMention && !hasAll) return state;
+            const nextRecent = removeRecentUnreadTarget(state.recentUnreadTargets, channelId);
+            if (!hasUnread && !hasMention && !hasAll) {
+              return nextRecent === state.recentUnreadTargets
+                ? state
+                : { recentUnreadTargets: nextRecent };
+            }
             const nextUnread = new Map(state.unreadCounts);
             const nextMention = new Map(state.mentionCounts);
             const nextAll = new Map(state.allUnreadCounts);
@@ -318,6 +364,7 @@ export const useUnreadStore = wrapStore(
               (ownsSnapshot || state.allUnreadCompleteServerIds.has(serverId)) &&
               !hasRemainingServerUnread(ownsSnapshot ? nextUnread : null, nextAll, serverId);
             return {
+              recentUnreadTargets: nextRecent,
               unreadCounts: nextUnread,
               mentionCounts: nextMention,
               allUnreadCounts: nextAll,
@@ -455,7 +502,15 @@ export const useUnreadStore = wrapStore(
             next.set(channelId, { serverId, count: (prev?.count ?? 0) + 1 });
             const dirty = new Set(state.channelUnreadDirty);
             dirty.add(channelId);
-            return { allUnreadCounts: next, channelUnreadDirty: dirty };
+            return {
+              allUnreadCounts: next,
+              channelUnreadDirty: dirty,
+              recentUnreadTargets: pushRecentUnreadTarget(state.recentUnreadTargets, {
+                type: 'channel',
+                targetId: channelId,
+                serverId,
+              }),
+            };
           }),
 
         clearServerChannelUnreads: (serverId: string) =>
@@ -487,6 +542,7 @@ export const useUnreadStore = wrapStore(
 
         clearAll: () =>
           set({
+            recentUnreadTargets: [],
             unreadResetId: Symbol('unread-reset'),
             serverReadVersions: new Map<string, symbol>(),
             unreadCounts: new Map(),

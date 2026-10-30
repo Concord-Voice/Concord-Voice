@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
@@ -102,7 +103,7 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 	// a JWT claim; it needs no consistent snapshot with the locked read.
 	tier := h.entCache.GetTier(ctx, userID)
 
-	tx, err := h.db.BeginTx(ctx, nil)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return "", "", "", fmt.Errorf("begin: %w", err)
 	}
@@ -112,7 +113,15 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 		}
 	}()
 
+	userAuthority, err := lockMintUserTx(ctx, tx, userID)
+	if err != nil {
+		return "", "", "", err
+	}
 	userState, err := h.lockSSOMintUser(ctx, tx, userID, expectedEpoch)
+	if err != nil {
+		return "", "", "", err
+	}
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, userAuthority, userState.credentialEpoch.String)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -128,7 +137,11 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 
 	// tokenID first so the access token carries it as the sid claim (#2201).
 	tokenID := uuid.New().String()
-	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, userState.emailVerified, userState.credentialEpoch.String, tokenID, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, userState.emailVerified, tier)
+	if err != nil {
+		return "", "", "", err
+	}
+	accessToken, err = prepared.Sign(h.jwtSecret)
 	if err != nil {
 		return "", "", "", fmt.Errorf("access: %w", err)
 	}
@@ -154,20 +167,20 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 	}
 
 	if err := tx.Commit(); err != nil {
-		return "", "", "", fmt.Errorf("commit: %w", err)
+		return "", "", "", loginfamily.NewError(loginfamily.ReasonCommitUnknown, err)
 	}
 	h.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonAuthenticationSucceeded, AuthMethod: securityevent.AuthSSO})
 
 	return accessToken, refreshToken, tokenID, nil
 }
 
-// lockSSOMintUser loads the user state used for an SSO session while holding
-// the same row lock as destructive credential-reset flows.
+// lockSSOMintUser reads SSO state after lockMintUserTx has acquired authority.
+// Keeping this read separate gives it a fresh snapshot after the user-lock wait.
 func (h *Handler) lockSSOMintUser(ctx context.Context, tx *sql.Tx, userID string, expectedEpoch *string) (ssoMintUserState, error) {
 	var state ssoMintUserState
 	var disabled bool
 	if err := tx.QueryRowContext(ctx,
-		`SELECT email_verified, disabled, credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+		`SELECT email_verified, disabled, credential_epoch FROM users WHERE id = $1`, userID,
 	).Scan(&state.emailVerified, &disabled, &state.credentialEpoch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ssoMintUserState{}, fmt.Errorf("user %s not found", userID)

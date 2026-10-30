@@ -52,15 +52,24 @@ func TestUpsertChannelOverride_DemotedActorRejectedByTransactionalAuthority(t *t
 }
 
 func TestUpsertChannelOverrideRejectsStaleCredentialEpoch(t *testing.T) {
-	ts, owner, member, serverID := setupOwnerAndMember(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
+	owner := ts.CreateTestUser(t, "epoch-override-owner")
+	member := ts.CreateTestUser(t, "epoch-override-member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Epoch override server")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
 	channelID := ts.CreateTestChannel(t, serverID, "stale-epoch-channel-override")
 
-	staleToken := ts.SimulateStaleEpochWindow(t, owner.ID)
+	require.NoError(t, boundary.Arm(owner.AccessToken))
+	boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
 	w := ts.DoRequest(http.MethodPut, channelOverridesPath(channelID), rbac.UpsertOverrideRequest{
 		TargetType: "user",
 		TargetID:   member.ID,
 		Allow:      int64(rbac.PermSendMessages),
-	}, testhelpers.AuthHeaders(staleToken))
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	boundary.RequireRotated(t)
+	seen, hookErr := boundary.Hook.Report()
+	require.NoError(t, hookErr)
+	require.Equal(t, 1, seen, "handler GuardTx must be reached after admitted epoch rotation")
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 
 	var count int
@@ -198,7 +207,7 @@ func TestStaleAuthority_RBACMutationHandlersRejectDemotedActor(t *testing.T) {
 			ts, actorID, serverID, roleID, h := newStaleRBACMutationActor(t)
 			params, body, assertUnchanged := test.setup(t, ts, serverID)
 			demotionTx := holdStaleRBACMutationDemotion(t, ts, serverID, actorID, roleID)
-			completed := invokeStaleRBACMutation(t, actorID, params, body, test.call, h)
+			completed := invokeStaleRBACMutation(ts.ActorContext(context.Background(), t, actorID), t, actorID, params, body, test.call, h)
 			require.NoError(t, demotionTx.Commit())
 			w := <-completed
 			assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
@@ -234,7 +243,7 @@ func holdStaleRBACMutationDemotion(t *testing.T, ts *testhelpers.TestServer, ser
 	return tx
 }
 
-func invokeStaleRBACMutation(t *testing.T, actorID string, params gin.Params, body any, handler func(*rbac.Handler, *gin.Context), h *rbac.Handler) <-chan *httptest.ResponseRecorder {
+func invokeStaleRBACMutation(ctx context.Context, t *testing.T, actorID string, params gin.Params, body any, handler func(*rbac.Handler, *gin.Context), h *rbac.Handler) <-chan *httptest.ResponseRecorder {
 	t.Helper()
 	payload, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -242,7 +251,7 @@ func invokeStaleRBACMutation(t *testing.T, actorID string, params gin.Params, bo
 	c, _ := gin.CreateTestContext(w)
 	c.Params = params
 	c.Set("user_id", actorID)
-	c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload))
+	c.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload)).WithContext(ctx)
 	c.Request.Header.Set("Content-Type", "application/json")
 	completed := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -254,8 +263,8 @@ func invokeStaleRBACMutation(t *testing.T, actorID string, params gin.Params, bo
 
 // TestRBACAuthorityWritersRejectStaleCredentialEpoch keeps the epoch fence on
 // every RBAC writer that can change role or permission authority. The helper
-// admits the request through the stale Redis middleware window, so a 401 must
-// come from the writer's transaction guard rather than token middleware.
+// rotates only after successful SQL family admission; independent statement
+// evidence requires the writer transaction's credential guard to be reached.
 func TestRBACAuthorityWritersRejectStaleCredentialEpoch(t *testing.T) {
 	tests := []struct {
 		name string
@@ -264,6 +273,9 @@ func TestRBACAuthorityWritersRejectStaleCredentialEpoch(t *testing.T) {
 		{name: "create role", call: func(t *testing.T, ts *testhelpers.TestServer, _ string, serverID, token string) {
 			w := ts.DoRequest(http.MethodPost, rolesPath(serverID), map[string]any{"name": "stale-role", "permissions": "2048"}, testhelpers.AuthHeaders(token))
 			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var count int
+			require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM roles WHERE server_id = $1 AND name = 'stale-role'`, serverID).Scan(&count))
+			assert.Zero(t, count)
 		}},
 		{name: "edit role", call: func(t *testing.T, ts *testhelpers.TestServer, _ string, serverID, token string) {
 			roleID := ts.CreateTestRole(t, serverID, "stale-edit-role", 1, int64(rbac.PermSendMessages))
@@ -277,6 +289,9 @@ func TestRBACAuthorityWritersRejectStaleCredentialEpoch(t *testing.T) {
 			roleID := ts.CreateTestRole(t, serverID, "stale-reorder-role", 1, int64(rbac.PermSendMessages))
 			w := ts.DoRequest(http.MethodPatch, reorderRolesPath(serverID), map[string]any{"role_ids": []string{roleID}}, testhelpers.AuthHeaders(token))
 			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var position int
+			require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, roleID).Scan(&position))
+			assert.Equal(t, 1, position)
 		}},
 		{name: "assign role", call: func(t *testing.T, ts *testhelpers.TestServer, _ string, serverID, token string) {
 			member := ts.CreateTestUser(t, "stale-assignment-target")
@@ -284,11 +299,17 @@ func TestRBACAuthorityWritersRejectStaleCredentialEpoch(t *testing.T) {
 			roleID := ts.CreateTestRole(t, serverID, "stale-assignment-role", 1, int64(rbac.PermSendMessages))
 			w := ts.DoRequest(http.MethodPost, assignRolePath(serverID, member.ID), map[string]any{"role_id": roleID}, testhelpers.AuthHeaders(token))
 			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var count int
+			require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`, serverID, member.ID, roleID).Scan(&count))
+			assert.Zero(t, count)
 		}},
 		{name: "category override", call: func(t *testing.T, ts *testhelpers.TestServer, ownerID, serverID, token string) {
 			categoryID := createStaleRBACCategory(t, ts, serverID)
 			w := ts.DoRequest(http.MethodPut, "/api/v1/categories/"+categoryID+"/overrides", rbac.UpsertOverrideRequest{TargetType: "user", TargetID: ownerID, Allow: int64(rbac.PermSendMessages)}, testhelpers.AuthHeaders(token))
 			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var count int
+			require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM category_permission_overrides WHERE category_id = $1`, categoryID).Scan(&count))
+			assert.Zero(t, count)
 		}},
 		{name: "channel override delete", call: func(t *testing.T, ts *testhelpers.TestServer, ownerID, serverID, token string) {
 			channelID := ts.CreateTestChannel(t, serverID, "stale-delete-channel-override")
@@ -319,13 +340,24 @@ func TestRBACAuthorityWritersRejectStaleCredentialEpoch(t *testing.T) {
 			require.NoError(t, err)
 			w := ts.DoRequest(http.MethodPut, "/api/v1/channels/"+channelID+"/permission-sync", map[string]bool{"sync_permissions": true}, testhelpers.AuthHeaders(token))
 			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var synced bool
+			require.NoError(t, ts.DB.QueryRow(`SELECT sync_permissions FROM channels WHERE id = $1`, channelID).Scan(&synced))
+			assert.False(t, synced)
 		}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ts, owner, _, serverID := setupOwnerAndMember(t)
-			test.call(t, ts, owner.ID, serverID, ts.SimulateStaleEpochWindow(t, owner.ID))
+			ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
+			owner := ts.CreateTestUser(t, "epoch-rbac-owner")
+			serverID := ts.CreateTestServer(t, owner.ID, "Epoch RBAC server")
+			require.NoError(t, boundary.Arm(owner.AccessToken))
+			boundary.Hook.ArmArg([]string{`SELECT credential_epoch FROM users WHERE id = $1 FOR SHARE`}, owner.ID, nil, nil)
+			test.call(t, ts, owner.ID, serverID, owner.AccessToken)
+			boundary.RequireRotated(t)
+			seen, hookErr := boundary.Hook.Report()
+			require.NoError(t, hookErr)
+			require.Equal(t, 1, seen, "named RBAC mutation GuardTx must be reached after admitted epoch rotation")
 		})
 	}
 }

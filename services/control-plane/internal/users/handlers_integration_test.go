@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -1825,82 +1825,145 @@ func TestChangePasswordContinuationPairIsNotALivenessGuarantee(t *testing.T) {
 		"a live blocked marker must reject even the epoch this flow just committed")
 }
 
-// bodyWatchingDisconnector samples how much response body had been written at
-// the moment DisconnectUser was called. Ordering is the whole point of the
-// assertion: a client must not be able to observe the 200 before its sockets
-// have been severed.
+// The first response body write is observed through the real Gin writer. SQL
+// checks use the independent pool, so uncommitted terminal evidence cannot pass.
+// This proves authority ordering, not physical closure of remote sockets.
+type credentialTerminalResponseWriter struct {
+	gin.ResponseWriter
+	before  func()
+	checked bool
+}
+
+func (w *credentialTerminalResponseWriter) check() {
+	if !w.checked {
+		w.checked = true
+		w.before()
+	}
+}
+
+func (w *credentialTerminalResponseWriter) Write(body []byte) (int, error) {
+	w.check()
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *credentialTerminalResponseWriter) WriteString(body string) (int, error) {
+	w.check()
+	return w.ResponseWriter.WriteString(body)
+}
+
+// Records exact family fences and proves no credential-wide sweep occurs.
 type bodyWatchingDisconnector struct {
-	recorder      *httptest.ResponseRecorder
-	bodyLenAtCall []int
+	calls    int
+	families []uuid.UUID
 }
 
-func (d *bodyWatchingDisconnector) DisconnectUser(uuid.UUID) {
-	d.bodyLenAtCall = append(d.bodyLenAtCall, d.recorder.Body.Len())
+func (d *bodyWatchingDisconnector) DisconnectUser(uuid.UUID) { d.calls++ }
+
+func (d *bodyWatchingDisconnector) DisconnectFamilyContext(_ context.Context, _, family uuid.UUID) error {
+	d.families = append(d.families, family)
+	return nil
 }
 
-// (d) #2415: BOTH destructive flows enqueue the forced socket teardown BEFORE
-// the response body is written — ChangePassword directly
-// (internal/users/handlers.go:1576-1578) and ReplaceMyKeys through
-// completeKeyReplacementClear (:492-494). The desktop client treats the 200 as
-// the point at which its old sockets are already gone; if the body could be
-// observed first, that assumption would be wrong.
-//
-// Both subtests take the committed path, so ForcedClearCompletion.Outcome is a
-// durable one and RequiresDisconnect() (internal/presencehistory/forced_clear.go)
-// is true — it is FALSE for ForcedClearRolledBack. A "must disconnect exactly
-// once" failure below can therefore mean the flow rolled back and never
-// disconnected at all, not that its ordering changed.
-func TestDestructiveFlowsDisconnectBeforeResponseBody(t *testing.T) {
-	_, wrappedKey, salt := testhelpers.E2EETestKeys()
-	publicKey, replaceWrapped, replaceSalt := testhelpers.E2EETestKeys()
+// liveFamilyIDs snapshots the user's non-terminal families before a mutation.
+func liveFamilyIDs(t *testing.T, ts *testhelpers.TestServer, userID string) []uuid.UUID {
+	t.Helper()
+	rows, err := ts.DB.Query(`SELECT family_id FROM login_families WHERE user_id=$1 AND terminal_at IS NULL`, userID)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	require.NotEmpty(t, ids)
+	return ids
+}
 
-	t.Run("ChangePassword severs sockets before writing its 200", func(t *testing.T) {
-		ts := setupTS(t)
-		user := ts.CreateTestUser(t, "disconnectorderpw")
-		h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
-			testCredFence(t, ts.DB), nil)
+// Snapshot the real predecessor frontier before the mutation, then require every
+// member to be terminal under one actual epoch parent at the response boundary.
+func credentialTerminalCheck(t *testing.T, ts *testhelpers.TestServer, user testhelpers.TestUser) func() {
+	t.Helper()
+	claims, err := auth.ValidateAccessToken(user.AccessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	family := securityFamily(t, ts, user)
+	var frontier int
+	var frontierIDs string
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*), COALESCE(jsonb_agg(family_id ORDER BY family_id), '[]'::jsonb)::text FROM login_families
+		WHERE user_id=$1 AND credential_epoch=$2 AND terminal_at IS NULL`, user.ID, claims.CredentialEpoch).Scan(&frontier, &frontierIDs))
+	require.Positive(t, frontier, "the terminal assertion needs real live predecessor families")
+	return func() {
+		var generation string
+		require.NoError(t, ts.DB.QueryRow(`SELECT epoch_generation FROM login_families
+			WHERE family_id=$1 AND user_id=$2 AND credential_epoch=$3
+			AND terminal_at IS NOT NULL AND auth_operation_id IS NULL`, family, user.ID, claims.CredentialEpoch).Scan(&generation))
+		var exactParent bool
+		require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM credential_epoch_voice_ejections e
+			JOIN users u ON u.id=e.user_id WHERE e.generation=$1 AND e.user_id=$2
+			AND e.superseded_credential_epoch=$3 AND e.credential_epoch=u.credential_epoch
+			AND e.credential_epoch<>e.superseded_credential_epoch)`, generation, user.ID, claims.CredentialEpoch).Scan(&exactParent))
+		require.True(t, exactParent, "terminal family must belong to the committed exact epoch parent")
+		var terminal, total int
+		var terminalIDs string
+		require.NoError(t, ts.DB.QueryRow(`SELECT count(*), COALESCE(jsonb_agg(family_id ORDER BY family_id), '[]'::jsonb)::text,
+			count(*) FILTER (WHERE terminal_at IS NOT NULL
+			AND auth_operation_id IS NULL AND epoch_generation=$3)
+			FROM login_families WHERE user_id=$1 AND credential_epoch=$2`, user.ID, claims.CredentialEpoch, generation).Scan(&total, &terminalIDs, &terminal))
+		require.Equal(t, frontierIDs, terminalIDs, "the exact captured family identities must survive")
+		require.Equal(t, frontier, total, "the predecessor frontier must remain exact")
+		require.Equal(t, frontier, terminal, "every predecessor must commit under the same epoch owner")
+	}
+}
 
-		c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
-			keyCurrentPassword:   user.Password,
-			keyNewPassword:       "DisconnectOrder456!",
-			keyWrappedPrivateKey: wrappedKey,
-			keyKeyDerivationSalt: salt,
+func TestDestructiveFlowsCommitFamilyTerminalBeforeResponseBody(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		name := "ChangePassword"
+		if replace {
+			name = "ReplaceMyKeys"
+		}
+		t.Run(name, func(t *testing.T) {
+			ts := setupTS(t)
+			user := securityUser(t, ts, "terminalorder")
+			h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
+				testCredFence(t, ts.DB), nil)
+			h.SetPresenceHistory(ts.PresenceHistory)
+			publicKey, wrappedKey, salt := testhelpers.E2EETestKeys()
+			payload := map[string]interface{}{
+				keyCurrentPassword:   user.Password,
+				keyWrappedPrivateKey: wrappedKey,
+				keyKeyDerivationSalt: salt,
+				"key_derivation_alg": "argon2id",
+			}
+			if replace {
+				payload["public_key"] = publicKey
+				payload["acknowledge_data_loss"] = true
+			} else {
+				payload[keyNewPassword] = "TerminalOrder456!" // pragma: allowlist secret
+			}
+			c, w := newFenceMissingContext(t, user.ID, payload)
+			checked := &credentialTerminalResponseWriter{ResponseWriter: c.Writer, before: func() {}}
+			assertCommitted := credentialTerminalCheck(t, ts, user)
+			frontier := liveFamilyIDs(t, ts, user.ID)
+			observer := &bodyWatchingDisconnector{}
+			checked.before = func() {
+				require.Zero(t, w.Body.Len())
+				assertCommitted()
+				assert.ElementsMatch(t, frontier, observer.families,
+					"every terminalized family socket must be fenced before the response body")
+			}
+			c.Writer = checked
+			users.SetKeyResetSessionDisconnectorForTest(h, observer)
+			if replace {
+				c.Request.Method = http.MethodPut
+				h.ReplaceMyKeys(c)
+			} else {
+				h.ChangePassword(c)
+			}
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			require.True(t, checked.checked, "committed frontier must be sampled before the response body")
+			assert.NotZero(t, w.Body.Len())
+			assert.Zero(t, observer.calls, "credential mutation must not use the retired broad user sweep")
 		})
-		observer := &bodyWatchingDisconnector{recorder: w}
-		users.SetKeyResetSessionDisconnectorForTest(h, observer)
-
-		h.ChangePassword(c)
-		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.Len(t, observer.bodyLenAtCall, 1, "the flow must disconnect exactly once")
-		assert.Zero(t, observer.bodyLenAtCall[0],
-			"no response body may have been written when DisconnectUser fired")
-		assert.NotZero(t, w.Body.Len(), "the body is written after the disconnect, not never")
-	})
-
-	t.Run("ReplaceMyKeys severs sockets before writing its 200", func(t *testing.T) {
-		ts := setupTS(t)
-		user := ts.CreateTestUser(t, "disconnectorderkeys")
-		h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
-			testCredFence(t, ts.DB), nil)
-		h.SetPresenceHistory(ts.PresenceHistory)
-
-		c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
-			keyCurrentPassword:      user.Password,
-			keyWrappedPrivateKey:    replaceWrapped,
-			keyKeyDerivationSalt:    replaceSalt,
-			"key_derivation_alg":    "argon2id",
-			"public_key":            publicKey,
-			"acknowledge_data_loss": true,
-		})
-		c.Request.Method = http.MethodPut
-		observer := &bodyWatchingDisconnector{recorder: w}
-		users.SetKeyResetSessionDisconnectorForTest(h, observer)
-
-		h.ReplaceMyKeys(c)
-		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.Len(t, observer.bodyLenAtCall, 1, "the flow must disconnect exactly once")
-		assert.Zero(t, observer.bodyLenAtCall[0],
-			"no response body may have been written when DisconnectUser fired")
-		assert.NotZero(t, w.Body.Len(), "the body is written after the disconnect, not never")
-	})
+	}
 }

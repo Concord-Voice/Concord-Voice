@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"math"
@@ -13,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -23,6 +24,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -121,25 +123,56 @@ func TestNightwatchObserverCountsOneControlDecisionOrFallback(t *testing.T) {
 }
 
 func TestNightwatchObserverDoesNotTreatNonCanonicalIdentityObservationAsTerminal(t *testing.T) {
-	db, _ := dbtest.SetupTestDB(t)
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
 	redisServer := miniredis.RunT(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
 
-	const canonical = "0f1e2d3c-4b5a-4968-8776-655443322110"
-	testJWTSecret := rand.Text()
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     middleware.AccessTokenIssuer,
-		"user_id": "{" + canonical + "}",
-		"exp":     time.Now().Add(15 * time.Minute).Unix(),
+	userID := dbtest.CreateUser(t, db)
+	var epoch string
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(credential_epoch,'') FROM users WHERE id=$1`, userID).Scan(&epoch))
+	sid := uuid.New()
+	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{UserID: userID, SID: sid, CredentialEpoch: epoch}, time.Now())
+	require.NoError(t, err)
+	tx, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := tx.Rollback()
+		if err != sql.ErrTxDone {
+			require.NoError(t, err)
+		}
 	})
+	barrier, err := loginfamily.AcquireWriterBarrierTx(t.Context(), tx)
+	require.NoError(t, err)
+	users, err := loginfamily.LockUsersTx(t.Context(), tx, barrier, []uuid.UUID{userID}, loginfamily.UserNoKeyUpdate)
+	require.NoError(t, err)
+	user, err := users.ForUser(userID)
+	require.NoError(t, err)
+	family, err := loginfamily.CreateFamilyTx(t.Context(), tx, user, epoch)
+	require.NoError(t, err)
+	require.NoError(t, loginfamily.BindSIDTx(t.Context(), tx, family, sid, prepared.ExpiresAt()))
+	require.NoError(t, tx.Commit())
+	const testJWTSecret = "observer-family-test-secret"
+	canonicalToken, err := prepared.Sign(testJWTSecret)
+	require.NoError(t, err)
+	token, err := jwt.Parse(canonicalToken, func(*jwt.Token) (any, error) { return []byte(testJWTSecret), nil }, jwt.WithValidMethods([]string{"HS256"}))
+	require.NoError(t, err)
+	claims, ok := token.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+	// Keep every signed authority claim, including the exact committed expiry;
+	// vary only the legacy identity spelling observed by AuthRequired.
+	claims["user_id"] = "{" + userID.String() + "}"
 	encoded, err := token.SignedString([]byte(testJWTSecret))
 	require.NoError(t, err)
 
 	recorder := &eventRecorder{}
 	router := gin.New()
 	router.Use(nightwatchSecurityObserver(recorder))
+	handlerCalls := 0
 	router.POST("/api/v1/servers/:id/bans/:user_id", middleware.AuthRequired(testJWTSecret, redisClient, db, nil), func(c *gin.Context) {
+		handlerCalls++
+		require.Equal(t, userID.String(), c.GetString("user_id"))
 		if c.Query("terminal") == "1" {
 			middleware.MarkNightwatchVerdict(c, middleware.NightwatchVerdict{
 				EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied,
@@ -151,7 +184,10 @@ func TestNightwatchObserverDoesNotTreatNonCanonicalIdentityObservationAsTerminal
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/servers/server-1/bans/user-1", nil)
 	req.Header.Set("Authorization", "Bearer "+encoded)
-	router.ServeHTTP(httptest.NewRecorder(), req)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	require.Equal(t, http.StatusForbidden, response.Code)
+	require.Equal(t, 1, handlerCalls, "identity observation must reach the privileged handler")
 
 	require.Len(t, recorder.events, 2,
 		"a noncanonical identity observation must be emitted before the downstream privileged fallback")
@@ -163,7 +199,10 @@ func TestNightwatchObserverDoesNotTreatNonCanonicalIdentityObservationAsTerminal
 
 	terminalReq := httptest.NewRequest(http.MethodPost, "/api/v1/servers/server-1/bans/user-1?terminal=1", nil)
 	terminalReq.Header.Set("Authorization", "Bearer "+encoded)
-	router.ServeHTTP(httptest.NewRecorder(), terminalReq)
+	terminalResponse := httptest.NewRecorder()
+	router.ServeHTTP(terminalResponse, terminalReq)
+	require.Equal(t, http.StatusForbidden, terminalResponse.Code)
+	require.Equal(t, 2, handlerCalls, "terminal verdict must originate in the privileged handler")
 
 	require.Len(t, recorder.events, 4,
 		"a downstream terminal verdict must follow the identity observation without a coarse fallback duplicate")

@@ -23,6 +23,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -321,7 +322,7 @@ func TestStartManualRotation_RecordsAndBroadcasts(t *testing.T) {
 	owner, serverID, channelID := krSeedServerChannel(t, db)
 	krSeedEpoch(t, db, channelID, owner, 2)
 
-	rotation, err := r.StartManualRotation(context.Background(), channelID, owner, "", nil)
+	rotation, err := r.StartManualRotation(testdb.ActorContext(context.Background(), t, db, owner), channelID, owner, "", nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, rotation)
@@ -373,7 +374,7 @@ func TestStartManualRotation_DoesNotPersistOrBroadcastOnAdmissionError(t *testin
 	krSeedEpoch(t, db, channelID, owner, 2)
 	admissionErr := errors.New("quota exhausted")
 
-	rotation, err := r.StartManualRotation(context.Background(), channelID, owner, "", func(context.Context) error {
+	rotation, err := r.StartManualRotation(testdb.ActorContext(context.Background(), t, db, owner), channelID, owner, "", func(context.Context) error {
 		return admissionErr
 	})
 
@@ -394,7 +395,7 @@ func TestStartManualRotation_DoesNotBroadcastOnRecordError(t *testing.T) {
 	})
 	owner, _, _ := krSeedServerChannel(t, db)
 
-	rotation, err := r.StartManualRotation(context.Background(), uuid.NewString(), owner, "", nil)
+	rotation, err := r.StartManualRotation(testdb.ActorContext(context.Background(), t, db, owner), uuid.NewString(), owner, "", nil)
 
 	require.ErrorContains(t, err, "lock channel for key revocation")
 	assert.Nil(t, rotation)

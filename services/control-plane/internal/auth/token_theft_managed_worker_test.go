@@ -14,7 +14,6 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/alicebob/miniredis/v2/server"
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -67,9 +66,16 @@ func TestStartTokenTheftRecoveryWorker_ManagedFactory(t *testing.T) {
 				return client, openErr
 			}
 			userID := dbtest.CreateUser(t, db)
+			// Keep the authenticated managed pool and owned cleanup factory under
+			// test; mint through production authority on that exact shared client.
+			h := NewHandler(db, shared, logger.New("test"), familyTestSecret, nil)
+			rig := familyTestRig{h: h, db: db, user: userID.String()}
+			var family string
 			seed := func() {
-				_, seedErr := db.Exec(`INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at) VALUES ($1,$2,$3,NOW()+INTERVAL '1 hour')`, uuid.New(), userID, HashRefreshToken("test-managed-worker-session"))
-				require.NoError(t, seedErr)
+				access, refresh, _, mintErr := h.IssueAccessAndRefresh(t.Context(), userID.String())
+				require.NoError(t, mintErr)
+				require.NotEmpty(t, refresh)
+				family, _ = assertFamilyAccess(t, rig, access)
 				require.NoError(t, EnqueueTokenTheftRevocation(t.Context(), db, userID.String()))
 			}
 			if stage == "startup" {
@@ -98,6 +104,15 @@ func TestStartTokenTheftRecoveryWorker_ManagedFactory(t *testing.T) {
 				}
 				return pending == 0 && active == 0
 			}, 5*time.Second, 10*time.Millisecond, "worker must revoke the session and retire its pending row")
+			var terminal bool
+			var reason, revocationScope string
+			require.NoError(t, db.QueryRow(`SELECT f.terminal_at IS NOT NULL,r.reason,r.scope
+				FROM login_families f JOIN login_family_revocations r
+				ON r.operation_id=f.auth_operation_id AND r.user_id=f.user_id
+				WHERE f.family_id=$1 AND f.user_id=$2`, family, userID).Scan(&terminal, &reason, &revocationScope))
+			require.True(t, terminal, "the captured managed session must be terminal before cleanup completes")
+			require.Equal(t, "theft", reason)
+			require.Equal(t, "user", revocationScope)
 			cancel()
 			require.False(t, mini.Exists(middleware.TokenTheftBlockedKey(userID.String())))
 			mu.Lock()

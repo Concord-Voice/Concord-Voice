@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	protocol "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voiceauthprotocol"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/mediaproof"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -115,7 +116,7 @@ func TestVoiceEnforcementReleaseRejectsOversizedBodyBeforeDatabase(t *testing.T)
 	handler := newVoiceEnforcementSessionHandler(openUnqueriedVoiceEnforcementTestDB(t), voiceEnforcementProtocolTestSecret)
 	recorder := serveVoiceEnforcementRequest(t, handler.Release, http.MethodPost,
 		bytes.Repeat([]byte("x"), voiceEnforcementReleaseMaxBodyBytes+1))
-	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code)
 }
 
 func TestVoiceEnforcementReleaseRejectsInvalidProofBeforeDatabase(t *testing.T) {
@@ -125,7 +126,7 @@ func TestVoiceEnforcementReleaseRejectsInvalidProofBeforeDatabase(t *testing.T) 
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/voice/enforcement-sessions", bytes.NewReader(body))
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/internal/voice/enforcement-sessions/release", bytes.NewReader(body))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Request.Header.Set(voiceEnforcementReleaseTimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
 	ctx.Request.Header.Set(voiceEnforcementReleaseProofHeader, strings.Repeat("0", 64))
@@ -134,23 +135,21 @@ func TestVoiceEnforcementReleaseRejectsInvalidProofBeforeDatabase(t *testing.T) 
 	require.Equal(t, http.StatusForbidden, recorder.Code)
 }
 
-func TestVoiceEnforcementRegisterRejectsInvalidServiceProofBeforeDatabase(t *testing.T) {
-	request := validVoiceEnforcementSessionRequest()
-	body, err := json.Marshal(request)
-	require.NoError(t, err)
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/voice/enforcement-sessions", bytes.NewReader(body))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	ctx.Request.Header.Set("Authorization", "Bearer test-token-123")
-	ctx.Request.Header.Set(voiceEnforcementRegistrationTimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
-	ctx.Request.Header.Set(voiceEnforcementRegistrationProofHeader, strings.Repeat("0", 64))
-	ctx.Set("concord_service_hop", true)
-	ctx.Set("user_id", request.UserID)
-	newVoiceEnforcementSessionHandler(openUnqueriedVoiceEnforcementTestDB(t), voiceEnforcementProtocolTestSecret).Register(ctx)
-	ctx.Writer.WriteHeaderNow()
-	require.Equal(t, http.StatusForbidden, recorder.Code)
+func TestVoiceEnforcementRegisterRejectsInvalidServiceProofBeforeRegistration(t *testing.T) {
+	r := newVoiceAuthRig(t)
+	binding := r.register(t)
+	payload := roomBindingFixture(t, r, "channel")
+	wire, _ := r.signed(t, protocol.EndpointRoomRegister, payload, r.token)
+	for i := range wire.Headers {
+		if wire.Headers[i].Name == "X-Concord-Auth-Room-Proof" {
+			wire.Headers[i].Value = strings.Repeat("0", 64)
+		}
+	}
+	w := r.do(wire)
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	require.Equal(t, 0, roomBindingCount(t, r, "voice_enforcement_sessions", payload.SessionGeneration))
+	// The same live family and connection owner succeeds with the real proof.
+	roomBindingAttach(t, r, binding, payload)
 }
 
 type voiceEnforcementRequesterStub struct {
@@ -212,96 +211,44 @@ func signedVoiceEnforcementACK(t *testing.T, request map[string]interface{}, ok 
 	return encoded
 }
 
-func validVoiceEnforcementHealthRequest() voiceEnforcementHealthRequest {
-	return voiceEnforcementHealthRequest{
-		NodeBootID: uuid.MustParse("22222222-2222-4222-8222-222222222222").String(),
-		Nonce:      strings.Repeat("a", 64),
-	}
-}
-
-func signedVoiceEnforcementHealthACK(t *testing.T, request map[string]interface{}, nodeBootID string, ok bool) []byte {
-	t.Helper()
-	challenge, present := request["challenge"].(string)
-	require.True(t, present)
-	timestamp, present := request["timestamp"].(string)
-	require.True(t, present)
-	ack := map[string]interface{}{
-		"version":    2,
-		"kind":       "health",
-		"nodeBootId": nodeBootID,
-		"challenge":  challenge,
-		"timestamp":  timestamp,
-		"ok":         ok,
-	}
-	ack["proof"] = mediaproof.Sign(
-		mediaproof.DeriveKey(voiceEnforcementProtocolTestSecret, "concord/voice-enforcement-session/health/ack/v1"),
-		"v1", timestamp, nodeBootID, challenge, "health", strconv.FormatBool(ok),
-	)
-	encoded, err := json.Marshal(ack)
-	require.NoError(t, err)
-	return encoded
-}
-
-func voiceEnforcementHealthProof(request voiceEnforcementHealthRequest, timestamp, method, uri string) string {
-	return mediaproof.Sign(
-		mediaproof.DeriveKey(voiceEnforcementProtocolTestSecret, voiceEnforcementHealthProofContext),
-		voiceEnforcementHealthProofVersion, timestamp, request.NodeBootID, request.Nonce, method, uri,
-	)
-}
-
 func TestVoiceEnforcementHealthBootstrapTargetsExactBootAndAcceptsSignedACK(t *testing.T) {
-	request := validVoiceEnforcementHealthRequest()
-	body, err := json.Marshal(request)
-	require.NoError(t, err)
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	requester := &voiceEnforcementRequesterStub{}
-	requester.respond = func(payload map[string]interface{}) []byte {
-		return signedVoiceEnforcementHealthACK(t, payload, request.NodeBootID, true)
-	}
-	handler := newVoiceEnforcementSessionHandler(openUnqueriedVoiceEnforcementTestDB(t), voiceEnforcementProtocolTestSecret, requester)
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/internal/voice/enforcement/health", bytes.NewReader(body))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	ctx.Request.Header.Set(voiceEnforcementReleaseTimestampHeader, timestamp)
-	ctx.Request.Header.Set(voiceEnforcementReleaseProofHeader, voiceEnforcementHealthProof(request, timestamp, ctx.Request.Method, ctx.Request.URL.RequestURI()))
-	handler.HealthBootstrap(ctx)
-	ctx.Writer.WriteHeaderNow()
-
-	require.Equal(t, http.StatusNoContent, recorder.Code)
-	require.Equal(t, 1, requester.calls)
-	assert.Equal(t, "voice.enforce.session."+request.NodeBootID, requester.subject)
-	assert.Equal(t, "health", requester.payload["kind"])
-	assert.Equal(t, request.NodeBootID, requester.payload["nodeBootId"])
+	r := newVoiceAuthRigPrepared(t)
+	boot := uuid.NewString()
+	requester := &bootstrapRequester{secret: r.secret, boot: boot}
+	bootstrapInstall(r, newVoiceEnforcementSessionHandler(r.db, r.secret, requester))
+	wire, request := bootstrapWire(t, r, boot)
+	w := r.do(wire)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	response := r.verify(t, protocol.EndpointHealthBootstrap, w, request, protocol.ExpectedResponse{})
+	result, ok := response.HealthBootstrap()
+	require.True(t, ok)
+	require.Equal(t, protocol.HealthBootstrapResult{Version: 1, VoiceEnforcementProtocol: 4, NodeBootID: boot, Activation: "prepared", TransportOK: true, AdmissionGranted: false}, result)
+	require.EqualValues(t, 1, requester.calls.Load())
 }
 
 func TestVoiceEnforcementHealthBootstrapRejectsInvalidHMACWithoutRequesting(t *testing.T) {
-	request := validVoiceEnforcementHealthRequest()
-	body, err := json.Marshal(request)
-	require.NoError(t, err)
-	for _, tc := range []struct {
-		name  string
-		proof string
-	}{
-		{name: "missing proof"},
-		{name: "invalid proof", proof: strings.Repeat("0", 64)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			requester := &voiceEnforcementRequesterStub{}
-			handler := newVoiceEnforcementSessionHandler(openUnqueriedVoiceEnforcementTestDB(t), voiceEnforcementProtocolTestSecret, requester)
-			gin.SetMode(gin.TestMode)
-			recorder := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/internal/voice/enforcement/health", bytes.NewReader(body))
-			ctx.Request.Header.Set("Content-Type", "application/json")
-			ctx.Request.Header.Set(voiceEnforcementReleaseTimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
-			ctx.Request.Header.Set(voiceEnforcementReleaseProofHeader, tc.proof)
-			handler.HealthBootstrap(ctx)
-			ctx.Writer.WriteHeaderNow()
-
-			require.Equal(t, http.StatusForbidden, recorder.Code)
-			assert.Zero(t, requester.calls)
+	for _, missing := range []bool{true, false} {
+		name := "invalid proof"
+		if missing {
+			name = "missing proof"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := newVoiceAuthRigPrepared(t)
+			boot := uuid.NewString()
+			requester := &bootstrapRequester{secret: r.secret, boot: boot}
+			bootstrapInstall(r, newVoiceEnforcementSessionHandler(r.db, r.secret, requester))
+			wire, _ := bootstrapWire(t, r, boot)
+			for i := range wire.Headers {
+				if strings.HasSuffix(wire.Headers[i].Name, "-Proof") {
+					wire.Headers[i].Value = strings.Repeat("0", 64)
+					if missing {
+						wire.Headers[i].Value = ""
+					}
+				}
+			}
+			w := r.do(wire)
+			require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+			require.Zero(t, requester.calls.Load())
 		})
 	}
 }
@@ -309,59 +256,58 @@ func TestVoiceEnforcementHealthBootstrapRejectsInvalidHMACWithoutRequesting(t *t
 func TestVoiceEnforcementHealthBootstrapRejectsMalformedBodies(t *testing.T) {
 	requester := &voiceEnforcementRequesterStub{}
 	handler := newVoiceEnforcementSessionHandler(openUnqueriedVoiceEnforcementTestDB(t), voiceEnforcementProtocolTestSecret, requester)
-	request := validVoiceEnforcementHealthRequest()
-	validBody, err := json.Marshal(request)
-	require.NoError(t, err)
 	for _, tc := range []struct {
 		name string
 		body []byte
 		code int
 	}{
-		{name: "oversized", body: bytes.Repeat([]byte("x"), voiceEnforcementReleaseMaxBodyBytes+1), code: http.StatusRequestEntityTooLarge},
-		{name: "trailing JSON", body: append(append([]byte(nil), validBody...), []byte(`{"extra":true}`)...), code: http.StatusBadRequest},
+		{"oversized", bytes.Repeat([]byte("x"), voiceEnforcementReleaseMaxBodyBytes+1), http.StatusRequestEntityTooLarge},
+		{"trailing JSON", []byte(`{"version":1,"nodeBootId":"22222222-2222-4222-8222-222222222222","nonce":"` + strings.Repeat("a", 64) + `"}{"extra":true}`), http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			recorder := serveVoiceEnforcementRequest(t, handler.HealthBootstrap, http.MethodPost, tc.body)
-			require.Equal(t, tc.code, recorder.Code)
+			w := serveVoiceEnforcementRequest(t, handler.HealthBootstrap, http.MethodPost, tc.body)
+			require.Equal(t, tc.code, w.Code)
 		})
 	}
-	assert.Zero(t, requester.calls)
+	require.Zero(t, requester.calls)
 }
 
 func TestVoiceEnforcementHealthBootstrapRejectsBadAcknowledgements(t *testing.T) {
-	request := validVoiceEnforcementHealthRequest()
-	body, err := json.Marshal(request)
-	require.NoError(t, err)
-	for _, tc := range []struct {
-		name    string
-		respond func(*testing.T, map[string]interface{}) []byte
-	}{
-		{name: "malformed", respond: func(*testing.T, map[string]interface{}) []byte { return []byte("{") }},
-		{name: "wrong node", respond: func(t *testing.T, payload map[string]interface{}) []byte {
-			return signedVoiceEnforcementHealthACK(t, payload, uuid.MustParse("99999999-9999-4999-8999-999999999999").String(), true)
-		}},
-		{name: "negative acknowledgement", respond: func(t *testing.T, payload map[string]interface{}) []byte {
-			return signedVoiceEnforcementHealthACK(t, payload, request.NodeBootID, false)
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			requester := &voiceEnforcementRequesterStub{respond: func(payload map[string]interface{}) []byte {
-				return tc.respond(t, payload)
+	for _, variant := range []string{"malformed", "wrong boot", "wrong challenge", "request error", "negative acknowledgement", "legacy acknowledgement"} {
+		t.Run(variant, func(t *testing.T) {
+			r := newVoiceAuthRigPrepared(t)
+			boot := uuid.NewString()
+			requester := &bootstrapRequester{secret: r.secret, boot: boot, respond: func(_ context.Context, command protocol.Command) ([]byte, error) {
+				switch variant {
+				case "malformed":
+					return []byte("{"), nil
+				case "request error":
+					return nil, errors.New("request failed")
+				case "negative acknowledgement":
+					ack, err := protocol.SignHealthACK(command, false, []byte(r.secret))
+					return bytes.Replace(ack, []byte(`"transportOK":true`), []byte(`"transportOK":false`), 1), err
+				case "legacy acknowledgement":
+					return []byte(`{"version":2,"kind":"health","ok":true}`), nil
+				}
+				h, ok := command.Health()
+				require.True(t, ok)
+				if variant == "wrong boot" {
+					h.NodeBootID = uuid.NewString()
+				} else {
+					h.Challenge = strings.Repeat("b", 64)
+				}
+				other, err := protocol.NewHealthCommand(h.NodeBootID, h.Challenge, h.Activation, h.AdmissionAllowed, h.Timestamp)
+				require.NoError(t, err)
+				return protocol.SignHealthACK(other, false, []byte(r.secret))
 			}}
-			handler := newVoiceEnforcementSessionHandler(openUnqueriedVoiceEnforcementTestDB(t), voiceEnforcementProtocolTestSecret, requester)
-			timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-			gin.SetMode(gin.TestMode)
-			recorder := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/internal/voice/enforcement/health", bytes.NewReader(body))
-			ctx.Request.Header.Set("Content-Type", "application/json")
-			ctx.Request.Header.Set(voiceEnforcementReleaseTimestampHeader, timestamp)
-			ctx.Request.Header.Set(voiceEnforcementReleaseProofHeader, voiceEnforcementHealthProof(request, timestamp, ctx.Request.Method, ctx.Request.URL.RequestURI()))
-			handler.HealthBootstrap(ctx)
-			ctx.Writer.WriteHeaderNow()
-
-			require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-			require.Equal(t, 1, requester.calls)
+			bootstrapInstall(r, newVoiceEnforcementSessionHandler(r.db, r.secret, requester))
+			wire, _ := bootstrapWire(t, r, boot)
+			w := r.do(wire)
+			require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+			require.EqualValues(t, 1, requester.calls.Load())
+			var count int
+			require.NoError(t, r.db.QueryRow(`SELECT count(*) FROM voice_auth_boot_fences WHERE node_boot_id=$1`, boot).Scan(&count))
+			require.Zero(t, count)
 		})
 	}
 }

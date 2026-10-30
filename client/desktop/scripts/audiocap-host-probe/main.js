@@ -25,6 +25,8 @@
 'use strict';
 
 const { app } = require('electron');
+const probeProfile = process.argv.find((arg) => arg.startsWith('--probe-profile='));
+if (probeProfile) app.setPath('userData', probeProfile.slice('--probe-profile='.length));
 const path = require('node:path');
 const { createRequire } = require('node:module');
 

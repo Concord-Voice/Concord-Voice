@@ -594,6 +594,7 @@ managed_egress_reconcile() {
 # Reconcile every namespace mutation, including a partially failed Compose
 # operation. Health waits run only after the new namespaces have been admitted.
 managed_compose_mutate() (
+  voice_enforcement_rollout_guard_mutation "$@" || return 1
   cd "$DEPLOY_DIR" || return
   local mode command wait=0 wait_timeout=180 result=0 ids id states state health deadline
   local -a original=("$@") args=() services=() containers=()
@@ -676,6 +677,7 @@ managed_compose_build() (
   local mode image metadata
   mode="$(managed_egress_mode)" || return 1
   if [[ "$mode" == direct ]]; then
+    voice_enforcement_rollout_guard_mutation "$@" || return 1
     $COMPOSE_CMD "$@"
     return
   fi
@@ -704,6 +706,9 @@ control_plane_cli() (
   fi
   managed_egress_gate verify || return 1
   running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q control-plane)" || return 1
+  if [[ "${1:-}" == voice-enforcement-rollout ]]; then
+    running=''
+  fi
   temporary=''
   if [[ -z "$running" ]]; then
     temporary="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD run --rm --detach --no-deps --pull never \
@@ -715,7 +720,7 @@ control_plane_cli() (
   fi
   managed_egress_gate verify || return 1
   if [[ -n "$temporary" ]]; then
-    docker exec "$temporary" ./main "$@"
+    docker exec -i "$temporary" ./main "$@"
   else
     cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T control-plane ./main "$@"
   fi
@@ -2134,6 +2139,7 @@ activity_history_rollback() {
   activity_history_parse_rollback_args "$@" || return $?
   old_image="$ACTIVITY_HISTORY_ROLLBACK_OLD_IMAGE"
   [[ $ACTIVITY_HISTORY_ROLLBACK_DOWNGRADE -eq 1 ]] && requested=true
+  # Validate arguments before the status probe starts any container.
   if [[ "$old_image" == *[[:space:]]* \
      || ! "$old_image" =~ ^(sha256:[[:xdigit:]]{64}|.+@sha256:[[:xdigit:]]{64})$ ]]; then
     echo "activity-history: --old-image must be an immutable sha256 digest reference" >&2
@@ -2175,6 +2181,8 @@ activity_history_rollback() {
       echo "activity-history: rollback retry requires zero running control-plane containers" >&2
       return 1
     fi
+    # The status probe starts a container, so it follows every static refusal.
+    voice_enforcement_rollout_require_inactive_current_image || return 1
     voice_enforcement_rollout_stop_media || return 1
     voice_enforcement_rollout_require_rollback_zero_state || return 1
     voice_enforcement_rollout_require_inactive_current_image || return 1
@@ -2193,6 +2201,8 @@ activity_history_rollback() {
   # The currently rendered image contains the administrative subcommands used
   # while the service is drained. Refuse before stopping if it is unavailable.
   activity_history_image_is_local "$ACTIVITY_HISTORY_RENDERED_IMAGE" || return 1
+  # The status probe starts a container, so it follows every static refusal.
+  voice_enforcement_rollout_require_inactive_current_image || return 1
   echo "Activity History rollback: stopping/verifying local media, proving voice zero-state, deactivating durable enforcement, then stopping CP with a 45s drain, disabling durable state, journaling optional exact downgrade, selecting the pinned old image, and requiring one healthy CP."
   voice_enforcement_rollout_stop_media || return 1
   voice_enforcement_rollout_require_rollback_zero_state || return 1
@@ -2370,7 +2380,7 @@ voice_enforcement_rollout_cli() {
   local verb="$1"
   shift
   case "$verb" in
-    activate|deactivate|status) ;;
+    activate|deactivate|status|retire-boot|verify-retired-boot) ;;
     *)
       echo "voice-enforcement-rollout: invalid CLI verb '$verb'" >&2
       return 2
@@ -2379,61 +2389,309 @@ voice_enforcement_rollout_cli() {
   control_plane_cli voice-enforcement-rollout "$verb" "$@"
 }
 
+# Always resolve the privileged observer through the current selected source
+# image, even when a resumable Activity History checkpoint pins an older one.
+voice_enforcement_rollout_status() (
+  unset CONTROL_PLANE_IMAGE
+  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
+    selfhost_storage_select_image '' || return 1
+  fi
+  local observed
+  observed="$(voice_enforcement_rollout_cli status --json)" || return 1
+  printf '%s' "$observed" | python3 "$SCRIPT_DIR/voice-boot-containment.py" status "$@"
+)
+
 voice_enforcement_rollout_deactivate_for_rollback() {
-  if ! voice_enforcement_rollout_cli deactivate; then
-    echo "activity-history: unable to deactivate voice enforcement with the current control-plane; refusing old-image rollback" >&2
+  local activation
+  activation="$(voice_enforcement_rollout_status --field familyActivation)" || {
+    echo 'activity-history: unable to read voice-enforcement status with the current control-plane; refusing old-image rollback' >&2
+    return 1
+  }
+  if [[ "$activation" != prepared ]]; then
+    echo 'activity-history: immutable active family floor refuses older-image rollback' >&2
     return 1
   fi
+  voice_enforcement_rollout_cli deactivate || {
+    echo 'activity-history: unable to deactivate voice enforcement with the current control-plane; refusing old-image rollback' >&2
+    return 1
+  }
 }
 
 voice_enforcement_rollout_require_inactive_current_image() {
-  local status
-  # A resumable rollback has no current CP container left to execute the
-  # command. Do not run the status probe through the pinned old image: an old
-  # binary may not contain this CLI. Unsetting the selector makes Compose
-  # resolve the current image from the canonical environment instead.
-  if ! status="$(unset CONTROL_PLANE_IMAGE
-    if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
-      selfhost_storage_select_image '' || exit 1
-    fi
-    voice_enforcement_rollout_cli status 2>&1)"; then
-    echo "activity-history: unable to verify inactive voice enforcement with the current control-plane; refusing old-image rollback" >&2
+  local activation
+  activation="$(voice_enforcement_rollout_status --field familyActivation)" || {
+    echo 'activity-history: unable to verify inactive voice enforcement with the current control-plane; refusing old-image rollback' >&2
     return 1
-  fi
-  if [[ "$status" != *"voice-enforcement-rollout: inactive"* ]]; then
-    echo "activity-history: voice enforcement is not inactive; refusing old-image rollback" >&2
+  }
+  [[ "$activation" == prepared ]] || {
+    echo 'activity-history: immutable active family floor refuses older-image rollback' >&2
     return 1
-  fi
+  }
 }
 
 voice_enforcement_rollout_require_rollback_zero_state() {
-  local status evidence
-  # The current image must attest every durable obligation before an old CP
-  # can start. Shell SQL is intentionally forbidden here; absent evidence is
-  # a refusal, not an invitation to guess from worker health.
-  if ! status="$(unset CONTROL_PLANE_IMAGE
-    if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
-      selfhost_storage_select_image '' || exit 1
-    fi
-    voice_enforcement_rollout_cli status 2>&1)"; then
-    echo "activity-history: unable to obtain current-image voice-enforcement zero-state evidence; refusing old-image rollback" >&2
+  # Retained closures/retired fences are proof, not live liabilities. Never
+  # substitute an inactive substring or a failed observation for exact counts.
+  voice_enforcement_rollout_status --drained >/dev/null || {
+    echo 'activity-history: current-image voice-enforcement zero-state evidence is missing or nonzero; refusing old-image rollback' >&2
     return 1
-  fi
-  for evidence in registryRows=0 dmParentRows=0 credentialParentRows=0 dmReconciliationRows=0; do
-    if [[ "$status" != *"voice-enforcement-rollout: $evidence"* ]]; then
-      echo "activity-history: current-image status did not attest $evidence; refusing old-image rollback" >&2
-      return 1
-    fi
-  done
-  echo "activity-history: current-image registry/outbox/reconciliation zero-state verified; rollback evidence is single-host only (multi-host media is unsupported)"
+  }
+  echo 'activity-history: current-image voice-enforcement zero-state verified; rollback evidence is single-host only (multi-host media is unsupported)'
 }
 
-voice_enforcement_rollout_activate() {
-  # The application requires this operator receipt.  This helper is private
-  # to the ordered rollout paths below and is called only after old-media
-  # stop/verification and the replacement media protocol gate have passed.
-  voice_enforcement_rollout_cli activate --confirm-drained
+# These are private per-invocation state, initialized here rather than accepted
+# from the caller's environment. The deploy lock spans their entire lifetime.
+VOICE_RESTART_AUTH_FD=''
+VOICE_RETIRING_CONTAINER=''
+VOICE_NEVER_STARTED_CANDIDATES=''
+
+# A controlled --no-start create has no predecessor boot to retire. Bind its
+# immutable identity separately from retired boots, and only admit first start
+# while the exact candidate is still provably never started.
+voice_enforcement_rollout_created_identity() {
+  local project="$1" slot="$2" id="$3" inspected
+  inspected="$(docker inspect --type container --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Created":{{json .Created}},"RestartCount":{{json .RestartCount}},"State":{"Status":{{json .State.Status}},"Running":{{json .State.Running}},"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}},"Dead":{{json .State.Dead}},"Pid":{{json .State.Pid}},"StartedAt":{{json .State.StartedAt}},"FinishedAt":{{json .State.FinishedAt}}},"Labels":{"project":{{json (index .Config.Labels "com.docker.compose.project")}},"service":{{json (index .Config.Labels "com.docker.compose.service")}}}}' "$id")" || return 1
+  [[ ${#inspected} -le 4096 ]] || return 1
+  python3 -c '
+import json,re,sys
+def strict_object(pairs):
+    result={}
+    for key,value in pairs:
+        if key in result: raise ValueError()
+        result[key]=value
+    return result
+try:
+    c=json.load(sys.stdin,object_pairs_hook=strict_object)
+    project,slot,cid=sys.argv[1:]
+    if set(c)!={"Id","Image","Created","RestartCount","State","Labels"}: raise ValueError()
+    if c["Id"]!=cid or not re.fullmatch(r"[0-9a-f]{64}",cid): raise ValueError()
+    if c["Labels"]!={"project":project,"service":slot}: raise ValueError()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}",c["Image"]): raise ValueError()
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",c["Created"]): raise ValueError()
+    if type(c["RestartCount"]) is not int or c["RestartCount"]!=0: raise ValueError()
+    state=c["State"]
+    if type(state["Pid"]) is not int or any(type(state[k]) is not bool for k in ("Running","Paused","Restarting","Dead")): raise ValueError()
+    if state!={"Status":"created","Running":False,"Paused":False,"Restarting":False,"Dead":False,"Pid":0,
+               "StartedAt":"0001-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}: raise ValueError()
+    print(json.dumps([project,slot,cid,c["Image"],c["Created"]],separators=(",",":")))
+except (KeyError,TypeError,ValueError,RecursionError):
+    raise SystemExit(1)
+' "$project" "$slot" "$id" <<<"$inspected"
 }
+
+voice_enforcement_rollout_bind_created() {
+  local slot="$1" inventory project id identity
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  case "$slot" in
+    control-plane) ;;
+    media-plane|media-plane-blue|media-plane-green)
+      [[ $'\n'"${inventory#*$'\n'}"$'\n' == *$'\n'"$slot"$'\n'* ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  id="$(voice_enforcement_rollout_slot_id "$project" "$slot")" || return 1
+  identity="$(voice_enforcement_rollout_created_identity "$project" "$slot" "$id")" || return 1
+  VOICE_NEVER_STARTED_CANDIDATES+=$'\n'"$identity"$'\n'
+}
+
+voice_enforcement_rollout_retire_named() {
+  local slot="$1" inventory project configured found=0 id
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  while IFS= read -r configured; do
+    [[ "$configured" != "$slot" ]] || found=1
+  done <<<"${inventory#*$'\n'}"
+  [[ "$found" -eq 1 ]] || return 1
+  id="$(voice_enforcement_rollout_slot_id "$project" "$slot")" || return 1
+  voice_enforcement_rollout_retire_slot "$project" "$slot" || return 1
+}
+
+# A successful SQL observation is always made with the current admitted image.
+voice_enforcement_rollout_verify_retired() (
+  unset CONTROL_PLANE_IMAGE
+  if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
+    selfhost_storage_select_image '' || return 1
+  fi
+  voice_enforcement_rollout_cli verify-retired-boot --node-boot-id "$1"
+)
+
+voice_enforcement_rollout_association() {
+  local operation="$1" project="$2" slot="$3"
+  shift 3
+  python3 "$SCRIPT_DIR/voice-boot-containment.py" "$operation" \
+    --lock-path "$DEPLOY_TRANSACTION_LOCK_PATH" --compose-project "$project" --slot "$slot" "$@" || {
+    if [[ "$operation" == association-state ]]; then
+      echo 'voice-enforcement-rollout: restart state unavailable or unsafe; install the trusted provisioning boundary before lifecycle operations' >&2
+    fi
+    return 1
+  }
+}
+
+voice_enforcement_rollout_read_retired() {
+  local project="$1" slot="$2" id="$3" record boot
+  shift 3
+  record="$(voice_enforcement_rollout_association association-read "$project" "$slot" --container-id "$id" "$@")" || return 1
+  boot="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["nodeBootId"])' <<<"$record")" || return 1
+  voice_enforcement_rollout_verify_retired "$boot" >/dev/null || return 1
+  printf '%s\n' "$record"
+}
+
+voice_enforcement_rollout_guard_mutation() {
+  local command="${1:-}" token inventory project slot ids id identity record selected all=0 i
+  local -a named=() records=() record_slots=() record_ids=() allow_dead=()
+  case "$command" in
+    up|start|restart|stop|down|rm|kill) ;;
+    *) return 0 ;;
+  esac
+  shift
+  while (( $# )); do
+    case "$1" in
+      --wait-timeout|--pull|--timeout|-t|--scale|--attach|--no-attach|--exit-code-from)
+        [[ $# -ge 2 ]] || return 1
+        shift 2 ;;
+      --) shift; named+=("$@"); break ;;
+      -*) shift ;;
+      *) named+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#named[@]} -gt 0 ]] || all=1
+  selected=0
+  for token in "${named[@]}"; do
+    case "$token" in
+      media-plane|media-plane-blue|media-plane-green) selected=1 ;;
+    esac
+  done
+  (( all || selected )) || return 0
+  case "$command" in
+    up|down|rm) allow_dead=(--allow-dead) ;;
+  esac
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  while IFS= read -r slot; do
+    selected="$all"
+    for token in "${named[@]}"; do
+      [[ "$token" != "$slot" ]] || selected=1
+    done
+    (( selected )) || continue
+    ids="$(docker ps -a --no-trunc --filter "label=com.docker.compose.project=$project" \
+      --filter "label=com.docker.compose.service=$slot" --format '{{.ID}}')" || return 1
+    [[ -n "$ids" ]] || continue
+    [[ "$ids" =~ ^[0-9a-f]{64}$ ]] || return 1
+    id="$ids"
+    if [[ "$command" == stop && "$id" == "$VOICE_RETIRING_CONTAINER" ]]; then
+      continue
+    fi
+    if [[ "$command" == start && "$all" -eq 0 ]] \
+      && identity="$(voice_enforcement_rollout_created_identity "$project" "$slot" "$id")" \
+      && [[ "$VOICE_NEVER_STARTED_CANDIDATES" == *$'\n'"$identity"$'\n'* ]]; then
+      voice_enforcement_rollout_association association-invalidate "$project" "$slot" || return 1
+      continue
+    fi
+    # Reading this anonymous pipe spends the capability in every shell copy.
+    # It is issued only after durable consumption before a managed CP start.
+    if [[ -n "$VOICE_RESTART_AUTH_FD" ]]; then
+      [[ "$command" == start && "$all" -eq 0 && ${#named[@]} -eq 1 ]] || return 1
+      IFS= read -r -t 1 record <&"$VOICE_RESTART_AUTH_FD" || return 1
+      printf '%s' "$record" | python3 "$SCRIPT_DIR/voice-boot-containment.py" association-match \
+        --compose-project "$project" --slot "$slot" --container-id "$id" || return 1
+      continue
+    fi
+    record="$(voice_enforcement_rollout_read_retired "$project" "$slot" "$id" "${allow_dead[@]}")" || {
+      echo "voice-enforcement-rollout: $slot lacks its exact retired association; refusing $command" >&2
+      return 1
+    }
+    records+=("$record"); record_slots+=("$slot"); record_ids+=("$id")
+  done <<<"${inventory#*$'\n'}"
+  # Check every selected slot before consuming any, and consume all before the
+  # first runtime mutation. Stop-only inspection retains the durable records.
+  if [[ "$command" != stop ]]; then
+    for (( i=0; i<${#records[@]}; i++ )); do
+      voice_enforcement_rollout_association association-consume "$project" "${record_slots[i]}" \
+        --container-id "${record_ids[i]}" "${allow_dead[@]}" <<<"${records[i]}" || return 1
+    done
+  fi
+}
+
+voice_enforcement_rollout_inventory() {
+  local rendered
+  rendered="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD config --format json)" || return 1
+  printf '%s' "$rendered" | python3 "$SCRIPT_DIR/voice-boot-containment.py" inventory
+}
+
+voice_enforcement_rollout_slot_id() {
+  local project="$1" slot="$2" ids
+  ids="$(docker ps -a --no-trunc --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.service=$slot" --format '{{.ID}}')" || return 1
+  [[ "$ids" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$ids"
+}
+
+# An optional second argument limits the probe to that one configured slot.
+voice_enforcement_rollout_probe_slots() {
+  local inventory project slot id observed expected active='' only="${2:-}"
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  if [[ "${1:-either}" == productive && "${inventory#*$'\n'}" != media-plane ]]; then
+    active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+    [[ -n "$active" ]] || active=blue
+    [[ "$active" == blue || "$active" == green ]] || return 1
+  fi
+  while IFS= read -r slot; do
+    [[ -n "$slot" ]] || continue
+    [[ -z "$only" || "$slot" == "$only" ]] || continue
+    expected="${1:-either}"
+    if [[ "$expected" == productive ]]; then
+      expected=either
+      [[ "$slot" != media-plane && "$slot" != "media-plane-$active" ]] || expected=true
+    fi
+    id="$(voice_enforcement_rollout_slot_id "$project" "$slot")" || return 1
+    observed="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" probe-container \
+      --container-id "$id" --slot "$slot" --compose-project "$project" --grant "$expected")" || return 1
+    [[ -n "$observed" ]] || return 1
+  done <<<"${inventory#*$'\n'}"
+}
+
+voice_enforcement_rollout_activate() (
+  local status activation inventory project slot id observed boot image artifact control_id control_image control_artifact receipt
+  local -a evidence=()
+  status="$(voice_enforcement_rollout_status)" || return 1
+  activation="$(printf '%s' "$status" | python3 "$SCRIPT_DIR/voice-boot-containment.py" status --field familyActivation)" || return 1
+  if [[ "$activation" == active ]]; then
+    # Maintenance reproves capability and preserves the first committed receipt.
+    voice_enforcement_rollout_probe_slots either
+    return
+  fi
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  control_id="$(docker ps --no-trunc --filter "label=com.docker.compose.project=$project" \
+    --filter label=com.docker.compose.service=control-plane --format '{{.ID}}')" || return 1
+  [[ "$control_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  control_image="$(docker inspect --format '{{.Image}}' "$control_id")" || return 1
+  control_artifact="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" image-artifact "$control_image")" || return 1
+  while IFS= read -r slot; do
+    [[ -n "$slot" ]] || continue
+    id="$(voice_enforcement_rollout_slot_id "$project" "$slot")" || return 1
+    observed="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" probe-container \
+      --container-id "$id" --slot "$slot" --compose-project "$project" --grant false)" || return 1
+    boot="${observed%%$'\n'*}"; image="${observed#*$'\n'}"
+    artifact="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" image-artifact "$image")" || return 1
+    [[ "$(docker inspect --format '{{.Image}}' "$id")" == "$image" ]] || return 1
+    evidence+=(--slot "$slot" "$artifact" "$boot")
+  done <<<"${inventory#*$'\n'}"
+  [[ "$(docker inspect --format '{{.Image}}' "$control_id")" == "$control_image" ]] || return 1
+  receipt="$(mktemp)" || return 1
+  trap 'rm -f -- "$receipt"' EXIT
+  # Legacy SID normalization belongs to the serialized CP transaction. All
+  # other live/pending counts must already be zero; retained proof is copied.
+  status="$(voice_enforcement_rollout_status)" || return 1
+  printf '%s' "$status" | python3 "$SCRIPT_DIR/voice-boot-containment.py" receipt \
+    --control-plane-artifact "$control_artifact" "${evidence[@]}" >"$receipt" || return 1
+  # /dev/stdin is the receipt-file path inside either the maintenance container
+  # or the actual current-image exec. The private host tempfile is never guessed
+  # to exist in another filesystem and contains only the frozen receipt schema.
+  voice_enforcement_rollout_cli activate --confirm-drained --receipt-file /dev/stdin <"$receipt" || return 1
+  [[ "$(voice_enforcement_rollout_status --field familyActivation)" == active ]]
+)
 
 voice_enforcement_rollout_wait_control_plane() {
   local timeout="${VOICE_ENFORCEMENT_HEALTH_TIMEOUT:-180}"
@@ -2458,53 +2716,127 @@ voice_enforcement_rollout_wait_control_plane() {
 }
 
 voice_enforcement_rollout_wait_media() {
-  local timeout="${VOICE_ENFORCEMENT_HEALTH_TIMEOUT:-180}"
-  local deadline body status
-  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || {
-    echo "voice-enforcement-rollout: health timeout must be a positive integer" >&2
-    return 1
-  }
-  body="$(mktemp)"
+  local timeout="${VOICE_ENFORCEMENT_HEALTH_TIMEOUT:-180}" deadline
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || return 1
   deadline=$(( $(date +%s) + timeout ))
-  while :; do  # probe before the deadline test; see voice_enforcement_rollout_wait_control_plane
-    : >"$body"
-    status="$(curl -sS --max-time 2 -o "$body" -w '%{http_code}' \
-      http://127.0.0.1:3000/readyz 2>/dev/null || true)"
-    if [[ "$status" == 200 ]] && python3 -c '
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as stream:
-        value = json.load(stream)
-except (OSError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(0 if isinstance(value, dict) and value.get("ready") is True
-                 and value.get("voiceEnforcementProtocol") == 3 else 1)
-' "$body"; then
-      rm -f "$body"
-      return 0
-    fi
+  while :; do
+    voice_enforcement_rollout_probe_slots "${1:-either}" && return 0
     (( $(date +%s) < deadline )) || break
     sleep 2
   done
-  rm -f "$body"
-  echo "voice-enforcement-rollout: media-plane did not advertise protocol 3 readiness" >&2
+  echo 'voice-enforcement-rollout: every configured slot must prove protocol 4 transport' >&2
   return 1
 }
 
+voice_enforcement_rollout_retire_slot() (
+  local project="$1" slot="$2" id boot capture_read capture_write capture_pid rc=0 value state record
+  local -a evidence=()
+  id="$(voice_enforcement_rollout_slot_id "$project" "$slot")" || {
+    echo 'voice-enforcement-rollout: absent or ambiguous predecessor association' >&2
+    return 1
+  }
+  voice_enforcement_rollout_association association-state "$project" "$slot" || return 1
+  state="$(docker inspect --type container --format '{{.State.Status}}' "$id")" || return 1
+  if [[ "$state" != running ]]; then
+    # Truthful stopped history can only use the durable consumer; never capture
+    # a new boot or reconstruct physical authority after its owner was lost.
+    voice_enforcement_rollout_read_retired "$project" "$slot" "$id" --allow-dead >/dev/null
+    return
+  fi
+  # One live owner retains its actual kernel descriptors across stop and the
+  # CP commit. No pathname/inode/argv reconstruction can stand in for this.
+  coproc VOICE_BOOT_CAPTURE { python3 "$SCRIPT_DIR/voice-boot-containment.py" hold-container \
+    --container-id "$id" --slot "$slot" --compose-project "$project" --timeout-seconds 45 \
+    --lock-path "$DEPLOY_TRANSACTION_LOCK_PATH"; }
+  capture_read="${VOICE_BOOT_CAPTURE[0]}"; capture_write="${VOICE_BOOT_CAPTURE[1]}"; capture_pid="$VOICE_BOOT_CAPTURE_PID"
+  trap 'exec {capture_write}>&-; exec {capture_read}<&-; kill "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+  IFS= read -r -t 10 boot <&"$capture_read" || {
+    echo "voice-enforcement-rollout: $slot has no retirement route; refusing before stop (media left running)" >&2
+    return 1
+  }
+  [[ "$boot" =~ ^[0-9a-f-]{36}$ ]] || return 1
+  VOICE_RETIRING_CONTAINER="$id"
+  (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 "$slot") || return 1
+  voice_enforcement_rollout_verify_retired "$boot" || rc=$?
+  case "$rc" in
+    0) ;;
+    3)
+      printf 'verify-stopped\n' >&"$capture_write" || return 1
+      for (( rc=0; rc<12; rc++ )); do
+        IFS= read -r -t 10 value <&"$capture_read" || return 1
+        evidence+=("$value")
+      done
+      voice_enforcement_rollout_cli retire-boot "${evidence[@]}" || return 1
+      voice_enforcement_rollout_verify_retired "$boot" || return 1
+      ;;
+    *) echo 'voice-enforcement-rollout: retired-boot observation failed' >&2; return 1 ;;
+  esac
+  printf 'publish-stopped\n' >&"$capture_write" || return 1
+  IFS= read -r -t 10 record <&"$capture_read" || return 1
+  [[ ${#record} -le 4096 ]] || return 1
+  printf 'release\n' >&"$capture_write" || return 1
+  exec {capture_write}>&-
+  wait "$capture_pid" || return 1
+  exec {capture_read}<&-
+  trap - EXIT
+)
+
+# No-mutation retirement preflight (#2272). Stopping a running slot is safe only
+# when the stop can end in a published association: the boot commits its own
+# protocol-4 fence during shutdown, or this controller holds the host-root
+# capture the physical fallback needs. A protocol-3 predecessor reached through
+# the non-root CD account has neither, and a stopped slot without an association
+# can never be restarted, so every configured slot is checked before any stop.
+# hold-container rechecks the same route, so a change after this check still
+# refuses before its own stop.
+voice_enforcement_rollout_preflight_slot() {
+  local project="$1" slot="$2" id="$3" state
+  state="$(docker inspect --type container --format '{{.State.Status}}' "$id")" || return 1
+  if [[ "$state" != running ]]; then
+    voice_enforcement_rollout_read_retired "$project" "$slot" "$id" --allow-dead >/dev/null || {
+      echo "voice-enforcement-rollout: $slot lacks its exact retired association; refusing before any media stop" >&2
+      return 1
+    }
+    return 0
+  fi
+  python3 "$SCRIPT_DIR/voice-boot-containment.py" retirement-preflight \
+    --container-id "$id" --slot "$slot" --compose-project "$project" >/dev/null || {
+    echo "voice-enforcement-rollout: $slot has no retirement route; refusing before any media stop (media left running)." \
+      "Run the first protocol-4 cutover as host root; see [internal]deploys.md (#2272)" >&2
+    return 1
+  }
+}
+
+# Checks every configured slot without mutating anything. The rollout runs it
+# before it replaces the control plane, so a slot that cannot retire refuses
+# while both planes still run their previous images; stop_media rechecks it.
+voice_enforcement_rollout_preflight_media() {
+  local inventory project slot ids
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  while IFS= read -r slot; do
+    [[ -n "$slot" ]] || continue
+    voice_enforcement_rollout_association association-state "$project" "$slot" || return 1
+    ids="$(docker ps -a --no-trunc --filter "label=com.docker.compose.project=$project" \
+      --filter "label=com.docker.compose.service=$slot" --format '{{.ID}}')" || return 1
+    [[ -z "$ids" || "$ids" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ -z "$ids" ]] || voice_enforcement_rollout_preflight_slot "$project" "$slot" "$ids" || return 1
+  done <<<"${inventory#*$'\n'}"
+}
+
 voice_enforcement_rollout_stop_media() {
-  local running
-  echo "voice-enforcement-rollout: draining the old media-plane"
-  (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 media-plane) || return 1
-  if ! running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q media-plane 2>/dev/null)"; then
-    echo "voice-enforcement-rollout: cannot verify that the old media-plane stopped" >&2
-    return 1
-  fi
-  if [[ -n "$running" ]]; then
-    echo "voice-enforcement-rollout: old media-plane is still running; refusing to start a replacement" >&2
-    return 1
-  fi
+  local inventory project slot ids
+  voice_enforcement_rollout_preflight_media || return 1
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  while IFS= read -r slot; do
+    [[ -n "$slot" ]] || continue
+    ids="$(docker ps -a --no-trunc --filter "label=com.docker.compose.project=$project" \
+      --filter "label=com.docker.compose.service=$slot" --format '{{.ID}}')" || return 1
+    # No configured runtime is a fresh start, never proof about a lost boot.
+    [[ -n "$ids" ]] || continue
+    voice_enforcement_rollout_retire_slot "$project" "$slot" || return 1
+  done <<<"${inventory#*$'\n'}"
 }
 
 voice_enforcement_rollout_deploy() {
@@ -2514,17 +2846,18 @@ voice_enforcement_rollout_deploy() {
   }
   local -a restore_pull=()
   [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]] || restore_pull=(--pull never)
+  # Refuse an unretirable media slot before the control plane is replaced.
+  voice_enforcement_rollout_preflight_media || return 1
 
   # The paired rollout always replaces the control-plane image.  Do not let a
   # stale Activity History rollback pin silently select an old digest here.
-  clear_activity_history_image_selector
+  clear_activity_history_image_selector || return 1
 
-  # Build first so the new image owns the migration and the compatibility
-  # default before any media handoff.  The explicit deactivation follows CP
-  # readiness because the rollout singleton is created by CP startup migration.
+  # Build first so the new image owns migrations. Prepared denies productive
+  # admission; an active family floor remains authoritative during maintenance.
   if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
     echo "voice-enforcement-rollout: building the new control-plane image"
-    managed_compose_build build control-plane
+    managed_compose_build build control-plane || return 1
   fi
   # Migrations 000165–000166 change privacy and presence defaults. Stop and
   # drain the previous local binary before startup can apply them; older
@@ -2534,41 +2867,134 @@ voice_enforcement_rollout_deploy() {
   privacy_defaults_refuse_foreign_control_plane || return 1
   activity_history_stop_control_plane || return 1
   privacy_defaults_require_local_control_plane_drained || return 1
-  echo "voice-enforcement-rollout: starting the control-plane in compatibility mode"
+  echo "voice-enforcement-rollout: starting the current control-plane with its durable family floor"
   (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build "${restore_pull[@]}" --wait \
     --wait-timeout 180 control-plane) || return 1
-  voice_enforcement_rollout_wait_control_plane
+  voice_enforcement_rollout_wait_control_plane || return 1
   # Keep the old media serving while an uncached image build runs.
   if [[ ${STAGE_RESTORE_MODE:-0} -eq 0 ]]; then
     echo "voice-enforcement-rollout: building the new media-plane image"
     managed_compose_build build media-plane || return 1
   fi
-  voice_enforcement_rollout_cli deactivate
+  voice_enforcement_rollout_status >/dev/null || return 1
 
   # The old media container is explicitly stopped before its replacement is
   # created or started. A single compose up for CP+MP has ambiguous ordering
   # and can leave old sockets unregistered during the handoff.
-  voice_enforcement_rollout_stop_media
+  voice_enforcement_rollout_stop_media || return 1
   echo "voice-enforcement-rollout: starting the new media-plane"
   echo "voice-enforcement-rollout: waiting for media-plane liveness"
   (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build "${restore_pull[@]}" --wait \
     --wait-timeout 180 media-plane) || return 1
-  echo "voice-enforcement-rollout: waiting for media-plane protocol 3 readiness"
-  voice_enforcement_rollout_wait_media
+  echo "voice-enforcement-rollout: waiting for media-plane protocol 4 transport capability"
+  voice_enforcement_rollout_wait_media || return 1
 
   echo "voice-enforcement-rollout: activating durable enforcement"
-  voice_enforcement_rollout_activate
+  voice_enforcement_rollout_activate || return 1
+  voice_enforcement_rollout_wait_media productive || return 1
   echo "voice-enforcement-rollout: completed"
 }
 
+# First protocol-4 cutover from a protocol-3 media predecessor (#2272). The
+# released protocol-3 image reports no boot identity, so neither retirement
+# route can bind it and the rollout preflight refuses even as root. A database
+# that has never applied migration 000194 holds no protocol-4 boot fence and no
+# family authority, so a drained, truthfully stopped legacy container leaves
+# nothing to retire. Host root removes exactly that container; the rollout then
+# treats the empty slot as a fresh start.
+voice_enforcement_rollout_legacy_schema() {
+  local row
+  row="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD exec -T postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -At -c "SELECT version, dirty, pg_catalog.to_regclass('"'"'public.login_family_rollout'"'"') IS NULL, (SELECT pg_catalog.count(*) FROM public.voice_enforcement_sessions) FROM public.schema_migrations"')" || {
+    echo 'voice-enforcement-rollout: schema observation failed; refusing' >&2
+    return 1
+  }
+  if [[ ! "$row" =~ ^([0-9]+)\|f\|t\|([0-9]+)$ ]] || (( BASH_REMATCH[1] >= 194 )); then
+    echo 'voice-enforcement-rollout: migration 000194 is applied, dirty or unreadable; a protocol-4 boot may exist, so the legacy predecessor cannot be removed' >&2
+    return 1
+  fi
+  printf '%s\n' "${BASH_REMATCH[2]}"
+}
+
+voice_enforcement_rollout_retire_legacy() {
+  local value window t0 deadline state first second reason inventory project id identity sessions
+  [[ "$(id -u)" -eq 0 ]] || {
+    echo 'voice-enforcement-rollout: retire-legacy-predecessor requires host root' >&2
+    return 1
+  }
+  [[ "$MEDIA_DEPLOY_PROFILE" == media-single ]] || {
+    echo 'voice-enforcement-rollout: retire-legacy-predecessor supports only the media-single profile' >&2
+    return 1
+  }
+  voice_enforcement_rollout_legacy_schema >/dev/null || return 1
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  [[ "${inventory#*$'\n'}" == media-plane ]] || return 1
+  voice_enforcement_rollout_association association-state "$project" media-plane || return 1
+  state="$(media_legacy_state)" || return 1
+  case "$state" in
+    absent)
+      echo 'voice-enforcement-rollout: no legacy media-plane container; nothing to retire'
+      return 0 ;;
+    running)
+      # Only a proved join pause may end calls: the slot is empty, or the
+      # pause's own cutoff has passed.
+      value="$(media_bluegreen_redis GET "$MEDIA_LEGACY_PAUSE_KEY")" || return 1
+      window="$(media_legacy_parse_pause "$value")" || {
+        echo 'voice-enforcement-rollout: run media-legacy-pause and drain before retiring legacy media' >&2
+        return 1
+      }
+      read -r t0 deadline <<<"$window"
+      first="$(media_legacy_counts)" || first=''
+      second=''
+      if [[ "$first" == '0 0' ]]; then
+        sleep 2
+        second="$(media_legacy_counts)" || second=''
+      fi
+      if [[ "$first" == '0 0' && "$second" == '0 0' ]]; then
+        reason=empty
+      elif (( $(date +%s) >= deadline )); then
+        reason=deadline
+      else
+        echo "voice-enforcement-rollout: legacy media is not drained (counts ${second:-${first:-unknown}}); refusing before stop" >&2
+        return 1
+      fi
+      # The mutation guard admits a stop without a retired association only
+      # for the exact container this owner is retiring.
+      VOICE_RETIRING_CONTAINER="$(voice_enforcement_rollout_slot_id "$project" media-plane)" || return 1
+      (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 media-plane) || return 1
+      VOICE_RETIRING_CONTAINER=''
+      echo "voice-enforcement-rollout: stopped legacy media reason=${reason} t0=${t0}" ;;
+    exited) ;;
+    *) return 1 ;;
+  esac
+  id="$(voice_enforcement_rollout_slot_id "$project" media-plane)" || return 1
+  identity="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" stopped-identity \
+    --container-id "$id" --slot media-plane --compose-project "$project")" || return 1
+  # Recheck after the stop: the schema must still predate 000194, and the
+  # stopped protocol-3 boot must have released every enforcement session,
+  # because activation refuses while any remain. Keep the container on refusal
+  # so `compose start media-plane` and media-legacy-resume roll back.
+  sessions="$(voice_enforcement_rollout_legacy_schema)" || return 1
+  [[ "$sessions" == 0 ]] || {
+    echo "voice-enforcement-rollout: ${sessions} voice enforcement sessions remain after the legacy stop; refusing to remove it" >&2
+    return 1
+  }
+  docker rm "$id" >/dev/null || return 1
+  echo "voice-enforcement-rollout: removed legacy media predecessor ${identity}"
+  echo 'voice-enforcement-rollout: next: media-legacy-resume, then voice-enforcement-rollout deploy as host root'
+}
+
 voice_enforcement_rollout_media_rebuild() {
+  voice_enforcement_rollout_preflight_media || return 1
   managed_compose_build build media-plane || return 1
-  voice_enforcement_rollout_cli deactivate
-  voice_enforcement_rollout_stop_media
+  voice_enforcement_rollout_status >/dev/null || return 1
+  voice_enforcement_rollout_stop_media || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build --wait \
     --wait-timeout 180 media-plane) || return 1
-  voice_enforcement_rollout_wait_media
-  voice_enforcement_rollout_activate
+  voice_enforcement_rollout_wait_media || return 1
+  voice_enforcement_rollout_activate || return 1
+  voice_enforcement_rollout_wait_media productive || return 1
 }
 
 # The blue/green rail is enabled only when the rendered model contains both
@@ -2767,6 +3193,13 @@ raise SystemExit(0 if valid else 1)
 
 media_bluegreen_probe_ready() {
   local colour="$1" expected_accept="$2" port="$3" expected_workers="${4:-}" expected_empty="${5:-false}" status body
+  local inventory project id observed boot
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  id="$(voice_enforcement_rollout_slot_id "$project" "media-plane-$colour")" || return 1
+  observed="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" probe-container \
+    --container-id "$id" --slot "media-plane-$colour" --compose-project "$project" --grant either)" || return 1
+  boot="${observed%%$'\n'*}"
   body="$(mktemp)" || return 1
   status="$(curl -sS --max-time 3 -o "$body" -w '%{http_code}' \
     "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)"
@@ -2778,8 +3211,13 @@ try:
     creates = value["creates_in_flight"]
     generation = value["generation"]
     valid = (value["colour"] == sys.argv[2]
+             and value.get("nodeBootId") == sys.argv[6]
              and value.get("ready") is (sys.argv[3] == "true")
-             and (sys.argv[3] == "false" or value.get("voiceEnforcementProtocol") == 3)
+             and type(value.get("voiceEnforcementProtocol")) is int
+             and value["voiceEnforcementProtocol"] == 4
+             and value.get("voiceEnforcementTransportOK") is True
+             and type(value.get("voiceEnforcementAdmissionGranted")) is bool
+             and (sys.argv[3] == "false" or value.get("voiceEnforcementAdmissionGranted") is True)
              and value["accepting_new_rooms"] is (sys.argv[3] == "true")
              and type(count) is int and count >= 0
              and type(creates) is int and creates >= 0
@@ -2792,7 +3230,7 @@ try:
 except (OSError, ValueError, KeyError, TypeError):
     valid = False
 raise SystemExit(0 if valid else 1)
-' "$body" "$colour" "$expected_accept" "$status" "$expected_empty"; then
+' "$body" "$colour" "$expected_accept" "$status" "$expected_empty" "$boot"; then
     rm -f "$body"
     return 1
   fi
@@ -2882,8 +3320,44 @@ media_bluegreen_preflight() {
   printf '%s:%s\n' "${active:-none}" "$standby"
 }
 
+# Activation proves every configured slot, so a first promotion's slot
+# preparation runs both colours. Retire the colour that promotion does not
+# use, so the single-standby preflight sees the state it expects.
+media_bluegreen_retire_unpromoted() {
+  local active ids inventory
+  active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+  [[ -z "$active" ]] || return 0
+  ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q media-plane-green)" || return 1
+  [[ -n "$ids" ]] || return 0
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  voice_enforcement_rollout_retire_slot "${inventory%%$'\n'*}" media-plane-green
+}
+
+voice_enforcement_rollout_prepare_slots() {
+  local activation inventory slot
+  local -a slots=()
+  activation="$(voice_enforcement_rollout_status --field familyActivation)" || return 1
+  [[ "$activation" == prepared ]] || return 0
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  voice_enforcement_rollout_stop_media || return 1
+  while IFS= read -r slot; do
+    [[ -z "$slot" ]] || slots+=("$slot")
+  done <<<"${inventory#*$'\n'}"
+  [[ ${#slots[@]} -gt 0 ]] || return 1
+  managed_compose_build build "${slots[@]}" || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --no-build --wait --wait-timeout 180 "${slots[@]}") || return 1
+  voice_enforcement_rollout_wait_media || return 1
+  voice_enforcement_rollout_activate || return 1
+  voice_enforcement_rollout_wait_media productive || return 1
+  media_bluegreen_retire_unpromoted || return 1
+}
+
 media_bluegreen_cutover_locked() {
   local active standby old_colour active_port standby_port tombstone old_generation status deadline running drain_started result
+  # Refuse before a prepared family's slot preparation stops any media; the
+  # second preflight re-reads the state that preparation replaced.
+  media_bluegreen_preflight >/dev/null || return 1
+  voice_enforcement_rollout_prepare_slots || return 1
   media_bluegreen_preflight >/dev/null || return 1
   if ! active="$(media_bluegreen_redis GET media:active_colour)"; then
     echo 'media-bluegreen: Redis promotion read failed; refusing cutover' >&2
@@ -2959,6 +3433,13 @@ media_bluegreen_cutover_locked() {
     return 1
   }
 
+  if [[ -n "$active_port" ]]; then
+    voice_enforcement_rollout_probe_slots either || return 1
+  else
+    # Slot preparation retired the colour a first promotion does not use, so
+    # only the standby runs; probing the exited colour would always refuse.
+    voice_enforcement_rollout_probe_slots either "media-plane-${standby}" || return 1
+  fi
   if ! media_bluegreen_redis SADD media:colours:registered "$standby" >/dev/null; then
     echo 'media-bluegreen: registry write failed before promotion; active color is unchanged' >&2
     return 1
@@ -3150,7 +3631,7 @@ print(value["rooms"], value["creates_in_flight"], value["generation"])
     result="$(media_bluegreen_redis SREM media:colours:registered "$colour")" || return 1
     [[ "$result" =~ ^[01]$ ]] || return 1
     echo "media-bluegreen: ${colour} reached the 2-hour deadline; disconnecting remaining rooms"
-    if ! (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 "media-plane-${colour}"); then
+    if ! voice_enforcement_rollout_retire_named "media-plane-${colour}"; then
       echo "media-bluegreen: deadline stop failed; ${colour} remains fenced for retry" >&2
       return 1
     fi
@@ -3200,7 +3681,7 @@ print(value["rooms"], value["creates_in_flight"])
     return 2
   fi
   rm -f "$body"
-  if ! (cd "$DEPLOY_DIR" && managed_compose_mutate stop --timeout 45 "media-plane-${colour}"); then
+  if ! voice_enforcement_rollout_retire_named "media-plane-${colour}"; then
     echo "media-bluegreen: stop failed; ${colour} remains fenced; rerun media-reap to resume" >&2
     return 1
   fi
@@ -3325,7 +3806,7 @@ media_legacy_actuate() {
     return 0
   fi
   read -r rooms creates <<<"${second:-${first:-unknown unknown}}"
-  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane) || {
+  voice_enforcement_rollout_stop_media || {
     echo 'media-legacy: legacy stop failed; retrying next run' >&2
     return 1
   }
@@ -3657,6 +4138,7 @@ redis_managed_assert_compatible_image() {
 }
 
 redis_managed_prepare_registered_apps() {
+  local VOICE_NEVER_STARTED_CANDIDATES=''
   local standby="$1" active="$2" full="$3" start_cp="$4" status service ids hostname cp_running=0
   local candidate_service="media-plane-${standby}" active_service=""
   local -a cp_hosts=() media_hosts=() prior_cp_hosts=() prior_media_hosts=() prior_cp_containers=() prior_media_containers=() start_services=()
@@ -3692,7 +4174,9 @@ redis_managed_prepare_registered_apps() {
     service=control-plane
     redis_managed_replace_ready "$service" || return 1
     managed_compose_build build "$service" || return 1
+    voice_enforcement_rollout_guard_mutation up "$service" || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD up --no-start --no-build --no-deps --force-recreate "$service") || return 1
+    voice_enforcement_rollout_bind_created "$service" || return 1
     managed_egress_reconcile || return 1
     ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
     [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || return 1
@@ -3726,7 +4210,9 @@ redis_managed_prepare_registered_apps() {
   }
   redis_managed_replace_ready "$candidate_service" || return 1
   managed_compose_build build "$candidate_service" || return 1
+  voice_enforcement_rollout_guard_mutation up "$candidate_service" || return 1
   (cd "$DEPLOY_DIR" && $COMPOSE_CMD up --no-start --no-build --no-deps --force-recreate "$candidate_service") || return 1
+  voice_enforcement_rollout_bind_created "$candidate_service" || return 1
   managed_egress_reconcile || return 1
   ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$candidate_service")" || return 1
   [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || return 1
@@ -3851,7 +4337,7 @@ except (ValueError, TypeError, KeyError, json.JSONDecodeError):
     start_services+=(control-plane)
   fi
   if [[ ${#start_services[@]} -gt 0 ]]; then
-    (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --no-deps --wait --wait-timeout 180 -- "${start_services[@]}") || return 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 -- "${start_services[@]}") || return 1
   fi
 
   local deadline=$((SECONDS + 90)) current
@@ -4106,6 +4592,11 @@ redis_managed_wait_apps() {
       media="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "$media_service")" || return 1
       [[ -n "$cp" && -n "$media" ]] || { sleep 3; continue; }
       curl -fsS --max-time 3 http://127.0.0.1:8080/readyz >/dev/null || { sleep 3; continue; }
+      # Final Redis ACKs and HTTP success do not prove the replacement's
+      # protocol or boot. Reuse the exact configured-container gate for the
+      # restarted slot before promotion or success; stop_media already retired
+      # every other slot's boot, and this rebuild does not start them.
+      voice_enforcement_rollout_probe_slots productive "$media_service" || { sleep 3; continue; }
       if [[ "${MEDIA_DEPLOY_PROFILE:-media-single}" == media-bluegreen ]]; then
         active="$(media_bluegreen_redis GET media:active_colour)" || { sleep 3; continue; }
         if [[ -z "$active" ]]; then
@@ -4176,8 +4667,8 @@ redis_managed_rollback_locked() {
   # The controller exists only in the managed overlay, so a legacy `up` would
   # leave it running. Stop every Redis client first, then remove the
   # controller and stop Redis. The marker, journal and ACL stay as history.
+  voice_enforcement_rollout_stop_media || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate stop control-plane) || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane media-plane-blue media-plane-green) || return 1
   redis_managed_stopped_apps || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate stop redis-auth-controller) || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate rm -f redis-auth-controller) || return 1
@@ -4236,6 +4727,7 @@ print(json.dumps({"operation":"register","rotationId":s["rotationId"],
 }
 
 redis_managed_prepare_locked() {
+  local VOICE_NEVER_STARTED_CANDIDATES=''
   local recover=0 proof='' media_service mode=initial redis_running controller_running status cp_id media_id
   [[ "${1:-}" == --first-activation && $# -eq 1 ]] && recover=3
   [[ "${1:-}" == --recover ]] && recover=1
@@ -4268,8 +4760,8 @@ redis_managed_prepare_locked() {
     && { [[ "$recover" != 3 ]] || ! cmp -s /var/lib/concord/redis-auth/activated <(printf 'concord-managed-redis-initializing-v1\n'); }; then
     echo 'redis-managed: state already exists; use redis-managed-rebuild or --recover' >&2; return 1
   fi
+  voice_enforcement_rollout_stop_media || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate stop control-plane) || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane media-plane-blue media-plane-green) || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate stop redis-auth-controller) || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate stop redis) || return 1
   redis_managed_stopped_apps || return 1
@@ -4303,7 +4795,7 @@ except (KeyError,TypeError,ValueError,json.JSONDecodeError):
     valid=False
 raise SystemExit(0 if valid and sys.argv[2]!=sys.argv[3] else 1)
 ' "$media_service" "$cp_id" "$media_id" <<<"$status"; then
-      redis_managed_resume_stopped_rebuild restart
+      redis_managed_resume_stopped_rebuild created
       return $?
     fi
   fi
@@ -4315,15 +4807,20 @@ raise SystemExit(0 if valid and sys.argv[2]!=sys.argv[3] else 1)
       local existing bound
       existing="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
       bound="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("bindings",{}).get(sys.argv[1],{}).get("containerId",""))' "$service" <<<"$status")" || return 1
-      [[ -n "$existing" && "$existing" == "$bound" ]] && continue
+      if [[ -n "$existing" && "$existing" == "$bound" ]]; then
+        voice_enforcement_rollout_bind_created "$service" || return 1
+        continue
+      fi
     fi
     redis_managed_replace_ready "$service" || return 1
+    voice_enforcement_rollout_guard_mutation up "$service" || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD up --no-start --no-build --no-deps --force-recreate "$service") || return 1
+    voice_enforcement_rollout_bind_created "$service" || return 1
     managed_egress_reconcile || return 1
   done
   redis_managed_register_stopped_apps "$media_service" || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 "$media_service") || return 1
   redis_managed_wait_apps "$media_service" "$mode"
 }
 
@@ -4412,6 +4909,7 @@ PY
 }
 
 redis_managed_rebuild_locked() {
+  local VOICE_NEVER_STARTED_CANDIDATES=''
   local status service media_service cp_id='' media_id=''
   if [[ $# -eq 1 && "$1" == --resume ]]; then
     redis_managed_resume_stopped_rebuild rebuild
@@ -4440,8 +4938,8 @@ redis_managed_rebuild_locked() {
   local initial_status="$status"
   redis_managed_assert_same_rotation "$initial_status" || return 1
   redis_managed_rebuild_marker begin "$status" "$media_service" "$cp_id" "$media_id" || return 1
+  voice_enforcement_rollout_stop_media || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate stop control-plane) || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate stop media-plane media-plane-blue media-plane-green) || return 1
   redis_managed_stopped_apps || return 1
   redis_managed_assert_same_rotation "$initial_status" || return 1
   local cp_running
@@ -4450,21 +4948,29 @@ redis_managed_rebuild_locked() {
   for service in control-plane "$media_service"; do
     redis_managed_replace_ready "$service" || return 1
     managed_compose_build build "$service" || return 1
+    voice_enforcement_rollout_guard_mutation up "$service" || return 1
     (cd "$DEPLOY_DIR" && $COMPOSE_CMD up --no-start --no-build --no-deps --force-recreate "$service") || return 1
+    voice_enforcement_rollout_bind_created "$service" || return 1
     managed_egress_reconcile || return 1
   done
   redis_managed_assert_same_rotation "$initial_status" || return 1
   redis_managed_register_stopped_apps "$media_service" || return 1
   redis_managed_assert_same_rotation "$initial_status" || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 control-plane) || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 control-plane) || return 1
   redis_managed_assert_same_rotation "$initial_status" || return 1
-  (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-deps --wait --wait-timeout 180 "$media_service") || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 "$media_service") || return 1
   redis_managed_wait_apps "$media_service" || return 1
   rm -- "$REDIS_MANAGED_REBUILD_MARKER"
 }
 
 redis_managed_resume_stopped_rebuild() {
+  local VOICE_NEVER_STARTED_CANDIDATES='' VOICE_RESTART_AUTH_FD=''
+  local inventory project cp_identity='' media_record='' current_identity
   local mode="${1:-restart}" status media_service service ids bound hostname cp_id='' media_id=''
+  case "$mode" in
+    restart|rebuild|created) ;;
+    *) return 2 ;;
+  esac
   redis_managed_marker_preflight required || return 1
   redis_managed_host_preflight || return 1
   redis_managed_validate_mount_model || return 1
@@ -4472,11 +4978,21 @@ redis_managed_resume_stopped_rebuild() {
   status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
   python3 -c 'import json,sys; s=json.load(sys.stdin); t=s.get("targets",{}); raise SystemExit(0 if s.get("state") in ("finalized","prepared","promoted") and s.get("rotationId") and set(t)=={"control-plane","media-plane"} and all(type(v) is int and v>0 for v in t.values()) else 1)' <<<"$status" || return 1
   media_service="$(redis_managed_select_media_service rebuild)" || return 1
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
   for service in control-plane "$media_service"; do
     ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps -a -q "$service")" || return 1
     [[ "$ids" =~ ^[a-f0-9]{64}$ ]] || { echo 'redis-managed: resume requires exactly one stopped container per slot' >&2; return 1; }
     bound="$(python3 -c 'import json,sys; s=json.load(sys.stdin); b=s.get("bindings",{}).get(sys.argv[1],{}); print(b.get("containerId",""))' "$service" <<<"$status")" || return 1
     [[ "$ids" == "$bound" ]] || { echo 'redis-managed: resume container differs from durable ACK binding' >&2; return 1; }
+    if [[ "$mode" != restart ]]; then
+      voice_enforcement_rollout_bind_created "$service" || return 1
+    elif [[ "$service" == control-plane ]]; then
+      cp_identity="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" stopped-identity \
+        --compose-project "$project" --slot "$service" --container-id "$ids")" || return 1
+    else
+      media_record="$(voice_enforcement_rollout_read_retired "$project" "$service" "$ids")" || return 1
+    fi
     redis_managed_assert_compatible_image "$ids" "$service" || return 1
     if [[ "$service" == control-plane ]]; then cp_id="$ids"; else media_id="$ids"; fi
   done
@@ -4491,9 +5007,20 @@ redis_managed_resume_stopped_rebuild() {
   redis_managed_assert_same_rotation "$status" || return 1
   redis_managed_register_stopped_apps "$media_service" || return 1
   redis_managed_assert_same_rotation "$status" || return 1
+  if [[ "$mode" == restart ]]; then
+    current_identity="$(python3 "$SCRIPT_DIR/voice-boot-containment.py" stopped-identity \
+      --compose-project "$project" --slot control-plane --container-id "$cp_id")" || return 1
+    [[ "$cp_identity" == "$current_identity" ]] || return 1
+    voice_enforcement_rollout_association association-consume "$project" "$media_service" \
+      --container-id "$media_id" <<<"$media_record" || return 1
+    # The read end is shared by subshells. A failed or ambiguous attempt cannot
+    # reuse a parent-shell variable after the durable record has been consumed.
+    exec {VOICE_RESTART_AUTH_FD}< <(printf '%s\n' "$media_record") || return 1
+  fi
   (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 control-plane) || return 1
   redis_managed_assert_same_rotation "$status" || return 1
   (cd "$DEPLOY_DIR" && managed_compose_mutate start --wait --wait-timeout 180 "$media_service") || return 1
+  if [[ -n "$VOICE_RESTART_AUTH_FD" ]]; then exec {VOICE_RESTART_AUTH_FD}<&-; fi
   redis_managed_wait_apps "$media_service" || return 1
   [[ "$mode" != rebuild ]] || rm -- "$REDIS_MANAGED_REBUILD_MARKER"
 }
@@ -4532,6 +5059,9 @@ redis_managed_restart_bound_stack() {
     status="$(redis_managed_control_request '{"operation":"status"}')" || return 1
     redis_managed_require_registered_state "$status" || return 1
     redis_managed_status_acks_preflight "$status" || return 1
+    # Keep CP/Redis transport alive until every exact media predecessor has
+    # completed retirement; the all-service stop guard requires that proof.
+    voice_enforcement_rollout_stop_media || return 1
     (cd "$DEPLOY_DIR" && managed_compose_mutate stop) || return 1
   fi
   redis_managed_stopped_apps || return 1
@@ -4935,7 +5465,7 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
         "${closure_arr[@]}")
     fi
   fi
-  voice_enforcement_rollout_deploy
+  voice_enforcement_rollout_deploy || return 1
   if [[ ${#rest_arr[@]} -gt 0 ]]; then
     # No --wait: coturn's STUN probe flaking would abort a deploy that
     # otherwise succeeded, and post-rsync's wait-healthy follows anyway.
@@ -4954,7 +5484,11 @@ print(" ".join(sorted(set(svcs) - closure - set(voice))))
 # this file inside a root-owned directory, owned by concord but not unlinkable by
 # concord. Keeping that inode is load-bearing: kernel lock ownership, not file
 # existence, controls admission.
-readonly DEPLOY_TRANSACTION_LOCK_PATH="/var/lib/concord/deploy-transaction.lock"
+DEPLOY_TRANSACTION_LOCK_PATH="/var/lib/concord/deploy-transaction.lock"
+if [[ ! -d /var/lib/concord ]]; then
+  DEPLOY_TRANSACTION_LOCK_PATH="$(cd "$CONFIG_DEPLOY_DIR" && pwd -P)/.deploy-transaction.lock" || exit 1
+fi
+readonly DEPLOY_TRANSACTION_LOCK_PATH
 # Non-blocking by default; the deploy verbs raise it just before acquiring.
 DEPLOY_LOCK_WAIT_SECS=0
 readonly LOCKF_REENTRY_MARKER="--concord-ctl-lockf-reentry-v1"
@@ -4988,34 +5522,14 @@ fi
 acquire_deploy_transaction_lock() {
   local operation="$1" lock_rc=0 lock_backend=""
 
-  # SELF-HOSTED HOSTS HAVE NO LOCK, AND MUST NOT BE REFUSED FOR IT.
-  # /var/lib/concord is created by provision-production.sh's
-  # install_sudoers_boundary -- a MANAGED-host step. A self-hosted operator runs
-  # install-selfhost.sh instead and never has that directory, so requiring the
-  # lock here would break `concord-selfhost up|stop|down|freshstart` outright.
-  #
-  # Skipping is correct rather than merely tolerable: the same provisioning step
-  # that creates this directory is the one that installs the #3107 healthwatch
-  # actor and its /var/lib/concord/healthwatch state. No directory means no
-  # actor, which means no contender -- the interlock is protecting against
-  # something that cannot exist on that host.
-  #
-  # nginx-reload and sudoers-sync are managed-only paths that require the lock,
-  # even though they now wait for a contending healthwatch cycle.
-  # The skip is ANNOUNCED, never silent. A deploy that quietly runs without the
-  # interlock it was told it has is the worse failure of the two: it looks
-  # identical to one that took the lock. Self-hosted hosts are single-operator
-  # and have no healthwatch actor today, so the exposure is nil -- but that is a
-  # property of TODAY'S self-host topology, not a guarantee, and the notice is
-  # what makes it re-checkable when that changes.
-  if [[ "$operation" != nginx-reload && "$operation" != sudoers-sync ]] \
-     && (( ${DEPLOY_LOCK_WAIT_SECS:-0} > 0 )) \
-     && [[ ! -d "$(dirname "$DEPLOY_TRANSACTION_LOCK_PATH")" ]]; then
-    echo "  ℹ ${operation}: no $(dirname "$DEPLOY_TRANSACTION_LOCK_PATH") — running WITHOUT the deploy transaction lock." >&2
-    echo "    Expected on a self-hosted host: that directory and the #3107 healthwatch actor are both" >&2
-    echo "    created by provision-production.sh, which self-hosted installs never run. No actor means" >&2
-    echo "    no contender. A self-hosted interlock of its own is tracked at #3161 (epic #1615)." >&2
-    return 0
+  # Self-hosted aliases/copies using this physical configuration directory
+  # contend on the same retained fallback inode. Never unlink it on release.
+  # The managed-only verbs never take that fallback: their root-owned inode
+  # under /var/lib/concord is the only admission they accept.
+  if [[ "$operation" == nginx-reload || "$operation" == sudoers-sync ]] \
+     && [[ "$DEPLOY_TRANSACTION_LOCK_PATH" != /var/lib/concord/* ]]; then
+    echo "  ✗ ${operation}: managed deploy transaction lock is missing (no /var/lib/concord)" >&2
+    exit 1
   fi
   # Bounded wait in seconds, taken from DEPLOY_LOCK_WAIT_SECS rather than a
   # positional argument: callers invoke this as `"$@"`, and the lockf backend
@@ -5309,7 +5823,12 @@ case "${1:-help}" in
       echo "Done."
       exit 0
     fi
-    cd "$DEPLOY_DIR" && managed_compose_mutate restart
+    voice_enforcement_rollout_stop_media || exit 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate restart) || exit 1
+    voice_enforcement_rollout_wait_control_plane || exit 1
+    voice_enforcement_rollout_wait_media || exit 1
+    voice_enforcement_rollout_activate || exit 1
+    voice_enforcement_rollout_wait_media productive || exit 1
     selfhost_post_up_check || exit 1
     selfhost_tls_ready_gate || exit 1
     echo "Done."
@@ -5646,9 +6165,9 @@ else:
     # but control-plane can be in this scope beside it.
     if [[ $_has_media_plane -eq 1 ]]; then
       if [[ $_has_control_plane -eq 1 ]]; then
-        voice_enforcement_rollout_deploy
+        voice_enforcement_rollout_deploy || exit 1
       else
-        voice_enforcement_rollout_media_rebuild
+        voice_enforcement_rollout_media_rebuild || exit 1
       fi
       selfhost_post_up_check || exit 1
       [[ $_rebuild_starts_coturn -eq 0 ]] || selfhost_tls_ready_gate || exit 1
@@ -5753,11 +6272,19 @@ else:
         turn_managed_pair_guard || exit 1
         media_shared_listeners_routine_guard || exit 1
         managed_production_nats_reconcile || exit 1
-        voice_enforcement_rollout_deploy "$@"
+        voice_enforcement_rollout_deploy "$@" || exit 1
         selfhost_post_up_check || exit 1
         ;;
+      retire-legacy-predecessor)
+        shift
+        if [[ $# -ne 0 ]]; then
+          echo 'Usage: concord-ctl.sh voice-enforcement-rollout retire-legacy-predecessor' >&2
+          exit 2
+        fi
+        voice_enforcement_rollout_retire_legacy || exit 1
+        ;;
       *)
-        echo "Usage: concord-ctl.sh voice-enforcement-rollout deploy" >&2
+        echo "Usage: concord-ctl.sh voice-enforcement-rollout deploy|retire-legacy-predecessor" >&2
         exit 2
         ;;
     esac
@@ -6787,7 +7314,8 @@ else:
     activity_history_invalidate_activation_receipt
     echo ""
     echo "Stopping all services and removing volumes..."
-    cd "$DEPLOY_DIR" && managed_compose_mutate down -v
+    voice_enforcement_rollout_stop_media || exit 1
+    (cd "$DEPLOY_DIR" && managed_compose_mutate down -v) || exit 1
     managed_production_nats_reconcile || exit 1
     echo ""
     # #1015: sync_releases no longer auto-called. If the server's
@@ -6799,7 +7327,7 @@ else:
     if ! voice_enforcement_rollout_wait_control_plane \
       || ! voice_enforcement_rollout_wait_media \
       || ! voice_enforcement_rollout_activate; then
-      echo "Fresh start failed the voice-enforcement readiness/activation gate; enforcement remains inactive." >&2
+      echo "Fresh start failed the voice-enforcement capability/activation gate; client admission is unverified." >&2
       exit 1
     fi
     selfhost_post_up_check || exit 1
@@ -6888,13 +7416,15 @@ else:
       exit 1
     fi
     echo "Stopping all services..."
+    # Stale-MinIO recovery refuses on its own faults; it runs before media retirement.
     if [[ "$ACTIVITY_HISTORY_CONTRACT_MODE" == selfhost ]]; then
       selfhost_storage_stop_stale_minio || exit 1
     fi
+    voice_enforcement_rollout_stop_media || exit 1
     if [[ "$REDIS_CREDENTIAL_MODE" == managed ]]; then
-      cd "$DEPLOY_DIR" && managed_compose_mutate stop
+      cd "$DEPLOY_DIR" && managed_compose_mutate stop || exit 1
     else
-      cd "$DEPLOY_DIR" && managed_compose_mutate down
+      cd "$DEPLOY_DIR" && managed_compose_mutate down || exit 1
     fi
     echo "Done."
     ;;
@@ -6933,7 +7463,7 @@ else:
     echo "  activity-history-rollback --confirm-drained --old-image <immutable-image-ref> [--downgrade-schema]"
     echo "                 Drain/disable, optionally downgrade, and start one pinned old CP image"
     echo "  voice-enforcement-rollout deploy"
-    echo "                 Build CP, drain/rebuild MP, verify protocol 3, activate"
+    echo "                 Build CP, retire/rebuild MP, verify protocol 4, activate"
     echo "  media-reap"
     echo "                 Reap a draining color when empty or at its automatic 2-hour cutoff;"
     echo "                 on a paused legacy host, stop legacy when empty or at the cutoff"

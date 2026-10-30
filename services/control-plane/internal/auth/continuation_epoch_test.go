@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,10 +8,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
-	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // #2201 (Codex #2397 review, F1): the post-rotation continuation pair must bind
@@ -22,59 +17,62 @@ import (
 // so the earlier request cannot receive a session the later flow meant to kill.
 
 func TestIssueTokenPair_SkipsWhenEpochAdvanced(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	db, _ := dbtest.SetupTestDB(t)
-	userID := dbtest.CreateUser(t, db)
+	rig := newFamilyTestRig(t)
+	const currentEpoch = "00112233445566778899aabbccddeeff"
+	const staleEpoch = "ffeeddccbbaa99887766554433221100"
 
-	// The durable epoch is "currentEpoch"; the caller's flow committed
-	// "staleEpoch" and a later flow advanced it — the mismatch must skip.
-	_, err := db.Exec(`UPDATE users SET credential_epoch = 'currentEpoch' WHERE id = $1`, userID)
+	// The caller committed staleEpoch before a later flow advanced it. Keep
+	// both epochs valid so only the superseded-epoch guard refuses the mint.
+	_, err := rig.db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, currentEpoch, rig.user)
 	require.NoError(t, err)
-
-	// The mismatch is rejected before entCache/token minting, so a DB-only
-	// handler exercises the guard in isolation.
-	h := &Handler{db: db, log: logger.NewWithWriter(io.Discard)}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 
-	_, _, _, err = h.IssueTokenPair(c, userID.String(), "staleEpoch")
+	access, refresh, sessionID, err := rig.h.IssueTokenPair(c, rig.user, staleEpoch)
 	assert.ErrorIs(t, err, ErrContinuationEpochAdvanced,
 		"a continuation mint under a superseded epoch must be refused")
 
-	var n int
-	require.NoError(t, db.QueryRow(`SELECT count(*) FROM refresh_tokens WHERE user_id = $1`, userID).Scan(&n))
-	assert.Zero(t, n, "no refresh row may be minted when the epoch advanced")
+	assert.Empty(t, access, "no access token may be returned when the epoch advanced")
+	assert.Empty(t, refresh, "no refresh token may be returned when the epoch advanced")
+	assert.Empty(t, sessionID, "no session id may be returned when the epoch advanced")
+	for _, query := range []string{
+		`SELECT count(*) FROM refresh_tokens WHERE user_id = $1`,
+		`SELECT count(*) FROM login_families WHERE user_id = $1`,
+		`SELECT count(*) FROM login_family_sids WHERE user_id = $1`,
+	} {
+		var n int
+		require.NoError(t, rig.db.QueryRow(query, rig.user).Scan(&n))
+		assert.Zero(t, n, "no refresh or family authority may be minted when the epoch advanced: %s", query)
+	}
 }
 
 func TestIssueTokenPair_MintsWhenEpochMatches(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	db, _ := dbtest.SetupTestDB(t)
-	rdb := setupAuthAttemptRedis(t)
-	userID := dbtest.CreateUser(t, db)
+	rig := newFamilyTestRig(t)
+	const epoch = "00112233445566778899aabbccddeeff"
 
-	_, err := db.Exec(`UPDATE users SET credential_epoch = 'e1', email_verified = true WHERE id = $1`, userID)
+	_, err := rig.db.Exec(`UPDATE users SET credential_epoch = $1, email_verified = true WHERE id = $2`, epoch, rig.user)
 	require.NoError(t, err)
-
-	h := &Handler{
-		db:        db,
-		redis:     rdb,
-		log:       logger.NewWithWriter(io.Discard),
-		jwtSecret: "test-jwt-secret-continuation",
-		entCache:  entitlements.NewCache(rdb, db),
-	}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 
-	access, refresh, sessionID, err := h.IssueTokenPair(c, userID.String(), "e1")
+	access, refresh, sessionID, err := rig.h.IssueTokenPair(c, rig.user, epoch)
 	require.NoError(t, err)
 	assert.NotEmpty(t, access)
 	assert.NotEmpty(t, refresh)
 	assert.NotEmpty(t, sessionID)
 
+	_, signedSID := assertFamilyAccess(t, rig, access)
+	assert.Equal(t, sessionID, signedSID)
+	claims, err := ValidateAccessToken(access, familyTestSecret)
+	require.NoError(t, err)
+	assert.Equal(t, epoch, claims.CredentialEpoch)
+	require.NotNil(t, claims.EmailVerified)
+	assert.True(t, *claims.EmailVerified)
+
 	var storedID string
-	require.NoError(t, db.QueryRow(
-		`SELECT id FROM refresh_tokens WHERE user_id = $1`, userID).Scan(&storedID))
+	require.NoError(t, rig.db.QueryRow(
+		`SELECT id FROM refresh_tokens WHERE user_id = $1 AND token_hash = $2`, rig.user, HashRefreshToken(refresh)).Scan(&storedID))
 	assert.Equal(t, sessionID, storedID, "the minted refresh row must carry the returned session id")
 }

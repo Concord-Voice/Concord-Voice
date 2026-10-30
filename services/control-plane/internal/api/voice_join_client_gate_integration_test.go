@@ -29,6 +29,7 @@ import (
 func TestVoiceJoinUnderClientVersionGate(t *testing.T) {
 	t.Setenv("TEST_CLIENT_MIN_VERSION", "0.2.44")
 	ts := testhelpers.SetupTestServer(t)
+	initializeServiceJoinRollout(t, ts)
 
 	owner := ts.CreateTestUser(t, "hopowner")
 	serverID := ts.CreateTestServer(t, owner.ID, "hop-server")
@@ -37,6 +38,7 @@ func TestVoiceJoinUnderClientVersionGate(t *testing.T) {
 	require.NoError(t, err)
 
 	path := "/api/v1/channels/" + channelID + "/voice/join"
+	admission, capabilityHeaders := serviceJoinFixture(t, ts, owner, channelID, "client-gate-socket")
 
 	hopHeaders := func(token string) http.Header {
 		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
@@ -59,11 +61,7 @@ func TestVoiceJoinUnderClientVersionGate(t *testing.T) {
 	})
 
 	t.Run("a proven hop joins with no client-version header", func(t *testing.T) {
-		w := ts.DoRequest("POST", path, map[string]interface{}{
-			"admission_id": "24e27f2b-1d45-4fcf-90c3-3f0ff028a910",
-			"socket_id":    "client-gate-socket",
-			"activate":     false,
-		}, hopHeaders(owner.AccessToken))
+		w := ts.DoRequest("POST", path, admission, capabilityHeaders())
 
 		assert.Equal(t, http.StatusOK, w.Code,
 			"the service-hop proof is what restores voice, with no client change")

@@ -25,6 +25,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -182,8 +183,10 @@ func hookedHandler(
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
+	testdb.RememberActor(t, ts.DB, actingUserID)
 	engine.Use(func(c *gin.Context) {
 		c.Set("user_id", actingUserID)
+		testdb.AttachRememberedActor(c, actingUserID)
 		c.Next()
 	})
 	register(engine, h)

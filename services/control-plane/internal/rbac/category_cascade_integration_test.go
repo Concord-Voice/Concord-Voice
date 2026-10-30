@@ -3,7 +3,6 @@
 package rbac
 
 import (
-	"context"
 	"sync"
 	"testing"
 	"time"
@@ -28,7 +27,7 @@ func TestCategoryOverrideTransactionsFenceFinalAdmission(t *testing.T) {
 					VALUES ($1, $2, 'role', $3, $4, 0)`,
 					overrideID, categoryID, env.viewRole, int64(PermViewVoiceChannels))
 				_, _, err := env.handler.deleteCategoryOverrideWithCapture(
-					context.Background(), categoryAuthorityRequest{
+					env.ownerCtx(), categoryAuthorityRequest{
 						serverID: env.serverID, categoryID: categoryID, userID: env.serverOwnerID,
 					}, overrideID, "role", env.viewRole,
 					&[]keyrotation.Rotation{}, &map[string][]string{},
@@ -44,7 +43,7 @@ func TestCategoryOverrideTransactionsFenceFinalAdmission(t *testing.T) {
 				}
 				state := newCategoryOverrideWriteState(categoryID, req)
 				_, _, err := env.handler.upsertCategoryOverrideWithAuthority(
-					context.Background(), categoryAuthorityRequest{
+					env.ownerCtx(), categoryAuthorityRequest{
 						serverID: env.serverID, categoryID: categoryID, userID: env.serverOwnerID,
 					}, req, roleGateConfirm{}, &state,
 				)
@@ -55,7 +54,7 @@ func TestCategoryOverrideTransactionsFenceFinalAdmission(t *testing.T) {
 			name: "sync",
 			run: func(env *rbacPresenceEnv, categoryID, channelID string) error {
 				category := categoryID
-				_, _, _, err := env.handler.enableChannelPermissionSync(context.Background(), channelSyncRequest{
+				_, _, _, err := env.handler.enableChannelPermissionSync(env.ownerCtx(), channelSyncRequest{
 					userID: env.serverOwnerID, channelID: channelID, serverID: env.serverID,
 					categoryID: &category, isVoice: true, syncPermissions: true,
 				})
@@ -136,7 +135,7 @@ func TestDeleteCategoryOverride_CascadeNarrowing_ClearsExactlyTheLosingViewer(t 
 	env.waitForDispatch(t)
 
 	plan, _, err := env.handler.deleteCategoryOverrideWithCapture(
-		context.Background(), categoryAuthorityRequest{
+		env.ownerCtx(), categoryAuthorityRequest{
 			serverID: env.serverID, categoryID: category, userID: env.serverOwnerID,
 		}, overrideID, "role", grantRole,
 		&[]keyrotation.Rotation{}, &map[string][]string{},
@@ -176,7 +175,7 @@ func TestDeleteCategoryOverride_CaptureFailure_BlocksTheWrite(t *testing.T) {
 	defer env.clearInjectedFailure()
 
 	_, _, err := env.handler.deleteCategoryOverrideWithCapture(
-		context.Background(), categoryAuthorityRequest{
+		env.ownerCtx(), categoryAuthorityRequest{
 			serverID: env.serverID, categoryID: category, userID: env.serverOwnerID,
 		}, overrideID, "role", env.viewRole,
 		&[]keyrotation.Rotation{}, &map[string][]string{},
@@ -233,7 +232,7 @@ func TestDeleteCategoryOverride_CapturesOnlySyncedChannels(t *testing.T) {
 	}
 	env.resetRefreshes()
 	plan, _, err := env.handler.deleteCategoryOverrideWithCapture(
-		context.Background(), categoryAuthorityRequest{
+		env.ownerCtx(), categoryAuthorityRequest{
 			serverID: env.serverID, categoryID: category, userID: env.serverOwnerID,
 		}, overrideID, "role", grantRole,
 		&[]keyrotation.Rotation{}, &map[string][]string{},

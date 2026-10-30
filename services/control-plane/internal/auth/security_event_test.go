@@ -268,15 +268,28 @@ func TestRefreshBranchesEmitOnlyTheirAuthoritativeOutcomes(t *testing.T) {
 		require.Equal(t, http.StatusInternalServerError, failingResponse.Code)
 		require.Empty(t, failingRecorder.events, "a failed refresh transaction must not emit refresh_rotated")
 
-		successHandler, successDB, successUserID := newAdmitPathHandler(t)
-		sourceID := uuid.NewString()
-		_, err := successDB.Exec(`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`, sourceID, successUserID, HashRefreshToken("source-refresh"), time.Now().Add(time.Hour))
+		rig := newFamilyTestRig(t)
+		access, _, sourceID, err := rig.h.IssueAccessAndRefresh(t.Context(), rig.user)
 		require.NoError(t, err)
+		family, _ := assertFamilyAccess(t, rig, access)
+		var expiry time.Time
+		require.NoError(t, rig.db.QueryRow(`SELECT expires_at FROM refresh_tokens WHERE id=$1`, sourceID).Scan(&expiry))
 		successRecorder := &securityEventRecorder{}
-		successHandler.SetSecurityEvents(successRecorder)
+		rig.h.SetSecurityEvents(successRecorder)
 		successContext, successResponse := newContext()
-		successHandler.rotateAndRespond(successContext, models.RefreshToken{ID: sourceID, UserID: successUserID.String(), ExpiresAt: time.Now().Add(time.Hour)}, "")
-		require.Equal(t, http.StatusOK, successResponse.Code)
+		rig.h.rotateAndRespond(successContext, models.RefreshToken{ID: sourceID, UserID: rig.user, ExpiresAt: expiry}, "")
+		require.Equal(t, http.StatusOK, successResponse.Code, successResponse.Body.String())
+		pair := familyResponse(t, successResponse)
+		successorFamily, successorID := assertFamilyAccess(t, rig, pair.Access)
+		require.Equal(t, family, successorFamily)
+		require.NotEqual(t, sourceID, successorID)
+		var revoked sql.NullTime
+		var predecessor, successorHash string
+		require.NoError(t, rig.db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE id=$1`, sourceID).Scan(&revoked))
+		require.True(t, revoked.Valid, "the rotation event must follow a committed source revocation")
+		require.NoError(t, rig.db.QueryRow(`SELECT predecessor_id,token_hash FROM refresh_tokens WHERE id=$1 AND revoked_at IS NULL`, successorID).Scan(&predecessor, &successorHash))
+		require.Equal(t, sourceID, predecessor)
+		require.Equal(t, HashRefreshToken(pair.Refresh), successorHash)
 		require.Equal(t, []securityevent.Event{{
 			EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess,
 			Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRefreshRotated,
@@ -319,39 +332,59 @@ func TestRefreshBranchesEmitOnlyTheirAuthoritativeOutcomes(t *testing.T) {
 }
 
 func TestLogoutEmitsOnlyAfterCommittedRevoke(t *testing.T) {
-	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
-		response := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(response)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-		c.Request.Header.Set("X-Refresh-Token", "logout-refresh")
-		return c, response
+	for _, unavailable := range []bool{true, false} {
+		name := "committed selected family"
+		if unavailable {
+			name = "family SQL unavailable"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := newFamilyTestRig(t)
+			pair, family, sid := terminalMint(t, rig)
+			claims, err := ValidateAccessToken(pair.Access, familyTestSecret)
+			require.NoError(t, err)
+			recorder := &securityEventRecorder{}
+			rig.h.SetSecurityEvents(recorder)
+			if unavailable {
+				closedDB := sql.OpenDB(noRowsConnector{})
+				require.NoError(t, closedDB.Close())
+				rig.h.db = closedDB
+			}
+			c, response := familyTestContext()
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+			c.Request.Header.Set("X-Refresh-Token", pair.Refresh)
+			c.Request.Header.Set("Authorization", "Bearer "+pair.Access)
+			c.Request.AddCookie(&http.Cookie{Name: "refresh_token", Value: pair.Refresh, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+			rig.h.Logout(c)
+			var revoked sql.NullTime
+			require.NoError(t, rig.db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE id=$1`, sid).Scan(&revoked))
+			at, owner := terminalState(t, rig, family)
+			blacklisted, err := rig.h.redis.Exists(t.Context(), "blacklist:"+claims.ID).Result()
+			require.NoError(t, err)
+			if unavailable {
+				require.Equal(t, http.StatusServiceUnavailable, response.Code)
+				require.JSONEq(t, `{"error":"Authentication temporarily unavailable"}`, response.Body.String())
+				require.Empty(t, recorder.events)
+				require.Empty(t, response.Header().Values("Set-Cookie"))
+				require.Zero(t, blacklisted)
+				require.False(t, revoked.Valid)
+				require.False(t, at.Valid)
+				require.False(t, owner.Valid)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.True(t, revoked.Valid)
+			require.True(t, at.Valid)
+			require.True(t, owner.Valid)
+			var reason string
+			require.NoError(t, rig.db.QueryRow(`SELECT reason FROM login_family_revocations WHERE operation_id=$1 AND user_id=$2`, owner.String, rig.user).Scan(&reason))
+			require.Equal(t, "logout", reason)
+			require.Equal(t, []securityevent.Event{{
+				EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess,
+				Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked,
+				AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthLogout,
+			}}, recorder.events)
+		})
 	}
-	failingHandler, _, _ := newAdmitPathHandler(t)
-	failingRecorder := &securityEventRecorder{}
-	failingHandler.SetSecurityEvents(failingRecorder)
-	failingDB := sql.OpenDB(noRowsConnector{})
-	failingHandler.db = failingDB
-	require.NoError(t, failingDB.Close())
-	failingContext, failingResponse := newContext()
-	failingHandler.Logout(failingContext)
-	require.Equal(t, http.StatusInternalServerError, failingResponse.Code)
-	require.Empty(t, failingRecorder.events)
-
-	successHandler, successDB, successUserID := newAdmitPathHandler(t)
-	successHandler.hub = tokenTheftTestDisconnector{}
-	logoutID := uuid.NewString()
-	_, err := successDB.Exec(`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`, logoutID, successUserID, HashRefreshToken("logout-refresh"), time.Now().Add(time.Hour))
-	require.NoError(t, err)
-	successRecorder := &securityEventRecorder{}
-	successHandler.SetSecurityEvents(successRecorder)
-	successContext, successResponse := newContext()
-	successHandler.Logout(successContext)
-	require.Equal(t, http.StatusOK, successResponse.Code)
-	require.Equal(t, []securityevent.Event{{
-		EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess,
-		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked,
-		AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthLogout,
-	}}, successRecorder.events)
 }
 
 type recoveryTokenFailureChecker struct{ ambiguousRecoveryMFAChecker }

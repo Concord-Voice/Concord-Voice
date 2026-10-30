@@ -7,11 +7,9 @@ package dm_test
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
@@ -59,10 +57,16 @@ func ringDM(t *testing.T, ts *testhelpers.TestServer, caller testhelpers.TestUse
 
 // dialRichPresenceViewer connects a websocket client that receives Rich
 // Presence frames; the clear fan-out skips clients without the capability.
-func dialRichPresenceViewer(t *testing.T, ts *testhelpers.TestServer, userID string) *gorillaWS.Conn {
+func dialRichPresenceViewer(t *testing.T, ts *testhelpers.TestServer, accessToken string) *gorillaWS.Conn {
 	t.Helper()
-	ticket := "dm-ring-clear-viewer-" + uuid.NewString()
-	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, fmt.Sprintf("%s:ring-viewer::%d", userID, time.Now().Add(15*time.Minute).Unix()), 30*time.Second).Err())
+	ticketResponse := ts.DoRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil, testhelpers.AuthHeaders(accessToken))
+	require.Equal(t, http.StatusOK, ticketResponse.Code, ticketResponse.Body.String())
+	var ticketBody struct {
+		Ticket string `json:"ticket"`
+	}
+	testhelpers.ParseJSON(t, ticketResponse, &ticketBody)
+	require.NotEmpty(t, ticketBody.Ticket)
+	ticket := ticketBody.Ticket
 	wsServer := httptest.NewServer(ts.Router)
 	t.Cleanup(wsServer.Close)
 	conn, _, err := gorillaWS.DefaultDialer.Dial(
@@ -82,7 +86,7 @@ func TestRingDMCall_ExpiredStaleRowClearsViewerBadge(t *testing.T) {
 	viewer := ts.CreateTestUser(t, "ring_clear_viewer")
 	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 	insertStaleDMVoiceRow(t, ts, convID, callee.ID)
-	viewerConn := dialRichPresenceViewer(t, ts, viewer.ID)
+	viewerConn := dialRichPresenceViewer(t, ts, viewer.AccessToken)
 
 	require.Equal(t, http.StatusOK, ringDM(t, ts, caller, convID))
 	require.Zero(t, dmVoiceRowCount(t, ts, convID, callee.ID))

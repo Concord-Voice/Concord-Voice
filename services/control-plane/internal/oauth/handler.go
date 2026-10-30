@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -689,6 +690,10 @@ func handleSSOIssueError(c *gin.Context, err error) bool {
 	}
 	if errors.Is(err, auth.ErrSSOIdentityInsert) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "sso_identity_insert_failed"})
+		return true
+	}
+	if errors.Is(err, loginfamily.ErrUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Authentication temporarily unavailable"})
 		return true
 	}
 	c.JSON(http.StatusInternalServerError, gin.H{"error_code": "token_issuance_failed"})

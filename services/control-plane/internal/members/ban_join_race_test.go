@@ -172,8 +172,9 @@ func TestJoinServerCannotRecreateMembershipAfterConcurrentBan(t *testing.T) {
 	banHandler := &Handler{db: db, log: log, resolver: resolver}
 	banHandler.SetAuthorityHandler(rbac.NewHandler(db, log, nil, hub, resolver, nil, nil))
 	banDone := make(chan error, 1)
+	banCtx := dbtest.ActorContext(context.Background(), t, db, owner.String())
 	go func() {
-		banDone <- banHandler.execBanTx(context.Background(), serverID.String(), target.String(), owner.String(), nil, true)
+		banDone <- banHandler.execBanTx(banCtx, serverID.String(), target.String(), owner.String(), nil, true)
 	}()
 	waitForBanUserLock(t, db)
 
@@ -304,8 +305,9 @@ func TestAddMemberCannotRecreateMembershipAfterConcurrentBan(t *testing.T) {
 	banHandler := &Handler{db: db, log: log, resolver: resolver}
 	banHandler.SetAuthorityHandler(rbac.NewHandler(db, log, nil, nil, resolver, nil, nil))
 	banDone := make(chan error, 1)
+	banCtx := dbtest.ActorContext(context.Background(), t, db, owner.String())
 	go func() {
-		banDone <- banHandler.execBanTx(context.Background(), serverID.String(), target.String(), owner.String(), nil, true)
+		banDone <- banHandler.execBanTx(banCtx, serverID.String(), target.String(), owner.String(), nil, true)
 	}()
 	waitForBanUserLock(t, db)
 

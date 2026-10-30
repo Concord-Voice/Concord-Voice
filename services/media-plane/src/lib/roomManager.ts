@@ -1,3 +1,5 @@
+import type { ConnectionHandle, VoiceAuthConnections } from './voiceAuthConnection.js';
+import type { VoiceEnforcementSession } from './voiceEnforcementSession.js';
 import type {
   Router,
   WebRtcTransport,
@@ -1433,6 +1435,17 @@ function joinRoomResult(
   };
 }
 
+/**
+ * Keep media admission exactly aligned with the authoritative control-plane
+ * heartbeat bound. Existing users may reconnect at capacity without evicting
+ * their valid old session.
+ */
+function assertChannelCapacity(room: Room, existing: Participant | undefined): void {
+  if (room.roomKind === 'channel' && !existing && room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS) {
+    throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
+  }
+}
+
 /** The admitted caps for the joining participant, or nothing when unresolvable. */
 function admittedMediaCapsField(
   room: Room,
@@ -1564,6 +1577,12 @@ interface ExactUserModerationCapture {
   readonly target: ExactVoiceCommandTarget;
 }
 
+interface OwnedVoiceNativeRoom {
+  session: VoiceEnforcementSession;
+  room?: Room;
+  participant?: Participant;
+}
+
 /** Whether a camera producer sends one SVC layer stack (AV1 or VP9, one encoding). */
 function isSingleLayerSvcProducer(parameters: RtpParameters | undefined): boolean {
   if (parameters?.encodings?.length !== 1) return false;
@@ -1574,6 +1593,89 @@ function isSingleLayerSvcProducer(parameters: RtpParameters | undefined): boolea
 }
 
 export class RoomManager {
+  private voiceAuthConnections: VoiceAuthConnections | undefined;
+  private readonly ownedVoiceNativeRooms = new Map<string, OwnedVoiceNativeRoom>();
+
+  setVoiceAuthConnections(owner: VoiceAuthConnections): void {
+    if (this.voiceAuthConnections && this.voiceAuthConnections !== owner)
+      throw new Error('Voice ownership already installed');
+    this.voiceAuthConnections = owner;
+  }
+
+  /** Reserve the identity before join/router work; capture native provenance privately. */
+  reserveVoiceAuthRoom(handle: ConnectionHandle, session: VoiceEnforcementSession): void {
+    const owner = this.voiceAuthConnections;
+    if (!owner) throw new Error('Voice connection ownership unavailable');
+    const native: OwnedVoiceNativeRoom = { session: { ...session } };
+    owner.reserveRoom(handle, session, () => this.closeOwnedVoiceNativeRoom(native));
+    this.ownedVoiceNativeRooms.set(session.sessionGeneration, native);
+  }
+
+  private async closeOwnedVoiceNativeRoom(native: OwnedVoiceNativeRoom): Promise<void> {
+    const { session, room, participant } = native;
+    // A zero-resource witness comes from this retained reservation's complete
+    // creation history, not from a lookup that happened to miss a participant.
+    if (participant && room) {
+      const creating = [...(this.nativeTransportCreations.get(participant) ?? [])];
+      await Promise.all(creating);
+      this.retainNativeTermination(room, participant);
+      // Retired objects may share a user ID with a successor. Only close the
+      // retained object's native resources; shared moderation/layer metadata
+      // remains owned by the current participant's ordinary removal path.
+      // Layer demands are keyed by consumer ID and located through
+      // participant.consumers, so clear them BEFORE closeParticipantConsumers
+      // empties that map (same ordering as cleanupParticipantResources);
+      // otherwise departed viewers' demands leak and pin layering gates on.
+      this.clearParticipantCameraLayerDemands(room, participant);
+      this.clearParticipantScreenLayerDemands(room, participant);
+      // Sharer gate state is keyed by user ID, which a successor may share.
+      if (room.participants.get(session.userId) === participant)
+        this.cleanupSharerScreenGate(room, participant.userId);
+      this.closeParticipantConsumers(participant);
+      const removedCameraProducer = this.closeParticipantProducers(
+        room, participant, session.roomId, session.userId);
+      // A retired participant is no longer reachable by the ordinary leave path,
+      // so a removed camera producer must recompute the room gate here.
+      if (removedCameraProducer) this.recomputeCameraLayeringGate(room);
+      this.closeParticipantTransports(participant);
+    }
+    await this.removeProvisionalParticipantForEnforcement(session.roomId, session.userId,
+      session.socketId, session.sessionGeneration);
+    await this.leaveRoomIfSocketOwned(session.roomId, session.userId,
+      session.socketId, session.sessionGeneration);
+    if (room && this.rooms.get(session.roomId) === room && room.participants.size === 0 &&
+        room.pendingDMParticipants.size === 0 && room.pendingChannelParticipants.size === 0)
+      await this.closeRoom(session.roomId, room, false);
+    await this.awaitNativeTermination(session.roomId, session.userId, session.socketId, session.sessionGeneration);
+    this.ownedVoiceNativeRooms.delete(session.sessionGeneration);
+  }
+
+  private assertVoiceParticipantProductive(participant: Participant): void {
+    if (!this.voiceAuthConnections) return;
+    const generation = participant.voiceEnforcementSessionGeneration;
+    if (!generation) throw new Error('Voice room owner unavailable');
+    this.voiceAuthConnections.assertRoomProductive(generation);
+  }
+
+  private voiceParticipantProductive(participant: Participant): boolean {
+    try { this.assertVoiceParticipantProductive(participant); return true; }
+    catch { return false; }
+  }
+
+  private async runOwnedMediaOperation<T>(roomId: string, userId: string, effect: () => Promise<T>): Promise<T> {
+    const room = this.rooms.get(roomId);
+    const participant = room?.participants.get(userId);
+    if (!room || !participant) throw new Error('Participant not found');
+    this.assertVoiceParticipantProductive(participant);
+    const finish = this.trackNativeTransportCreation(participant);
+    try {
+      const result = await effect();
+      this.assertVoiceParticipantProductive(participant);
+      if (room.participants.get(userId) !== participant) throw new Error('Voice participant changed');
+      return result;
+    } finally { finish(); }
+  }
+
   private readonly pendingNativeClose = new Map<string, NativeCloseRecord>();
   private readonly nativeTransportCreations = new WeakMap<Participant, Set<Promise<void>>>();
   private readonly nativeRecvClosures = new WeakMap<Participant, Set<NativeTerminationTarget>>();
@@ -2224,6 +2326,44 @@ export class RoomManager {
 
   // ─── Participant management ──────────────────────────────────────────
 
+  /**
+   * Under voice auth, a join needs a productive owned session generation; the
+   * post-lookup check also requires the native room owner to still exist.
+   */
+  private assertJoinRoomProductive(generation: string | undefined, ownerPresent: boolean): void {
+    if (!this.voiceAuthConnections) return;
+    if (!generation || !ownerPresent) throw new Error('Voice room owner unavailable');
+    this.voiceAuthConnections.assertRoomProductive(generation);
+  }
+
+  /** Records an A1 candidate that is not yet an authoritative participant. */
+  private registerProvisionalParticipant(
+    room: Room,
+    participant: Participant,
+    roomContext: JoinRoomOptions['roomContext']
+  ): void {
+    if (room.roomKind !== 'dm') {
+      // A1 is visible to credential-epoch enforcement but is not authoritative:
+      // a stale candidate must never evict an admitted same-user session before A2.
+      room.pendingChannelParticipants.set(participant.userId, participant);
+      return;
+    }
+    // A1 records only an exact-socket candidate. It is deliberately absent
+    // from participants, call history, cap/codec inputs, heartbeats, epochs,
+    // and lifecycle events until the synchronous A2 promotion.
+    try {
+      registerProvisionalDMParticipant(room, participant, roomContext);
+    } catch (error) {
+      this.securityDeny(
+        error instanceof CryptoVersionMismatchError
+          ? 'crypto_version_invalid'
+          : 'authorization_denied',
+        'socket.join'
+      );
+      throw error;
+    }
+  }
+
   /** Add a participant to a room. Returns the router's RTP capabilities and existing producers. */
   async joinRoom(
     roomId: string,
@@ -2233,6 +2373,7 @@ export class RoomManager {
     rtpCapabilities: RtpCapabilities | undefined,
     options: JoinRoomOptions
   ): Promise<JoinRoomResult> {
+    this.assertJoinRoomProductive(options.voiceEnforcementSessionGeneration, true);
     this.refuseDuringMediaPolicyCooldown(roomId, userId, 'socket.join');
     const {
       entitlement,
@@ -2246,15 +2387,17 @@ export class RoomManager {
       voiceEnforcementSessionGeneration,
     } = options;
     this.assertDMCallOpen(roomContext);
-    let parsedMediaFrameCryptoVersion: number;
-    try {
-      parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
-    } catch (error) {
-      this.securityDeny('crypto_version_invalid', 'socket.join');
-      throw error;
-    }
+    const parsedMediaFrameCryptoVersion = this.guardSecurityDecision(
+      () => parseMediaFrameCryptoVersion(mediaFrameCryptoVersion),
+      'crypto_version_invalid',
+      'socket.join'
+    );
     const { username, displayName, avatarUrl } = identity;
     const room = await this.getOrCreateRoom(roomId, roomContext);
+    const nativeOwner = voiceEnforcementSessionGeneration
+      ? this.ownedVoiceNativeRooms.get(voiceEnforcementSessionGeneration) : undefined;
+    if (nativeOwner) nativeOwner.room = room;
+    this.assertJoinRoomProductive(voiceEnforcementSessionGeneration, nativeOwner !== undefined);
     // An existing-room lookup still yields; the last leave can close it meanwhile.
     if (this.rooms.get(roomId) !== room || room.router.closed) {
       return this.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, options);
@@ -2275,18 +2418,10 @@ export class RoomManager {
       room.ownerTier = roomContext.ownerTier;
     }
 
-    // Keep media admission exactly aligned with the authoritative control-plane
-    // heartbeat bound. This section is synchronous through participants.set, so
-    // simultaneous boundary joins cannot both reserve the final slot. Existing
-    // users may reconnect at capacity without evicting their valid old session.
+    // This section is synchronous through participants.set, so simultaneous
+    // boundary joins cannot both reserve the final slot.
     const existing = room.participants.get(userId);
-    if (
-      room.roomKind === 'channel' &&
-      !existing &&
-      room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS
-    ) {
-      throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
-    }
+    assertChannelCapacity(room, existing);
 
     // Per-user media caps (#1300): from the parsed control-plane entitlement,
     // or the fail-closed free floor for pre-#1300 callers. Copy the tiers array
@@ -2329,33 +2464,10 @@ export class RoomManager {
       mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
     };
 
-    if (room.roomKind === 'dm') {
-      // A1 records only an exact-socket candidate. It is deliberately absent
-      // from participants, call history, cap/codec inputs, heartbeats, epochs,
-      // and lifecycle events until the synchronous A2 promotion below.
-      try {
-        registerProvisionalDMParticipant(room, participant, roomContext);
-      } catch (error) {
-        this.securityDeny(
-          error instanceof CryptoVersionMismatchError
-            ? 'crypto_version_invalid'
-            : 'authorization_denied',
-          'socket.join'
-        );
-        throw error;
-      }
+    if (nativeOwner) nativeOwner.participant = participant;
 
-      return joinRoomResult(
-        room,
-        userId,
-        room.mediaFrameCryptoVersion ?? parsedMediaFrameCryptoVersion
-      );
-    }
-
-    if (deferChannelPromotion) {
-      // A1 is visible to credential-epoch enforcement but is not authoritative:
-      // a stale candidate must never evict an admitted same-user session before A2.
-      room.pendingChannelParticipants.set(userId, participant);
+    if (room.roomKind === 'dm' || deferChannelPromotion) {
+      this.registerProvisionalParticipant(room, participant, roomContext);
       return joinRoomResult(
         room,
         userId,
@@ -2421,6 +2533,7 @@ export class RoomManager {
       this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('Channel provisional participant is not owned by this socket');
     }
+    this.assertVoiceParticipantProductive(pending);
     if (promotion.admissionId !== undefined && pending.admissionId !== promotion.admissionId) {
       this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('Channel provisional participant admission does not match');
@@ -2526,6 +2639,7 @@ export class RoomManager {
         this.securityDeny('authorization_denied', 'socket.join');
         throw new Error('DM call ID does not match the provisional admission');
       }
+      this.assertVoiceParticipantProductive(admitted);
       commitSocketMembership();
       return joinRoomResult(room, userId, admitted.mediaFrameCryptoVersion);
     }
@@ -2549,6 +2663,7 @@ export class RoomManager {
     this.refuseDuringMediaPolicyCooldown(roomId, userId, 'socket.join');
 
     const participant = pending.participant;
+    this.assertVoiceParticipantProductive(participant);
     if (
       room.mediaFrameCryptoVersion !== null &&
       room.mediaFrameCryptoVersion !== participant.mediaFrameCryptoVersion
@@ -2956,6 +3071,14 @@ export class RoomManager {
     userId: string,
     direction: 'send' | 'recv'
   ): Promise<TransportOptions> {
+    return this.runOwnedMediaOperation(roomId, userId, () => this.createTransportOwned(roomId, userId, direction));
+  }
+
+  private async createTransportOwned(
+    roomId: string,
+    userId: string,
+    direction: 'send' | 'recv'
+  ): Promise<TransportOptions> {
     if (direction !== 'send' && direction !== 'recv') {
       throw new Error('Invalid transport direction');
     }
@@ -2973,6 +3096,7 @@ export class RoomManager {
       await this.drainClosedRecvTransports(room, participant);
       if (room.participants.get(userId) !== participant)
         throw new Error('Participant left during transport creation');
+      this.assertVoiceParticipantProductive(participant);
       this.guardSecurityDecision(
         () => this.reserveRecvTransportSlot(participant),
         'structural_limit_exceeded'
@@ -3014,6 +3138,9 @@ export class RoomManager {
         throw err;
       }
 
+      // Capture and close a late orphan before starting another worker request.
+      this.assertTransportParticipantCurrent(room, participant, userId, transport, direction);
+
       // The send transport may carry camera, screen, mic, and screen audio at
       // once. `maxManualBitrateBps` is a single-source ceiling, so using it as a
       // transport-wide REMB advisory would throttle a legitimate Free user's
@@ -3042,7 +3169,7 @@ export class RoomManager {
       }
 
       // The participant may have left — or reconnected onto a FRESH Participant
-      // object — while the router call was in flight. Storing here would attach
+      // object — while bitrate configuration was in flight. Storing here would attach
       // the transport to a detached object that nothing ever closes and that the
       // recv cap cannot see. Close the orphan and fail closed (#2032).
       this.assertTransportParticipantCurrent(room, participant, userId, transport, direction);
@@ -3089,7 +3216,7 @@ export class RoomManager {
     transport: WebRtcTransport,
     direction: 'send' | 'recv'
   ): void {
-    if (room.participants.get(userId) === participant) return;
+    if (room.participants.get(userId) === participant && this.voiceParticipantProductive(participant)) return;
     this.counterHooks.onIceTerminalWithoutConnect?.();
     this.retainNativeTermination(room, participant, [transport.id]);
     if (!transport.closed) transport.close();
@@ -3192,6 +3319,15 @@ export class RoomManager {
 
   /** Connect a transport's DTLS */
   async connectTransport(
+    roomId: string,
+    userId: string,
+    transportId: string,
+    dtlsParameters: DtlsParameters
+  ): Promise<void> {
+    return this.runOwnedMediaOperation(roomId, userId, () => this.connectTransportOwned(roomId, userId, transportId, dtlsParameters));
+  }
+
+  private async connectTransportOwned(
     roomId: string,
     userId: string,
     transportId: string,
@@ -3328,6 +3464,17 @@ export class RoomManager {
     rtpParameters: RtpParameters,
     source: MediaSource
   ): Promise<ProducerInfo> {
+    return this.runOwnedMediaOperation(roomId, userId, () => this.produceOwned(roomId, userId, transportId, kind, rtpParameters, source));
+  }
+
+  private async produceOwned(
+    roomId: string,
+    userId: string,
+    transportId: string,
+    kind: MediaKind,
+    rtpParameters: RtpParameters,
+    source: MediaSource
+  ): Promise<ProducerInfo> {
     const room = this.rooms.get(roomId);
     if (!room) throw new Error('Room not found');
 
@@ -3451,7 +3598,7 @@ export class RoomManager {
     // from the CURRENT participants, so the producer would keep a mediasoup
     // encoder alive with nothing left to close it. Same hazard, and the same
     // fix, as createTransport's post-await identity check. (#2793 CodeRabbit.)
-    if (room.participants.get(userId) !== participant) {
+    if (room.participants.get(userId) !== participant || !this.voiceParticipantProductive(participant)) {
       this.discardUnpublishedProducer(
         producer,
         room,
@@ -3712,6 +3859,14 @@ export class RoomManager {
    * caller must not announce `producer-resumed`.
    */
   async resumeProducer(
+    roomId: string,
+    userId: string,
+    producerId: string
+  ): Promise<'resumed' | 'media_policy_paused'> {
+    return this.runOwnedMediaOperation(roomId, userId, () => this.resumeProducerOwned(roomId, userId, producerId));
+  }
+
+  private async resumeProducerOwned(
     roomId: string,
     userId: string,
     producerId: string
@@ -4308,6 +4463,22 @@ export class RoomManager {
     producerUserId: string;
     source: MediaSource;
   } | null> {
+    return this.runOwnedMediaOperation(roomId, consumerUserId, () => this.consumeOwned(roomId, consumerUserId, producerId, transportId));
+  }
+
+  private async consumeOwned(
+    roomId: string,
+    consumerUserId: string,
+    producerId: string,
+    transportId?: string
+  ): Promise<{
+    id: string;
+    producerId: string;
+    kind: MediaKind;
+    rtpParameters: RtpParameters;
+    producerUserId: string;
+    source: MediaSource;
+  } | null> {
     const room = this.rooms.get(roomId);
     if (!room) throw new Error('Room not found');
 
@@ -4389,6 +4560,10 @@ export class RoomManager {
         },
       });
 
+      if (room.participants.get(consumerUserId) !== consumer || !this.voiceParticipantProductive(consumer)) {
+        newConsumer.close();
+        throw new Error('Voice participant changed during consume');
+      }
       consumer.consumers.set(newConsumer.id, newConsumer);
       consumer.consumersByKey.set(key, newConsumer.id);
     } finally {
@@ -4467,6 +4642,10 @@ export class RoomManager {
 
   /** Resume a consumer (called after client has set up its decoder) */
   async resumeConsumer(roomId: string, userId: string, consumerId: string): Promise<void> {
+    return this.runOwnedMediaOperation(roomId, userId, () => this.resumeConsumerOwned(roomId, userId, consumerId));
+  }
+
+  private async resumeConsumerOwned(roomId: string, userId: string, consumerId: string): Promise<void> {
     const room = this.rooms.get(roomId);
     if (!room) throw new Error('Room not found');
 
@@ -4710,9 +4889,8 @@ export class RoomManager {
       for (const [consumerId, consumer] of participant.consumers) {
         if (!room.lastNPausedConsumers.has(consumerId)) continue;
         room.lastNPausedConsumers.delete(consumerId); // delete BEFORE resume
-        if (participant.serverDeafened) continue;
-        consumer
-          .resume()
+        if (participant.serverDeafened || !this.voiceParticipantProductive(participant)) continue;
+        this.runOwnedMediaOperation(room.id, participant.userId, () => consumer.resume())
           .catch((err) => logger.warn('last-N drain resume failed', { consumerId, error: err }));
       }
     }
@@ -4737,9 +4915,8 @@ export class RoomManager {
           // The deafen pause holds; on server-undeafen the client's resume — now
           // allowed by the guard since this consumer is out of lastNPausedConsumers —
           // restores forwarding.
-          if (participant.serverDeafened) continue;
-          consumer
-            .resume()
+          if (participant.serverDeafened || !this.voiceParticipantProductive(participant)) continue;
+          this.runOwnedMediaOperation(room.id, participant.userId, () => consumer.resume())
             .catch((err) => logger.warn('last-N resume failed', { consumerId, error: err }));
         } else {
           room.lastNPausedConsumers.add(consumerId); // add BEFORE pause

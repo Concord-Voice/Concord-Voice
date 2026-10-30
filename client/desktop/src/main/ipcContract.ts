@@ -310,8 +310,22 @@
  *        `typeof globalThis.electron?.openBilling === 'function'`, and a shell
  *        below 32 gets no paid controls (no OS-browser fallback, spec R41).
  *        Capability, not demand.
+ * - v33: Status-aware tray (spec 2026-10-29-tray-status-design §4). One renderer
+ *        -> main invoke, `tray:setStatus`, carrying a closed-enum
+ *        `TrayStatusSnapshot` (no free-text slot); main checks the sender frame,
+ *        requires the main window's own main frame (a PiP shares the origin),
+ *        rate-limits at 20/s and validates the exact shape before using it. One
+ *        main -> renderer push, `tray:action`, carrying a closed-enum
+ *        `TrayAction` that the preload re-validates. Open, Quit and the update
+ *        actions stay in main. Also hardens `app:setBadgeCount`,
+ *        `app:flashFrame` and `app:focusWindow` (sender check + payload shape);
+ *        their signatures are unchanged.
+ *
+ *        The SERVER's spaIpcContract stays 19: the renderer feature-detects
+ *        `typeof globalThis.electron?.traySetStatus === 'function'`, and a shell
+ *        below 33 keeps its static Open/Quit tray. Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 32;
+export const IPC_CONTRACT_VERSION = 33;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.

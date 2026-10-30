@@ -46,7 +46,7 @@ func TestServerVoiceTerminalOutbox_BoundedAuthorizationRetryReleasesClaim(t *tes
 	hub, baseURL := newVoiceReplicaHub(t, ts)
 	var calls atomic.Int32
 	hub.SetChannelPermissionChecker(invalidatingServerVoiceTerminalPermissionChecker{hub: hub, calls: &calls})
-	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	conn := connectVoiceWireClientAtURL(t, ts, hub, baseURL, viewer)
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{
 		"type": "subscribe_server",
 		"data": map[string]interface{}{"server_id": serverID},

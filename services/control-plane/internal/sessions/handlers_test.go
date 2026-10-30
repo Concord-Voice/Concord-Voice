@@ -2,6 +2,7 @@ package sessions_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -85,7 +86,7 @@ func TestListSessionsSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rw.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, rw, &body)
-	sessions := body["sessions"].([]interface{})
+	sessions := testhelpers.JSONField[[]interface{}](t, body, "sessions")
 	assert.GreaterOrEqual(t, len(sessions), 1)
 	assert.NotNil(t, body["total"])
 }
@@ -115,9 +116,9 @@ func TestRevokeSessionSuccess(t *testing.T) {
 
 	var listBody map[string]interface{}
 	testhelpers.ParseJSON(t, rw, &listBody)
-	sessions := listBody["sessions"].([]interface{})
+	sessions := testhelpers.JSONField[[]interface{}](t, listBody, "sessions")
 	require.GreaterOrEqual(t, len(sessions), 1)
-	sessionID := sessions[0].(map[string]interface{})["id"].(string)
+	sessionID := testhelpers.JSONField[string](t, testhelpers.JSONElem[map[string]interface{}](t, sessions, 0), "id")
 
 	// Revoke that session (password required when < 3 active sessions)
 	w := ts.DoRequest("DELETE", "/api/v1/sessions/"+sessionID, map[string]interface{}{
@@ -160,7 +161,7 @@ func TestRevokeAllSessionsExceptCurrent(t *testing.T) {
 	ts := setupTS(t)
 	accessToken, refreshCookie := registerAndGetTokens(t, ts, "revokeother@test.concord.chat", "revokeother")
 
-	// Revoke all except current (need cookie for "current" identification)
+	// The bearer SID identifies the family to preserve.
 	jsonBytes, _ := json.Marshal(map[string]interface{}{
 		"password": "TestPassword123!",
 	})
@@ -187,12 +188,7 @@ func TestRevokeAllSessionsExceptCurrent_UsesBearerSessionWithoutCookie(t *testin
 	require.NoError(t, err)
 	userID, currentSessionID := claims.UserID, claims.SessionID
 	require.NotEmpty(t, currentSessionID)
-	var otherSessionID string
-	require.NoError(t, ts.DB.QueryRow(
-		`INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-		 VALUES ($1, $2, NOW() + INTERVAL '30 days') RETURNING id`,
-		userID, auth.HashRefreshToken("other-session-token"),
-	).Scan(&otherSessionID))
+	otherSessionID := createSession(t, ts, userID, "OtherDevice", testIP2)
 
 	w := ts.DoRequest("POST", "/api/v1/sessions/revoke-all", map[string]interface{}{
 		"password": "TestPassword123!",
@@ -204,6 +200,8 @@ func TestRevokeAllSessionsExceptCurrent_UsesBearerSessionWithoutCookie(t *testin
 	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, otherSessionID).Scan(&otherActive))
 	assert.Equal(t, 1, currentActive, "the bearer-authenticated session must be preserved without a refresh cookie")
 	assert.Zero(t, otherActive, "all non-current sessions must be revoked")
+	assertSessionFamilyLive(t, ts, userID, currentSessionID)
+	assertSessionFamilyRevoked(t, ts, userID, otherSessionID)
 }
 
 func TestRevokeAllSessionsExceptCurrent_StaleBearerPreservesCurrentCookieSession(t *testing.T) {
@@ -251,47 +249,37 @@ func TestRevokeAllSessionsExceptCurrent_StaleBearerPreservesCurrentCookieSession
 	}
 	require.NotNil(t, refreshCookieB)
 
-	otherSessionID := createSession(t, ts, user.ID, "OtherDevice", testIP2)
-	body, err := json.Marshal(map[string]interface{}{"password": testhelpers.TestAuthPlaintext})
-	require.NoError(t, err)
-	staleReq := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewReader(body))
-	staleReq.Header.Set("Authorization", "Bearer "+loginBody.AccessToken)
-	staleReq.Header.Set("Content-Type", "application/json")
-	staleReq.AddCookie(refreshCookieA)
-	staleW := httptest.NewRecorder()
-	ts.Router.ServeHTTP(staleW, staleReq)
-	require.Equal(t, http.StatusBadRequest, staleW.Code)
-	var staleBody map[string]interface{}
-	testhelpers.ParseJSON(t, staleW, &staleBody)
-	assert.Equal(t, "Current session cannot be identified", staleBody["error"])
-
-	var activeBeforeCurrent, activeBeforeOther int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, refreshBody.SessionID,
-	).Scan(&activeBeforeCurrent))
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, otherSessionID,
-	).Scan(&activeBeforeOther))
-	assert.Equal(t, 1, activeBeforeCurrent, "unknown current session must not revoke the active cookie session")
-	assert.Equal(t, 1, activeBeforeOther, "unknown current session must not revoke unrelated sessions")
-
-	revokeReq := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewReader(body))
-	revokeReq.Header.Set("Authorization", "Bearer "+loginBody.AccessToken)
-	revokeReq.Header.Set("Content-Type", "application/json")
-	revokeReq.AddCookie(refreshCookieB)
-	revokeW := httptest.NewRecorder()
-	ts.Router.ServeHTTP(revokeW, revokeReq)
-	require.Equal(t, http.StatusOK, revokeW.Code)
-
-	var currentActive, otherActive int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, refreshBody.SessionID,
-	).Scan(&currentActive))
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, otherSessionID,
-	).Scan(&otherActive))
-	assert.Equal(t, 1, currentActive, "the current refresh-cookie session must be preserved when the bearer sid is stale")
-	assert.Zero(t, otherActive, "all unrelated active sessions must be revoked")
+	// Both predecessor and successor SID retain immutable same-family authority.
+	var sameFamily bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT a.family_id=b.family_id FROM login_family_sids a JOIN login_family_sids b ON b.sid=$2 WHERE a.sid=$1`, loginBody.SessionID, refreshBody.SessionID).Scan(&sameFamily))
+	require.True(t, sameFamily)
+	// Vary the cookie independently: neither a rotated cookie nor another login's
+	// valid cookie may choose the family preserved by the old bearer.
+	for _, cookie := range []*http.Cookie{refreshCookieA, refreshCookieB, nil} {
+		otherSessionID := createSession(t, ts, user.ID, "OtherDevice", testIP2)
+		var cookieSID string
+		if cookie == nil {
+			h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, nil)
+			_, refresh, sid, err := h.IssueAccessAndRefresh(context.Background(), user.ID)
+			require.NoError(t, err)
+			cookieSID = sid
+			cookie = &http.Cookie{Name: "refresh_token", Value: refresh, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode}
+		}
+		body, err := json.Marshal(map[string]interface{}{"password": testhelpers.TestAuthPlaintext})
+		require.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+loginBody.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(cookie)
+		w := httptest.NewRecorder()
+		ts.Router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assertSessionFamilyLive(t, ts, user.ID, refreshBody.SessionID)
+		assertSessionFamilyRevoked(t, ts, user.ID, otherSessionID)
+		if cookieSID != "" {
+			assertSessionFamilyRevoked(t, ts, user.ID, cookieSID)
+		}
+	}
 }
 
 func TestRevokeAllSessionsExceptCurrent_WithoutSessionIdentityFailsSafely(t *testing.T) {
@@ -305,11 +293,17 @@ func TestRevokeAllSessionsExceptCurrent_WithoutSessionIdentityFailsSafely(t *tes
 	w := ts.DoRequest("POST", revokeAllPath, map[string]interface{}{
 		"password": "TestPassword123!",
 	}, testhelpers.AuthHeaders(legacyAccessToken))
-	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, "Current session cannot be identified", body["error"])
+	assert.Equal(t, "Authentication required", body["error"])
+	var operations int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM login_family_revocations WHERE user_id=$1`, claims.UserID).Scan(&operations))
+	assert.Zero(t, operations)
+	assert.Empty(t, w.Result().Cookies(), "rejected admission must not clear a refresh cookie")
 
+	assertSessionFamilyLive(t, ts, claims.UserID, claims.SessionID)
+	assertSessionCounts(t, ts, claims.UserID, 1, 0)
 	var active int
 	require.NoError(t, ts.DB.QueryRow(
 		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, claims.UserID,
@@ -322,13 +316,13 @@ func TestRevokeAllSessions_EpochAdvanceAfterAuthenticationReturnsUnauthorized(t 
 	accessToken, _ := registerAndGetTokens(t, ts, "revokeepoch@test.concord.chat", "revokeepoch")
 	claims, err := auth.ValidateAccessToken(accessToken, testhelpers.TestJWTSecret)
 	require.NoError(t, err)
-	staleToken, err := auth.GenerateAccessToken(claims.UserID, testhelpers.TestJWTSecret, true, "stale-epoch", "")
-	require.NoError(t, err)
+	admitted := false
 
 	router := gin.New()
 	router.Use(middleware.AuthRequired(testhelpers.TestJWTSecret, ts.Redis, ts.DB, nil))
 	router.Use(func(c *gin.Context) {
-		if _, updateErr := ts.DB.Exec(`UPDATE users SET credential_epoch = 'new-epoch' WHERE id = $1`, claims.UserID); updateErr != nil {
+		admitted = true
+		if _, updateErr := ts.DB.Exec(`UPDATE users SET credential_epoch = '0123456789abcdef0123456789abcdef' WHERE id = $1`, claims.UserID); updateErr != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -338,8 +332,14 @@ func TestRevokeAllSessions_EpochAdvanceAfterAuthenticationReturnsUnauthorized(t 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewBufferString(`{"password":"TestPassword123!","include_current":true}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+staleToken)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	require.True(t, admitted, "real family must pass AuthRequired before epoch advance")
+	assertSessionFamilyLive(t, ts, claims.UserID, claims.SessionID)
+	assertSessionCounts(t, ts, claims.UserID, 1, 0)
+	var operations int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM login_family_revocations WHERE user_id=$1`, claims.UserID).Scan(&operations))
+	assert.Zero(t, operations)
 }

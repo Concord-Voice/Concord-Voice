@@ -30,8 +30,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -85,23 +87,20 @@ func sharedTestKey(t *testing.T) *rsa.PrivateKey {
 type recordingHub struct {
 	mu           sync.Mutex
 	disconnected []uuid.UUID
+	families     []uuid.UUID
+}
+
+func (r *recordingHub) DisconnectFamilyContext(_ context.Context, _, family uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.families = append(r.families, family)
+	return nil
 }
 
 func (r *recordingHub) DisconnectUser(id uuid.UUID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.disconnected = append(r.disconnected, id)
-}
-
-func (r *recordingHub) wasDisconnected(id string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, d := range r.disconnected {
-		if d.String() == id {
-			return true
-		}
-	}
-	return false
 }
 
 type ageITEnv struct {
@@ -111,6 +110,9 @@ type ageITEnv struct {
 	hub    *recordingHub
 	userID string
 	key    *rsa.PrivateKey
+	// actor carries the requesting login's signed identity, as AuthRequired
+	// attaches it.
+	actor context.Context
 }
 
 // setupAgeIT provisions a real DB + Redis, a verified user, and a public_keys row
@@ -161,6 +163,7 @@ func setupAgeIT(t *testing.T, withKey bool) (*ageITEnv, func()) {
 	env := &ageITEnv{
 		h:  NewHandler(db, rdb, hub, logger.New("test")),
 		db: db, rdb: rdb, hub: hub, userID: userID, key: key,
+		actor: dbtest.ActorContext(context.Background(), t, db, userID),
 	}
 	cleanup := func() {
 		_, _ = db.Exec(`TRUNCATE users, public_keys, refresh_tokens, age_verification_records CASCADE`)
@@ -214,7 +217,7 @@ func (e *ageITEnv) submit(t *testing.T, body string) *httptest.ResponseRecorder 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodPut, "/api/v1/age/claim", strings.NewReader(body))
+	c.Request = httptest.NewRequest(http.MethodPut, "/api/v1/age/claim", strings.NewReader(body)).WithContext(e.actor)
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("user_id", e.userID)
 	e.h.SubmitClaim(c)
@@ -228,6 +231,16 @@ func (e *ageITEnv) errorCode(t *testing.T, w *httptest.ResponseRecorder) string 
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	return resp.ErrorCode
+}
+
+// actorFamily is the login family of the requesting identity.
+func (e *ageITEnv) actorFamily(t *testing.T) uuid.UUID {
+	t.Helper()
+	identity, ok := loginfamily.AccessIdentityFromContext(e.actor)
+	require.True(t, ok)
+	var family uuid.UUID
+	require.NoError(t, e.db.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1`, identity.SID).Scan(&family))
+	return family
 }
 
 func (e *ageITEnv) userDisabled(t *testing.T) bool {
@@ -255,12 +268,8 @@ func TestAgeIT_InvalidAge_DisablesTerminally(t *testing.T) {
 	env, cleanup := setupAgeIT(t, true)
 	defer cleanup()
 
-	// Seed a live refresh token to prove the disable tx revokes it.
-	_, err := env.db.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me)
-		 VALUES ($1, $2, $3, 'dev', '1.2.3.4', 'ua', NOW() + INTERVAL '30 days', false)`,
-		uuid.New().String(), env.userID, "test-refresh-token-hash")
-	require.NoError(t, err)
+	// Mint real family/SID membership so the refresh row belongs to the revoked frontier.
+	family := ageFamily(t, env)
 
 	c := env.freshClaim()
 	c.ValidAge = false
@@ -284,8 +293,45 @@ func TestAgeIT_InvalidAge_DisablesTerminally(t *testing.T) {
 	require.NoError(t, rerr)
 	assert.Equal(t, int64(1), n, "denylist key must be set")
 
-	// live sessions kicked
-	assert.True(t, env.hub.wasDisconnected(env.userID), "DisconnectUser must be called")
+	// The handler commits the exact durable ejection obligation before replying.
+	// Actual family transport closure is independently covered by websocket's
+	// TestLoginFamilySecurityReceiptClosesDespiteBlockedWriter; delivery owns the close.
+	var terminal, sealed, completed bool
+	var scope, reasonCode string
+	require.NoError(t, env.db.QueryRow(`
+		SELECT f.terminal_at IS NOT NULL, r.sealed_at IS NOT NULL,
+		       r.completed_at IS NOT NULL, r.scope, r.reason
+		FROM login_families f
+		JOIN login_family_revocations r ON r.operation_id=f.auth_operation_id AND r.user_id=f.user_id
+		JOIN login_family_revocation_targets target ON target.operation_id=r.operation_id
+		  AND target.family_id=f.family_id AND target.user_id=f.user_id
+		WHERE f.family_id=$1 AND f.user_id=$2`, family, env.userID).
+		Scan(&terminal, &sealed, &completed, &scope, &reasonCode))
+	assert.True(t, terminal, "real family must be terminal")
+	assert.True(t, sealed, "captured family obligation must be sealed before the 200")
+	assert.False(t, completed, "handler must leave durable delivery pending for the family worker")
+	assert.Equal(t, "user", scope)
+	assert.Equal(t, "disablement", reasonCode)
+	// The committed family's sockets are fenced before the 200, not left to the ticker.
+	env.hub.mu.Lock()
+	defer env.hub.mu.Unlock()
+	assert.ElementsMatch(t, []uuid.UUID{family, env.actorFamily(t)}, env.hub.families, "disablement must fence every terminal family before responding")
+	assert.Empty(t, env.hub.disconnected, "an exact family close needs no user-wide fallback")
+}
+
+// The requesting login is itself a live family, so a disablement with no
+// other login fences exactly that family and needs no user-wide fallback.
+func TestAgeIT_InvalidAge_RequesterOnlyFencesItsFamily(t *testing.T) {
+	env, cleanup := setupAgeIT(t, true)
+	defer cleanup()
+	c := env.freshClaim()
+	c.ValidAge = false
+	w := env.submit(t, env.signBody(t, c, nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	env.hub.mu.Lock()
+	defer env.hub.mu.Unlock()
+	assert.Equal(t, []uuid.UUID{env.actorFamily(t)}, env.hub.families)
+	assert.Empty(t, env.hub.disconnected)
 }
 
 func TestAgeIT_Downgrade_TrueThenFalse_Disables(t *testing.T) {

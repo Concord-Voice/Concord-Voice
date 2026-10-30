@@ -25,8 +25,7 @@ func TestPersistDMMessage_UsesSharedExpirationPolicy(t *testing.T) {
 			_, err := setup.db.Exec(`UPDATE dm_conversations SET expiration_window_seconds = $1 WHERE id = $2`, tc.window, setup.convID)
 			require.NoError(t, err)
 			_, createdAt, _, expiresAt, _, err := setup.hub.persistDMMessageWithExpiry(
-				mustUUID(t, setup.convID), setup.user1, "", &dmMessageInput{content: "ciphertext", keyVersion: 1, msgType: "user"},
-			)
+				mustUUID(t, setup.convID), setup.user1, "", &dmMessageInput{identity: setup.identity(t, setup.user1), content: "ciphertext", keyVersion: 1, msgType: "user"})
 			require.NoError(t, err)
 			if tc.want {
 				require.NotNil(t, expiresAt)
@@ -45,8 +44,7 @@ func TestPersistDMMessage_ClearsOlderParticipantHides(t *testing.T) {
 	require.NoError(t, err)
 
 	_, createdAt, _, _, _, err := setup.hub.persistDMMessageWithExpiry(
-		mustUUID(t, setup.convID), setup.user1, "", &dmMessageInput{content: "respawn", keyVersion: 1, msgType: "user"},
-	)
+		mustUUID(t, setup.convID), setup.user1, "", &dmMessageInput{identity: setup.identity(t, setup.user1), content: "respawn", keyVersion: 1, msgType: "user"})
 	require.NoError(t, err)
 	require.True(t, createdAt.After(hiddenAt))
 
@@ -72,7 +70,7 @@ func TestPersistMessage_UsesSharedExpirationPolicy(t *testing.T) {
 			_, err := setup.db.Exec(`UPDATE channels SET expiration_window_seconds = $1 WHERE id = $2`, tc.window, setup.convID)
 			require.NoError(t, err)
 			_, createdAt, _, expiresAt, _, persistErr, _ := setup.hub.persistMessageWithExpiry(persistMessageParams{
-				channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+				channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 				content: "ciphertext", keyVersion: 1,
 			})
 			require.Empty(t, persistErr)
@@ -96,7 +94,7 @@ func TestPersistMessage_RechecksRevocationInsideTransaction(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, _, _, _, persistErr, _ := setup.hub.persistMessageWithExpiry(persistMessageParams{
-		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		channelUUID: channelID, userID: setup.user1, identity: setup.identity(t, setup.user1), membershipIncarnation: incarnation,
 		content: "ciphertext", keyVersion: 1,
 	})
 	assert.Equal(t, errMsgFailedVerifyKeyEpoch, persistErr)

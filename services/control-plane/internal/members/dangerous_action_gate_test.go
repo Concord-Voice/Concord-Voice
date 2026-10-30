@@ -371,6 +371,7 @@ func TestModerationGate_PurgeProvenance(t *testing.T) {
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", f.mod.ID)
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": sid})
+		ts.AttachActorIdentity(t, c, f.mod.ID)
 		c.Next()
 	})
 	router.POST("/api/v1/servers/:id/bans/:user_id", handler.BanMember)

@@ -15,6 +15,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -58,6 +59,7 @@ type MFAVerifier interface {
 
 type sessionDisconnector interface {
 	DisconnectUser(uuid.UUID)
+	loginfamily.FamilyCloser
 }
 
 // TokenPairIssuer mints the post-rotation continuation token pair (#2201).
@@ -415,6 +417,13 @@ func (h *Handler) replaceMyKeysCoordinated(
 	defer tx.Rollback() //nolint:errcheck
 	defer h.rollbackKeyReplacement(tx)
 
+	userAuthority, err := lockCredentialUserTx(c.Request.Context(), tx, senderID)
+	if err != nil {
+		fenceOp.Rollback(c.Request.Context())
+		h.respondKeyReplacementReauthenticationFailure(c, err)
+		return
+	}
+	// Factor consumption is a users-serialized prerequisite to family capture.
 	if err := h.verifyStepUpWithLockedUser(
 		c.Request.Context(), tx, senderID, stepup.PurposeE2EEKeyReset, req.CurrentPassword, req.MFACode,
 	); err != nil {
@@ -423,11 +432,11 @@ func (h *Handler) replaceMyKeysCoordinated(
 		return
 	}
 
-	// Rotate the credential epoch under the user-row lock taken above (#2201).
-	if err := fenceOp.RotateTx(c.Request.Context(), tx); err != nil {
+	// Capture the old families before epoch and forced-clear child work.
+	owners, err := rotateCredentialFamiliesTx(c.Request.Context(), tx, senderID, userAuthority, fenceOp)
+	if err != nil {
 		fenceOp.Rollback(c.Request.Context())
-		h.log.Error("Failed to rotate credential epoch", "error_class", "epoch_rotate")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
+		h.respondKeyReplacementReauthenticationFailure(c, err)
 		return
 	}
 
@@ -462,7 +471,7 @@ func (h *Handler) replaceMyKeysCoordinated(
 		return
 	}
 
-	if !h.completeKeyReplacementClear(c, tx, forcedClear, fenceOp) {
+	if !h.completeKeyReplacementClear(c, tx, forcedClear, fenceOp, owners) {
 		return
 	}
 
@@ -485,6 +494,10 @@ func (h *Handler) respondKeyReplacementReauthenticationFailure(c *gin.Context, e
 		c.JSON(reauthErr.status, reauthErr.body)
 		return
 	}
+	if errors.Is(err, loginfamily.ErrUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedReplaceKeys})
+		return
+	}
 	h.log.Error("Failed to re-authenticate key replacement", "error_class", "reauthentication")
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 }
@@ -494,12 +507,15 @@ func (h *Handler) completeKeyReplacementClear(
 	tx *sql.Tx,
 	forcedClear presencehistory.ForcedClearResult,
 	fenceOp *credepoch.Op,
+	owners []loginfamily.DeliveryOwner,
 ) bool {
 	completion := h.presenceHistory.CompleteForcedSecurityClear(
 		c.Request.Context(), tx, forcedClear,
 	)
-	if completion.RequiresDisconnect() && h.sessionDisconnector != nil {
-		h.sessionDisconnector.DisconnectUser(forcedClear.Operation.SenderID)
+	// Committed (or possibly committed): fence the old families before any
+	// response. The async epoch evictor and reconciler stay the backstop.
+	if completion.RequiresDisconnect() {
+		h.closeCredentialFamilies(c.Request.Context(), owners)
 	}
 	if completion.Err == nil {
 		if fenceOp != nil {
@@ -1112,14 +1128,7 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 
 	// Record username change in history for audit/abuse tracking
 	if b.usernameChanged {
-		_, histErr := h.db.Exec(
-			`INSERT INTO username_history (user_id, old_username, new_username) VALUES ($1, $2, $3)`,
-			userID, b.previousUsername, user.Username,
-		)
-		if histErr != nil {
-			h.log.Error("Failed to record username history", "error", histErr)
-			// Non-fatal — the username change already succeeded
-		}
+		h.recordUsernameHistory(userID, b.previousUsername, user.Username)
 	}
 
 	h.log.Info("Profile updated", "user_id", userID)
@@ -1127,22 +1136,41 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 	// Notify the current profile audience in real time. A lone
 	// matching inline re-send changed nothing, so it has nothing to broadcast.
 	if h.hub != nil && changesProfile {
-		broadcastCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), time.Second)
-		defer cancel()
-		if err := h.broadcastProfileUpdate(broadcastCtx, user); err != nil {
-			failureClass := "database"
-			if errors.Is(err, context.DeadlineExceeded) {
-				failureClass = "timeout"
-			} else if errors.Is(err, errProfileBroadcastUnavailable) {
-				failureClass = "hub_unavailable"
-			}
-			h.log.Warn("Profile update broadcast suppressed", "failure_class", failureClass)
-		}
+		h.broadcastProfileUpdateBounded(c.Request.Context(), user)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"user": user.PublicUser(ent.UsernameChangeIntervalMonths),
 	})
+}
+
+// recordUsernameHistory logs a username change for audit and abuse tracking.
+// Failure is non-fatal: the username change already succeeded.
+func (h *Handler) recordUsernameHistory(userID any, previous, current string) {
+	if _, err := h.db.Exec(
+		`INSERT INTO username_history (user_id, old_username, new_username) VALUES ($1, $2, $3)`,
+		userID, previous, current,
+	); err != nil {
+		h.log.Error("Failed to record username history", "error", err)
+	}
+}
+
+// broadcastProfileUpdateBounded notifies the profile audience within one
+// second, outliving request cancellation, and logs only a failure class.
+func (h *Handler) broadcastProfileUpdateBounded(ctx context.Context, user *models.User) {
+	broadcastCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	err := h.broadcastProfileUpdate(broadcastCtx, user)
+	if err == nil {
+		return
+	}
+	failureClass := "database"
+	if errors.Is(err, context.DeadlineExceeded) {
+		failureClass = "timeout"
+	} else if errors.Is(err, errProfileBroadcastUnavailable) {
+		failureClass = "hub_unavailable"
+	}
+	h.log.Warn("Profile update broadcast suppressed", "failure_class", failureClass)
 }
 
 // validateCanonicalProfileMediaURLs keeps a canonical profile proxy URL from
@@ -1538,7 +1566,7 @@ func rotatePasswordSyncDomain(
 // Codex): a broadcast would reach sessions still holding the OLD preferences
 // key (including the initiating renderer mid-POST), whose fetch-and-apply
 // handlers could push old-key ciphertext back over the rotated rows. The
-// post-commit DisconnectUser + refresh-token revocation force every session
+// terminal-family authority and epoch eviction force old sessions
 // through re-login rehydration, which converges cross-device state safely.
 func rotateAllPasswordSyncDomains(
 	ctx context.Context,
@@ -1589,6 +1617,58 @@ var errCommitAmbiguous = errors.New("password change commit ambiguous")
 type passwordChangeOutcome struct {
 	presenceOverrideVersion int
 	domainVersions          map[string]int // nil when domains == nil (legacy request)
+	// owners is set even on an ambiguous commit so the caller can still fence.
+	owners []loginfamily.DeliveryOwner
+}
+
+// closeCredentialFamilies synchronously fences the families a credential
+// rotation terminalized. A failure never fails the committed change: the
+// epoch evictor and the durable owner's reconciler remain the backstop.
+func (h *Handler) closeCredentialFamilies(ctx context.Context, owners []loginfamily.DeliveryOwner) {
+	if h.sessionDisconnector == nil || len(owners) == 0 {
+		return
+	}
+	if err := loginfamily.CloseCommittedFamilies(ctx, h.db, h.sessionDisconnector, owners); err != nil {
+		h.log.Warn("Credential family socket close deferred to reconciliation")
+	}
+}
+
+// lockCredentialUserTx establishes the complete authority prefix before step-up.
+func lockCredentialUserTx(ctx context.Context, tx *sql.Tx, userID uuid.UUID) (loginfamily.UserAuthority, error) {
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, []uuid.UUID{userID}, loginfamily.UserNoKeyUpdate)
+	if errors.Is(err, loginfamily.ErrDenied) {
+		return loginfamily.UserAuthority{}, &stepUpReauthenticationError{status: http.StatusNotFound, body: gin.H{"error": errMsgUserNotFound}}
+	}
+	if err != nil {
+		return loginfamily.UserAuthority{}, err
+	}
+	return users.ForUser(userID)
+}
+
+// rotateCredentialFamiliesTx never constructs user authority or owns commit.
+// Its caller has already completed the users-serialized factor prerequisite.
+func rotateCredentialFamiliesTx(ctx context.Context, tx *sql.Tx, userID uuid.UUID, user loginfamily.UserAuthority, op *credepoch.Op) ([]loginfamily.DeliveryOwner, error) {
+	var previous string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(credential_epoch, '') FROM users WHERE id=$1`, userID).Scan(&previous); err != nil {
+		return nil, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+	}
+	targets, err := loginfamily.CaptureEpochTargetsTx(ctx, tx, user, previous)
+	if err != nil {
+		return nil, err
+	}
+	owner, err := op.RotateTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	revoked, err := loginfamily.RevokeFamiliesForEpochTx(ctx, tx, targets, owner)
+	if err != nil {
+		return nil, err
+	}
+	return revoked.Owners, nil
 }
 
 // executePasswordChange atomically rotates password/key material, the
@@ -1610,16 +1690,20 @@ func (h *Handler) executePasswordChange(ctx context.Context, change passwordChan
 		}
 	}()
 
+	userAuthority, err := lockCredentialUserTx(ctx, tx, change.userID)
+	if err != nil {
+		return outcome, err
+	}
+	// Keep transactional factor consumption ahead of family capture.
 	if err := h.verifyStepUpWithLockedUser(
 		ctx, tx, change.userID, stepup.PurposePasswordChange, change.currentPassword, change.mfaCode,
 	); err != nil {
 		return outcome, err
 	}
 
-	// Rotate the credential epoch under the user-row lock taken above (#2201) —
-	// a users-table write, so it stays in the users-first phase before the
-	// domain tables.
-	if err := fenceOp.RotateTx(ctx, tx); err != nil {
+	// Capture families before any domain mutation; the epoch parent owns them.
+	owners, err := rotateCredentialFamiliesTx(ctx, tx, change.userID, userAuthority, fenceOp)
+	if err != nil {
 		return passwordChangeOutcome{}, err
 	}
 
@@ -1657,8 +1741,9 @@ func (h *Handler) executePasswordChange(ctx context.Context, change passwordChan
 	); err != nil {
 		return passwordChangeOutcome{}, fmt.Errorf("revoke refresh tokens: %w", err)
 	}
+	outcome.owners = owners
 	if err := tx.Commit(); err != nil {
-		return passwordChangeOutcome{}, errors.Join(errCommitAmbiguous, err)
+		return passwordChangeOutcome{owners: owners}, errors.Join(errCommitAmbiguous, err)
 	}
 	return outcome, nil
 }
@@ -1686,6 +1771,10 @@ func (h *Handler) respondChangePasswordError(c *gin.Context, err error) {
 			"domain":          domainConflict.Domain,
 			"current_version": domainConflict.CurrentVersion,
 		})
+		return
+	}
+	if errors.Is(err, loginfamily.ErrUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedChangePassword})
 		return
 	}
 	h.log.Error(errMsgFailedChangePassword, "error", err)
@@ -1772,21 +1861,16 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		domains:         req.SyncDomains,
 	}, fenceOp)
 	settleCredentialFence(c.Request.Context(), fenceOp, err)
+	if err == nil || errors.Is(err, errCommitAmbiguous) {
+		h.closeCredentialFamilies(c.Request.Context(), outcome.owners)
+	}
 	if err != nil {
 		h.respondChangePasswordError(c, err)
 		return
 	}
 
-	// Deliberately NO *_updated broadcasts for rotated domains: sessions still
-	// holding the old preferences key (including the initiating renderer
-	// mid-POST) would fetch-and-apply and could push old-key ciphertext back
-	// over the rotated rows. DisconnectUser below forces every session through
-	// re-login rehydration instead (#2200 review, Codex).
-
-	// Force-close all WebSocket connections for this user.
-	if h.sessionDisconnector != nil {
-		h.sessionDisconnector.DisconnectUser(parsedUID)
-	}
+	// No domain broadcasts: old-key clients reauthenticate through terminal
+	// family authority. The existing epoch evictor targets only the old epoch.
 
 	resp := gin.H{
 		"message":                   "Password changed successfully",

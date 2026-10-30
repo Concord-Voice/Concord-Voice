@@ -246,8 +246,41 @@ func TruncateAllTables(db *sql.DB) error {
 	return err
 }
 
+// ExecReplica runs one statement in a transaction with session_replication_role
+// = replica. Migration 000194 puts statement-level BEFORE TRUNCATE triggers on
+// the login-family evidence tables; ordinary triggers do not fire in replica
+// mode, so this is how a disposable test database resets them. It needs a
+// superuser role, which the test database role is; production's is not.
+func ExecReplica(db *sql.DB, query string, args ...any) (sql.Result, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`SET LOCAL session_replication_role = replica`); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	res, err := tx.Exec(query, args...)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return res, tx.Commit()
+}
+
 func truncateAllTablesOnce(db *sql.DB) error {
-	_, err := db.Exec(`TRUNCATE
+	_, err := ExecReplica(db, `TRUNCATE
+		login_family_revocation_targets,
+		login_family_sids,
+		login_families,
+		login_family_revocations,
+		voice_auth_room_bindings,
+		voice_enforcement_sessions,
+		voice_auth_connections,
+		voice_auth_room_closures,
+		voice_auth_connection_closures,
+		voice_auth_boot_fences,
+		login_family_rollout,
 		presence_settings_pending_operations,
 		presence_history,
 		user_presence_overrides,
@@ -311,6 +344,12 @@ func truncateAllTablesOnce(db *sql.DB) error {
 		user_presence_settings
 	CASCADE`)
 	if err != nil {
+		return err
+	}
+	// Only this disposable-test reset replaces the rollout singleton. Production's
+	// one-way activation UPDATE/DELETE guards remain enabled; each activation
+	// case owns its initial prepared/active state after fixture setup.
+	if _, err := db.Exec(`INSERT INTO login_family_rollout (id) VALUES (TRUE)`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`

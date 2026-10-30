@@ -2177,7 +2177,7 @@ func createAttachmentRecord(h *Handler, c *gin.Context, p attachmentParams) erro
 			h.log.Error("Failed to rollback attachment tx", "error", rbErr)
 		}
 	}()
-	if guardErr := credepoch.GuardTx(ctx, tx, p.userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardFamilyTx(ctx, tx, p.userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		return guardErr
 	}
 

@@ -291,7 +291,7 @@ func TestDeleteGroupDataCapturesAPlanPerVoiceParticipant(t *testing.T) {
 	handler, deliverer := newDMHandlerWithRail(t, db, convID)
 	creator := groupCreatorID(t, db, convID)
 
-	require.NoError(t, handler.deleteGroupData(context.Background(), convID, creator, ""))
+	require.NoError(t, handler.deleteGroupData(actorCtx(context.Background(), t, db, creator), convID, creator, ""))
 
 	require.ElementsMatch(t, participants, deliverer.subjectsCleared(),
 		"every participant in the active call is owed exactly one clear frame")
@@ -324,7 +324,7 @@ func TestDeleteGroupDataLocksUsersBeforeConversations(t *testing.T) {
 		observed <- sampleRelationLocks(t, db, backendPID(t, tx))
 	}
 
-	require.NoError(t, handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID), ""))
+	require.NoError(t, handler.deleteGroupData(actorCtx(context.Background(), t, db, groupCreatorID(t, db, convID)), convID, groupCreatorID(t, db, convID), ""))
 
 	select {
 	case relations := <-observed:
@@ -349,7 +349,7 @@ func TestDeleteGroupDataFailsClosedOnCandidateDrift(t *testing.T) {
 		once.Do(func() { joinExtraVoiceParticipant(t, db, convID) })
 	}
 
-	err := handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID), "")
+	err := handler.deleteGroupData(actorCtx(context.Background(), t, db, groupCreatorID(t, db, convID)), convID, groupCreatorID(t, db, convID), "")
 	require.ErrorIs(t, err, errCandidateSetDrifted)
 
 	require.Equal(t, 1,
@@ -393,6 +393,7 @@ func TestDeleteGroupRejectsAdminDemotedBeforeDestructiveTransaction(t *testing.T
 	recorder.ctx.Params = gin.Params{{Key: "id", Value: convID}}
 	recorder.ctx.Set("user_id", adminID.String())
 
+	withActor(t, handler.db, recorder.ctx, adminID.String())
 	handler.DeleteGroup(recorder.ctx)
 	require.Equal(t, http.StatusConflict, recorder.status(),
 		"an admin demoted after the initial check must not complete group deletion")
@@ -424,6 +425,7 @@ func TestDeleteGroupRejectsRemovedAdminBeforeUngatedTransaction(t *testing.T) {
 	recorder.ctx.Params = gin.Params{{Key: "id", Value: convID}}
 	recorder.ctx.Set("user_id", admin.String())
 
+	withActor(t, handler.db, recorder.ctx, admin.String())
 	handler.DeleteGroup(recorder.ctx)
 	require.Equal(t, http.StatusConflict, recorder.status(),
 		"a removed admin after the initial check must not complete group deletion")
@@ -457,7 +459,7 @@ func TestDeleteGroupDataWithoutAnActiveCallCapturesNothing(t *testing.T) {
 	handler, deliverer := newDMHandlerWithRail(t, db, convID)
 	creator := groupCreatorID(t, db, convID)
 
-	require.NoError(t, handler.deleteGroupData(context.Background(), convID, creator, ""))
+	require.NoError(t, handler.deleteGroupData(actorCtx(context.Background(), t, db, creator), convID, creator, ""))
 
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM presence_active_pending_plans`))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
@@ -473,7 +475,7 @@ func TestDeleteGroupDataFailsClosedAboveTheSubjectBound(t *testing.T) {
 	convID, _ := seedGroupCallWithParticipants(t, db, maxGroupVoiceCandidates+1)
 	handler, deliverer := newDMHandlerWithRail(t, db, convID)
 
-	err := handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID), "")
+	err := handler.deleteGroupData(actorCtx(context.Background(), t, db, groupCreatorID(t, db, convID)), convID, groupCreatorID(t, db, convID), "")
 	require.ErrorIs(t, err, activepresence.ErrTooManySubjects)
 
 	require.Equal(t, 1,
@@ -493,7 +495,7 @@ func TestDeleteGroupDataFailsClosedAboveTheBoundWithNoRail(t *testing.T) {
 	handler := NewHandler(HandlerDeps{DB: db, Log: logger.NewWithWriter(io.Discard)})
 	require.False(t, handler.HasActivePlanRail())
 
-	err := handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID), "")
+	err := handler.deleteGroupData(actorCtx(context.Background(), t, db, groupCreatorID(t, db, convID)), convID, groupCreatorID(t, db, convID), "")
 	require.ErrorIs(t, err, activepresence.ErrTooManySubjects)
 	require.Equal(t, 1,
 		countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID),
@@ -515,7 +517,7 @@ func TestDeleteGroupDataWithoutARailStillDeletes(t *testing.T) {
 		PurgeEngine: purge.NewEngine(db, log, purge.NewReaper(db, log, nil), 5000),
 	})
 
-	require.NoError(t, handler.deleteGroupData(context.Background(), convID, creator, ""))
+	require.NoError(t, handler.deleteGroupData(actorCtx(context.Background(), t, db, creator), convID, creator, ""))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM presence_active_pending_plans`))
 	expected := append([]string{creator}, uuidStrings(participants)...)
@@ -598,6 +600,7 @@ func TestDeleteGroupDataReapsConversationAttachmentAfterCommit(t *testing.T) {
 	var userID string
 	require.NoError(t, db.QueryRow(`SELECT created_by FROM dm_conversations WHERE id = $1`, convID).Scan(&userID))
 	recorder.ctx.Set("user_id", userID)
+	withActor(t, handler.db, recorder.ctx, userID)
 	handler.DeleteGroup(recorder.ctx)
 	require.Equal(t, http.StatusOK, recorder.status())
 	select {
@@ -653,7 +656,7 @@ func TestDeleteGroupDataFailsClosedOnCrossContextAttachmentBridge(t *testing.T) 
 			require.Equal(t, 2, countRows(t, db, `SELECT count(*) FROM dm_message_attachments WHERE file_id = $1`, fileID))
 
 			handler, _ := newDMHandlerWithRail(t, db, convID)
-			err = handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID), "")
+			err = handler.deleteGroupData(actorCtx(context.Background(), t, db, groupCreatorID(t, db, convID)), convID, groupCreatorID(t, db, convID), "")
 			require.Error(t, err)
 			require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 			require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_messages WHERE conversation_id = $1`, convID))
@@ -756,7 +759,7 @@ func TestDeleteGroupDataFailsClosedOnOutOfScopeMediaContext(t *testing.T) {
 	engine := purge.NewEngine(db, log, purge.NewReaper(db, log, store), 5000)
 	handler := NewHandler(HandlerDeps{DB: db, Log: log, PurgeEngine: engine})
 
-	err = handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID), "")
+	err = handler.deleteGroupData(actorCtx(context.Background(), t, db, groupCreatorID(t, db, convID)), convID, groupCreatorID(t, db, convID), "")
 	require.Error(t, err)
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_messages WHERE conversation_id = $1`, convID))
@@ -790,6 +793,8 @@ func TestDeleteGroupDataDoesNotDeadlockAgainstMessageEdit(t *testing.T) {
 	editor := participants[0]
 
 	ctx := context.Background()
+	creatorID := groupCreatorID(t, db, convID)
+	deleteCtx := actorCtx(ctx, t, db, creatorID) // before the test takes any lock
 	editTx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	require.NoError(t, err)
 	defer func() { _ = editTx.Rollback() }()
@@ -797,9 +802,8 @@ func TestDeleteGroupDataDoesNotDeadlockAgainstMessageEdit(t *testing.T) {
 	// The message-edit path's FIRST lock: users, before the conversation.
 	require.NoError(t, credepoch.GuardTx(ctx, editTx, editor.String(), ""))
 
-	creatorID := groupCreatorID(t, db, convID)
 	deleteErr := make(chan error, 1)
-	go func() { deleteErr <- handler.deleteGroupData(ctx, convID, creatorID, "") }()
+	go func() { deleteErr <- handler.deleteGroupData(deleteCtx, convID, creatorID, "") }()
 
 	// Both orders reach this same wait; only what T1 holds while waiting differs.
 	require.Eventually(t, func() bool {
@@ -843,6 +847,7 @@ func TestUpdateDMMessageCiphertextRetriesLegacyMembershipDriftWithoutDuplicateWr
 		VALUES ($1, $2, $3, 'before', 1, 'text')`, messageID, convID, editor)
 	require.NoError(t, err)
 
+	editCtx := actorCtx(context.Background(), t, db, editor.String()) // before the test takes any lock
 	removalTx, err := db.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	defer func() { _ = removalTx.Rollback() }()
@@ -853,7 +858,7 @@ func TestUpdateDMMessageCiphertextRetriesLegacyMembershipDriftWithoutDuplicateWr
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest("PATCH", "/", nil)
+	c.Request = httptest.NewRequest("PATCH", "/", nil).WithContext(editCtx)
 	c.Set("user_id", editor.String())
 	h := NewHandler(HandlerDeps{DB: db, Log: logger.NewWithWriter(io.Discard)})
 	resultCh := make(chan struct {

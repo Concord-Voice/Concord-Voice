@@ -11,8 +11,10 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/erasureclear"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -157,6 +159,8 @@ type committedAccountDeletion struct {
 	stranded         erasedMedia
 	survivorSubjects []uuid.UUID
 	commitUnresolved bool
+	// familyOwners locate the login families the erasure made terminal.
+	familyOwners []loginfamily.DeliveryOwner
 }
 
 // AccountService is the concrete AccountDeleter backed by the primary
@@ -193,6 +197,10 @@ type AccountService struct {
 	// same sender-gate stripe (see the comment on the erasure capture below) and
 	// re-entering WithGatedTx would self-deadlock.
 	audienceFence *websocket.Hub
+	// familyCloser fences the erased user's login-family sockets after commit.
+	// It is the audience-fence hub; nil skips the fast path, never the durable
+	// auth owner the reconciler retries.
+	familyCloser loginfamily.FamilyCloser
 
 	// nats fans the erasure clear out to every replica (#2447). The Hub closes
 	// only LOCAL clients, so without this a viewer on another replica keeps the
@@ -241,6 +249,9 @@ func (s *AccountService) SetErasedMediaReclaimer(reclaimer ErasedMediaReclaimer)
 // SetAudienceFence binds the presence-audience revocation fence (#2992).
 func (s *AccountService) SetAudienceFence(hub *websocket.Hub) {
 	s.audienceFence = hub
+	if hub != nil {
+		s.familyCloser = hub
+	}
 }
 
 // AudienceFenceWired reports whether the fence is bound, so the router's boot
@@ -295,6 +306,7 @@ func (s *AccountService) DeleteAccount(
 		ctx, userID, creatorID, candidates, &survivorSubjects,
 	)
 	if committed != nil {
+		s.closeErasedFamilies(ctx, committed.familyOwners)
 		s.runPostCommitObligations(ctx, userID, committed.channelIDs,
 			committed.serverIDs, committed.drained, committed.stranded, committed.commitUnresolved)
 		if s.seatsErased != nil && len(committed.seats) > 0 && !committed.commitUnresolved {
@@ -302,6 +314,19 @@ func (s *AccountService) DeleteAccount(
 		}
 	}
 	return operationErr
+}
+
+// closeErasedFamilies fences the erased user's sockets before the request
+// answers. The owner query reads committed terminal rows only, so an
+// unresolved commit that rolled back closes nothing; a failed close stays with
+// the durable auth owner's reconciler and never fails the erasure.
+func (s *AccountService) closeErasedFamilies(ctx context.Context, owners []loginfamily.DeliveryOwner) {
+	if s.familyCloser == nil || len(owners) == 0 {
+		return
+	}
+	if err := loginfamily.CloseCommittedFamilies(ctx, s.db, s.familyCloser, owners); err != nil && s.log != nil {
+		s.log.Warn("Erased account socket close deferred to reconciliation")
+	}
 }
 
 func (s *AccountService) deleteAccountWithActivityCleanup(
@@ -409,7 +434,8 @@ func (s *AccountService) deleteAccount(
 		}
 	}()
 	var seats []ErasedSeat
-	channelIDs, serverIDs, plan, drained, stranded, err := s.deleteAccountTx(ctx, tx, userID, candidates, survivorSubjects, &seats)
+	var familyOwners []loginfamily.DeliveryOwner
+	channelIDs, serverIDs, plan, drained, stranded, err := s.deleteAccountTx(ctx, tx, userID, candidates, survivorSubjects, &seats, &familyOwners)
 	if err != nil {
 		// CauseWriteFailed and friends prove no commit happened, so Abandon does
 		// NOT disconnect anyone on those causes -- the deferred rollback discards
@@ -432,6 +458,7 @@ func (s *AccountService) deleteAccount(
 		channelIDs: channelIDs, serverIDs: serverIDs, drained: drained,
 		stranded:         stranded,
 		survivorSubjects: append([]uuid.UUID(nil), (*survivorSubjects)...),
+		familyOwners:     familyOwners,
 	}
 	if err := presencehook.Complete(ctx, s.graphPresence, tx, plan); err != nil {
 		switch {
@@ -545,11 +572,29 @@ func (s *AccountService) deleteAccountTx(
 	candidates []uuid.UUID,
 	survivorSubjects *[]uuid.UUID,
 	seats *[]ErasedSeat,
+	familyOwners *[]loginfamily.DeliveryOwner,
 ) (pq.StringArray, pq.StringArray, presencecapture.Plan, drainedObligation, erasedMedia, error) {
-	creatorID, lockedUserID, err := lockErasureSubjectsAndConversations(ctx, tx, userID, candidates)
+	creatorID, userAuthority, err := lockErasureSubjects(ctx, tx, userID, candidates)
 	if err != nil {
 		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
 	}
+	if err := guardErasureActorTx(ctx, tx, creatorID); err != nil {
+		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
+	}
+	// Terminal evidence must precede conversations and every users cascade.
+	targets, err := loginfamily.CaptureUserTargetsTx(ctx, tx, userAuthority, nil)
+	if err != nil {
+		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
+	}
+	revoked, err := loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeUser, Reason: loginfamily.ReasonErasure})
+	if err != nil {
+		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
+	}
+	*familyOwners = revoked.Owners
+	if err := lockErasureConversations(ctx, tx, creatorID); err != nil {
+		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
+	}
+	lockedUserID := creatorID.String()
 	currentCandidates, err := readCurrentErasurePrivateCallCandidates(ctx, tx, creatorID, candidates)
 	if err != nil {
 		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
@@ -716,52 +761,57 @@ func (s *AccountService) deleteAccountTx(
 	return channelIDs, serverIDs, plan, drained, stranded, nil
 }
 
-func lockErasureSubjectsAndConversations(
-	ctx context.Context,
-	tx *sql.Tx,
-	userID string,
-	candidates []uuid.UUID,
-) (creatorID uuid.UUID, lockedUserID string, returnErr error) {
-	var err error
-	creatorID, err = uuid.Parse(userID)
+// guardErasureActorTx revalidates the requesting login under the users lock.
+// Session revocation rotates no credential epoch, so a login revoked while
+// its request waited must not erase the account and its surviving sessions.
+func guardErasureActorTx(ctx context.Context, tx *sql.Tx, userID uuid.UUID) error {
+	identity, ok := loginfamily.AccessIdentityFromContext(ctx)
+	if !ok || identity.UserID != userID {
+		// Keep the reason readable: a broken identity middleware must not look
+		// exactly like a revoked session.
+		return errors.Join(credepoch.ErrEpochMismatch, loginfamily.NewError(loginfamily.ReasonAccessIdentity, nil))
+	}
+	if err := loginfamily.GuardLockedActorFamilyTx(ctx, tx, identity); err != nil {
+		if errors.Is(err, loginfamily.ErrDenied) {
+			return errors.Join(credepoch.ErrEpochMismatch, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// lockErasureSubjects retains the sender/audience prefix held by the caller,
+// then private-voice scopes, rollout and the complete strongest users set.
+func lockErasureSubjects(ctx context.Context, tx *sql.Tx, userID string, candidates []uuid.UUID) (uuid.UUID, loginfamily.UserAuthority, error) {
+	creatorID, err := uuid.Parse(userID)
 	if err != nil {
-		return uuid.Nil, "", fmt.Errorf("delete account: parse user: %w", err)
+		return uuid.Nil, loginfamily.UserAuthority{}, fmt.Errorf("delete account: parse user: %w", err)
 	}
-	lockedSubjects := append([]uuid.UUID{creatorID}, candidates...)
-	if err := dm.LockPrivateVoiceScopesTx(ctx, tx, lockedSubjects); err != nil {
-		return uuid.Nil, "", fmt.Errorf("delete account: lock private voice scopes: %w", err)
+	subjects := append([]uuid.UUID{creatorID}, candidates...)
+	if err := dm.LockPrivateVoiceScopesTx(ctx, tx, subjects); err != nil {
+		return uuid.Nil, loginfamily.UserAuthority{}, fmt.Errorf("delete account: lock private voice scopes: %w", err)
 	}
-	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
-		pq.Array(lockedSubjects))
+	barrier, err := loginfamily.AcquireWriterBarrierTx(ctx, tx)
 	if err != nil {
-		return uuid.Nil, "", fmt.Errorf("delete account: lock users: %w", err)
+		return uuid.Nil, loginfamily.UserAuthority{}, err
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("delete account: close locked users: %w", closeErr))
+	users, err := loginfamily.LockUsersTx(ctx, tx, barrier, subjects, loginfamily.UserUpdate)
+	if errors.Is(err, loginfamily.ErrDenied) {
+		// A vanished survivor is candidate drift, not proof the erased user vanished.
+		var exists bool
+		if readErr := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)`, creatorID).Scan(&exists); readErr != nil {
+			return uuid.Nil, loginfamily.UserAuthority{}, fmt.Errorf("delete account: check erased user: %w", readErr)
 		}
-	}()
-	var foundCreator bool
-	for rows.Next() {
-		var subject uuid.UUID
-		if err := rows.Scan(&subject); err != nil {
-			return uuid.Nil, "", fmt.Errorf("delete account: scan locked user: %w", err)
+		if !exists {
+			return uuid.Nil, loginfamily.UserAuthority{}, ErrUserNotFound
 		}
-		if subject == creatorID {
-			foundCreator = true
-		}
+		return uuid.Nil, loginfamily.UserAuthority{}, ErrErasureCandidateSetDrifted
 	}
-	if err := rows.Err(); err != nil {
-		return uuid.Nil, "", fmt.Errorf("delete account: iterate locked users: %w", err)
+	if err != nil {
+		return uuid.Nil, loginfamily.UserAuthority{}, err
 	}
-	if !foundCreator {
-		return uuid.Nil, "", ErrUserNotFound
-	}
-	if err := lockErasureConversations(ctx, tx, creatorID); err != nil {
-		return uuid.Nil, "", err
-	}
-	return creatorID, creatorID.String(), nil
+	user, err := users.ForUser(creatorID)
+	return creatorID, user, err
 }
 
 func lockErasureConversations(ctx context.Context, tx *sql.Tx, creatorID uuid.UUID) (returnErr error) {

@@ -88,7 +88,7 @@ func TestHandleDMMessage_UnreadNotifyCarriesRealAttachmentMetadata(t *testing.T)
 	fileID := seedMediaFileTyped(t, setup, "photo", "image/jpeg")
 	client2 := registerUnsubscribedParticipant(setup)
 
-	setup.hub.handleDMMessage(dmMessageWithAttachments(setup, "check out this photo", fileID))
+	setup.hub.handleDMMessage(setup.live(t, dmMessageWithAttachments(setup, "check out this photo", fileID)))
 	completePendingDMDeliveries(t, setup.hub)
 
 	notify := readClientMsg(t, client2)
@@ -115,7 +115,7 @@ func TestHandleDMMessage_UnreadNotifyUsesFirstAttachmentWhenMultiple(t *testing.
 	fileID1 := seedMediaFileTyped(t, setup, "video", "video/mp4")
 	client2 := registerUnsubscribedParticipant(setup)
 
-	setup.hub.handleDMMessage(dmMessageWithAttachments(setup, "two attachments", fileID0, fileID1))
+	setup.hub.handleDMMessage(setup.live(t, dmMessageWithAttachments(setup, "two attachments", fileID0, fileID1)))
 	completePendingDMDeliveries(t, setup.hub)
 
 	notify := readClientMsg(t, client2)

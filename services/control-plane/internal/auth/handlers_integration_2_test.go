@@ -14,6 +14,9 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -465,14 +468,59 @@ func TestLoginSetsRefreshTokenInDB(t *testing.T) {
 func TestLogoutNoRefreshToken(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "logoutnort")
+	claims, err := auth.ValidateAccessToken(user.AccessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	var family string
+	require.NoError(t, ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1 AND user_id=$2`, claims.SessionID, user.ID).Scan(&family))
+	var refreshes int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE id=$1`, claims.SessionID).Scan(&refreshes))
+	require.Zero(t, refreshes, "the selected bearer has an access-only family")
+	siblingAccess := ts.VerifyUserEmail(t, user.ID)
+	siblingClaims, err := auth.ValidateAccessToken(siblingAccess, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	var siblingFamily string
+	require.NoError(t, ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1`, siblingClaims.SessionID).Scan(&siblingFamily))
+	require.NotEqual(t, family, siblingFamily)
+	foreign := ts.CreateTestUser(t, "logoutnortforeign")
+	foreignClaims, err := auth.ValidateAccessToken(foreign.AccessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	var foreignFamily string
+	require.NoError(t, ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1`, foreignClaims.SessionID).Scan(&foreignFamily))
+	require.NotEqual(t, family, foreignFamily)
 
-	// Logout without any refresh token — should still return 200
 	w := ts.DoRequest("POST", pathLogout, nil, testhelpers.AuthHeaders(user.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.JSONEq(t, `{"message":"Logged out successfully"}`, w.Body.String())
+	var terminal, exactTarget bool
+	var reason, scope string
+	require.NoError(t, ts.DB.QueryRow(`SELECT f.terminal_at IS NOT NULL,r.reason,r.scope,EXISTS(SELECT 1 FROM login_family_revocation_targets t WHERE t.operation_id=r.operation_id AND t.family_id=f.family_id AND t.user_id=f.user_id) FROM login_families f JOIN login_family_revocations r ON r.operation_id=f.auth_operation_id AND r.user_id=f.user_id WHERE f.family_id=$1 AND f.user_id=$2`, family, user.ID).Scan(&terminal, &reason, &scope, &exactTarget))
+	assert.True(t, terminal)
+	assert.True(t, exactTarget)
+	assert.Equal(t, "logout", reason)
+	assert.Equal(t, "session", scope)
+	denied := ts.DoRequest("POST", pathWSTicket, nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusUnauthorized, denied.Code, denied.Body.String())
+	require.NoError(t, ts.DB.QueryRow(`SELECT terminal_at IS NOT NULL FROM login_families WHERE family_id=$1`, foreignFamily).Scan(&terminal))
+	assert.False(t, terminal)
+	require.NoError(t, ts.DB.QueryRow(`SELECT terminal_at IS NOT NULL FROM login_families WHERE family_id=$1`, siblingFamily).Scan(&terminal))
+	assert.False(t, terminal)
+	siblingAllowed := ts.DoRequest("POST", pathWSTicket, nil, testhelpers.AuthHeaders(siblingAccess))
+	assert.Equal(t, http.StatusOK, siblingAllowed.Code, siblingAllowed.Body.String())
+	allowed := ts.DoRequest("POST", pathWSTicket, nil, testhelpers.AuthHeaders(foreign.AccessToken))
+	assert.Equal(t, http.StatusOK, allowed.Code, allowed.Body.String())
+}
 
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Contains(t, body["message"], "Already logged out")
+func TestLogoutTrulyAbsentTargetAlreadyLoggedOut(t *testing.T) {
+	ts := setupTS(t)
+	headers := http.Header{}
+	headers.Set("X-Session-ID", uuid.NewString())
+	w := ts.DoRequest("POST", pathLogout, nil, headers)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.JSONEq(t, `{"message":"Already logged out"}`, w.Body.String())
+	assert.Empty(t, w.Header().Values("Set-Cookie"))
+	var operations int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM login_family_revocations`).Scan(&operations))
+	assert.Zero(t, operations)
 }
 
 func TestLogoutClearsCookie(t *testing.T) {
@@ -673,18 +721,56 @@ func TestLogout_CrossUserSessionIDDoesNotFallBackToAmbientCookie(t *testing.T) {
 
 func TestLogout_DatabaseFailureDoesNotReportSuccess(t *testing.T) {
 	ts := setupTS(t)
-	_, refreshToken, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	access, refreshToken, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	claims, err := auth.ValidateAccessToken(access, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	sid := sessionIDForRefreshToken(t, ts, refreshToken)
+	var family string
+	require.NoError(t, ts.DB.QueryRow(`SELECT family_id FROM login_family_sids WHERE sid=$1`, sid).Scan(&family))
+	attestationKey := "attestation:" + sid + ":canceled-logout-machine"
+	require.NoError(t, ts.Redis.Set(context.Background(), attestationKey, "test-attestation", time.Hour).Err())
+	recorder := &adapterSecurityEventRecorder{}
+	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
+	h.SetSecurityEvents(recorder)
+	router := gin.New()
+	router.POST(pathLogout, h.Logout)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req := httptest.NewRequest("POST", pathLogout, nil).WithContext(ctx)
 	req.Header.Set(headerXRefreshToken, refreshToken)
 	req.Header.Set(headerContentType, contentTypeJSON)
+	req.AddCookie(secureRefreshCookie(refreshToken))
 	rw := httptest.NewRecorder()
-	ts.Router.ServeHTTP(rw, req)
+	router.ServeHTTP(rw, req)
 
-	assert.Equal(t, http.StatusInternalServerError, rw.Code)
+	require.Equal(t, http.StatusServiceUnavailable, rw.Code, rw.Body.String())
+	assert.JSONEq(t, `{"error":"Authentication temporarily unavailable"}`, rw.Body.String())
+	assert.Empty(t, rw.Header().Values("Set-Cookie"))
+	assert.Empty(t, recorder.events)
 	assertRefreshTokenRevoked(t, ts, refreshToken, false)
+	var terminal bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT terminal_at IS NOT NULL FROM login_families WHERE family_id=$1`, family).Scan(&terminal))
+	assert.False(t, terminal)
+	var operations int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM login_family_revocations WHERE user_id=$1`, claims.UserID).Scan(&operations))
+	assert.Zero(t, operations)
+	blacklisted, err := ts.Redis.Exists(context.Background(), "blacklist:"+claims.ID).Result()
+	require.NoError(t, err)
+	assert.Zero(t, blacklisted)
+	attestation, err := ts.Redis.Get(context.Background(), attestationKey).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "test-attestation", attestation)
+	usable := ts.DoRequest("POST", pathWSTicket, nil, testhelpers.AuthHeaders(access))
+	require.Equal(t, http.StatusOK, usable.Code, usable.Body.String())
+	headers := http.Header{}
+	headers.Set(headerXRefreshToken, refreshToken)
+	refreshed := ts.DoRequest("POST", pathRefresh, nil, headers)
+	require.Equal(t, http.StatusOK, refreshed.Code, refreshed.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, refreshed, &body)
+	assert.NotEmpty(t, body["access_token"])
+	assert.NotEmpty(t, body["refresh_token"])
 }
 
 // TestLogout_AttackerCannotWipeArbitrarySessionAttestation is the security

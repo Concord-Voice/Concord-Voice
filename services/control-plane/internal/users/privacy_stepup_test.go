@@ -317,25 +317,37 @@ func TestUpdatePrivacy_MFAEnabledWithoutCodeIs403WithMethods(t *testing.T) {
 // TestUpdatePrivacy_SupersededCredentialEpochIs401 proves the session fence runs
 // alongside the step-up and preempts it.
 //
-// SimulateStaleEpochWindow reproduces the #2201 race exactly: the DB holds the
-// post-rotation epoch while the cache still serves the pre-rotation one, so the
-// HTTP middleware ADMITS the request and only the in-transaction read can stop
-// it. The password supplied is CORRECT — knowing a password is a different fact
-// from holding a live session, and a revoked session must not lower the fence
-// however good its credentials are.
+// Rotate only after the actual JWT's family admission commits. The password is
+// correct: session authority and knowledge of a password are different facts.
 func TestUpdatePrivacy_SupersededCredentialEpochIs401(t *testing.T) {
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	user := ts.CreateTestUser(t, "purgefencestaleepoch")
 	materializePrivacyRow(t, ts, user)
 
-	staleToken := ts.SimulateStaleEpochWindow(t, user.ID)
+	code := enableTOTP(t, ts, user)
+	validCode := code()
+	var factorBefore string
+	require.NoError(t, ts.DB.QueryRow(`SELECT to_jsonb(f)::text FROM user_mfa_totp f WHERE user_id=$1`, user.ID).Scan(&factorBefore))
+	var passwordBefore string
+	require.NoError(t, ts.DB.QueryRow(`SELECT password_hash FROM users WHERE id=$1`, user.ID).Scan(&passwordBefore))
+	require.NoError(t, boundary.Arm(user.AccessToken))
+	boundary.Hook.ArmArg([]string{`SELECT credential_epoch, COALESCE(password_hash, '') FROM users WHERE id = $1 FOR SHARE`}, user.ID, nil, nil)
 
-	w := patchPrivacy(t, ts, staleToken, map[string]interface{}{
+	w := patchPrivacy(t, ts, user.AccessToken, map[string]interface{}{
 		keyRequireAuthBeforePurge: false,
 		keyCurrentPassword:        testhelpers.TestAuthPlaintext,
+		keyMFACode:                validCode,
 	})
 
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	boundary.RequireRotated(t)
+	requireUsersEpochGuard(t, boundary, 1)
+	var passwordAfter string
+	require.NoError(t, ts.DB.QueryRow(`SELECT password_hash FROM users WHERE id=$1`, user.ID).Scan(&passwordAfter))
+	require.Equal(t, passwordBefore, passwordAfter, "refused step-up must preserve the password factor")
+	var factorAfter string
+	require.NoError(t, ts.DB.QueryRow(`SELECT to_jsonb(f)::text FROM user_mfa_totp f WHERE user_id=$1`, user.ID).Scan(&factorAfter))
+	require.Equal(t, factorBefore, factorAfter, "stale step-up must preserve the confirmed factor without consuming it")
 	require.True(t, storedPurgeFence(t, ts, user.ID),
 		"a superseded session must not lower the fence even with a correct password")
 }

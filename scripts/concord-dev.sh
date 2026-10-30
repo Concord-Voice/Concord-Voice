@@ -96,6 +96,14 @@ dispatch_verb() {
   shift || true
 
   case "$verb" in
+    up|down|stop|restart|rebuild|freshstart)
+      if [[ "$VOICE_NATIVE_LOCK_HELD" -eq 0 ]]; then
+        with_native_lifecycle "$verb" "$@"
+        return $?
+      fi
+      ;;
+  esac
+  case "$verb" in
     up)              verb_up "$@" ;;
     down|stop)       verb_down "$@" ;;
     status)          verb_status "$@" ;;
@@ -1288,6 +1296,146 @@ env_drift_warn() {
   return 0
 }
 
+# The controlled media lifecycle has no autonomous source watcher. Every
+# replacement holds the same retained lock through predecessor verification.
+VOICE_NATIVE_LOCK_HELD=0
+
+with_native_lifecycle() (
+  mkdir -p "$LOG_DIR" || return 1
+  umask 077
+  local lock_root
+  lock_root="$(cd "$PROJECT_ROOT" && pwd -P)" || return 1
+  exec 7>>"$lock_root/.voice-lifecycle.lock" || return 1
+  python3 -c 'import fcntl; fcntl.flock(7, fcntl.LOCK_EX | fcntl.LOCK_NB)' || {
+    echo 'voice lifecycle: another local lifecycle owns this inventory' >&2
+    return 1
+  }
+  VOICE_NATIVE_LOCK_HELD=1
+  dispatch_verb "$@"
+)
+
+voice_native_paths() {
+  local physical
+  physical="$(cd "$LOG_DIR" && pwd -P)" || return 1
+  VOICE_NATIVE_CONTROL_RUNTIME="$physical/voice-control-runtime"
+  VOICE_NATIVE_MEDIA_RUNTIME="$physical/voice-media-runtime"
+}
+
+voice_native_cli() (
+  voice_native_paths || return 1
+  local pid
+  pid="$(read_valid_pid "$LOG_DIR/control-plane.pid")" || return 1
+  tracked_pid_identity_state "$LOG_DIR/control-plane.pid" "$pid" || return 1
+  python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" native-process \
+    --process-id "$pid" --directory "$VOICE_NATIVE_CONTROL_RUNTIME" --kind control || return 1
+  cd "$PROJECT_ROOT/services/control-plane" || return 1
+  ENVIRONMENT="${ENVIRONMENT:-development}" "$VOICE_NATIVE_CONTROL_RUNTIME/control-plane" voice-enforcement-rollout "$@"
+)
+
+voice_native_status() {
+  local observed
+  observed="$(voice_native_cli status --json)" || return 1
+  printf '%s' "$observed" | python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" status "$@"
+}
+
+voice_native_boot() (
+  voice_native_paths || return 1
+  local pid before after body status boot
+  pid="$(read_valid_pid "$LOG_DIR/media-plane.pid")" || return 1
+  tracked_pid_identity_state "$LOG_DIR/media-plane.pid" "$pid" || return 1
+  before="$(process_start_identity "$pid")" || return 1
+  python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" native-process \
+    --process-id "$pid" --directory "$VOICE_NATIVE_MEDIA_RUNTIME" --kind media || return 1
+  [[ "$(lsof_query -a -p "$pid" -iTCP:3000 -sTCP:LISTEN -t)" == "$pid" ]] || return 1
+  body="$(mktemp)" || return 1
+  trap 'rm -f -- "$body"' EXIT
+  status="$(curl -sS --max-time 2 --max-filesize 65536 -o "$body" -w '%{http_code}' \
+    http://127.0.0.1:3000/readyz)" || return 1
+  [[ "$status" == 200 || "$status" == 503 ]] || return 1
+  boot="$(python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" native-ready \
+    --grant "$1" <"$body")" || return 1
+  after="$(process_start_identity "$pid")" || return 1
+  [[ "$before" == "$after" ]] || return 1
+  tracked_pid_identity_state "$LOG_DIR/media-plane.pid" "$pid" || return 1
+  python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" native-process \
+    --process-id "$pid" --directory "$VOICE_NATIVE_MEDIA_RUNTIME" --kind media || return 1
+  printf '%s' "$boot"
+)
+
+voice_native_wait_grant() {
+  local expected="$1" deadline=$((SECONDS + 180))
+  while :; do
+    voice_native_boot "$expected" && return 0
+    (( SECONDS < deadline )) || return 1
+    sleep 2
+  done
+}
+
+voice_native_activate() (
+  voice_native_paths || return 1
+  local status activation boot control_artifact media_artifact receipt
+  status="$(voice_native_status)" || return 1
+  activation="$(printf '%s' "$status" | python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" status --field familyActivation)" || return 1
+  if [[ "$activation" == prepared ]]; then
+    boot="$(voice_native_wait_grant false)" || return 1
+    control_artifact="$(python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" file-artifact "$VOICE_NATIVE_CONTROL_RUNTIME/control-plane")" || return 1
+    media_artifact="$(python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" native-artifact "$VOICE_NATIVE_MEDIA_RUNTIME")" || return 1
+    [[ "$control_artifact" == "$VOICE_NATIVE_CONTROL_ARTIFACT" && "$media_artifact" == "$VOICE_NATIVE_MEDIA_ARTIFACT" ]] || return 1
+    receipt="$(mktemp)" || return 1
+    trap 'rm -f -- "$receipt"' EXIT
+    status="$(voice_native_status)" || return 1
+    printf '%s' "$status" | python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" receipt \
+      --control-plane-artifact "$control_artifact" --slot media-plane "$media_artifact" "$boot" >"$receipt" || return 1
+    voice_native_cli activate --confirm-drained --receipt-file "$receipt" || return 1
+  fi
+  # An active restart never calls activate again or replaces its first receipt.
+  [[ "$(voice_native_status --field familyActivation)" == active ]] || return 1
+  voice_native_wait_grant true >/dev/null
+)
+
+voice_native_stop_media() {
+  voice_native_paths || return 1
+  local pid boot expected_start expected_cwd deadline rc
+  if [[ ! -f "$LOG_DIR/media-plane.pid" && ! -e "$VOICE_NATIVE_MEDIA_RUNTIME" ]]; then
+    return 0
+  fi
+  # Lost launcher/artifact association or an old autonomous watcher requires
+  # operator recovery. PID disappearance alone never authorizes replacement.
+  pid="$(read_valid_pid "$LOG_DIR/media-plane.pid")" || return 1
+  boot="$(voice_native_boot boot-only)" || {
+    echo 'voice lifecycle: predecessor boot/artifact association unavailable; automatic recovery refused' >&2
+    return 1
+  }
+  expected_start="$(sed -n '2p' "$LOG_DIR/media-plane.pid")"
+  expected_cwd="$(sed -n '3p' "$LOG_DIR/media-plane.pid")"
+  process_identity_state "$pid" "$expected_start" "$expected_cwd" || return 1
+  # Even an explicit force cleanup first gives the controlled shutdown its
+  # existing grace. A forced exit cannot fabricate the missing retired fence.
+  kill -TERM "$pid" || return 1
+  deadline=$((SECONDS + 45))
+  while :; do
+    rc=0
+    process_identity_state "$pid" "$expected_start" "$expected_cwd" || rc=$?
+    [[ "$rc" -eq 1 ]] && break
+    [[ "$rc" -eq 0 ]] || return 1
+    (( SECONDS < deadline )) || {
+      if [[ "${1:-}" == --force ]]; then
+        process_identity_state "$pid" "$expected_start" "$expected_cwd" || return 1
+        kill -KILL "$pid" || return 1
+      fi
+      echo 'voice lifecycle: graceful native stop deadline exhausted; closure retained' >&2
+      return 1
+    }
+    sleep 1
+  done
+  # Preserve the CP and DB transport until the exact predecessor fence is
+  # observed. Exit 3, 1 and 64 all refuse; no native operator fallback exists.
+  voice_native_cli verify-retired-boot --node-boot-id "$boot" || return 1
+  finish_tracked_stop "$LOG_DIR/media-plane.pid" "Media Plane" "$pid" "$expected_start" "$expected_cwd" || return 1
+  chmod -R u+w "$VOICE_NATIVE_MEDIA_RUNTIME" || return 1
+  rm -rf -- "$VOICE_NATIVE_MEDIA_RUNTIME"
+}
+
 # ── Verbs ──────────────────────────────────────────────────────────────
 
 verb_up() {
@@ -1318,15 +1466,22 @@ verb_up() {
     esac
   done
 
+  mkdir -p "$LOG_DIR" || return 1
+  voice_native_paths || return 1
+  if [[ -e "$VOICE_NATIVE_CONTROL_RUNTIME" || -e "$VOICE_NATIVE_MEDIA_RUNTIME" ]]; then
+    echo 'voice lifecycle: retained executable ownership requires verified down before a new launch' >&2
+    return 1
+  fi
   pre_flight_checks
   bootstrap_env
   mkdir -p "$LOG_DIR"
 
-  _up_infra "$reset_db"
-  _up_control_plane "$no_rebuild"
-  _up_media_plane "$no_rebuild"
+  _up_infra "$reset_db" || return 1
+  _up_control_plane "$no_rebuild" || return 1
+  _up_media_plane "$no_rebuild" || return 1
+  voice_native_activate || return 1
   if [[ "$skip_client" -eq 0 ]]; then
-    _up_clients "$no_rebuild" "$num_clients"
+    _up_clients "$no_rebuild" "$num_clients" || return 1
   fi
   _up_summary "$skip_client" "$num_clients"
 }
@@ -1387,24 +1542,27 @@ _up_control_plane() {
 
   [[ "$QUIET" -eq 0 ]] && echo -e "${BLUE}🎛  Starting Control Plane (Go)${NC}"
 
-  cd "$PROJECT_ROOT/services/control-plane"
+  cd "$PROJECT_ROOT/services/control-plane" || return 1
   if [[ "$no_rebuild" -eq 0 || ! -f bin/control-plane ]]; then
     [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 Building control-plane binary${NC}"
-    go mod download
-    mkdir -p bin
-    go build -o bin/control-plane ./cmd/server
+    go mod download || return 1
+    mkdir -p bin || return 1
+    go build -o bin/control-plane ./cmd/server || return 1
   fi
 
   # An unset ENVIRONMENT means production to the control plane (fail closed),
   # so local dev names its environment rather than inheriting a default.
-  ENVIRONMENT="${ENVIRONMENT:-development}" nohup ./bin/control-plane > "$LOG_DIR/control-plane.log" 2>&1 &
+  voice_native_paths || return 1
+  VOICE_NATIVE_CONTROL_ARTIFACT="$(python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" stage-native \
+    --source "$PROJECT_ROOT/services/control-plane" --destination "$VOICE_NATIVE_CONTROL_RUNTIME" --kind control)" || return 1
+  ENVIRONMENT="${ENVIRONMENT:-development}" nohup "$VOICE_NATIVE_CONTROL_RUNTIME/control-plane" 7>&- > "$LOG_DIR/control-plane.log" 2>&1 &
   local control_pid=$!
   if ! track_started_process "$LOG_DIR/control-plane.pid" "$control_pid" \
     "$PROJECT_ROOT/services/control-plane" "Control Plane"; then
     echo -e "${RED}✗${NC} Could not record Control Plane process identity" >&2
     return 1
   fi
-  cd "$PROJECT_ROOT"
+  cd "$PROJECT_ROOT" || return 1
 
   if ! wait_for_service "http://localhost:8080/health" "Control Plane"; then
     echo -e "${RED}✗${NC} Control Plane startup failed. Last 20 lines of log:" >&2
@@ -1418,7 +1576,7 @@ _up_media_plane() {
 
   [[ "$QUIET" -eq 0 ]] && echo -e "${BLUE}🎙  Starting Media Plane (Node.js)${NC}"
 
-  cd "$PROJECT_ROOT/services/media-plane"
+  cd "$PROJECT_ROOT/services/media-plane" || return 1
   # Install if --no-rebuild was NOT passed, OR if node_modules is missing
   # (fresh-checkout case — CI smoke + first-time developer).
   if [[ "$no_rebuild" -eq 0 || ! -d node_modules ]]; then
@@ -1443,19 +1601,24 @@ _up_media_plane() {
     #
     # Cost: ~3-5s extra on fresh `rm -rf node_modules`; zero cost on warm
     # cache (both passes short-circuit when deps + symlinks are current).
-    npm install --ignore-scripts >/dev/null
-    npm rebuild >/dev/null
+    npm install --ignore-scripts >/dev/null || return 1
+    npm rebuild >/dev/null || return 1
   fi
 
-  # Use npx tsx directly (not via npm run) so the PID file tracks tsx, not npm.
-  nohup npx tsx watch src/index.ts > "$LOG_DIR/media-plane.log" 2>&1 &
+  # Explicit lifecycle verbs own replacement. Stage the complete actual build
+  # and native worker closure before launch; source edits cannot restart it.
+  npm run build || return 1
+  voice_native_paths || return 1
+  VOICE_NATIVE_MEDIA_ARTIFACT="$(python3 "$PROJECT_ROOT/[internal]voice-boot-containment.py" stage-native \
+    --source "$PROJECT_ROOT/services/media-plane" --destination "$VOICE_NATIVE_MEDIA_RUNTIME" --kind media)" || return 1
+  nohup "$VOICE_NATIVE_MEDIA_RUNTIME/node" "$VOICE_NATIVE_MEDIA_RUNTIME/dist/index.js" 7>&- > "$LOG_DIR/media-plane.log" 2>&1 &
   local media_pid=$!
   if ! track_started_process "$LOG_DIR/media-plane.pid" "$media_pid" \
     "$PROJECT_ROOT/services/media-plane" "Media Plane"; then
     echo -e "${RED}✗${NC} Could not record Media Plane process identity" >&2
     return 1
   fi
-  cd "$PROJECT_ROOT"
+  cd "$PROJECT_ROOT" || return 1
 
   if ! wait_for_service "http://localhost:3000/health" "Media Plane"; then
     echo -e "${RED}✗${NC} Media Plane startup failed. Last 20 lines of log:" >&2
@@ -1470,17 +1633,17 @@ _up_clients() {
 
   [[ "$QUIET" -eq 0 ]] && echo -e "${BLUE}🖥  Starting Vite dev server + ${num_clients} Electron client(s)${NC}"
 
-  cd "$PROJECT_ROOT/client/desktop"
+  cd "$PROJECT_ROOT/client/desktop" || return 1
   # See _up_media_plane note — install when missing node_modules even with --no-rebuild.
   # A tree with no node_modules is where dependency RESOLUTION actually happens, so
   # that path is lock-exact (`npm ci`). An existing tree keeps `npm install` so the
   # normal dev loop does not pay for a full wipe-and-reinstall on every `up`.
   if [[ ! -d node_modules ]]; then
     [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 npm ci (client/desktop)${NC}"
-    npm ci >/dev/null
+    npm ci >/dev/null || return 1
   elif [[ "$no_rebuild" -eq 0 ]]; then
     [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 npm install (client/desktop)${NC}"
-    npm install >/dev/null
+    npm install >/dev/null || return 1
   fi
 
   # The native addon is a BUILD ARTEFACT, not a checked-in binary, so a fresh
@@ -1491,14 +1654,14 @@ _up_clients() {
   # sensibly mean "leave the client unable to start".
   if [[ "$no_rebuild" -eq 0 || ! -f native/concord-audiocap/build/Release/concord_audiocap.node ]]; then
     [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 npm run build:native (client/desktop)${NC}"
-    npm run build:native >/dev/null
+    npm run build:native >/dev/null || return 1
   fi
 
   # Always rebuild preload + main (Electron requires fresh JS).
-  npm run build:preload >/dev/null
-  npx tsc -p tsconfig.main.json >/dev/null
+  npm run build:preload >/dev/null || return 1
+  npx tsc -p tsconfig.main.json >/dev/null || return 1
 
-  nohup npx vite --port 3001 --strictPort > "$LOG_DIR/vite-renderer.log" 2>&1 &
+  nohup npx vite --port 3001 --strictPort 7>&- > "$LOG_DIR/vite-renderer.log" 2>&1 &
   local vite_pid=$!
   if ! track_started_process "$LOG_DIR/vite-renderer.pid" "$vite_pid" \
     "$PROJECT_ROOT/client/desktop" "Vite Dev Server"; then
@@ -1517,7 +1680,7 @@ _up_clients() {
   # "only 1 client launched". The resolved path also makes $! the real Electron
   # main PID, so the per-client .pid files are accurate and `down` can stop them.
   local electron_bin
-  electron_bin="$(node -p "require('electron')" 2>/dev/null)"
+  electron_bin="$(node -p "require('electron')" 2>/dev/null)" || return 1
   if [[ -z "$electron_bin" || ! -x "$electron_bin" ]]; then
     echo -e "${RED}✗${NC} Could not resolve Electron binary (node -p \"require('electron')\")" >&2
     exit 3
@@ -1551,9 +1714,9 @@ _up_clients() {
     # the Cocoa API to the real home and ignores $HOME, so all instances would
     # collide on one userData + one single-instance lock — only 1 client survives.)
     local user_data="$PROJECT_ROOT/.dev-data/client-$i"
-    mkdir -p "$user_data"
+    mkdir -p "$user_data" || return 1
     NODE_ENV=development nohup "$electron_bin" . --user-data-dir="$user_data" "${media_flags[@]}" \
-      > "$LOG_DIR/desktop-client-$i.log" 2>&1 &
+      7>&- > "$LOG_DIR/desktop-client-$i.log" 2>&1 &
     local client_pid=$!
     if ! track_started_process "$LOG_DIR/desktop-client-$i.pid" "$client_pid" \
       "$PROJECT_ROOT/client/desktop" "Desktop Client $i"; then
@@ -1564,7 +1727,7 @@ _up_clients() {
     sleep 2
   done
 
-  cd "$PROJECT_ROOT"
+  cd "$PROJECT_ROOT" || return 1
 }
 
 _up_summary() {
@@ -1641,12 +1804,22 @@ verb_down() {
     "client/desktop" "$force_flag" || native_failed=1
 
   [[ "$QUIET" -eq 0 ]] && echo -e "${BLUE}🎙  Stopping media-plane${NC}"
-  stop_native_service "$LOG_DIR/media-plane.pid" "Media Plane" 3000 \
-    "services/media-plane" "$force_flag" || native_failed=1
+  if ! voice_native_stop_media "$force_flag"; then
+    echo 'voice lifecycle: media retirement unverified; control plane and executable closure retained' >&2
+    return 1
+  fi
 
   [[ "$QUIET" -eq 0 ]] && echo -e "${BLUE}🎛  Stopping control-plane${NC}"
-  stop_native_service "$LOG_DIR/control-plane.pid" "Control Plane" 8080 \
-    "services/control-plane" "$force_flag" || native_failed=1
+  if stop_native_service "$LOG_DIR/control-plane.pid" "Control Plane" 8080 \
+    "services/control-plane" "$force_flag"; then
+    voice_native_paths || return 1
+    if [[ -d "$VOICE_NATIVE_CONTROL_RUNTIME" ]]; then
+      chmod -R u+w "$VOICE_NATIVE_CONTROL_RUNTIME" || return 1
+      rm -rf -- "$VOICE_NATIVE_CONTROL_RUNTIME" || return 1
+    fi
+  else
+    native_failed=1
+  fi
 
   if [[ "$keep_docker" -eq 0 ]]; then
     [[ "$QUIET" -eq 0 ]] && echo -e "${BLUE}📦 Stopping infrastructure containers${NC}"
@@ -1705,6 +1878,11 @@ verb_down() {
 verb_status() {
   [[ $# -gt 0 ]] && { echo "verb_status: takes no args, got '$1'" >&2; return 2; }
 
+  if [[ -d "$LOG_DIR" ]]; then
+    if ! voice_native_status; then
+      echo 'voice lifecycle: current-process family status unavailable' >&2
+    fi
+  fi
   echo "=== Concord Voice Dev — Status ==="
   echo ""
   echo "--- Containers ---"

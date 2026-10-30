@@ -1,3 +1,4 @@
+import type { Mock } from 'vitest';
 import {
   useSettingsStore,
   clampUiScale,
@@ -120,7 +121,7 @@ describe('settingsStore', () => {
   describe('page-zoom applier (#2367 part 2)', () => {
     type ElectronStub = { window?: { setZoomFactor: (factor: number) => void } };
     const electronStub = (): ElectronStub => globalThis.electron as unknown as ElectronStub;
-    let setZoomFactor: ReturnType<typeof vi.fn<(factor: number) => void>>;
+    let setZoomFactor: Mock<(factor: number) => void>;
 
     const setInnerWidth = (width: number): void => {
       Object.defineProperty(globalThis, 'innerWidth', {
@@ -459,6 +460,46 @@ describe('settingsStore', () => {
       localStorage.setItem('concord-settings', JSON.stringify({ state: {}, version: 1 }));
       await useSettingsStore.persist.rehydrate();
       expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+    });
+  });
+  describe('trayIconStyle (tray status, Task 8)', () => {
+    it('defaults to auto', () => {
+      expect(useSettingsStore.getState().appearance.trayIconStyle).toBe('auto');
+    });
+
+    it('setTrayIconStyle updates state and persists', () => {
+      useSettingsStore.getState().setTrayIconStyle('dark');
+      expect(useSettingsStore.getState().appearance.trayIconStyle).toBe('dark');
+      expect(localStorage.getItem('concord-settings')).toContain('"trayIconStyle":"dark"');
+      useSettingsStore.getState().setTrayIconStyle('auto');
+    });
+
+    it('a persisted value survives a rehydrate', async () => {
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({ state: { appearance: { trayIconStyle: 'colour' } }, version: 1 })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance.trayIconStyle).toBe('colour');
+      useSettingsStore.getState().setTrayIconStyle('auto');
+    });
+
+    it('an invalid persisted value sanitises to auto', async () => {
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({ state: { appearance: { trayIconStyle: 'neon' } }, version: 1 })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance.trayIconStyle).toBe('auto');
+    });
+
+    it('a snapshot without the key (pre-feature) falls back to auto', async () => {
+      localStorage.setItem(
+        'concord-settings',
+        JSON.stringify({ state: { appearance: { theme: 'light' } }, version: 1 })
+      );
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().appearance.trayIconStyle).toBe('auto');
     });
   });
 });

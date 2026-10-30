@@ -86,6 +86,7 @@ func TestChannelExpiration_TogglingPinnedOnExpiresDuePinsBeforeTheResponse(t *te
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", f.mod.ID)
+		testhelpers.AttachUserIdentity(t, c, f.mod.ID)
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": uuid.NewString()})
 		c.Next()
 	})
@@ -178,6 +179,7 @@ func TestChannelExpiration_PinDeletionRunsInsideTheResponseBudget(t *testing.T) 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", f.mod.ID)
+		testhelpers.AttachUserIdentity(t, c, f.mod.ID)
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": uuid.NewString()})
 		c.Next()
 	})
@@ -253,6 +255,7 @@ func TestChannelExpiration_PolicyIsAnnouncedWhileTheDueDeletionIsStillHeld(t *te
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", f.mod.ID)
+		testhelpers.AttachUserIdentity(t, c, f.mod.ID)
 		c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{"sid": uuid.NewString()})
 		c.Next()
 	})

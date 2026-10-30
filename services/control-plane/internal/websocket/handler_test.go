@@ -4,10 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -322,10 +327,11 @@ func TestAuthenticateWebSocketNoAuth(t *testing.T) {
 }
 
 func TestAuthenticateWebSocketJWTViaHeader(t *testing.T) {
-	userID := uuid.New()
 	db, _ := dbtest.SetupTestDB(t)
+	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
 	h := NewHandler(nil, db, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
-	token := generateTestJWT(t, userID.String(), testJWTSecret)
+	token := access.token
 
 	r, _ := http.NewRequest("GET", "/ws", nil)
 	r.Header.Set("Authorization", "Bearer "+token)
@@ -334,45 +340,56 @@ func TestAuthenticateWebSocketJWTViaHeader(t *testing.T) {
 	gotID, sessionID, err := h.authenticateWebSocket(c)
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
-	assert.Equal(t, "", sessionID)
+	assert.Equal(t, access.sid.String(), sessionID)
 }
 
 func TestAuthenticateWebSocketJWTViaQueryParam(t *testing.T) {
-	userID := uuid.New()
 	db, _ := dbtest.SetupTestDB(t)
+	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
 	h := NewHandler(nil, db, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
-	token := generateTestJWT(t, userID.String(), testJWTSecret)
+	token := access.token
 
 	r, _ := http.NewRequest("GET", wsTokenPath+token, nil)
 	c := newGinContext(r)
 
-	gotID, _, err := h.authenticateWebSocket(c)
+	gotID, sessionID, err := h.authenticateWebSocket(c)
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
+	assert.Equal(t, access.sid.String(), sessionID)
 }
 
 func TestAuthenticateWebSocketRejectsPendingTokenTheft(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	redisClient := setupHubTestRedis(t)
 	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
+	baselineTicket := admissionMintTicket(t, db, redisClient, access)
+	pendingTicket := admissionMintTicket(t, db, redisClient, access)
 	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
-	jwtToken := generateTestJWT(t, userID.String(), testJWTSecret)
 
-	jwtRequest, _ := http.NewRequest("GET", wsTokenPath+jwtToken, nil)
-	_, _, err := h.authenticateWebSocket(newGinContext(jwtRequest))
+	jwtRequest, _ := http.NewRequest("GET", wsTokenPath+access.token, nil)
+	gotID, sid, err := h.authenticateWebSocket(newGinContext(jwtRequest))
 	require.NoError(t, err, "ordinary JWT admission must remain available")
+	require.Equal(t, userID, gotID)
+	require.Equal(t, access.sid.String(), sid)
+	baselineRequest, _ := http.NewRequest("GET", wsTicketPath+baselineTicket, nil)
+	gotID, sid, err = h.authenticateWebSocket(newGinContext(baselineRequest))
+	require.NoError(t, err, "ordinary producer-ticket admission must remain available")
+	require.Equal(t, userID, gotID)
+	require.Equal(t, access.sid.String(), sid)
 
 	_, err = db.Exec(`INSERT INTO token_theft_pending_revocations (user_id, operation_id) VALUES ($1, $2)`, userID, uuid.New())
 	require.NoError(t, err)
+	blocked, err := redisClient.Exists(context.Background(), middleware.TokenTheftBlockedKey(userID.String())).Result()
+	require.NoError(t, err)
+	require.Zero(t, blocked, "the database pending row must suffice without a Redis marker")
 	_, _, err = h.authenticateWebSocket(newGinContext(jwtRequest))
-	require.Error(t, err, "a pending database row must deny JWT admission without a Redis marker")
+	require.ErrorIs(t, err, middleware.ErrTokenTheftRevocationPending)
 
-	ticket := "pending-theft-ticket-" + uuid.NewString()
-	require.NoError(t, redisClient.Set(context.Background(), wsTicketKeyPfx+ticket,
-		testTicketValue(userID.String(), "", ""), 30*time.Second).Err())
-	ticketRequest, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
+	ticketRequest, _ := http.NewRequest("GET", wsTicketPath+pendingTicket, nil)
 	_, _, err = h.authenticateWebSocket(newGinContext(ticketRequest))
-	require.Error(t, err, "a pending database row must also deny ticket admission")
+	require.ErrorIs(t, err, middleware.ErrTokenTheftRevocationPending)
 }
 
 func TestAuthenticateWebSocketInvalidJWT(t *testing.T) {
@@ -544,11 +561,9 @@ func TestAuthenticateViaTicketValid(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
 
-	userID := uuid.New()
-	ticket := "test-ticket-valid"
-	ctx := context.Background()
-	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "", ""), 30*time.Second).Err()
-	require.NoError(t, err)
+	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
+	ticket := admissionMintTicket(t, db, redisClient, access)
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
 	c := newGinContext(r)
@@ -556,7 +571,10 @@ func TestAuthenticateViaTicketValid(t *testing.T) {
 	gotID, sessionID, err := h.authenticateWebSocket(c)
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
-	assert.Equal(t, "", sessionID)
+	assert.Equal(t, access.sid.String(), sessionID)
+
+	_, _, err = h.authenticateWebSocket(newGinContext(r))
+	require.ErrorContains(t, err, "invalid ticket", "a redeemed producer ticket must be single use")
 }
 
 func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
@@ -564,11 +582,9 @@ func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	h := NewHandler(nil, db, redisClient, testJWTSecret, nil, nil, nil)
 
-	userID := uuid.New()
-	ticket := "test-ticket-session"
-	ctx := context.Background()
-	err := redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "my-session-id", ""), 30*time.Second).Err()
-	require.NoError(t, err)
+	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
+	ticket := admissionMintTicket(t, db, redisClient, access)
 
 	r, _ := http.NewRequest("GET", wsTicketPath+ticket, nil)
 	c := newGinContext(r)
@@ -576,7 +592,7 @@ func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
 	gotID, sessionID, err := h.authenticateWebSocket(c)
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
-	assert.Equal(t, "my-session-id", sessionID)
+	assert.Equal(t, access.sid.String(), sessionID)
 }
 
 func TestAuthenticateViaTicketInvalidTicket(t *testing.T) {
@@ -667,22 +683,20 @@ func TestHandlerSetMinimumClientVersion(t *testing.T) {
 }
 
 func TestHandleWebSocketClientVersionFloorTicket(t *testing.T) {
-	testHandleWebSocketClientVersionFloor(t, "ticket", func(t *testing.T, redisClient *redis.Client, userID uuid.UUID) string {
+	testHandleWebSocketClientVersionFloor(t, "ticket", func(t *testing.T, db *sql.DB, redisClient *redis.Client, access admissionAccess) string {
 		t.Helper()
-		ticket := "client-version-ticket-" + uuid.NewString()
-		require.NoError(t, redisClient.Set(context.Background(), wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "", ""), 30*time.Second).Err())
-		return wsTicketPath + ticket
+		return wsTicketPath + admissionMintTicket(t, db, redisClient, access)
 	})
 }
 
 func TestHandleWebSocketClientVersionFloorJWT(t *testing.T) {
-	testHandleWebSocketClientVersionFloor(t, "direct JWT", func(t *testing.T, _ *redis.Client, userID uuid.UUID) string {
+	testHandleWebSocketClientVersionFloor(t, "direct JWT", func(t *testing.T, _ *sql.DB, _ *redis.Client, access admissionAccess) string {
 		t.Helper()
-		return wsTokenPath + generateTestJWT(t, userID.String(), testJWTSecret)
+		return wsTokenPath + access.token
 	})
 }
 
-func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, authPath func(*testing.T, *redis.Client, uuid.UUID) string) {
+func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, authPath func(*testing.T, *sql.DB, *redis.Client, admissionAccess) string) {
 	t.Helper()
 	db := setupHubTestDB(t)
 	redisClient := setupHubTestRedis(t)
@@ -690,7 +704,8 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 	go hub.Run()
 	handler := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 	server := setupWSTestServer(t, handler, hub)
-	userID := uuid.New()
+	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
 
 	tests := []struct {
 		name          string
@@ -715,7 +730,7 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 	for _, test := range tests {
 		t.Run(authPathName+"/"+test.name, func(t *testing.T) {
 			handler.SetMinimumClientVersion(test.minimum)
-			wsURL := "ws" + server.URL[4:] + authPath(t, redisClient, userID) + "&client_version=" + test.clientVersion
+			wsURL := "ws" + server.URL[4:] + authPath(t, db, redisClient, access) + "&client_version=" + test.clientVersion
 
 			conn, response, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
 			if test.wantStatus == http.StatusSwitchingProtocols {
@@ -726,6 +741,7 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 			}
 
 			require.Error(t, err)
+			assert.Nil(t, conn, "a version refusal must not upgrade the connection")
 			require.NotNil(t, response, "version denial must happen before the WebSocket upgrade")
 			defer func() {
 				assert.NoError(t, response.Body.Close())
@@ -760,24 +776,75 @@ func setupWSTestServer(t *testing.T, h *Handler, hub *Hub) *httptest.Server {
 	return srv
 }
 
+// The fault is limited to the optional profile read; every authority query uses
+// the real PostgreSQL connection, including the final registration guard.
+type handlerProfileFailureConnector struct {
+	driver.Connector
+	failures atomic.Int64
+}
+
+func (c *handlerProfileFailureConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &handlerProfileFailureConn{
+		admissionProfileConn: &admissionProfileConn{Conn: conn, reads: &c.failures},
+		failures:             &c.failures,
+	}, nil
+}
+
+type handlerProfileFailureConn struct {
+	*admissionProfileConn
+	failures *atomic.Int64
+}
+
+func (c *handlerProfileFailureConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if query == "SELECT username, display_name, avatar_url FROM users WHERE id = $1" {
+		c.failures.Add(1)
+		return nil, errors.New("injected downstream profile lookup failure")
+	}
+	return c.admissionProfileConn.QueryContext(ctx, query, args)
+}
+
 func TestHandleWebSocketDBLookupFallback(t *testing.T) {
 	db := setupHubTestDB(t)
 	redisClient := setupHubTestRedis(t)
+	userID := dbtest.CreateUser(t, db)
+	access := admissionCanonicalAccess(t, db, userID)
+	connector, err := pq.NewConnector(dbtest.DatabaseURL())
+	require.NoError(t, err)
+	profile := &handlerProfileFailureConnector{Connector: connector}
+	handlerDB := sql.OpenDB(profile)
+	t.Cleanup(func() { require.NoError(t, handlerDB.Close()) })
 	hub := NewHub(db, redisClient)
 	go hub.Run()
-
-	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
-
-	userID := uuid.New()
-	token := generateTestJWT(t, userID.String(), testJWTSecret)
-
+	h := NewHandler(hub, handlerDB, redisClient, testJWTSecret, []string{"*"}, nil, nil)
+	before, err := h.resolveAccessFamily(context.Background(), userID, access.sid.String(), access.epoch, access.expiresAt)
+	require.NoError(t, err, "the fixture must have live family authority before the profile fault")
+	require.Zero(t, profile.failures.Load())
 	srv := setupWSTestServer(t, h, hub)
 
-	wsURL := "ws" + srv.URL[4:] + wsTokenPath + token
+	wsURL := "ws" + srv.URL[4:] + wsTokenPath + access.token
 	conn, resp, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
 	assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	_ = conn.Close()
+	require.EqualValues(t, 1, profile.failures.Load(), "the exact downstream profile SELECT must have failed")
+	require.Eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		for clientID := range hub.userClients[userID] {
+			client := hub.clients[clientID]
+			if client != nil && client.SessionID == access.sid.String() {
+				return client.Username == "Unknown" && client.DisplayName == nil && client.AvatarURL == nil && client.FamilyID == before.FamilyID
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond, "the live registered client must retain the Unknown profile fallback")
+	after, err := h.resolveAccessFamily(context.Background(), userID, access.sid.String(), access.epoch, access.expiresAt)
+	require.NoError(t, err, "family authority must remain live after registration")
+	require.Equal(t, before.FamilyID, after.FamilyID)
 }
 
 func TestHandleWebSocketCapturesActivityCapabilityBeforeRegistration(t *testing.T) {
@@ -787,8 +854,8 @@ func TestHandleWebSocketCapturesActivityCapabilityBeforeRegistration(t *testing.
 	go hub.Run()
 	handler := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 
-	userID := uuid.New()
-	token := generateTestJWT(t, userID.String(), testJWTSecret)
+	userID := dbtest.CreateUser(t, db)
+	token := admissionCanonicalAccess(t, db, userID).token
 	server := setupWSTestServer(t, handler, hub)
 	baseURL := "ws" + server.URL[4:] + wsTokenPath + token
 	legacy, _, err := gorillaWS.DefaultDialer.Dial(baseURL, nil)
@@ -834,8 +901,8 @@ func TestHandleWebSocketSecurityHeadersOn101(t *testing.T) {
 
 	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, secHeaders)
 
-	userID := uuid.New()
-	token := generateTestJWT(t, userID.String(), testJWTSecret)
+	userID := dbtest.CreateUser(t, db)
+	token := admissionCanonicalAccess(t, db, userID).token
 
 	srv := setupWSTestServer(t, h, hub)
 
@@ -863,8 +930,13 @@ func TestHandleWebSocketDBLookupSuccess(t *testing.T) {
 		db.Exec(`DELETE FROM users WHERE id = $1`, userID.String()) //nolint:errcheck,gosec
 	})
 
+	displayName := "WebSocket Profile"
+	avatarURL := "https://example.test/avatar.png"
+	_, err = db.Exec(`UPDATE users SET display_name = $2, avatar_url = $3 WHERE id = $1`, userID, displayName, avatarURL)
+	require.NoError(t, err)
 	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
-	token := generateTestJWT(t, userID.String(), testJWTSecret)
+	access := admissionCanonicalAccess(t, db, userID)
+	token := access.token
 
 	srv := setupWSTestServer(t, h, hub)
 
@@ -872,7 +944,18 @@ func TestHandleWebSocketDBLookupSuccess(t *testing.T) {
 	conn, resp, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	_ = conn.Close()
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	require.Eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		for clientID := range hub.userClients[userID] {
+			client := hub.clients[clientID]
+			if client != nil && client.SessionID == access.sid.String() {
+				return client.Username == "wshandleruser" && client.DisplayName != nil && *client.DisplayName == displayName && client.AvatarURL != nil && *client.AvatarURL == avatarURL
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond, "the registered client must carry the SQL profile")
 }
 
 func TestHandleWebSocketTicketAuth(t *testing.T) {
@@ -890,10 +973,8 @@ func TestHandleWebSocketTicketAuth(t *testing.T) {
 		db.Exec(`DELETE FROM users WHERE id = $1`, userID.String()) //nolint:errcheck,gosec
 	})
 
-	ticket := "integration-test-ticket"
-	ctx := context.Background()
-	err = redisClient.Set(ctx, wsTicketKeyPfx+ticket, testTicketValue(userID.String(), "test-session", ""), 30*time.Second).Err()
-	require.NoError(t, err)
+	access := admissionCanonicalAccess(t, db, userID)
+	ticket := admissionMintTicket(t, db, redisClient, access)
 
 	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 

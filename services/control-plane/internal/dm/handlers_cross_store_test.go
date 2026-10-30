@@ -10,12 +10,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -25,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func crossStoreVoiceContext(t *testing.T, method, path, userID, convID string, body any) (*gin.Context, *httptest.ResponseRecorder) {
+func crossStoreVoiceContext(t *testing.T, ts *testhelpers.TestServer, method, path, accessToken, convID string, body any) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
 	var payload []byte
 	if body != nil {
@@ -40,7 +43,15 @@ func crossStoreVoiceContext(t *testing.T, method, path, userID, convID string, b
 		c.Request.Header.Set("Content-Type", "application/json")
 	}
 	c.Params = gin.Params{{Key: "id", Value: convID}}
-	c.Set("user_id", userID)
+	// Admit the exact fixture JWT through production middleware before invoking
+	// the custom handler. Keeping this context's writer unwritten lets each
+	// handler retain its own response, cancellation and injected domain hooks.
+	c.Request.Header.Set("Authorization", "Bearer "+accessToken)
+	middleware.AuthRequired(ts.Config.JWTSecret, ts.Redis, ts.DB,
+		credepoch.New(ts.DB, ts.Redis, logger.New("test")))(c)
+	require.False(t, c.IsAborted(), "fixture authentication failed: %s", w.Body.String())
+	_, _, verified := middleware.VerifiedAccessFromContext(c)
+	require.True(t, verified, "fixture must carry a real verified family grant")
 	return c, w
 }
 
@@ -62,7 +73,10 @@ func TestOpenConversation_PostCommitFetchFailureReturnsError(t *testing.T) {
 	ts.CreateFriendship(t, caller.ID, target.ID, statusAccepted)
 	convID := ts.CreateDMConversation(t, caller.ID, target.ID)
 	h := crossStoreVoiceHandler(ts)
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
 	dm.SetDMTopologyCommitHookForTest(h, func(tx *sql.Tx) error {
+		commitReached.Store(true)
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -71,7 +85,7 @@ func TestOpenConversation_PostCommitFetchFailureReturnsError(t *testing.T) {
 	})
 	t.Cleanup(func() { dm.SetDMTopologyCommitHookForTest(h, nil) })
 
-	c, w := crossStoreVoiceContext(t, http.MethodPost, "/dm/conversations", caller.ID, "", map[string]string{
+	c, w := crossStoreVoiceContext(t, ts, http.MethodPost, "/dm/conversations", caller.AccessToken, "", map[string]string{
 		"user_id": target.ID,
 	})
 	h.OpenConversation(c)
@@ -89,9 +103,14 @@ func TestAuthorizeVoiceJoin_CommitFailureCompensatesLease(t *testing.T) {
 	callee := ts.CreateTestUser(t, "cross_store_join_callee")
 	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 	h := crossStoreVoiceHandler(ts)
-	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error { return errors.New("commit failed") })
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
+	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error {
+		commitReached.Store(true)
+		return errors.New("commit failed")
+	})
 
-	c, w := crossStoreVoiceContext(t, http.MethodPost, "/voice/join", caller.ID, convID, nil)
+	c, w := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/join", caller.AccessToken, convID, nil)
 	h.AuthorizeVoiceJoin(c)
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 
@@ -109,9 +128,14 @@ func TestAuthorizeVoiceJoin_AcceptCommitFailureLeavesRingRetryable(t *testing.T)
 	ringID := ringForTest(t, ts, caller, convID)
 	convUUID := uuid.MustParse(convID)
 	h := crossStoreVoiceHandler(ts)
-	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error { return errors.New("commit failed") })
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
+	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error {
+		commitReached.Store(true)
+		return errors.New("commit failed")
+	})
 
-	c, failed := crossStoreVoiceContext(t, http.MethodPost, "/voice/join", callee.ID, convID,
+	c, failed := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/join", callee.AccessToken, convID,
 		map[string]string{"ring_id": ringID})
 	h.AuthorizeVoiceJoin(c)
 	require.Equal(t, http.StatusInternalServerError, failed.Code)
@@ -124,7 +148,7 @@ func TestAuthorizeVoiceJoin_AcceptCommitFailureLeavesRingRetryable(t *testing.T)
 	require.False(t, admitted, "failed accept must retract its provisional admission")
 
 	dm.SetDMTopologyCommitHookForTest(h, nil)
-	c, retried := crossStoreVoiceContext(t, http.MethodPost, "/voice/join", callee.ID, convID,
+	c, retried := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/join", callee.AccessToken, convID,
 		map[string]string{"ring_id": ringID})
 	h.AuthorizeVoiceJoin(c)
 	require.Equal(t, http.StatusOK, retried.Code, retried.Body.String())
@@ -145,12 +169,15 @@ func TestAuthorizeVoiceJoin_AcceptCanceledRequestRetractsAndDeniesMedia(t *testi
 	h := crossStoreVoiceHandler(ts)
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	t.Cleanup(cancelRequest)
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
 	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error {
+		commitReached.Store(true)
 		cancelRequest()
 		return errors.New("commit canceled")
 	})
 
-	c, failed := crossStoreVoiceContext(t, http.MethodPost, "/voice/join", callee.ID, convID,
+	c, failed := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/join", callee.AccessToken, convID,
 		map[string]string{"ring_id": ringID})
 	c.Request = c.Request.WithContext(requestCtx)
 	h.AuthorizeVoiceJoin(c)
@@ -163,7 +190,7 @@ func TestAuthorizeVoiceJoin_AcceptCanceledRequestRetractsAndDeniesMedia(t *testi
 	require.NoError(t, err)
 	assert.False(t, admitted, "canceled request must not retain a media admission")
 
-	media, denied := crossStoreVoiceContext(t, http.MethodPost, "/voice/authorize", callee.ID, convID,
+	media, denied := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/authorize", callee.AccessToken, convID,
 		map[string]string{"call_id": ringID})
 	media.Request.Header = dmVoiceMediaAuthorizationHeaders(callee.AccessToken, convID, ringID)
 	h.AuthorizeDMVoiceForMediaPlane(media)
@@ -179,15 +206,25 @@ func TestAuthorizeVoiceJoin_AcceptActivationAcknowledgementLossConfirmsExactLeas
 	ringID := ringForTest(t, ts, caller, convID)
 	convUUID := uuid.MustParse(convID)
 	h := crossStoreVoiceHandler(ts)
-	dm.SetDMTopologyCommitHookForTest(h, func(tx *sql.Tx) error { return tx.Commit() })
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
+	dm.SetDMTopologyCommitHookForTest(h, func(tx *sql.Tx) error {
+		commitReached.Store(true)
+		return tx.Commit()
+	})
+	var activationReached atomic.Bool
+	t.Cleanup(func() {
+		assert.True(t, activationReached.Load(), "custom activation acknowledgement-loss hook must run")
+	})
 	dm.SetDMVoiceActivationHookForTest(h, func(ctx context.Context, conversationID, callID uuid.UUID, ttl time.Duration) error {
+		activationReached.Store(true)
 		if err := dm.ActivateAcceptedDMVoiceCallLease(ctx, ts.Redis, conversationID, callID, ttl); err != nil {
 			return err
 		}
 		return errors.New("activation acknowledgement lost")
 	})
 
-	c, accepted := crossStoreVoiceContext(t, http.MethodPost, "/voice/join", callee.ID, convID,
+	c, accepted := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/join", callee.AccessToken, convID,
 		map[string]string{"ring_id": ringID})
 	h.AuthorizeVoiceJoin(c)
 	require.Equal(t, http.StatusOK, accepted.Code, accepted.Body.String())
@@ -218,7 +255,7 @@ func TestAuthorizeDMVoiceForMediaPlane_RejectsProvisionalAcceptedRing(t *testing
 	))
 
 	h := crossStoreVoiceHandler(ts)
-	media, denied := crossStoreVoiceContext(t, http.MethodPost, "/voice/authorize", caller.ID, convID,
+	media, denied := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/authorize", caller.AccessToken, convID,
 		map[string]string{"call_id": callID.String()})
 	media.Request.Header = dmVoiceMediaAuthorizationHeaders(caller.AccessToken, convID, callID.String())
 	h.AuthorizeDMVoiceForMediaPlane(media)
@@ -233,9 +270,14 @@ func TestRingDMCall_CommitFailureCancelsPendingRing(t *testing.T) {
 	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 	calleeConn := dialDMObserver(t, ts, callee.ID, convID)
 	h := crossStoreVoiceHandler(ts)
-	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error { return errors.New("commit failed") })
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
+	dm.SetDMTopologyCommitHookForTest(h, func(*sql.Tx) error {
+		commitReached.Store(true)
+		return errors.New("commit failed")
+	})
 
-	c, w := crossStoreVoiceContext(t, http.MethodPost, "/voice/ring", caller.ID, convID, nil)
+	c, w := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/ring", caller.AccessToken, convID, nil)
 	h.RingDMCall(c)
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 	require.False(t, dm.PendingDMCallExistsForTest(uuid.MustParse(convID)), "a failed fence commit must retract the pending ring")
@@ -270,7 +312,10 @@ func TestRingDMCall_RefreshesRecipientsUnderAnnouncementFence(t *testing.T) {
 
 	committed := make(chan struct{})
 	release := make(chan struct{})
+	var commitReached atomic.Bool
+	t.Cleanup(func() { assert.True(t, commitReached.Load(), "custom topology commit hook must run") })
 	dm.SetDMTopologyCommitHookForTest(h, func(tx *sql.Tx) error {
+		commitReached.Store(true)
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -280,7 +325,7 @@ func TestRingDMCall_RefreshesRecipientsUnderAnnouncementFence(t *testing.T) {
 	})
 	t.Cleanup(func() { dm.SetDMTopologyCommitHookForTest(h, nil) })
 
-	c, w := crossStoreVoiceContext(t, http.MethodPost, "/voice/ring", caller.ID, convID, nil)
+	c, w := crossStoreVoiceContext(t, ts, http.MethodPost, "/voice/ring", caller.AccessToken, convID, nil)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)

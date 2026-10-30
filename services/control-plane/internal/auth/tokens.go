@@ -51,6 +51,60 @@ type Claims struct {
 // AccessTokenTTL is the lifetime of JWT access tokens.
 const AccessTokenTTL = 15 * time.Minute
 
+// AccessTokenInput is the identity and claims selected by a canonical mint.
+type AccessTokenInput struct {
+	UserID          uuid.UUID
+	SID             uuid.UUID
+	CredentialEpoch string
+	EmailVerified   bool
+	Tier            string
+}
+
+// PreparedAccessToken fixes the signed identity and lifetime before SQL commit.
+// Its private values cannot be changed through a returned claims pointer.
+type PreparedAccessToken struct {
+	input     AccessTokenInput
+	jti       uuid.UUID
+	issuedAt  time.Time
+	expiresAt time.Time
+}
+
+// PrepareAccessToken fixes the token's JTI and lifetime using the supplied clock.
+func PrepareAccessToken(input AccessTokenInput, now time.Time) (PreparedAccessToken, error) {
+	if input.UserID == uuid.Nil || input.SID == uuid.Nil || now.IsZero() {
+		return PreparedAccessToken{}, ErrInvalidToken
+	}
+	jti, err := uuid.NewRandom()
+	if err != nil {
+		return PreparedAccessToken{}, err
+	}
+	issuedAt := jwt.NewNumericDate(now.UTC().Truncate(time.Second)).Time
+	return PreparedAccessToken{input: input, jti: jti, issuedAt: issuedAt,
+		expiresAt: jwt.NewNumericDate(issuedAt.Add(AccessTokenTTL)).Time}, nil
+}
+
+// ExpiresAt returns the exact signed expiry, or zero for an unprepared token.
+func (p PreparedAccessToken) ExpiresAt() time.Time { return p.expiresAt }
+
+// Sign signs the prepared claims without consulting the clock.
+func (p PreparedAccessToken) Sign(jwtSecret string) (string, error) {
+	if p.jti == uuid.Nil || p.input.UserID == uuid.Nil || p.input.SID == uuid.Nil ||
+		p.issuedAt.IsZero() || !p.expiresAt.Equal(p.issuedAt.Add(AccessTokenTTL)) {
+		return "", ErrInvalidToken
+	}
+	verified := p.input.EmailVerified
+	claims := Claims{
+		UserID: p.input.UserID.String(), SessionID: p.input.SID.String(),
+		CredentialEpoch: p.input.CredentialEpoch, EmailVerified: &verified, Tier: p.input.Tier,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID: p.jti.String(), Issuer: middleware.AccessTokenIssuer,
+			IssuedAt: &jwt.NumericDate{Time: p.issuedAt}, NotBefore: &jwt.NumericDate{Time: p.issuedAt},
+			ExpiresAt: &jwt.NumericDate{Time: p.expiresAt},
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(jwtSecret))
+}
+
 // GenerateAccessToken creates a short-lived JWT access token with a unique JTI.
 // emailVerified and the optional entitlement tier are embedded so downstream
 // middleware (control-plane) and the media-plane JWT verifier can gate without a

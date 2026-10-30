@@ -30,6 +30,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/loginfamily"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/managedredis"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -42,10 +43,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// refreshTokenHeader carries the refresh token for non-cookie clients.
+const refreshTokenHeader = "X-Refresh-Token" //nolint:gosec // G101: header name, not a credential
+
 // SessionDisconnector allows forcefully disconnecting WebSocket connections.
 // Defined as an interface to avoid an import cycle (websocket imports auth).
+// DisconnectUser is the user-wide kill for theft, where no family is terminal
+// yet; DisconnectFamilyContext is the exact post-commit revocation fence.
 type SessionDisconnector interface {
 	DisconnectUser(userID uuid.UUID)
+	loginfamily.FamilyCloser
 }
 
 // RecoveryClaims contains the user_id extracted from a validated recovery token.
@@ -268,16 +275,21 @@ var ErrContinuationEpochAdvanced = errors.New("continuation epoch advanced")
 // the locked epoch so the pair cannot outlive the rotation it belongs to.
 func (h *Handler) IssueTokenPair(c *gin.Context, userID, expectedEpoch string) (accessToken, refreshToken, sessionID string, err error) {
 	ctx := c.Request.Context()
-	tx, err := h.db.BeginTx(ctx, nil)
+	tier := h.entCache.GetTier(ctx, userID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return "", "", "", fmt.Errorf("begin: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer h.rollbackLoginMint(tx)
+	userAuthority, err := lockMintUserTx(ctx, tx, userID)
+	if err != nil {
+		return "", "", "", err
+	}
 
 	var emailVerified bool
 	var epoch sql.NullString
 	if err = tx.QueryRowContext(ctx,
-		`SELECT email_verified, credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+		`SELECT email_verified, credential_epoch FROM users WHERE id = $1`, userID,
 	).Scan(&emailVerified, &epoch); err != nil {
 		return "", "", "", fmt.Errorf("lookup: %w", err)
 	}
@@ -286,8 +298,15 @@ func (h *Handler) IssueTokenPair(c *gin.Context, userID, expectedEpoch string) (
 	}
 
 	sessionID = uuid.New().String()
-	tier := h.entCache.GetTier(ctx, userID)
-	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, epoch.String, sessionID, tier)
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, userAuthority, epoch.String)
+	if err != nil {
+		return "", "", "", err
+	}
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, sessionID, emailVerified, tier)
+	if err != nil {
+		return "", "", "", err
+	}
+	accessToken, err = prepared.Sign(h.jwtSecret)
 	if err != nil {
 		return "", "", "", fmt.Errorf("access: %w", err)
 	}
@@ -305,7 +324,7 @@ func (h *Handler) IssueTokenPair(c *gin.Context, userID, expectedEpoch string) (
 		return "", "", "", fmt.Errorf("store: %w", err)
 	}
 	if err = tx.Commit(); err != nil {
-		return "", "", "", fmt.Errorf("commit: %w", err)
+		return "", "", "", loginfamily.NewError(loginfamily.ReasonCommitUnknown, err)
 	}
 	return accessToken, refreshToken, sessionID, nil
 }
@@ -441,28 +460,35 @@ func ValidateE2EEPublicKey(publicKey []byte) error {
 	return nil
 }
 
-// generateTokenPair creates an access+refresh token pair and persists the
-// refresh token. Its ONLY caller is issueSessionTokens ← ConfirmRegistration,
-// which mints the FIRST session for a brand-new user (credential_epoch NULL).
-//
-// #2418 caution: this reads the epoch and INSERTs the refresh row in two
-// UNFENCED statements (no user-row lock, no transaction) — the same shape the
-// CompleteLogin fix replaced. That is safe HERE only because a user being
-// created for the first time has no pre-reset credential a destructive reset
-// could advance the epoch past. Do NOT reuse this for any flow that mints for an
-// EXISTING user (SSO, recovery, re-login) without first binding it to the
-// authorizing epoch under FOR NO KEY UPDATE, exactly as CompleteLogin and
-// IssueTokenPair do — otherwise the pre-reset-mint race this issue closes reopens.
+// generateTokenPair owns the first registration session's transaction. The
+// family, access deadline and refresh row are committed together.
 func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified bool) (accessToken, refreshToken, tokenID string, err error) {
-	// #2201: embed the user's current credential epoch (fail closed — no mint
-	// without epoch knowledge) and the new refresh-session id in the access token.
+	ctx := c.Request.Context()
+	tier := h.entCache.GetTier(ctx, userID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return "", "", "", loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+	}
+	defer h.rollbackLoginMint(tx)
+	userAuthority, err := lockMintUserTx(ctx, tx, userID)
+	if err != nil {
+		return "", "", "", err
+	}
+
 	var credEpoch sql.NullString
-	if err = h.db.QueryRow(`SELECT credential_epoch FROM users WHERE id = $1`, userID).Scan(&credEpoch); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT credential_epoch FROM users WHERE id = $1`, userID).Scan(&credEpoch); err != nil {
 		return "", "", "", fmt.Errorf("epoch lookup: %w", err)
 	}
 	tokenID = uuid.New().String()
-	tier := h.entCache.GetTier(c.Request.Context(), userID)
-	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, credEpoch.String, tokenID, tier)
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, userAuthority, credEpoch.String)
+	if err != nil {
+		return "", "", "", err
+	}
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, emailVerified, tier)
+	if err != nil {
+		return "", "", "", err
+	}
+	accessToken, err = prepared.Sign(h.jwtSecret)
 	if err != nil {
 		return "", "", "", fmt.Errorf("access: %w", err)
 	}
@@ -475,7 +501,7 @@ func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
 	machineID := c.GetHeader(headerMachineID)
 
-	_, err = h.db.Exec(
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		tokenID, userID, tokenHash, c.GetHeader(headerDeviceName),
@@ -484,6 +510,9 @@ func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified
 	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("store: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return "", "", "", loginfamily.NewError(loginfamily.ReasonCommitUnknown, err)
 	}
 	return accessToken, refreshToken, tokenID, nil
 }
@@ -896,7 +925,7 @@ func (h *Handler) issueSessionTokens(c *gin.Context, userID string) (access, ref
 	access, refresh, sessionID, err = h.generateTokenPair(c, userID, true)
 	if err != nil {
 		h.log.Error("confirm: token issuance failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
+		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgInternalError)
 		return
 	}
 	SetRefreshCookie(c, refresh, 30*24*60*60)
@@ -1413,13 +1442,18 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	// same users-row lock every destructive reset needs. The tier is only a JWT
 	// claim and needs no consistent snapshot with the locked read.
 	tier := h.entCache.GetTier(ctx, userID)
-	tx, err := h.db.BeginTx(ctx, nil)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("Failed to begin login mint tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
 		return false
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer h.rollbackLoginMint(tx)
+	userAuthority, err := lockMintUserTx(ctx, tx, userID)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgLoginFailed)
+		return false
+	}
 
 	// Reading disabled, email_verified and credential_epoch in this same locked
 	// snapshot keeps the terminal gate, the JWT claim, and the returned user
@@ -1429,7 +1463,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	if err := tx.QueryRowContext(ctx,
 		`SELECT id, email, username, password_hash, display_name, bio, avatar_url, COALESCE(links, '[]'::jsonb),
 		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled, credential_epoch
-		 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+		 FROM users WHERE id = $1`, userID,
 	).Scan(
 		&user.ID, &user.Email, &user.Username, &user.PasswordHash,
 		&user.DisplayName, &user.Bio, &user.AvatarURL, &user.Links,
@@ -1471,10 +1505,29 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		return false
 	}
 
+	deviceName := c.GetHeader(headerDeviceName)
+	ipAddress := c.ClientIP()
+	userAgent := truncateUserAgent(c.GetHeader(headerUserAgent))
+	machineID := c.GetHeader(headerMachineID)
+	if err := displaceLoginRefreshRowsTx(ctx, tx, userAuthority, userID, machineID, ipAddress, userAgent); err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgLoginFailed)
+		return false
+	}
+
 	// Generate access token (JWT, 15 min). tokenID (the refresh-session id) is
 	// minted first so the access token can carry it as the sid claim (#2201).
 	tokenID := uuid.New().String()
-	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, user.EmailVerified, credEpoch.String, tokenID, tier)
+	family, err := loginfamily.CreateFamilyTx(ctx, tx, userAuthority, credEpoch.String)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgLoginFailed)
+		return false
+	}
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, user.EmailVerified, tier)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgLoginFailed)
+		return false
+	}
+	accessToken, err := prepared.Sign(h.jwtSecret)
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
@@ -1492,10 +1545,6 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	// Store refresh token in database
 	tokenHash := HashRefreshToken(refreshToken)
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
-	deviceName := c.GetHeader(headerDeviceName)
-	ipAddress := c.ClientIP()
-	userAgent := truncateUserAgent(c.GetHeader(headerUserAgent))
-	machineID := c.GetHeader(headerMachineID)
 
 	h.log.Info("CompleteLogin: storing refresh token",
 		"request_id", c.GetString(middleware.RequestIDContextKey),
@@ -1503,47 +1552,6 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		"machine_id", machineID,
 		"user_id", userID,
 	)
-
-	// Revoke old sessions from the same device. This moves INSIDE the transaction:
-	// it mutates refresh_tokens for this user and must be atomic with the mint, or a
-	// reset interleaving between the revoke and the INSERT could leave the old
-	// session dead and the new one live under a superseded epoch.
-	if machineID != "" {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE refresh_tokens SET revoked_at = NOW()
-			 WHERE user_id = $1 AND machine_id = $2 AND revoked_at IS NULL`,
-			userID, machineID,
-		); err != nil {
-			h.log.Error("Failed to revoke same-device sessions", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-			return false
-		}
-	} else if _, err := tx.ExecContext(ctx,
-		// SSO rows are deliberately NOT displaced here, and the predicate is left
-		// alone (#3290). This is a device-identity match, and a row carrying no
-		// device identity cannot be matched under any NULL semantics:
-		//   - IS NOT DISTINCT FROM is a no-op ($2/$3 bind from c.ClientIP() and a
-		//     header and are never NULL), and would add a comment falsely
-		//     claiming the gap is closed;
-		//   - COALESCE-ing both sides text-ifies an inet comparison, so stored
-		//     192.168.1.42/32 stops matching supplied 192.168.1.42 and same-origin
-		//     revocation breaks for EVERY machine-ID-less client, to fix nothing;
-		//   - an IS NULL wildcard is the only form that displaces an SSO row, and
-		//     it displaces every metadata-less session of that user from any
-		//     device — a cross-device silent-logout primitive on an auth path.
-		// Exposure is bounded to one refresh interval: rotation writes real IP and
-		// user-agent into the successor, after which this same-origin predicate can
-		// displace a matching machine-ID-less session. A request with a machine ID
-		// uses the branch above. This arm is reached only for web-SPA login requests.
-		// Closing it properly means stamping metadata at the SSO mint.
-		`UPDATE refresh_tokens SET revoked_at = NOW()
-		 WHERE user_id = $1 AND ip_address = $2 AND user_agent = $3 AND revoked_at IS NULL`,
-		userID, ipAddress, userAgent,
-	); err != nil {
-		h.log.Error("Failed to revoke same-origin sessions", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return false
-	}
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
@@ -1556,8 +1564,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	}
 
 	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit login mint", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
+		writeLoginFamilyError(c, loginfamily.NewError(loginfamily.ReasonCommitUnknown, err), errMsgInvalidCredentials, errMsgLoginFailed)
 		return false
 	}
 
@@ -1656,7 +1663,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 func (h *Handler) extractRefreshToken(c *gin.Context) string {
 	refreshToken, err := c.Cookie("refresh_token")
 	if err != nil || refreshToken == "" {
-		refreshToken = c.GetHeader("X-Refresh-Token")
+		refreshToken = c.GetHeader(refreshTokenHeader)
 	}
 	return refreshToken
 }
@@ -1897,7 +1904,9 @@ func (h *Handler) handleTokenTheft(c *gin.Context, token models.RefreshToken) bo
 		h.retryTokenTheftRecovery(token.UserID, true, releaseLocalDeny)
 	}
 
-	if uid, parseErr := uuid.Parse(token.UserID); parseErr == nil {
+	// Kill every socket now, whatever the revocation outcome: the deferred and
+	// Redis-fallback branches have no terminal family for an exact fence yet.
+	if uid, parseErr := uuid.Parse(token.UserID); parseErr == nil && h.hub != nil {
 		h.hub.DisconnectUser(uid)
 	}
 	h.triggerTheftKeyRevocations(token.UserID)
@@ -2293,18 +2302,24 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 	// refuse — a pre-reset refresh token can no longer mint a fresh session under
 	// the new epoch.
 	ctx := c.Request.Context()
-	tx, err := h.db.BeginTx(ctx, nil)
+	tier := h.entCache.GetTier(ctx, token.UserID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("Failed to begin refresh rotation tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer h.rollbackLoginMint(tx)
+	userAuthority, err := lockMintUserTx(ctx, tx, token.UserID)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
 
 	var refreshEmailVerified, disabled bool
 	var refreshCredEpoch sql.NullString
 	if err := tx.QueryRowContext(ctx,
-		`SELECT email_verified, credential_epoch, disabled FROM users WHERE id = $1 FOR NO KEY UPDATE`, token.UserID,
+		`SELECT email_verified, credential_epoch, disabled FROM users WHERE id = $1`, token.UserID,
 	).Scan(&refreshEmailVerified, &refreshCredEpoch, &disabled); err != nil {
 		h.log.Error("Failed to lock user for refresh rotation", "error", err, "user_id", token.UserID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -2320,13 +2335,39 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		return
 	}
 
+	family, err := guardRefreshFamilyTx(ctx, tx, userAuthority, token.ID)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, newTokenID, refreshEmailVerified, tier)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+	accessToken, err := prepared.Sign(h.jwtSecret)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+
 	var revokedID string
-	if err := tx.QueryRowContext(ctx,
-		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW() WHERE id = $1 AND revoked_at IS NULL RETURNING id`,
+	// Lock before checking the current clock: an UPDATE predicate can be
+	// evaluated before waiting for a row lock held without a tuple change.
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL FOR UPDATE`,
 		token.ID,
-	).Scan(&revokedID); err != nil {
+	).Scan(&revokedID)
+	if err == nil {
+		err = tx.QueryRowContext(ctx,
+			`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW()
+			 WHERE id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp() RETURNING id`,
+			token.ID,
+		).Scan(&revokedID)
+	}
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// A concurrent destructive reset revoked the source token first.
+			// The source was revoked or expired before locked consumption.
 			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgRefreshFailed})
 			return
 		}
@@ -2348,8 +2389,7 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 	}
 
 	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit refresh rotation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		writeLoginFamilyError(c, loginfamily.NewError(loginfamily.ReasonCommitUnknown, err), errMsgInvalidRefreshToken, errMsgRefreshFailed)
 		return
 	}
 
@@ -2359,14 +2399,6 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		token.UserID)
 
 	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
-
-	tier := h.entCache.GetTier(c.Request.Context(), token.UserID)
-	accessToken, err := GenerateAccessToken(token.UserID, h.jwtSecret, refreshEmailVerified, refreshCredEpoch.String, newTokenID, tier)
-	if err != nil {
-		h.log.Error(errMsgFailedAccessToken, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
-		return
-	}
 
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRefreshRotated, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusOK, gin.H{
@@ -2387,20 +2419,26 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 // (attemptGracePeriodRecovery); recovery keys on revokedTokenID, not the timestamp.
 func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, _ time.Time) {
 	ctx := c.Request.Context()
-	tx, err := h.db.BeginTx(ctx, nil)
+	tier := h.entCache.GetTier(ctx, userID)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		h.log.Error("Failed to begin grace recovery tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer h.rollbackLoginMint(tx)
+	userAuthority, err := lockMintUserTx(ctx, tx, userID)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
 
 	// Lock the user row (the same lock a destructive reset holds) and read epoch +
 	// disabled under it, so grace recovery composes with the #2201 epoch fence.
 	var graceEmailVerified, disabled bool
 	var graceCredEpoch sql.NullString
 	if err := tx.QueryRowContext(ctx,
-		`SELECT email_verified, credential_epoch, disabled FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+		`SELECT email_verified, credential_epoch, disabled FROM users WHERE id = $1`, userID,
 	).Scan(&graceEmailVerified, &graceCredEpoch, &disabled); err != nil {
 		h.log.Error("Failed to lock user for grace recovery", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -2414,12 +2452,18 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		return
 	}
 
+	family, err := guardRefreshFamilyTx(ctx, tx, userAuthority, revokedTokenID)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+
 	// Exact lineage lookup: the still-live token whose predecessor is the replayed
 	// token. A foreign concurrent/post-reset token has no edge to revokedTokenID and
 	// can never be selected. LIMIT 1 is defensive — the chain is strictly linear.
-	// `expires_at > NOW()` mirrors the normal Refresh path's expiry gate (#2428
-	// CWE-613): an already-expired successor must not re-mint a fresh access token;
-	// it fails closed to the sql.ErrNoRows -> 401 branch below.
+	// Lock the successor before final consumption checks its expiry again:
+	// neither transaction-start NOW() nor a predicate evaluated before a row-lock
+	// wait proves that the successor is still live after that wait (#2428 CWE-613).
 	var successor models.RefreshToken
 	var successorMachineID sql.NullString
 	err = tx.QueryRowContext(ctx,
@@ -2430,8 +2474,8 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		// reads (#3290).
 		`SELECT id, user_id, COALESCE(device_name, ''), expires_at, remember_me, COALESCE(machine_id, '')
 		 FROM refresh_tokens
-		 WHERE predecessor_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
-		 ORDER BY created_at DESC LIMIT 1`,
+		 WHERE predecessor_id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp()
+		 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
 		revokedTokenID,
 	).Scan(
 		&successor.ID, &successor.UserID, &successor.DeviceName,
@@ -2440,7 +2484,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	if errors.Is(err, sql.ErrNoRows) {
 		// No live successor in this lineage — nothing to recover; stale replay.
 		h.log.Warn("Grace period replay but no live successor in lineage",
-			"user_id", userID, "revoked_token_id", revokedTokenID)
+			"user_id", userID)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
 		return
 	}
@@ -2461,15 +2505,24 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		return
 	}
 
+	if successor.UserID != userID {
+		writeLoginFamilyError(c, loginfamily.NewError(loginfamily.ReasonAccessIdentity, nil), errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+	if err := verifyRefreshFamilySIDTx(ctx, tx, family, successor.ID); err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+
 	// Revoke the successor (never delivered to the client) — checked, inside the tx.
 	var revokedSuccessorID string
 	revokeErr := tx.QueryRowContext(ctx,
 		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW()
-		 WHERE id = $1 AND revoked_at IS NULL RETURNING id`,
+		 WHERE id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp() RETURNING id`,
 		successor.ID,
 	).Scan(&revokedSuccessorID)
 	if errors.Is(revokeErr, sql.ErrNoRows) {
-		// Revoked out from under us mid-tx (e.g. concurrent reset). Fail closed.
+		// The successor was revoked or expired before locked consumption.
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
 		return
 	}
@@ -2494,6 +2547,16 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 	newTokenHash := HashRefreshToken(newRefreshToken)
 	newTokenID := uuid.New().String()
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, newTokenID, graceEmailVerified, tier)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+	accessToken, err := prepared.Sign(h.jwtSecret)
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
@@ -2507,23 +2570,14 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 
 	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit grace recovery", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		writeLoginFamilyError(c, loginfamily.NewError(loginfamily.ReasonCommitUnknown, err), errMsgInvalidRefreshToken, errMsgRefreshFailed)
 		return
 	}
 
 	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
 
-	tier := h.entCache.GetTier(ctx, userID)
-	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, graceEmailVerified, graceCredEpoch.String, newTokenID, tier)
-	if err != nil {
-		h.log.Error("Failed to generate access token during grace recovery", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
-		return
-	}
-
 	h.log.Info("Session recovered via grace period refresh",
-		"user_id", userID, "new_session_id", newTokenID)
+		"user_id", userID)
 
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRefreshRotated, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusOK, gin.H{
@@ -2611,184 +2665,268 @@ func (h *Handler) recordTheftKeyRevocation(userID, channelID string) (*keyrotati
 	return rotation, nil
 }
 
-// Logout handles session termination. It returns claims only when the bearer
-// was valid before this request, so X-Session-ID can never authorize a
-// cross-user (or already logged-out) session revoke.
-func (h *Handler) blacklistAccessToken(c *gin.Context) *Claims {
-	authHeader := c.GetHeader("Authorization")
-	if !strings.HasPrefix(authHeader, bearerPrefix) {
-		return nil
+// verifiedLogoutBearer checks the bearer without mutating its blacklist state.
+func (h *Handler) verifiedLogoutBearer(c *gin.Context) (*Claims, error) {
+	header := c.GetHeader("Authorization")
+	if !strings.HasPrefix(header, bearerPrefix) {
+		return nil, nil
 	}
-	token := strings.TrimPrefix(authHeader, bearerPrefix)
-	claims, err := ValidateAccessToken(token, h.jwtSecret)
-	if err != nil || claims.ID == "" {
-		return nil
+	claims, err := ValidateAccessToken(strings.TrimPrefix(header, bearerPrefix), h.jwtSecret)
+	if err != nil || claims.ID == "" || claims.ExpiresAt == nil {
+		return nil, loginfamily.NewError(loginfamily.ReasonAccessIdentity, err)
 	}
-	wasBlacklisted, lookupErr := h.redis.Exists(
-		c.Request.Context(),
-		"blacklist:"+claims.ID,
-	).Result()
-	remaining := time.Until(claims.ExpiresAt.Time)
-	if blErr := middleware.BlacklistToken(context.Background(), h.redis, claims.ID, remaining); blErr != nil {
-		h.log.Error("Failed to blacklist access token", "error", blErr)
+	blacklisted, err := h.redis.Exists(c.Request.Context(), "blacklist:"+claims.ID).Result()
+	if err != nil {
+		return nil, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
 	}
-	if lookupErr != nil || wasBlacklisted != 0 {
-		return nil
+	if blacklisted != 0 {
+		return nil, nil
 	}
-	return claims
+	return claims, nil
 }
 
-func (h *Handler) disconnectUserByID(userID string) {
-	if userID == "" {
-		return
-	}
-	if uid, parseErr := uuid.Parse(userID); parseErr == nil {
-		h.hub.DisconnectUser(uid)
-	}
-}
-
-// Logout revokes the current session's refresh token and blacklists the access token.
-//
-// Explicit credentials take precedence over the cookie so best-effort cleanup
-// of an aborted flow can never revoke a successor session from the ambient
-// cookie jar. Without a valid bearer, X-Session-ID must atomically match the
-// ambient refresh cookie's token hash.
+// Logout commits only the selected logical login. An invalid explicit target
+// never falls through to an ambient cookie or bearer, and has no side effects.
 func (h *Handler) Logout(c *gin.Context) {
-	claims := h.blacklistAccessToken(c)
-	revoked := h.revokeLogoutSession(
-		c, claims,
-		c.GetHeader("X-Refresh-Token"),
-		c.GetHeader("X-Session-ID"),
-	)
-	revokedUserID, revokedSessionID := revoked.userID, revoked.sessionID
-	if revoked.err != nil && !errors.Is(revoked.err, sql.ErrNoRows) {
-		h.log.Error("Failed to revoke refresh session during logout", "error", revoked.err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
+	claims, err := h.verifiedLogoutBearer(c)
+	if errors.Is(err, loginfamily.ErrDenied) {
+		claims, err = nil, nil
+	}
+	if err != nil {
+		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgInternalError)
 		return
 	}
-
-	if !revoked.credentialPresented {
+	revoked := h.revokeLogoutSession(c, claims, c.GetHeader(refreshTokenHeader), c.GetHeader("X-Session-ID"))
+	if revoked.err != nil {
+		// An unknown commit may have terminalized the family: fence what committed.
+		h.closeCommittedFamilies(c.Request.Context(), revoked.result)
+		writeLoginFamilyError(c, revoked.err, errMsgInvalidCredentials, errMsgInternalError)
+		return
+	}
+	if revoked.sessionID == "" {
 		c.JSON(http.StatusOK, gin.H{"message": "Already logged out"})
 		return
 	}
-
-	// Free this session's attestation tokens proactively so they don't outlive
-	// the session in Redis. Orphan attestation keys are harmless (they bind a
-	// session_id that no longer exists), but the explicit cleanup avoids
-	// up-to-2h of dead state. Per ADR-0010 (#677). Drives off revokedSessionID
-	// rather than c.GetHeader("X-Session-ID") so an attacker can't target
-	// arbitrary sessions for cleanup. revokedSessionID is empty when the
-	// UPDATE matched no row (e.g., already-revoked refresh token) — in that
-	// case the cleanup is a no-op, which is correct: there's no live session
-	// to clean up.
-	if revokedSessionID != "" {
-		attestation.CleanupTokensForSession(c.Request.Context(), h.redis, h.log, revokedSessionID)
+	// Fence the logged-out family's sockets before answering. The durable owner
+	// stays the delivery obligation for native media and any failed close.
+	h.closeCommittedFamilies(c.Request.Context(), revoked.result)
+	if revoked.blacklistBearer && claims != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		defer cancel()
+		if err := middleware.BlacklistToken(ctx, h.redis, claims.ID, time.Until(claims.ExpiresAt.Time)); err != nil {
+			h.log.Error("Failed to blacklist committed logout bearer")
+		}
 	}
-
-	h.disconnectUserByID(revokedUserID)
-
-	if revoked.cookieAuthorized && revokedSessionID != "" {
+	attestation.CleanupTokensForSession(c.Request.Context(), h.redis, h.log, revoked.sessionID)
+	if revoked.cookieAuthorized {
 		SetRefreshCookie(c, "", -1)
 	}
-	if revokedSessionID != "" {
-		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthLogout})
-	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthLogout})
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
 
-// logoutRevocation is the outcome of revokeLogoutSession: which session (if any)
-// was revoked, whether the revocation was cookie-authorized (so the caller may
-// clear the cookie), whether any credential was presented at all, and the DB
-// error (sql.ErrNoRows is expected when no live row matched).
+// closeCommittedFamilies synchronously fences the sockets of every family a
+// definite commit made terminal. A failure never rescinds the committed
+// revocation: it is logged and left to the durable owner's reconciler.
+func (h *Handler) closeCommittedFamilies(ctx context.Context, result loginfamily.RevocationResult) {
+	if h.hub == nil || len(result.Owners) == 0 {
+		return
+	}
+	if err := loginfamily.CloseCommittedFamilies(ctx, h.db, h.hub, result.Owners); err != nil {
+		h.log.Warn("Revoked family socket close deferred to reconciliation")
+	}
+}
+
+// logoutRevocation contains committed authority only; a commit whose outcome
+// is unknown exposes no target for postcommit effects, only the owner
+// locators, whose close reads committed terminal rows alone.
 type logoutRevocation struct {
 	userID              string
 	sessionID           string
 	cookieAuthorized    bool
 	credentialPresented bool
+	blacklistBearer     bool
+	result              loginfamily.RevocationResult
 	err                 error
 }
 
-// wrapRevokeErr adds operation context to a refresh-token revocation error.
-// A nil error is returned unchanged — wrapping nil would turn a successful
-// revoke into a failure — and the %w verb keeps the caller's
-// errors.Is(err, sql.ErrNoRows) check matching through the wrapper.
-func wrapRevokeErr(err error, op string) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", op, err)
+type logoutSelection struct {
+	sid              string
+	tokenHash        string
+	bearerAuthorized bool
+	cookieAuthorized bool
 }
 
-// revokeByTokenHash revokes the live refresh-token row whose hash matches
-// tokenHash and returns the owning user and session IDs. Shared by the explicit
-// X-Refresh-Token path and the ambient-cookie path, which issue an identical
-// statement — one copy stops the two from drifting.
-func (h *Handler) revokeByTokenHash(
-	ctx context.Context,
-	tokenHash string,
-) (userID, sessionID string, err error) {
-	err = h.db.QueryRowContext(
-		ctx,
-		`UPDATE refresh_tokens SET revoked_at = NOW()
-		 WHERE token_hash = $1 AND revoked_at IS NULL
-		 RETURNING user_id, id`,
-		tokenHash,
-	).Scan(&userID, &sessionID)
-	return userID, sessionID, wrapRevokeErr(err, "revoke refresh token by token hash")
-}
-
-// revokeLogoutSession selects the refresh-token revocation strategy for a logout
-// and runs it: explicit X-Refresh-Token first, then X-Session-ID (bearer-scoped
-// to claims.UserID, else matched against the ambient cookie's token hash), then
-// the ambient refresh cookie alone. Explicit credentials take precedence over the
-// cookie so best-effort cleanup of an aborted flow can never revoke a successor
-// session from the ambient cookie jar (see Logout's doc comment).
-func (h *Handler) revokeLogoutSession(
-	c *gin.Context,
-	claims *Claims,
-	refreshToken, sessionID string,
-) logoutRevocation {
-	result := logoutRevocation{credentialPresented: refreshToken != "" || sessionID != ""}
+func selectLogoutTarget(c *gin.Context, claims *Claims, refreshToken, sessionID string) logoutSelection {
+	_, refreshPresent := c.Request.Header[http.CanonicalHeaderKey(refreshTokenHeader)]
+	_, sessionPresent := c.Request.Header[http.CanonicalHeaderKey("X-Session-ID")]
+	cookie, _ := c.Cookie("refresh_token")
 	switch {
-	case refreshToken != "":
-		result.userID, result.sessionID, result.err = h.revokeByTokenHash(
-			c.Request.Context(), HashRefreshToken(refreshToken),
-		)
-	case sessionID != "":
-		if _, parseErr := uuid.Parse(sessionID); parseErr != nil {
-			return result
+	case refreshToken != "" || refreshPresent:
+		if refreshToken == "" {
+			return logoutSelection{}
+		}
+		return logoutSelection{tokenHash: HashRefreshToken(refreshToken)}
+	case sessionID != "" || sessionPresent:
+		if sessionID == "" {
+			return logoutSelection{}
 		}
 		if claims != nil {
-			result.err = wrapRevokeErr(h.db.QueryRowContext(
-				c.Request.Context(),
-				`UPDATE refresh_tokens SET revoked_at = NOW()
-				 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-				 RETURNING user_id, id`,
-				sessionID, claims.UserID,
-			).Scan(&result.userID, &result.sessionID), "revoke session for bearer user")
-			return result
+			return logoutSelection{sid: sessionID, bearerAuthorized: true}
 		}
-		cookieToken, err := c.Cookie("refresh_token")
-		if err == nil && cookieToken != "" {
-			result.cookieAuthorized = true
-			result.err = wrapRevokeErr(h.db.QueryRowContext(
-				c.Request.Context(),
-				`UPDATE refresh_tokens SET revoked_at = NOW()
-				 WHERE id = $1 AND token_hash = $2 AND revoked_at IS NULL
-				 RETURNING user_id, id`,
-				sessionID, HashRefreshToken(cookieToken),
-			).Scan(&result.userID, &result.sessionID), "revoke session by id and cookie hash")
+		if cookie != "" {
+			return logoutSelection{sid: sessionID, tokenHash: HashRefreshToken(cookie), cookieAuthorized: true}
 		}
+		return logoutSelection{sid: sessionID}
+	case cookie != "":
+		return logoutSelection{tokenHash: HashRefreshToken(cookie), cookieAuthorized: true}
+	case claims != nil:
+		return logoutSelection{sid: claims.SessionID, bearerAuthorized: true}
 	default:
-		cookieToken, err := c.Cookie("refresh_token")
-		if err == nil && cookieToken != "" {
-			result.credentialPresented = true
-			result.cookieAuthorized = true
-			result.userID, result.sessionID, result.err = h.revokeByTokenHash(
-				c.Request.Context(), HashRefreshToken(cookieToken),
-			)
+		return logoutSelection{}
+	}
+}
+
+type logoutQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+// The unlocked read discovers an owner only. The same credential is rechecked
+// after the rollout and user locks, before acquiring the selected family.
+func resolveLogoutSelection(ctx context.Context, q logoutQueryer, selection logoutSelection, claims *Claims) (userID, sid string, familyID uuid.UUID, err error) {
+	if selection.sid != "" {
+		if id, parseErr := uuid.Parse(selection.sid); parseErr != nil || id == uuid.Nil {
+			return "", "", uuid.Nil, sql.ErrNoRows
 		}
 	}
+	if selection.tokenHash != "" {
+		err = q.QueryRowContext(ctx, `SELECT r.user_id,r.id,s.family_id FROM refresh_tokens r
+   JOIN login_family_sids s ON s.sid=r.id AND s.user_id=r.user_id
+   WHERE r.token_hash=$1 AND ($2='' OR r.id::text=$2) AND r.expires_at>clock_timestamp()`, selection.tokenHash, selection.sid).Scan(&userID, &sid, &familyID)
+		return
+	}
+	if !selection.bearerAuthorized || claims == nil || selection.sid == "" {
+		return "", "", uuid.Nil, sql.ErrNoRows
+	}
+	err = q.QueryRowContext(ctx, `SELECT user_id,sid,family_id FROM login_family_sids WHERE sid=$1 AND user_id=$2`, selection.sid, claims.UserID).Scan(&userID, &sid, &familyID)
+	return
+}
+
+// A terminal bearer may authenticate its own idempotent logout, never a different
+// live family. Epoch and exact signed lifetime are revalidated under U-N.
+func logoutBearerFamilyTx(ctx context.Context, tx *sql.Tx, claims *Claims, target uuid.UUID) (uuid.UUID, error) {
+	if claims == nil || claims.ExpiresAt == nil {
+		return uuid.Nil, nil
+	}
+	sid, err := uuid.Parse(claims.SessionID)
+	if err != nil {
+		return uuid.Nil, loginfamily.NewError(loginfamily.ReasonAccessIdentity, err)
+	}
+	user, err := uuid.Parse(claims.UserID)
+	if err != nil {
+		return uuid.Nil, loginfamily.NewError(loginfamily.ReasonAccessIdentity, err)
+	}
+	var family uuid.UUID
+	err = tx.QueryRowContext(ctx, `SELECT s.family_id FROM login_family_sids s
+ JOIN login_families f ON f.family_id=s.family_id AND f.user_id=s.user_id
+ JOIN users u ON u.id=s.user_id
+ WHERE s.sid=$1 AND s.user_id=$2 AND s.access_expires_at=$3 AND s.access_expires_at>clock_timestamp()
+ AND f.credential_epoch=$4 AND COALESCE(u.credential_epoch,'')=$4 AND NOT u.disabled
+ AND (f.terminal_at IS NULL OR f.family_id=$5)`, sid, user, claims.ExpiresAt.Time, claims.CredentialEpoch, target).Scan(&family)
+	if errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+	}
+	return family, nil
+}
+
+func (h *Handler) revokeLogoutSession(c *gin.Context, claims *Claims, refreshToken, sessionID string) (result logoutRevocation) {
+	selection := selectLogoutTarget(c, claims, refreshToken, sessionID)
+	result.credentialPresented = refreshToken != "" || sessionID != "" || selection.tokenHash != "" || selection.bearerAuthorized
+	ctx := c.Request.Context()
+	userID, _, _, err := resolveLogoutSelection(ctx, h.db, selection, claims)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result
+	}
+	if err != nil {
+		result.err = loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+		return result
+	}
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		result.err = loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+		return result
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			result = logoutRevocation{err: errors.Join(result.err, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, rollbackErr))}
+		}
+	}()
+	user, err := lockMintUserTx(ctx, tx, userID)
+	if errors.Is(err, loginfamily.ErrDenied) {
+		return result
+	}
+	if err != nil {
+		result.err = err
+		return result
+	}
+	lockedUser, sid, family, err := resolveLogoutSelection(ctx, tx, selection, claims)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result
+	}
+	if err != nil {
+		result.err = loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+		return result
+	}
+	if lockedUser != userID {
+		return result
+	}
+	// Never query another user's authority while holding this user's prefix.
+	bearerFamily := uuid.Nil
+	if claims != nil && claims.UserID == userID {
+		bearerFamily, err = logoutBearerFamilyTx(ctx, tx, claims, family)
+		if errors.Is(err, loginfamily.ErrDenied) {
+			bearerFamily, err = uuid.Nil, nil
+		}
+		if err != nil {
+			result.err = err
+			return result
+		}
+	}
+	if selection.bearerAuthorized && bearerFamily == uuid.Nil {
+		return result
+	}
+	sidID, err := uuid.Parse(sid)
+	if err != nil {
+		result.err = loginfamily.NewError(loginfamily.ReasonOwnershipInvalid, err)
+		return result
+	}
+	targets, err := loginfamily.ResolveTargetSIDTx(ctx, tx, user, sidID)
+	if errors.Is(err, loginfamily.ErrTargetNotFound) {
+		return result
+	}
+	if err != nil {
+		result.err = err
+		return result
+	}
+	revoked, err := loginfamily.RevokeFamiliesTx(ctx, tx, targets, loginfamily.AuthCause{Scope: loginfamily.ScopeSession, Reason: loginfamily.ReasonLogout})
+	if err != nil {
+		result.err = err
+		return result
+	}
+	if err = tx.Commit(); err != nil {
+		result.err = loginfamily.NewError(loginfamily.ReasonCommitUnknown, err)
+		// Only the owner locators survive, so Logout can fence a durable
+		// revocation; nothing else of an unconfirmed commit is exposed.
+		result.result = loginfamily.RevocationResult{Owners: revoked.Owners}
+		return result
+	}
+	result.userID, result.sessionID = userID, sid
+	result.cookieAuthorized = selection.cookieAuthorized
+	result.blacklistBearer = bearerFamily == family
+	result.result = revoked
 	return result
 }
 
@@ -3240,6 +3378,9 @@ type recoveryTxOp struct {
 type recoveryPresenceResult struct {
 	Operation presencehistory.AudienceOperation
 	Plan      presencehistory.DeliveryPlan
+	// Owners locate the families the epoch rotation made terminal; they are
+	// uncommitted references until the completion proves the commit.
+	Owners []loginfamily.DeliveryOwner
 }
 
 type recoveryWork func(context.Context, *sql.Tx) (recoveryPresenceResult, error)
@@ -3286,18 +3427,27 @@ func (h *Handler) recoveryWork(senderID uuid.UUID, fenceOp *credepoch.Op, ops []
 		if h.mfaChecker == nil {
 			return recoveryPresenceResult{}, ErrRecoveryPolicyUnavailable
 		}
+		userAuthority, err := lockMintUserTx(ctx, tx, senderID.String())
+		if err != nil {
+			if errors.Is(err, loginfamily.ErrDenied) {
+				return recoveryPresenceResult{}, ErrRecoveryPolicyUnavailable
+			}
+			return recoveryPresenceResult{}, err
+		}
+		// Existing recovery factor validation stays serialized by the users lock.
 		if err := h.mfaChecker.ValidateRecoveryClaimsTx(ctx, tx, claims); err != nil {
 			return recoveryPresenceResult{}, err
 		}
 		if fenceOp == nil {
 			return recoveryPresenceResult{}, errors.New("recovery credential fence unavailable")
 		}
-		forcedClear, err := h.presenceHistory.BeginForcedSecurityClear(ctx, tx, senderID)
+		revoked, err := rotateRecoveryFamiliesTx(ctx, tx, senderID, userAuthority, fenceOp)
 		if err != nil {
 			return recoveryPresenceResult{}, err
 		}
-		if err := fenceOp.RotateTx(ctx, tx); err != nil {
-			return recoveryPresenceResult{}, fmt.Errorf("rotate recovery credential epoch: %w", err)
+		forcedClear, err := h.presenceHistory.BeginForcedSecurityClear(ctx, tx, senderID)
+		if err != nil {
+			return recoveryPresenceResult{}, err
 		}
 		for _, op := range ops {
 			if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
@@ -3307,8 +3457,27 @@ func (h *Handler) recoveryWork(senderID uuid.UUID, fenceOp *credepoch.Op, ops []
 		return recoveryPresenceResult{
 			Operation: forcedClear.Operation,
 			Plan:      forcedClear.Plan,
+			Owners:    revoked.Owners,
 		}, nil
 	}
+}
+
+// rotateRecoveryFamiliesTx never constructs user authority or owns commit.
+// Its caller has already completed the users-serialized factor prerequisite.
+func rotateRecoveryFamiliesTx(ctx context.Context, tx *sql.Tx, userID uuid.UUID, user loginfamily.UserAuthority, op *credepoch.Op) (loginfamily.RevocationResult, error) {
+	var previous string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(credential_epoch, '') FROM users WHERE id=$1`, userID).Scan(&previous); err != nil {
+		return loginfamily.RevocationResult{}, loginfamily.NewError(loginfamily.ReasonSQLUnavailable, err)
+	}
+	targets, err := loginfamily.CaptureEpochTargetsTx(ctx, tx, user, previous)
+	if err != nil {
+		return loginfamily.RevocationResult{}, err
+	}
+	owner, err := op.RotateTx(ctx, tx)
+	if err != nil {
+		return loginfamily.RevocationResult{}, err
+	}
+	return loginfamily.RevokeFamiliesForEpochTx(ctx, tx, targets, owner)
 }
 
 // execRecoveryTx owns the typed recovery callback and preserves token
@@ -3349,7 +3518,7 @@ func (h *Handler) execRecoveryTx(
 			fenceOp.Rollback(ctx) // definite: commit was never attempted
 		}
 		if !writeRecoveryPolicyError(c, err) {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+			writeLoginFamilyError(c, err, errMsg, errMsg)
 		}
 		return result, err
 	}
@@ -3362,8 +3531,11 @@ func (h *Handler) execRecoveryTx(
 			Plan:      result.Plan,
 		},
 	)
-	if completion.RequiresDisconnect() && h.hub != nil {
-		h.hub.DisconnectUser(result.Operation.SenderID)
+	// A possibly-durable reset fences the old families' sockets now. The owner
+	// query reads only committed terminal rows, so a rolled-back reset closes
+	// nothing; a failed close stays with the durable epoch owner.
+	if completion.RequiresDisconnect() {
+		h.closeCommittedFamilies(ctx, loginfamily.RevocationResult{Owners: result.Owners})
 	}
 	if completion.Err != nil {
 		classifyRecoveryFenceCompletion(ctx, fenceOp, completion.Outcome)

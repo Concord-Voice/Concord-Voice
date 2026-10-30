@@ -4,8 +4,8 @@ package channels_test
 // server-existence probe after it failed, the write answered its 500 with no
 // cause logged anywhere, so the failed authorization read could not be
 // diagnosed. The hook ends the hooked transaction's own backend (idle after
-// the visibility lock) and answers the guard with no row, so the probe that
-// follows really fails.
+// the login-family writer barrier) and answers the guard with no row, so the
+// probe that follows really fails.
 
 import (
 	"database/sql"
@@ -20,9 +20,9 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/stmthook"
 )
 
-// groupVisibilityLockFragment is the channel-group transaction's first
-// statement, so it is the hooked backend's last query before the guard.
-const groupVisibilityLockFragment = `pg_advisory_xact_lock`
+// groupRolloutProbeQuery is the login-family writer barrier's share lock,
+// the hooked transaction's last statement before the epoch guard's read (#2272).
+const groupRolloutProbeQuery = `FROM login_family_rollout`
 
 func TestChannelGroupWrites_FailedServerProbeIsLogged(t *testing.T) {
 	hook, hookedDB := stmthook.Open(t)
@@ -58,7 +58,7 @@ func TestChannelGroupWrites_FailedServerProbeIsLogged(t *testing.T) {
 			require.NoError(t, err)
 			terminated := 0
 			hook.Arm([]string{groupEpochGuardFragment},
-				stmthook.TerminateIdleBackend(ts.DB, groupVisibilityLockFragment, &terminated), sql.ErrNoRows)
+				stmthook.TerminateIdleBackend(ts.DB, groupRolloutProbeQuery, &terminated), sql.ErrNoRows)
 			logs := ts.CaptureLogs(t)
 
 			w := ts.DoRequest(write.method, write.path(serverID, groupID), write.body, testhelpers.AuthHeaders(owner.AccessToken))

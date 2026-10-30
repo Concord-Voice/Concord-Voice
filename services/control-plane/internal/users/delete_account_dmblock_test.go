@@ -39,7 +39,7 @@ func TestDeleteAccountDrainsDMBlockMarkerForThirdPartyGroup(t *testing.T) {
 	insertErasureBlockMarker(t, db, erased, survivor)
 
 	service := NewAccountService(db, logger.New("test"))
-	require.NoError(t, service.DeleteAccount(context.Background(), erased.String()))
+	require.NoError(t, service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String()))
 
 	assert.Zero(t, countUsers(t, db, erased))
 	assert.Zero(t, countErasureBlockMarkers(t, db, erased))
@@ -61,7 +61,7 @@ func TestDeleteAccountRollbackRestoresDMBlockMarkerAndParticipant(t *testing.T) 
 	installErasureAuditFailure(t, db)
 
 	service := NewAccountService(db, logger.New("test"))
-	err := service.DeleteAccount(context.Background(), erased.String())
+	err := service.DeleteAccount(testdb.ActorContext(context.Background(), t, db, erased.String()), erased.String())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "erasure marker rollback sentinel")
 	assert.Equal(t, 1, countUsers(t, db, erased))
@@ -82,7 +82,8 @@ func TestConcurrentBlockCannotRecreateMarkerAcrossAccountErasure(t *testing.T) {
 
 	service := NewAccountService(db, logger.New("test"))
 	erasureDone := make(chan error, 1)
-	go func() { erasureDone <- service.DeleteAccount(context.Background(), erased.String()) }()
+	actor := testdb.ActorContext(context.Background(), t, db, erased.String())
+	go func() { erasureDone <- service.DeleteAccount(actor, erased.String()) }()
 	assertErasureIsBlockedAtDelete(t, db)
 
 	router := gin.New()

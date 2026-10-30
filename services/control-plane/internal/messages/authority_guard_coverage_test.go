@@ -9,17 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These requests are admitted by the deliberately stale epoch cache and must
-// be rejected by the transaction-local guard.  This keeps the write fence
-// covered for every channel mutation entry point.
-func staleMessageFixture(t *testing.T) (*testhelpers.TestServer, testhelpers.TestUser, string) {
+// These requests rotate credentials after real HTTP admission and must reach
+// the transaction-local guard before being refused.
+func staleMessageFixture(t *testing.T) (*testhelpers.TestServer, *testhelpers.StaleBoundary, testhelpers.TestUser, string) {
 	t.Helper()
-	ts := setupTS(t)
+	ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
 	user := ts.CreateTestUser(t, "stale-guard")
 	serverID := ts.CreateTestServer(t, user.ID, "stale guard server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 	messageID := ts.CreateTestMessage(t, channelID, user, "guarded message")
-	return ts, user, messageID
+	return ts, boundary, user, messageID
 }
 
 func TestChannelMessageMutationsRejectStaleCredentialEpoch(t *testing.T) {
@@ -39,8 +38,22 @@ func TestChannelMessageMutationsRejectStaleCredentialEpoch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ts, user, messageID := staleMessageFixture(t)
-			staleToken := ts.SimulateStaleEpochWindow(t, user.ID)
+			ts, boundary, user, messageID := staleMessageFixture(t)
+			if tt.name == "unpin" {
+				_, err := ts.DB.Exec(`UPDATE messages SET pinned_at = NOW(), pinned_by = $2 WHERE id = $1`, messageID, user.ID)
+				require.NoError(t, err)
+			}
+			if tt.name == "suppress" {
+				_, err := ts.DB.Exec(`UPDATE messages SET embeds_suppressed = FALSE WHERE id = $1`, messageID)
+				require.NoError(t, err)
+			}
+			var originalContent string
+			var originalVersion int
+			var originalPinned, originalSuppressed bool
+			require.NoError(t, ts.DB.QueryRow(`SELECT content, key_version, pinned_at IS NOT NULL, embeds_suppressed FROM messages WHERE id = $1`, messageID).Scan(&originalContent, &originalVersion, &originalPinned, &originalSuppressed))
+			staleToken := user.AccessToken
+			require.NoError(t, boundary.Arm(staleToken))
+			boundary.Hook.ArmArg([]string{messageEpochGuardSQL}, user.ID, nil, nil)
 			// A nil map must go out as NO body: DoRequest marshals a typed nil
 			// to `null`, which the delete route's optional step-up body refuses
 			// with 400 before any fence runs (#3455).
@@ -51,11 +64,17 @@ func TestChannelMessageMutationsRejectStaleCredentialEpoch(t *testing.T) {
 			w := ts.DoRequest(tt.method, "/api/v1/messages/"+messageID+tt.suffix, body,
 				testhelpers.AuthHeaders(staleToken))
 			require.Equal(t, http.StatusUnauthorized, w.Code)
-			if tt.name == "delete" {
-				var exists bool
-				require.NoError(t, ts.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM messages WHERE id = $1)`, messageID).Scan(&exists))
-				require.True(t, exists, "stale delete must leave the message intact")
-			}
+			requireMessageStaleBoundary(t, boundary)
+			var content string
+			var version, reactions int
+			var pinned, suppressed bool
+			require.NoError(t, ts.DB.QueryRow(`SELECT content, key_version, pinned_at IS NOT NULL, embeds_suppressed FROM messages WHERE id = $1`, messageID).Scan(&content, &version, &pinned, &suppressed))
+			require.Equal(t, originalContent, content, "refused mutation must preserve ciphertext")
+			require.Equal(t, originalVersion, version)
+			require.Equal(t, originalPinned, pinned)
+			require.Equal(t, originalSuppressed, suppressed)
+			require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM message_reactions WHERE message_id = $1`, messageID).Scan(&reactions))
+			require.Zero(t, reactions)
 		})
 	}
 }
@@ -77,20 +96,28 @@ func TestChannelMessageMutationRejectsRemovedMember(t *testing.T) {
 }
 
 func TestPurgeRejectsStaleCredentialEpoch(t *testing.T) {
-	ts, user, serverID, channelID, messageID := setupWithMessage(t)
-	staleToken := ts.SimulateStaleEpochWindow(t, user.ID)
-
-	w := ts.DoRequest(http.MethodDelete, "/api/v1/channels/"+channelID+"/messages", map[string]interface{}{"range": "all"},
-		testhelpers.AuthHeaders(staleToken))
-	require.Equal(t, http.StatusUnauthorized, w.Code)
-	require.Contains(t, w.Body.String(), "Authentication required")
-	assertMessageExists(t, ts, messageID)
-
-	w = ts.DoRequest(http.MethodDelete, "/api/v1/servers/"+serverID+"/messages", map[string]interface{}{"range": "all"},
-		testhelpers.AuthHeaders(staleToken))
-	require.Equal(t, http.StatusUnauthorized, w.Code)
-	require.Contains(t, w.Body.String(), "Authentication required")
-	assertMessageExists(t, ts, messageID)
+	for _, scope := range []string{"channel", "server"} {
+		t.Run(scope, func(t *testing.T) {
+			ts, boundary := testhelpers.SetupStaleBoundaryServer(t)
+			user := ts.CreateTestUser(t, "purge-stale-"+scope)
+			serverID := ts.CreateTestServer(t, user.ID, "stale purge server")
+			channelID := ts.CreateTestChannel(t, serverID, "general")
+			messageID := ts.CreateTestMessage(t, channelID, user, "guarded message")
+			path := "/api/v1/channels/" + channelID + "/messages"
+			if scope == "server" {
+				path = "/api/v1/servers/" + serverID + "/messages"
+			}
+			require.NoError(t, boundary.Arm(user.AccessToken))
+			// Purge admission first fences the subject through LockGateTx;
+			// its epoch refusal precedes the later per-batch GuardTx.
+			boundary.Hook.ArmArg([]string{`SELECT credential_epoch, COALESCE(password_hash, '') FROM users WHERE id = $1 FOR SHARE`}, user.ID, nil, nil)
+			w := ts.DoRequest(http.MethodDelete, path, map[string]interface{}{"range": "all"}, testhelpers.AuthHeaders(user.AccessToken))
+			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			requireMessageStaleBoundary(t, boundary)
+			require.Contains(t, w.Body.String(), "Authentication required")
+			assertMessageExists(t, ts, messageID)
+		})
+	}
 }
 
 // A credential epoch may change between purge batches. The first irreversible

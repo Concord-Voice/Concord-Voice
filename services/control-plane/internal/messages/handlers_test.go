@@ -54,6 +54,7 @@ func exerciseOpsMessageHandler(t *testing.T, ts *testhelpers.TestServer, counter
 	router := gin.New()
 	router.POST("/messages", func(c *gin.Context) {
 		c.Set("user_id", userID)
+		testhelpers.AttachUserIdentity(t, c, userID)
 		handler.SendMessage(c)
 	})
 	payload, err := json.Marshal(body)
@@ -362,6 +363,7 @@ func TestDeleteMessage_FailsClosedWithoutPurgeEngine(t *testing.T) {
 	router := gin.New()
 	router.DELETE("/api/v1/messages/:id", func(c *gin.Context) {
 		c.Set("user_id", user.ID)
+		testhelpers.AttachUserIdentity(t, c, user.ID)
 		handler.DeleteMessage(c)
 	})
 

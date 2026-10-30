@@ -232,7 +232,7 @@ func (h *Handler) guardChannelPurgeBatch(ctx context.Context, tx *sql.Tx, g chan
 	if ds.ScopeID != g.channelID || !samePurgeAuthor(ds.Author, g.author) {
 		return errors.New("unexpected channel purge batch scope")
 	}
-	if err := credepoch.GuardTx(ctx, tx, g.actorID, g.epoch); err != nil {
+	if err := credepoch.GuardFamilyTx(ctx, tx, g.actorID, g.epoch); err != nil {
 		return err
 	}
 	// The HTTP route carries no ban/kick provenance: a D1 spec it never
@@ -666,7 +666,7 @@ func (h *Handler) runServerPurge(ctx context.Context, req serverPurgeRequest, de
 // re-authorizes the actor in the spec's channel (authorizeServerPurgeBatchTx).
 func (h *Handler) guardServerPurgeBatch(guardCtx context.Context, tx *sql.Tx, req serverPurgeRequest, ds purge.DeleteSpec) error {
 	if req.credentialEpoch != nil {
-		if err := credepoch.GuardTx(guardCtx, tx, req.actorID, *req.credentialEpoch); err != nil {
+		if err := credepoch.GuardFamilyTx(guardCtx, tx, req.actorID, *req.credentialEpoch); err != nil {
 			return err
 		}
 	}
