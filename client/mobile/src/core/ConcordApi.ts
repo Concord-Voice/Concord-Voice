@@ -15,7 +15,10 @@ export type LoginKeys = {
 };
 
 export class ApiError extends Error {
-  constructor(readonly status: number, readonly code: string | undefined) {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+  ) {
     // Status and error code only: response bodies may echo user data.
     super(`Concord API ${status}${code ? ` ${code}` : ''}`);
   }

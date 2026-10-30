@@ -5,6 +5,7 @@
   "scripts": {
     "android": "react-native run-android",
     "ios": "react-native run-ios",
+    "format:check": "prettier --check App.tsx __tests__ src babel.config.js jest.config.js metro.config.js .eslintrc.js .prettierrc.js",
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
@@ -31,7 +32,7 @@
     "@types/react-test-renderer": "^19.1.0",
     "eslint": "^8.19.0",
     "jest": "^30.5.2",
-    "prettier": "2.8.8",
+    "prettier": "3.9.10",
     "react-test-renderer": "19.2.3",
     "typescript": "^6.0.3"
   },

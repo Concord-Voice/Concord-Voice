@@ -21,6 +21,7 @@ The crypto and core code come from the #663 framework probe.
 ```sh
 npm ci
 npm test && npm run typecheck && npm run lint
+npm run format:check                                # pinned Prettier 3
 npm start                                           # Metro
 cd ios && bundle install && bundle exec pod install && cd ..
 npm run ios                                         # or: npm run android

@@ -197,7 +197,7 @@ describe('ConcordApi', () => {
                 reject(new Error('aborted')),
               ),
             ),
-        } as unknown as Response),
+        }) as unknown as Response,
     );
     const api = new ConcordApi(
       'http://localhost:8080',
@@ -215,7 +215,7 @@ describe('ConcordApi', () => {
           ok: true,
           status: 200,
           json: () => Promise.reject(new TypeError('network lost')),
-        } as unknown as Response),
+        }) as unknown as Response,
     );
     const api = new ConcordApi(
       'http://localhost:8080',
@@ -252,7 +252,7 @@ describe('ConcordApi', () => {
             ok: status < 300,
             status,
             json: () => Promise.reject(new SyntaxError('Unexpected token')),
-          } as unknown as Response),
+          }) as unknown as Response,
       ) as unknown as typeof fetch;
     const failing = new ConcordApi(
       'http://localhost:8080',

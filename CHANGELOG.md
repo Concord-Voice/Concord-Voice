@@ -44,9 +44,12 @@ gate can learn from your voice.
 ### Changed
 
 - **Voice:** The desktop call library handles mixed audio and video RTP header extensions with mediasoup-client 3.25.3.
+- **Voice:** Updated server voice transport dependencies.
 - **Accessibility:** The desktop app follows the system's reduced-motion setting, hides decorative icons from screen readers, and shows text while bundled fonts load.
 - **Plans:** Every account can create any number of servers, search as far back as a subscriber, and customize theme colors. One account can create up to 10 servers in 24 hours.
+- **Desktop:** Updated navigation dependencies.
 - **Web:** Opening the web address in a browser shows a link to download the desktop app, not an "Update Required" prompt.
+- **Desktop:** Updated installer tooling.
 - **Search:** Message search looks back 90 days or 600 messages at a time, loads older results as you scroll, and says when it is paused or stopped.
 - **Search:** Jump reaches messages that are not loaded or are in another channel, from search results, pins, and reply quotes.
 - **Settings:** Subscription is under Account, protection settings are under Security, and device permissions are under About & Updates.
@@ -126,6 +129,7 @@ gate can learn from your voice.
 ### Security
 
 - **Dependencies:** Updated golang.org/x/net and fast-uri for security fixes.
+- **Desktop:** Updated the URI parser security floor to address upstream normalization advisories.
 - **Accounts:** Sign-in protection accepts a key re-encryption only from the maintenance run that started it. It refuses to roll back while its state is unknown.
 - **Accounts:** An account with suspicious session use stays blocked until session revocation finishes.
 - **Accounts:** Account recovery asks for the authenticator you reserved for recovery.
