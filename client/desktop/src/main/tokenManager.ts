@@ -71,6 +71,8 @@ interface RefreshOwnerSnapshot {
 interface OwnedRefreshResult {
   result: RefreshResult;
   owner: RefreshOwnerSnapshot | null;
+  /** The server refused the token itself (401/403); retrying cannot succeed. */
+  rejected?: boolean;
 }
 
 interface RefreshOperation {
@@ -440,6 +442,10 @@ async function doProactiveRefresh(): Promise<void> {
   if (result.status === 'ok' && result.accessToken) {
     console.debug('[TokenManager] Proactive refresh succeeded');
     proactiveRefreshCallback?.(result.accessToken, result.sessionId, result.previousSessionId);
+  } else if (outcome.rejected) {
+    // A revoked token stays revoked: stop until the next login or restore
+    // schedules a fresh timer. The renderer's next 401 runs its normal logout.
+    console.warn('[TokenManager] Proactive refresh rejected by the server; not retrying');
   } else if (inMemoryRefreshToken && inMemoryApiBase) {
     // Refresh failed but we still have credentials — schedule a retry
     console.warn(`[TokenManager] Proactive refresh failed (${result.status}), retrying in 10s`);
@@ -840,7 +846,8 @@ function performOwnedRefresh(): Promise<OwnedRefreshResult> {
         const mfaResult = await tryParseMfaChallenge(response, owner.apiBase);
         if (mfaResult) return { result: mfaResult, owner };
         console.warn(`[TokenManager] Refresh failed: HTTP ${response.status}`);
-        return { result: { status: 'refresh_failed' }, owner };
+        const rejected = response.status === 401 || response.status === 403;
+        return { result: { status: 'refresh_failed' }, owner, rejected };
       }
 
       const data = (await response.json()) as {

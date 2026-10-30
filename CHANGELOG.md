@@ -81,6 +81,7 @@ gate can learn from your voice.
 
 ### Fixed
 
+- **Sign-in:** A signed-out session no longer retries its rejected refresh token every 10 seconds in the background.
 - **Voice:** Calling someone back in a DM joins the call still open there instead of silently stopping, a failed call start now shows an error, your camera comes back after a brief connection drop, and 1:1 DMs show Join voice call during a call.
 - **Voice:** Microphone processing failures now notify the existing error handler and release the failed audio node once.
 - **Billing:** Blocking someone ends a Wing seat between you, whichever side blocks. Unfriending or blocking also cancels a pending seat invite at once; unfriending alone keeps an active seat.

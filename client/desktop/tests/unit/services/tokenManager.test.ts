@@ -1474,6 +1474,30 @@ describe('tokenManager', () => {
       expect(cb).toHaveBeenCalledWith(jwt3, undefined, undefined);
     });
 
+    it.each([401, 403])('stops proactive retries after an HTTP %i rejection', async (status) => {
+      vi.useFakeTimers();
+      storeRefreshToken({
+        refreshToken: 'rt-abc',
+        rememberMe: true,
+        apiBase: 'http://localhost:8080',
+      });
+
+      const exp = Math.floor(Date.now() / 1000) + 120;
+      mockNetFetch.mockResolvedValueOnce(jsonResponse({ access_token: makeJwt(exp) }));
+      await performRefresh();
+
+      const cb = vi.fn();
+      setProactiveRefreshCallback(cb);
+
+      // A revoked token: the proactive refresh is refused and must not loop.
+      mockNetFetch.mockResolvedValue(new Response('Unauthorized', { status }));
+      await vi.advanceTimersByTimeAsync(61_000);
+      const callsAfterRejection = mockNetFetch.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockNetFetch.mock.calls.length).toBe(callsAfterRejection);
+      expect(cb).not.toHaveBeenCalled();
+    });
+
     it('rate-limits immediate refresh for near-expiry tokens', async () => {
       vi.useFakeTimers();
       storeRefreshToken({
