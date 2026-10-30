@@ -1,0 +1,8927 @@
+{
+ "vectors": [
+  {
+   "name": "t1/login-floor-signs-out-others",
+   "row": "t1",
+   "cite": "parent \u00a76.2 T1; plan Task 5",
+   "input": {
+    "action": {
+     "type": "sign_out_others"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1",
+    "rotate_epoch": true,
+    "continuation": true,
+    "enrol_class": "c2"
+   }
+  },
+  {
+   "name": "t1/lone-password-on-mfa-account-refused",
+   "row": "t1",
+   "cite": "parent \u00a76.2 T1 (login floor); ruling 8 (refusal row t1)",
+   "input": {
+    "action": {
+     "type": "sign_out_others"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t1"
+   }
+  },
+  {
+   "name": "t1/sso-account-signs-out-others-with-sso",
+   "row": "t1",
+   "cite": "parent \u00a76.1 login floor (password_login ? password : sso)",
+   "input": {
+    "action": {
+     "type": "sign_out_others"
+    },
+    "proof": [
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "sso_login": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1",
+    "rotate_epoch": true,
+    "continuation": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t1/immature-password-still-signs-out-others",
+   "row": "t1",
+   "cite": "parent \u00a76.2 T1 (maturity ignored); F5",
+   "input": {
+    "action": {
+     "type": "sign_out_others"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "48h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1",
+    "rotate_epoch": true,
+    "continuation": true
+   }
+  },
+  {
+   "name": "t1/changes-no-pending-request",
+   "row": "t1",
+   "cite": "parent \u00a76.2 T1 (changes no pending request)",
+   "input": {
+    "action": {
+     "type": "sign_out_others"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1",
+    "rotate_epoch": true,
+    "continuation": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t1b/mature-totp-signs-out-everywhere",
+   "row": "t1b",
+   "cite": "parent \u00a76.2 T1b; plan Task 5",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1b",
+    "notices": [
+     {
+      "kind": "signed_out_everywhere"
+     }
+    ],
+    "rotate_epoch": true
+   }
+  },
+  {
+   "name": "t1b/mature-webauthn-signs-out-everywhere",
+   "row": "t1b",
+   "cite": "parent \u00a76.2 T1b (UV WebAuthn is a non-paper P)",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "webauthn:wa0"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "device_bound": [
+     "webauthn:wa0"
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1b",
+    "notices": [
+     {
+      "kind": "signed_out_everywhere"
+     }
+    ],
+    "rotate_epoch": true
+   }
+  },
+  {
+   "name": "t1b/anchor-plus-password-refused",
+   "row": "t1b",
+   "cite": "parent \u00a76.2 T1b; mutation #57; ruling 8",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t1b"
+   }
+  },
+  {
+   "name": "t1b/paper-plus-password-refused",
+   "row": "t1b",
+   "cite": "parent \u00a76.2 T1b (a backup code is paper); ruling 8",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "password:pw",
+     "backup_code_set:paper"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_code_set:paper",
+      "matures": "-1h",
+      "enrolled_at": "legacy",
+      "paper": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t1b"
+   }
+  },
+  {
+   "name": "t1b/immature-totp-refused",
+   "row": "t1b",
+   "cite": "parent \u00a76.2 T1b (mature credentials only); ruling 8",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t1b"
+   }
+  },
+  {
+   "name": "t1b/paper-flagged-totp-refused",
+   "row": "t1b",
+   "cite": "architect ruling 15d (the qualifying ref has Paper == false)",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy",
+      "paper": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t1b"
+   }
+  },
+  {
+   "name": "t1b/contests-phisher-immature-factor",
+   "row": "t1b",
+   "cite": "spec \u00a73 LEAD-B 3-A; plan Task 7; ruling 3",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c2"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1b",
+    "effects": [
+     {
+      "kind": "contest",
+      "cred": "webauthn:wa1"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "signed_out_everywhere"
+     },
+     {
+      "kind": "enrolment_contested",
+      "subject": "webauthn:wa1"
+     }
+    ],
+    "rotate_epoch": true,
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t1b/contests-immature-anchor",
+   "row": "t1b",
+   "cite": "spec \u00a73 LEAD-B 3-A; parent \u00a76.2 T5 (an anchor is contested at C2)",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_device:rd",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c2"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1b",
+    "effects": [
+     {
+      "kind": "contest",
+      "cred": "recovery_device:rd"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "signed_out_everywhere"
+     },
+     {
+      "kind": "enrolment_contested",
+      "subject": "recovery_device:rd"
+     }
+    ],
+    "rotate_epoch": true,
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t1b/never-contests-address-or-password",
+   "row": "t1b",
+   "cite": "spec \u00a73 LEAD-B 3-A (addresses and passwords are excluded)",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c1"
+     },
+     {
+      "ref": "address:addr2",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c1"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1b",
+    "notices": [
+     {
+      "kind": "signed_out_everywhere"
+     }
+    ],
+    "rotate_epoch": true
+   }
+  },
+  {
+   "name": "t1b/does-not-contest-higher-enrolment",
+   "row": "t1b",
+   "cite": "spec \u00a73 LEAD-B 3-A (c >= the enrolling class)",
+   "input": {
+    "action": {
+     "type": "sign_out_everywhere"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c3"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t1b",
+    "notices": [
+     {
+      "kind": "signed_out_everywhere"
+     }
+    ],
+    "rotate_epoch": true
+   }
+  },
+  {
+   "name": "t2/c2-removes-mature-sso-immediately",
+   "row": "t2",
+   "cite": "parent \u00a76.2 T2 (c > rank); plan Task 5; ruling 3",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "sso:sso"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t2",
+    "effects": [
+     {
+      "kind": "remove",
+      "cred": "sso:sso"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "credential_removed",
+      "subject": "sso:sso"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t2/c3-removes-possession-factor",
+   "row": "t2",
+   "cite": "parent \u00a76.2 T2 (C3 > rank 2)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "webauthn:wa0"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "device_bound": [
+     "webauthn:wa0"
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t2",
+    "effects": [
+     {
+      "kind": "remove",
+      "cred": "totp:totp"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "credential_removed",
+      "subject": "totp:totp"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t2/class-none-refused",
+   "row": "t2",
+   "cite": "parent \u00a76.1 (ClassNone acts on nothing); ruling 8 (Remove refuses with RowNone)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "sso:sso"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t2/remove-password-refused",
+   "row": "t2",
+   "cite": "plan D9 (the password rotates via T1); ruling 8",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "password:pw"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t2/remove-primary-address-refused",
+   "row": "t2",
+   "cite": "parent \u00a76.2 T2b; plan D9; ruling 8",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "address:addr"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t2/remove-immature-target-refused",
+   "row": "t2",
+   "cite": "plan D9; ruling 8",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "sso:sso"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t2/remove-contested-target-refused",
+   "row": "t2",
+   "cite": "plan D9; ruling 8",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "sso:sso"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy",
+      "contested": "-2h"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t2b/backup-address-removes-itself",
+   "row": "t2b",
+   "cite": "parent \u00a76.2 T2b; plan Task 5",
+   "input": {
+    "action": {
+     "type": "self_remove_backup",
+     "target": "backup_address:bk"
+    },
+    "proof": [
+     "backup_address:bk"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t2b",
+    "effects": [
+     {
+      "kind": "remove",
+      "cred": "backup_address:bk"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "credential_removed",
+      "subject": "backup_address:bk"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t2b/immature-backup-address-removes-itself",
+   "row": "t2b",
+   "cite": "plan Task 5 (T2b has no maturity requirement)",
+   "input": {
+    "action": {
+     "type": "self_remove_backup",
+     "target": "backup_address:bk"
+    },
+    "proof": [
+     "backup_address:bk"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t2b",
+    "effects": [
+     {
+      "kind": "remove",
+      "cred": "backup_address:bk"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "credential_removed",
+      "subject": "backup_address:bk"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t2b/target-not-in-proof-refused",
+   "row": "t2b",
+   "cite": "parent \u00a76.2 T2b (a code to that address); ruling 8 (t2b: a present backup address)",
+   "input": {
+    "action": {
+     "type": "self_remove_backup",
+     "target": "backup_address:bk"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t2b"
+   }
+  },
+  {
+   "name": "t2b/non-backup-target-refused",
+   "row": "t2b",
+   "cite": "parent \u00a76.2 T2b (the primary is never surrendered); ruling 8 (RowNone: not a backup address)",
+   "input": {
+    "action": {
+     "type": "self_remove_backup",
+     "target": "sso:sso"
+    },
+    "proof": [
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t2b/contested-backup-refused",
+   "row": "t2b",
+   "cite": "plan Task 5 (the target must be uncontested); ruling 8",
+   "input": {
+    "action": {
+     "type": "self_remove_backup",
+     "target": "backup_address:bk"
+    },
+    "proof": [
+     "backup_address:bk"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-1h",
+      "enrolled_at": "legacy",
+      "contested": "-2h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t2b"
+   }
+  },
+  {
+   "name": "t2b/absent-target-refused",
+   "row": "t2b",
+   "cite": "ruling 8 (RowNone: the target is not a present backup address)",
+   "input": {
+    "action": {
+     "type": "self_remove_backup",
+     "target": "backup_address:bk"
+    },
+    "proof": [
+     "backup_address:bk"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t4/totp-under-login-floor",
+   "row": "t4",
+   "cite": "parent \u00a76.2 T4 (a P needs the login floor); plan Task 5; ruling 7",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "totp:totp-new"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t4",
+    "notices": [
+     {
+      "kind": "credential_added",
+      "subject": "totp:totp-new"
+     }
+    ],
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t4/mfa-account-needs-its-inline-factor",
+   "row": "t4",
+   "cite": "parent \u00a76.2 T4; parent \u00a76.1 login floor; ruling 8 (t4)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "webauthn:wa-new"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t4"
+   }
+  },
+  {
+   "name": "t4/anchor-needs-c2",
+   "row": "t4",
+   "cite": "parent \u00a76.2 T4 (an A needs C2); plan Task 5; ruling 8 (t4)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "recovery_key:rk-new"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t4"
+   }
+  },
+  {
+   "name": "t4/anchor-at-c2-applied",
+   "row": "t4",
+   "cite": "parent \u00a76.2 T4 (an A needs C2)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "recovery_key:rk-new"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t4",
+    "notices": [
+     {
+      "kind": "credential_added",
+      "subject": "recovery_key:rk-new"
+     }
+    ],
+    "enrol_class": "c2"
+   }
+  },
+  {
+   "name": "t4/backup-address-needs-code-to-it",
+   "row": "t4",
+   "cite": "parent \u00a76.2 T4 (an address needs a code to that address plus the login floor)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "backup_address:bk-new"
+    },
+    "proof": [
+     "password:pw",
+     "backup_address:bk-new"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t4",
+    "notices": [
+     {
+      "kind": "credential_added",
+      "subject": "backup_address:bk-new"
+     }
+    ],
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t4/backup-address-without-code-refused",
+   "row": "t4",
+   "cite": "parent \u00a76.2 T4; plan Task 5; ruling 8 (t4)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "backup_address:bk-new"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t4"
+   }
+  },
+  {
+   "name": "t4/password-refused",
+   "row": "t4",
+   "cite": "plan Task 5; ruling 8 (RowNone for a password target)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "password:pw2"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t4/primary-address-refused",
+   "row": "t4",
+   "cite": "plan Task 5; ruling 8 (RowNone for the primary address)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "address:addr-new"
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t4/existing-slot-refused",
+   "row": "t4",
+   "cite": "architect ruling 7 (Creds holds live credentials only; a present slot is refused with RowNone)",
+   "input": {
+    "action": {
+     "type": "enrol",
+     "ref": "sso:sso"
+    },
+    "proof": [
+     "password:pw",
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t3/equal-class-opens-request",
+   "row": "t3",
+   "cite": "parent \u00a76.2 T3 (c <= rank); plan Task 6 (#1); ruling 3",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "user_session",
+    "row": "t3",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "pending",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ]
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t3/c3-against-another-anchor-still-waits",
+   "row": "t3",
+   "cite": "parent \u00a76.2 (a C3 proof against another anchor falls through to T3)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "recovery_key:rk"
+    },
+    "proof": [
+     "recovery_key:rk2",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk2",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "user_session",
+    "row": "t3",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "pending",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk2"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "recovery_key:rk"
+       ]
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t3/non-conflicting-open-request-does-not-dispute",
+   "row": "t3",
+   "cite": "parent \u00a76.2 T8 (conflict definition)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "user_session",
+    "row": "t3",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "pending",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ]
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t3/recovery-key-request-never-conflicts",
+   "row": "t3",
+   "cite": "parent \u00a76.2 (recovery_key rows are outside T7-T12)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "rk1",
+      "kind": "recovery_key",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "recovery_key:rk"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "user_session",
+    "row": "t3",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "pending",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ]
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t6/mailbox-opens-break-glass",
+   "row": "t6",
+   "cite": "parent \u00a76.2 T6; plan Task 6; rulings 3 and 4 (no Targets on a break-glass)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t6/notice-reaches-reserved-primary",
+   "row": "t6",
+   "cite": "parent \u00a76.5 / plan Task 6 (#52); ruling 3",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-48h",
+      "floor_until": "24h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested",
+      "reserved_to": [
+       "address:old"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "t6/class-none-refused",
+   "row": "t6",
+   "cite": "parent \u00a76.2 T6 (a C1 or C2 proof); ruling 8 (RowNone)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass"
+   }
+  },
+  {
+   "name": "t6/immature-mailbox-refused",
+   "row": "t6",
+   "cite": "parent \u00a76.2 T6 (mature credentials); ruling 8",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass"
+   }
+  },
+  {
+   "name": "t6/c2-proof-opens-break-glass",
+   "row": "t6",
+   "cite": "parent \u00a76.2 T6",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t6c/c3-break-glass-completes-at-once",
+   "row": "t6c",
+   "cite": "parent \u00a76.2 T6c; plan Task 6; rulings 3, 5, 11",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "reset": true
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t6c",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "completed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "0",
+       "reset_factors": true,
+       "completed_at": "0"
+      }
+     },
+     {
+      "kind": "remove",
+      "cred": "webauthn:wa1"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed"
+     },
+     {
+      "kind": "password_changed"
+     },
+     {
+      "kind": "credential_removed",
+      "subject": "webauthn:wa1"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "perm_gen_bump": true,
+    "enrol_class": "c3"
+   }
+  },
+  {
+   "name": "t6c/reset-spares-origin-factor",
+   "row": "t6c",
+   "cite": "parent \u00a76.2 T6 (mutation #35); plan Task 6",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "reset": true
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t6c",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "completed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "0",
+       "reset_factors": true,
+       "completed_at": "0"
+      }
+     },
+     {
+      "kind": "remove",
+      "cred": "webauthn:wa0"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed"
+     },
+     {
+      "kind": "password_changed"
+     },
+     {
+      "kind": "credential_removed",
+      "subject": "webauthn:wa0"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "perm_gen_bump": true,
+    "enrol_class": "c3"
+   }
+  },
+  {
+   "name": "t6c/no-reset-keeps-mature-factors",
+   "row": "t6c",
+   "cite": "parent \u00a76.2 T6 (reset is optional)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t6c",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "completed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "0",
+       "completed_at": "0"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed"
+     },
+     {
+      "kind": "password_changed"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "enrol_class": "c3"
+   }
+  },
+  {
+   "name": "t6c/anchors-never-reset-by-break-glass",
+   "row": "t6c",
+   "cite": "parent \u00a76.2 T6 (anchors are never reset)",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "reset": true
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_device:rd",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t6c",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "completed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "0",
+       "reset_factors": true,
+       "completed_at": "0"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed"
+     },
+     {
+      "kind": "password_changed"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "enrol_class": "c3"
+   }
+  },
+  {
+   "name": "t6c/completed-opening-carries-no-fingerprint",
+   "row": "t6c",
+   "cite": "architect ruling 15a (child \u00a76.2 CHECK: a completed row has no fingerprint)",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t6c",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "completed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "0",
+       "completed_at": "0"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed"
+     },
+     {
+      "kind": "password_changed"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "enrol_class": "c3"
+   }
+  },
+  {
+   "name": "t8/conflicting-break-glass-disputes-both",
+   "row": "t8",
+   "cite": "parent \u00a76.2 T8; plan Task 6 (#11); rulings 3, 9",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0"
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/origin-sets-differing-only-by-version-dispute",
+   "row": "t8",
+   "cite": "parent mutation #59; plan Task 6",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "password:pw:2"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw:2",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "password:pw:2"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0"
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/duplicate-origin-set-refused",
+   "row": "t8",
+   "cite": "plan D13 (a duplicate never disputes itself); ruling 8 (RowNone)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass"
+   }
+  },
+  {
+   "name": "t8/union-member-with-the-openers-origin-set-is-not-a-duplicate",
+   "row": "t8",
+   "cite": "plan D13 (an opener is refused only against a row it conflicts with); architect ruling A-20; ruling 12 (group union)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "backup_address:bk"
+    },
+    "proof": [
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "backup_address:bk"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "user_session",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "disputed",
+       "origins": [
+        "sso:sso"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "backup_address:bk"
+       ],
+       "disputed_at": "0"
+      },
+      "group": "g1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/duplicate-of-a-disputed-conflicting-row-refused",
+   "row": "t8",
+   "cite": "plan D13 (a duplicate never disputes itself); architect ruling A-20 (the compared row is a conflicting row, whatever its status)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "backup_address:bk"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass"
+   }
+  },
+  {
+   "name": "t8/merge-carries-two-rows-with-one-origin-set",
+   "row": "t8",
+   "cite": "architect ruling A-20; ruling 12 (a merge may leave one group holding several rows with one origin set)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r2",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r4",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "webauthn:wa1"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g2",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0"
+      },
+      "group": "g1"
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r4",
+      "group": "g1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/immature-ref-cannot-turn-duplicate-into-dispute",
+   "row": "t8",
+   "cite": "architect ruling A2 (Origins hold only counted refs)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass"
+   }
+  },
+  {
+   "name": "t8/c3-break-glass-meeting-a-conflict-disputes-not-completes",
+   "row": "t8",
+   "cite": "plan D14",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0"
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/target-intersection-disputes-both",
+   "row": "t8",
+   "cite": "parent \u00a76.2 T8 (their targets intersect)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "user_session",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "disputed",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ],
+       "disputed_at": "0"
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/target-in-the-others-origin-set-disputes-both",
+   "row": "t8",
+   "cite": "parent \u00a76.2 T8 (one's target is in the other's origin set)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "totp:totp"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "user_session",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "disputed",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ],
+       "disputed_at": "0"
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/opener-joins-the-smallest-existing-group",
+   "row": "t8",
+   "cite": "plan D13 as amended by ruling 12; ruling 9",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "d1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g-a",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0"
+      },
+      "group": "g-a"
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r2",
+      "group": "g-a"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r2"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/joins-smallest-group-and-merges",
+   "row": "t8",
+   "cite": "architect ruling 12 (group union)",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "d1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "recovery_key:rk"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-3h",
+      "dispute_group": "ga",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "d2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-2h",
+      "dispute_group": "gb",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "d3",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr",
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-2h",
+      "dispute_group": "gb",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "user_session",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "disputed",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ],
+       "disputed_at": "0"
+      },
+      "group": "ga"
+     },
+     {
+      "kind": "dispute",
+      "request_id": "d2",
+      "group": "ga"
+     },
+     {
+      "kind": "dispute",
+      "request_id": "d3",
+      "group": "ga"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t8/disputing-a-held-row-folds-it",
+   "row": "t8",
+   "cite": "architect ruling 1 corollary (a row leaving pending with an open hold folds it)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "held_since": "-1h",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t8",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0"
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     },
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_ms": 3600000
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t9/stronger-canceller-refuses-reopen",
+   "row": "t9",
+   "cite": "parent \u00a76.2 T9; plan Task 6",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c2",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass",
+    "row": "t9"
+   }
+  },
+  {
+   "name": "t9/hold-cap-cancel-does-not-refuse",
+   "row": "t9",
+   "cite": "parent \u00a76.2 T9 (a HOLD_CAP cancel never triggers T9); mutation #7",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "hold_cap",
+      "canceller_class": "c3",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t9/expired-dispute-cancel-does-not-refuse",
+   "row": "t9",
+   "cite": "parent \u00a76.2 T9 (an expiry cancel never triggers T9)",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "dispute_expired",
+      "canceller_class": "c3",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t9/unrelated-fingerprint-does-not-refuse",
+   "row": "t9",
+   "cite": "parent \u00a76.2 T9 (an unrelated request is never a reopen); #10",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c3",
+      "cancelled_at": "-1h",
+      "fingerprint": "other-fp",
+      "coarse": "other-co",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t9/t12-loser-cannot-reopen-at-equal-class",
+   "row": "t9",
+   "cite": "parent \u00a76.2 T9 (the cancel was T12's); mutation #15",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "dispute_resolved",
+      "canceller_class": "c3",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass",
+    "row": "t9"
+   }
+  },
+  {
+   "name": "t9/is-checked-before-t8",
+   "row": "t9",
+   "cite": "plan D14 (T9 and T10 before T8)",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c2",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1,
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass",
+    "row": "t9"
+   }
+  },
+  {
+   "name": "t9/shared-stale-key-falls-back-to-coarse",
+   "row": "t9",
+   "cite": "architect ruling 2 (D19 governs; child \u00a73.0 LEAD-D 11-A)",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c3",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp-a",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 2
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass",
+    "row": "t9"
+   }
+  },
+  {
+   "name": "t10/equal-class-cancel-disputes-reopen",
+   "row": "t10",
+   "cite": "parent \u00a76.2 T10; plan Task 6; rulings 3, 9",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c1",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t10",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t10/weaker-canceller-also-disputes",
+   "row": "t10",
+   "cite": "parent \u00a76.2 T10 ('Otherwise'); plan Task 6 algorithm",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "password:pw",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c1",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t10",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "password:pw",
+        "totp:totp"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t10/c3-break-glass-disputes-instead-of-completing",
+   "row": "t10",
+   "cite": "plan D14",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c3",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t10",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "totp:totp",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t10/also-disputes-conflicting-open-row",
+   "row": "t10",
+   "cite": "architect ruling A1 (T10 also applies T8; parent T8 'Both disputed')",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c1",
+      "cancelled_at": "-1h",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1,
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "disputed",
+    "source": "break_glass",
+    "row": "t10",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "disputed",
+       "origins": [
+        "address:addr"
+       ],
+       "origin_class": "c1",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "disputed_at": "0",
+       "candidate": {
+        "keyed": "fp1",
+        "coarse": "co1",
+        "key_id": 1
+       }
+      }
+     },
+     {
+      "kind": "dispute",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_disputed"
+     },
+     {
+      "kind": "change_disputed",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t5/c2-contests-new-totp",
+   "row": "t5",
+   "cite": "parent \u00a76.2 T5; plan Task 7",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c2"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t5",
+    "effects": [
+     {
+      "kind": "contest",
+      "cred": "webauthn:wa0"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "enrolment_contested",
+      "subject": "webauthn:wa0"
+     }
+    ],
+    "rotate_epoch": true,
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t5/below-enrolling-class-refused",
+   "row": "t5",
+   "cite": "parent \u00a76.2 T5 (c >= the enrolling class); mutation #34",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp-new",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c3"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t5"
+   }
+  },
+  {
+   "name": "t5/anchor-contested-at-c2",
+   "row": "t5",
+   "cite": "parent \u00a76.2 T5 (an anchor is contested at C2); mutation #22",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk-new",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c3"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t5",
+    "effects": [
+     {
+      "kind": "contest",
+      "cred": "recovery_key:rk-new"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "enrolment_contested",
+      "subject": "recovery_key:rk-new"
+     }
+    ],
+    "rotate_epoch": true,
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t5/mailbox-cannot-contest-possession",
+   "row": "t5",
+   "cite": "parent \u00a76.2 T5 (never below rank(X)); plan Task 7",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp-new",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c1"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t5"
+   }
+  },
+  {
+   "name": "t5/credential-mature-after-enrolment-does-not-count",
+   "row": "t5",
+   "cite": "parent \u00a76.1 reference instant; #3 shape",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-30m",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "70h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c2"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t5"
+   }
+  },
+  {
+   "name": "t5/awaiting-notice-factor-is-contestable",
+   "row": "t5",
+   "cite": "plan Task 7 (immature or awaiting)",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "awaiting",
+      "enrolled_at": "-1h",
+      "enrol_class": "c2"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t5",
+    "effects": [
+     {
+      "kind": "contest",
+      "cred": "webauthn:wa0"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "enrolment_contested",
+      "subject": "webauthn:wa0"
+     }
+    ],
+    "rotate_epoch": true,
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t5/mature-credential-cannot-be-contested",
+   "row": "t5",
+   "cite": "plan Task 7 (x does not count at Now)",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-1h",
+      "enrolled_at": "-1h",
+      "enrol_class": "c2"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t5"
+   }
+  },
+  {
+   "name": "t5/contested-primary-restores-displaced",
+   "row": "t5",
+   "cite": "spec \u00a74 input 1; parent \u00a76.2 T5; plan Task 9",
+   "input": {
+    "action": {
+     "type": "contest"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:b",
+      "matures": "70h",
+      "enrolled_at": "-2h",
+      "enrol_class": "c2"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-3h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:a",
+      "became_primary_at": "-300h",
+      "matures": "-200h",
+      "displaced_at": "-2h"
+     },
+     {
+      "ref": "address:b",
+      "became_primary_at": "-2h",
+      "matures": "70h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:a",
+      "displaced_at": "-2h",
+      "floor_until": "70h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t5",
+    "effects": [
+     {
+      "kind": "contest",
+      "cred": "address:b"
+     },
+     {
+      "kind": "restore_primary",
+      "cred": "address:a"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "enrolment_contested",
+      "subject": "address:b"
+     }
+    ],
+    "rotate_epoch": true,
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t7/origin-class-cancel",
+   "row": "t7",
+   "cite": "parent \u00a76.2 T7; plan Task 8; ruling 3",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t7",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "proof",
+      "canceller_class": "c1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t7/matured-after-open-does-not-count",
+   "row": "t7",
+   "cite": "parent \u00a76.1 reference instant (opened_at); mutation #3; ruling 8 (t7)",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-30m",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t7"
+   }
+  },
+  {
+   "name": "t7/sso-never-vetoes-own-removal",
+   "row": "t7",
+   "cite": "parent \u00a76.1 self-veto; mutation #2",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t7"
+   }
+  },
+  {
+   "name": "t7/lone-anchor-cannot-cancel-c2-origin",
+   "row": "t7",
+   "cite": "parent \u00a76.2 T7 (c >= origin_class); mutation #4",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "recovery_key:rk"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c2",
+      "origins": [
+       "password:pw",
+       "totp:totp"
+      ],
+      "targets": [
+       "recovery_key:rk"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t7"
+   }
+  },
+  {
+   "name": "t7/stale-version-proof-refused",
+   "row": "t7",
+   "cite": "parent mutation #55",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "totp:totp:1"
+    ],
+    "creds": [
+     {
+      "ref": "totp:totp:2",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t7"
+   }
+  },
+  {
+   "name": "t7/cancels-each-id-independently",
+   "row": "t7",
+   "cite": "plan Task 8 ('per ID, independently')",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1",
+      "r2"
+     ]
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c2",
+      "origins": [
+       "password:pw",
+       "totp:totp"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t7",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "proof",
+      "canceller_class": "c1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t7/password-cancels-break-glass-that-replaces-it",
+   "row": "t7",
+   "cite": "parent \u00a76.1 self-veto (the password may cancel a break-glass)",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [
+       "password:pw"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t7",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "proof",
+      "canceller_class": "c1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t7/cancelling-a-held-row-folds-it",
+   "row": "t7",
+   "cite": "architect ruling 1 corollary",
+   "input": {
+    "action": {
+     "type": "cancel",
+     "ids": [
+      "r1"
+     ]
+    },
+    "proof": [
+     "password:pw"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "held_since": "-1h",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t7",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "proof",
+      "canceller_class": "c1"
+     },
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_ms": 3600000
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t12/c3-resolves-dispute",
+   "row": "t12",
+   "cite": "parent \u00a76.2 T12; plan Task 8; rulings 9, 10 (RotateEpoch false)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g",
+     "chosen": "r1"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t12",
+    "effects": [
+     {
+      "kind": "return_to_pending",
+      "request_id": "r1"
+     },
+     {
+      "kind": "cancel",
+      "request_id": "r2",
+      "reason": "dispute_resolved",
+      "canceller_class": "c3"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r2"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t12/group-with-two-rows-of-one-origin-set-resolves-by-id",
+   "row": "t12",
+   "cite": "architect ruling A-20; parent \u00a76.2 T12 (members are resolved by id, not by origin set)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g1",
+     "chosen": "r4"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_address:bk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r2",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "totp:totp"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r4",
+      "kind": "credential_remove",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [
+       "webauthn:wa1"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r5",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c2",
+      "origins": [
+       "password:pw",
+       "totp:totp"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g1",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t12",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r2",
+      "reason": "dispute_resolved",
+      "canceller_class": "c3"
+     },
+     {
+      "kind": "cancel",
+      "request_id": "r5",
+      "reason": "dispute_resolved",
+      "canceller_class": "c3"
+     },
+     {
+      "kind": "return_to_pending",
+      "request_id": "r4"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r2"
+     },
+     {
+      "kind": "change_cancelled",
+      "request_id": "r5"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t12/no-choice-cancels-every-member",
+   "row": "t12",
+   "cite": "plan Task 8 (Chosen empty = none)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g",
+     "chosen": ""
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t12",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "dispute_resolved",
+      "canceller_class": "c3"
+     },
+     {
+      "kind": "cancel",
+      "request_id": "r2",
+      "reason": "dispute_resolved",
+      "canceller_class": "c3"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     },
+     {
+      "kind": "change_cancelled",
+      "request_id": "r2"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t12/c2-cannot-resolve",
+   "row": "t12",
+   "cite": "parent \u00a76.2 T12 (C3 only); ruling 8 (t12)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g",
+     "chosen": "r1"
+    },
+    "proof": [
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t12"
+   }
+  },
+  {
+   "name": "t12/unknown-group-refused",
+   "row": "t12",
+   "cite": "plan Task 8; ruling 8 (RowNone: no members)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "nope",
+     "chosen": ""
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t12/chosen-not-a-member-refused",
+   "row": "t12",
+   "cite": "plan Task 8; ruling 8 (RowNone)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g",
+     "chosen": "zzz"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  },
+  {
+   "name": "t12/only-the-named-group-is-touched",
+   "row": "t12",
+   "cite": "plan Task 8 (members are the rows with that DisputeGroup)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g",
+     "chosen": "r1"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-3h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r3",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "sso:sso"
+      ],
+      "targets": [],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "h",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t12",
+    "effects": [
+     {
+      "kind": "return_to_pending",
+      "request_id": "r1"
+     },
+     {
+      "kind": "cancel",
+      "request_id": "r2",
+      "reason": "dispute_resolved",
+      "canceller_class": "c3"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r2"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t12/maturity-is-measured-at-the-earliest-disputed-at",
+   "row": "t12",
+   "cite": "plan D22; ruling 8 (t12)",
+   "input": {
+    "action": {
+     "type": "resolve",
+     "group": "g",
+     "chosen": "r1"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "totp:totp"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-2h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-5h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-1h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     },
+     {
+      "id": "r2",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-5h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-3h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t12"
+   }
+  },
+  {
+   "name": "sweep/dispute-expires",
+   "row": "sweep",
+   "cite": "parent \u00a76.2 T12 (expires after NCancelCP); ruling 9, 13",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-730h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-720h",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "sweep",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "dispute_expired"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "sweep/dispute-not-yet-expired",
+   "row": "sweep",
+   "cite": "plan Task 8",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "disputed",
+      "origin_class": "c1",
+      "origins": [
+       "address:addr"
+      ],
+      "targets": [],
+      "opened_at": "-730h",
+      "completes_at": "71h",
+      "accepted_address_notice": true,
+      "disputed_at": "-719h59m59s",
+      "dispute_group": "g",
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "sweep/reservation-released",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1 (all three conditions hold); plan Task 8; ruling 9 (no notice)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-200h",
+      "matures": "-100h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "-1h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "sweep",
+    "effects": [
+     {
+      "kind": "release_reservation",
+      "cred": "address:old"
+     }
+    ]
+   }
+  },
+  {
+   "name": "sweep/reservation-held-before-floor",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1 (now >= displacement + delta_cp)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-200h",
+      "matures": "-100h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "1h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "sweep/reservation-held-while-primary-immature",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1 (the current primary is mature)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-10h",
+      "matures": "1h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "-1h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "sweep/reservation-held-by-open-break-glass",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1; #19",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-200h",
+      "matures": "-100h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "-1h"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-120h",
+      "completes_at": "-48h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "sweep/reservation-released-despite-later-break-glass",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1 (only a break-glass opened before the primary matured holds)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-200h",
+      "matures": "-100h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "-1h"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-50h",
+      "completes_at": "22h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "sweep",
+    "effects": [
+     {
+      "kind": "release_reservation",
+      "cred": "address:old"
+     }
+    ]
+   }
+  },
+  {
+   "name": "sweep/reservation-held-while-primary-contested",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1 (the current primary is uncontested)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-200h",
+      "matures": "-100h",
+      "contested": "-2h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "-1h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "sweep/contested-credential-deleted-after-deltacp",
+   "row": "sweep",
+   "cite": "architect ruling A3 (parent T5: the sweeper deletes a contested credential after delta_cp)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "70h",
+      "enrolled_at": "legacy",
+      "contested": "-72h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "sweep",
+    "effects": [
+     {
+      "kind": "remove",
+      "cred": "webauthn:wa0"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "credential_removed",
+      "subject": "webauthn:wa0"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "sweep/contested-credential-kept-until-deltacp",
+   "row": "sweep",
+   "cite": "architect ruling A3 (the -1ns twin)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "70h",
+      "enrolled_at": "legacy",
+      "contested": "-71h59m59.999999999s"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "sweep/contested-password-is-never-deleted",
+   "row": "sweep",
+   "cite": "architect ruling A3 and plan D9 (the password and primary are excluded)",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy",
+      "contested": "-100h"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy",
+      "contested": "-100h"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "t11/removal-completes-at-deltacp",
+   "row": "t11",
+   "cite": "parent \u00a76.2 T11; plan Task 9; rulings 3, 11",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     },
+     {
+      "kind": "remove",
+      "cred": "sso:sso"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "credential_removed",
+      "request_id": "r1",
+      "subject": "sso:sso"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t11/not-yet-due-changes-nothing",
+   "row": "t11",
+   "cite": "parent \u00a76.2 T11 (now >= completes_at)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "1m",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "t11"
+   }
+  },
+  {
+   "name": "t11/hold-not-opened-before-due",
+   "row": "t11",
+   "cite": "architect ruling 1 (a hold opens only once the request is due; mutation C-hold-order)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-1h",
+      "completes_at": "71h",
+      "accepted_address_notice": false,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "t11"
+   }
+  },
+  {
+   "name": "t11/hold-opens-at-due",
+   "row": "t11",
+   "cite": "architect ruling 1 (step 5: hold(0, CompletesAt) once Now == CompletesAt)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": false,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "held",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_since": "0"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/no-accepted-notice-holds",
+   "row": "t11",
+   "cite": "parent \u00a76.2 Holds (a); plan Task 9 (#9)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": false,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "held",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_since": "0"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/unaccepted-mature-notice-holds",
+   "row": "t11",
+   "cite": "plan Task 9 step 2",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "held",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_since": "0"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/hold-cap-cancels",
+   "row": "t11",
+   "cite": "parent \u00a76.2 Holds (HOLD_CAP cancels with no change); plan Task 9 (#6); rulings 9, 13",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": false,
+      "held_ms": 259200000,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "hold_cap"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/hold-cap-with-an-open-hold-folds-it",
+   "row": "t11",
+   "cite": "architect ruling 1 corollary",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": false,
+      "held_since": "-72h",
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "hold_cap"
+     },
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_ms": 259200000
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/break-glass-hold-cap-cancel-carries-break-glass-source",
+   "row": "t11",
+   "cite": "plan D11",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "password:pw"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": false,
+      "held_ms": 259200000,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "hold_cap"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/held-time-is-folded-when-the-hold-ends",
+   "row": "t11",
+   "cite": "architect ruling 2-Q2 / ruling 1 step 5 (amended); defensive: reachable only after a backward DB-clock step",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "1h",
+      "accepted_address_notice": true,
+      "held_since": "2h",
+      "held_ms": 0,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_ms": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/completes-after-folding-the-hold",
+   "row": "t11",
+   "cite": "architect ruling 1 step 6 (fold, then fence, then complete)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-83h",
+      "completes_at": "-11h",
+      "accepted_address_notice": true,
+      "held_since": "-10h",
+      "held_ms": 0,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     },
+     {
+      "kind": "remove",
+      "cred": "sso:sso"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     },
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_ms": 36000000
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "credential_removed",
+      "request_id": "r1",
+      "subject": "sso:sso"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t11/superseded-after-folding-the-hold",
+   "row": "t11",
+   "cite": "architect ruling 1 corollary (superseded moves the row out of pending)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso:2",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-83h",
+      "completes_at": "-11h",
+      "accepted_address_notice": true,
+      "held_since": "-10h",
+      "held_ms": 0,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "superseded"
+     },
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_ms": 36000000
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/superseded-on-target-generation",
+   "row": "t11",
+   "cite": "parent \u00a76.2 T11 (target fence); mutation #33; ruling 9",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso:2",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "superseded"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/superseded-when-the-target-is-gone",
+   "row": "t11",
+   "cite": "plan Task 9 step 6 (no slot in Creds)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "superseded"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/fence-applies-to-circle-change",
+   "row": "t11",
+   "cite": "spec \u00a77 / parent mutation #39",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso:2",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "circle_change",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "superseded"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/fence-applies-to-social-recovery",
+   "row": "t11",
+   "cite": "spec \u00a77 / parent mutation #39",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso:2",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "social_recovery",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "cancel",
+      "request_id": "r1",
+      "reason": "superseded"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_cancelled",
+      "request_id": "r1"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/address-change-completes-with-no-removal",
+   "row": "t11",
+   "cite": "plan Task 9 step 7; ruling 3",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "address_change",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "address:addr"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     }
+    ],
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t11/break-glass-exempt-from-fence",
+   "row": "t11",
+   "cite": "parent \u00a76.2 T11 (a break-glass is exempt); mutation #38",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw:2",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw:1"
+      ],
+      "targets": [
+       "password:pw:1"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "password_changed",
+      "request_id": "r1"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t11/break-glass-restores-reserved-primary",
+   "row": "t11",
+   "cite": "spec \u00a74 input 1; parent \u00a76.2 T11; mutation #21; ruling 3",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:b",
+      "matures": "62h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "password:pw"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:a",
+      "became_primary_at": "-300h",
+      "matures": "-200h",
+      "displaced_at": "-10h"
+     },
+     {
+      "ref": "address:b",
+      "became_primary_at": "-10h",
+      "matures": "62h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:a",
+      "displaced_at": "-10h",
+      "floor_until": "62h"
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     },
+     {
+      "kind": "restore_primary",
+      "cred": "address:a"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1",
+      "reserved_to": [
+       "address:a"
+      ]
+     },
+     {
+      "kind": "password_changed",
+      "request_id": "r1",
+      "reserved_to": [
+       "address:a"
+      ]
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t11/break-glass-keeps-current-primary-mature-at-open",
+   "row": "t11",
+   "cite": "architect ruling 2-Q3; parent \u00a76.2 T11 (restore only a primary that has since been replaced); child \u00a74 input 1; mutation: drop the isCur candidacy",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:b",
+      "matures": "-90h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "password:pw"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:a",
+      "became_primary_at": "-300h",
+      "matures": "-200h",
+      "displaced_at": "-100h"
+     },
+     {
+      "ref": "address:b",
+      "became_primary_at": "-100h",
+      "matures": "-90h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:a",
+      "displaced_at": "-100h",
+      "floor_until": "62h"
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1",
+      "reserved_to": [
+       "address:a"
+      ]
+     },
+     {
+      "kind": "password_changed",
+      "request_id": "r1",
+      "reserved_to": [
+       "address:a"
+      ]
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t11/break-glass-removes-immature-at-open",
+   "row": "t11",
+   "cite": "parent \u00a76.2 T11; ruling 3 (one credential_removed per EffectRemove)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "-10h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "password:pw"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     },
+     {
+      "kind": "remove",
+      "cred": "webauthn:wa1"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "password_changed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "credential_removed",
+      "request_id": "r1",
+      "subject": "webauthn:wa1"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "perm_gen_bump": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t11/break-glass-reset-removes-factors-outside-the-origin-set",
+   "row": "t11",
+   "cite": "parent \u00a76.2 T6/T11 reset; mutation #35",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "backup_code_set:paper",
+      "matures": "-100h",
+      "enrolled_at": "legacy",
+      "paper": true
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw",
+       "totp:totp"
+      ],
+      "targets": [
+       "password:pw"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "reset_factors": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     },
+     {
+      "kind": "remove",
+      "cred": "webauthn:wa0"
+     },
+     {
+      "kind": "remove",
+      "cred": "backup_code_set:paper"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "password_changed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "credential_removed",
+      "request_id": "r1",
+      "subject": "webauthn:wa0"
+     },
+     {
+      "kind": "credential_removed",
+      "request_id": "r1",
+      "subject": "backup_code_set:paper"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true,
+    "perm_gen_bump": true,
+    "enrol_class": "c1"
+   }
+  },
+  {
+   "name": "t11/budget-locked-uncovered-holds",
+   "row": "t11",
+   "cite": "parent \u00a76.2 Holds (b); plan Task 9",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "held",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_since": "0"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t11/budget-locked-covered-by-passkey",
+   "row": "t11",
+   "cite": "parent \u00a76.2 Holds (b) (a mature UV passkey covers C1 or C2 origins)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c2",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "complete",
+      "request_id": "r1"
+     },
+     {
+      "kind": "remove",
+      "cred": "sso:sso"
+     },
+     {
+      "kind": "resync_mfa_flags"
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed",
+      "request_id": "r1"
+     },
+     {
+      "kind": "credential_removed",
+      "request_id": "r1",
+      "subject": "sso:sso"
+     }
+    ],
+    "perm_gen_bump": true
+   }
+  },
+  {
+   "name": "t3/synced-passkey-plus-anchor-cannot-remove-possession-factor",
+   "row": "t3",
+   "cite": "parent \u00a76.1 C3 + \u00a76.9 (a backup-eligible passkey never pairs into C3); architect rulings-3 F1 option A: BE comes from THIS assertion (Proof.DeviceBound), whose zero value proves nothing",
+   "input": {
+    "action": {
+     "type": "remove",
+     "target": "totp:totp"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "webauthn:wa1"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "user_session",
+    "row": "t3",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "credential_remove",
+       "status": "pending",
+       "origins": [
+        "webauthn:wa1",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h",
+       "targets": [
+        "totp:totp"
+       ]
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t6/synced-passkey-plus-anchor-opens-a-delta-cp-break-glass",
+   "row": "t6",
+   "cite": "parent \u00a76.1 C3 + \u00a76.9; architect rulings-3 F1 option A (red-team F1: an anchor + a synced passkey must wait delta_cp, not complete at once)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "webauthn:wa1"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "opened",
+    "source": "break_glass",
+    "row": "t6",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "pending",
+       "origins": [
+        "webauthn:wa1",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c2",
+       "opened_at": "0",
+       "completes_at": "72h"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_requested"
+     }
+    ]
+   }
+  },
+  {
+   "name": "t6c/device-bound-key-plus-anchor-completes-at-once",
+   "row": "t6c",
+   "cite": "parent \u00a76.1 C3; architect rulings-3 F1 option A (positive control: the same shape with the key's assertion BE=0)",
+   "input": {
+    "action": {
+     "type": "open_break_glass"
+    },
+    "proof": [
+     "recovery_key:rk",
+     "webauthn:wa1"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa1",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "device_bound": [
+     "webauthn:wa1"
+    ]
+   },
+   "want": {
+    "verdict": "applied",
+    "source": "break_glass",
+    "row": "t6c",
+    "enrol_class": "c3",
+    "effects": [
+     {
+      "kind": "open",
+      "open": {
+       "kind": "break_glass",
+       "status": "completed",
+       "origins": [
+        "webauthn:wa1",
+        "recovery_key:rk"
+       ],
+       "origin_class": "c3",
+       "opened_at": "0",
+       "completes_at": "0",
+       "completed_at": "0"
+      }
+     }
+    ],
+    "notices": [
+     {
+      "kind": "change_completed"
+     },
+     {
+      "kind": "password_changed"
+     }
+    ],
+    "rotate_epoch": true,
+    "sets_password": true
+   }
+  },
+  {
+   "name": "t11/budget-locked-c3-origin-anchor-and-passkey-do-not-cover",
+   "row": "t11",
+   "cite": "parent \u00a76.2 Holds (b); architect rulings-3 F1 option A (covered() builds a proof with no assertion, so its DeviceBound is empty and a WebAuthn never pairs into C3)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "webauthn:wa0",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "recovery_key:rk",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c3",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-72h",
+      "completes_at": "0",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "held",
+    "source": "user_session",
+    "row": "t11",
+    "effects": [
+     {
+      "kind": "hold",
+      "request_id": "r1",
+      "held_since": "0"
+     }
+    ]
+   }
+  },
+  {
+   "name": "sweep/reservation-held-by-break-glass-opened-at-primary-maturity",
+   "row": "sweep",
+   "cite": "spec \u00a74 input 1 (no break-glass opened at or before the instant the primary matured, D7); architect rulings-3 F5; red-team F5",
+   "input": {
+    "action": {
+     "type": "expire"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "primaries": [
+     {
+      "ref": "address:addr",
+      "became_primary_at": "-200h",
+      "matures": "-100h"
+     }
+    ],
+    "reservations": [
+     {
+      "address_ref": "address:old",
+      "displaced_at": "-200h",
+      "floor_until": "-1h"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "break_glass",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [],
+      "opened_at": "-100h",
+      "completes_at": "-28h",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ]
+   },
+   "want": {
+    "verdict": "no_change",
+    "source": "user_session",
+    "row": "sweep"
+   }
+  },
+  {
+   "name": "t9/zero-cancelled-at-still-refuses",
+   "row": "t9",
+   "cite": "parent \u00a76.2 T9; architect rulings-3 H1 (RecentCancels is younger than NCancelCP by contract, so a zero CancelledAt must not exempt the row)",
+   "input": {
+    "action": {
+     "type": "open_break_glass",
+     "candidate": {
+      "keyed": "fp1",
+      "coarse": "co1",
+      "key_id": 1
+     }
+    },
+    "proof": [
+     "address:addr"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "recent_cancels": [
+     {
+      "id": "c1",
+      "kind": "break_glass",
+      "status": "cancelled",
+      "origin_class": "c1",
+      "origins": [],
+      "targets": [],
+      "opened_at": "-2h",
+      "completes_at": "70h",
+      "accepted_address_notice": true,
+      "cancel_reason": "proof",
+      "canceller_class": "c2",
+      "fingerprint": "fp1",
+      "coarse": "co1",
+      "fingerprint_key_id": 1
+     }
+    ],
+    "current_key_id": 1
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "break_glass",
+    "row": "t9"
+   }
+  },
+  {
+   "name": "t1/unset-sso-login-requires-the-password-leg",
+   "row": "t1",
+   "cite": "parent \u00a74 IdP row; architect rulings-3 H1 (SSOLogin zero means a password account, so an SSO-only proof is refused)",
+   "input": {
+    "action": {
+     "type": "sign_out_others"
+    },
+    "proof": [
+     "sso:sso"
+    ],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-1h",
+      "enrolled_at": "legacy"
+     }
+    ]
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session",
+    "row": "t1"
+   }
+  },
+  {
+   "name": "t11/row-completing-before-opened-plus-deltacp-refused",
+   "row": "t11",
+   "cite": "architect rulings-3 H3 (completable() refuses CompletesAt < OpenedAt + DeltaCP; a mapping bug must not complete early)",
+   "input": {
+    "action": {
+     "type": "complete",
+     "id": "r1"
+    },
+    "proof": [],
+    "creds": [
+     {
+      "ref": "password:pw",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "address:addr",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "sso:sso",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     },
+     {
+      "ref": "totp:totp",
+      "matures": "-100h",
+      "enrolled_at": "legacy"
+     }
+    ],
+    "reqs": [
+     {
+      "id": "r1",
+      "kind": "credential_remove",
+      "status": "pending",
+      "origin_class": "c1",
+      "origins": [
+       "password:pw"
+      ],
+      "targets": [
+       "sso:sso"
+      ],
+      "opened_at": "-10h",
+      "completes_at": "-1ns",
+      "accepted_address_notice": true,
+      "mature_notices_settled": true
+     }
+    ],
+    "guessable_budget_clear": true
+   },
+   "want": {
+    "verdict": "refused",
+    "source": "user_session"
+   }
+  }
+ ]
+}

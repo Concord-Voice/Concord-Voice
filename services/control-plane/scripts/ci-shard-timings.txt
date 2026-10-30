@@ -26,6 +26,8 @@
 # shard 2 job 119539093788 (all four ran there; shard 1 job 119539093592).
 # internal/authoritycontract was added 2026-10-15 from nightly run 38526580881, head a19c54a3a,
 # shard 1 job 115728676196. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
+# internal/accountguard/decide was added 2026-10-30 from Required PR build run 41004033007, head 5e6021236
+# (#3680 PR2): shard 2 job 123895091368. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
 #
 # Packages without test files remain absent and use the default weight.
 cmd/account-authority             4.742
@@ -33,6 +35,7 @@ cmd/issue-codes                   1.030
 cmd/mfa-rekey                     2.563
 cmd/migrate-media                 7.709
 cmd/server                        4.817
+internal/accountguard/decide      15.838
 internal/activepresence           16.729
 internal/admin                    30.598
 internal/age                      9.444
