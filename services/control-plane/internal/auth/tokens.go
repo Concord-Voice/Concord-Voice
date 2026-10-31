@@ -45,6 +45,11 @@ type Claims struct {
 	// so len(Purpose) > 0 means "the key was present", which is the property
 	// middleware.IsAccessToken enforces on the untyped path.
 	Purpose json.RawMessage `json:"purpose,omitempty"`
+	// AuthTime is the OIDC auth_time: set only when this token was minted by a
+	// primary authentication (password, SSO, step-up continuation). A token
+	// minted by refresh rotation never carries it, so routes that release
+	// password-guessable material can tell a fresh sign-in from a renewed one.
+	AuthTime *jwt.NumericDate `json:"auth_time,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -58,6 +63,8 @@ type AccessTokenInput struct {
 	CredentialEpoch string
 	EmailVerified   bool
 	Tier            string
+	// PrimaryAuth stamps auth_time = iat. False for refresh-rotation mints.
+	PrimaryAuth bool
 }
 
 // PreparedAccessToken fixes the signed identity and lifetime before SQL commit.
@@ -93,8 +100,13 @@ func (p PreparedAccessToken) Sign(jwtSecret string) (string, error) {
 		return "", ErrInvalidToken
 	}
 	verified := p.input.EmailVerified
+	var authTime *jwt.NumericDate
+	if p.input.PrimaryAuth {
+		authTime = &jwt.NumericDate{Time: p.issuedAt}
+	}
 	claims := Claims{
-		UserID: p.input.UserID.String(), SessionID: p.input.SID.String(),
+		AuthTime: authTime,
+		UserID:   p.input.UserID.String(), SessionID: p.input.SID.String(),
 		CredentialEpoch: p.input.CredentialEpoch, EmailVerified: &verified, Tier: p.input.Tier,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID: p.jti.String(), Issuer: middleware.AccessTokenIssuer,

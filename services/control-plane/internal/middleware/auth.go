@@ -206,6 +206,19 @@ func TokenSessionID(c *gin.Context) string {
 	return ""
 }
 
+// TokenAuthTime returns the access token's auth_time claim, present only on
+// tokens minted by a primary sign-in (never by refresh rotation).
+func TokenAuthTime(c *gin.Context) (time.Time, bool) {
+	if claims, ok := c.Get(JWTClaimsContextKey); ok {
+		if m, ok := claims.(jwt.MapClaims); ok {
+			if v, ok := m["auth_time"].(float64); ok {
+				return time.Unix(int64(v), 0), true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
 func abortUnauthorized(c *gin.Context) {
 	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonInvalidCredentials})
 	c.JSON(http.StatusUnauthorized, gin.H{"error": authError})

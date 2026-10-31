@@ -1814,7 +1814,7 @@ sequenceDiagram
 
 > The DM stack raises the same `key_needed` when a peer's first key fetch enrolls a `dm_pending_key_requests` row (`notifyDMKeyNeeded`); a DM has no server, so that push carries no `server_id` and the client schema marks the field optional.
 
-- RSA-OAEP 4096-bit key wrapping, AES-256-GCM message encryption, and Argon2id key derivation. The password-derived wrapping key is an AES-GCM 256 key. AES-GCM wraps the private key, not RFC 3394 AES-KW. `POST /api/v1/auth/register` uploads the registration-time key material (`public_key`, `wrapped_private_key`). `GET`/`PUT /api/v1/users/me/keys` cover re-wrap on password change and key recovery.
+- RSA-OAEP 4096-bit key wrapping, AES-256-GCM message encryption, and Argon2id key derivation. The password-derived wrapping key is an AES-GCM 256 key. AES-GCM wraps the private key, not RFC 3394 AES-KW. `POST /api/v1/auth/register` uploads the registration-time key material (`public_key`, `wrapped_private_key`). `GET /api/v1/users/me/keys` serves only a fresh primary sign-in (`auth_time` within the access-token lifetime; refresh-renewed tokens get 403 `recent_auth_required`), `POST /api/v1/users/me/keys/reveal` serves mid-session password change against the current password, and `PUT /api/v1/users/me/keys` covers key recovery.
 - PostgreSQL stores the public keys. The client wraps private keys locally, and they never leave the client unwrapped.
 - Encryption is **structural** under E2EE-everywhere (#201): every channel and DM is encrypted by construction. There is no plaintext-or-encrypted toggle and no `is_encrypted` column. Voice/video frames are likewise E2EE (see [Media E2EE](#media-e2ee-frame-encryption)).
 

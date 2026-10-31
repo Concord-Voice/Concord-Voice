@@ -4,6 +4,7 @@ import SSOEagerUnlock from '@/renderer/components/Auth/SSOEagerUnlock';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch (matches Register.test.tsx / SSOPassphraseSetup.test.tsx pattern)
@@ -327,6 +328,80 @@ describe('SSOEagerUnlock', () => {
     fireEvent.click(screen.getByRole('button', { name: /unlock/i }));
 
     await waitFor(() => expect(onUnlock).toHaveBeenCalledTimes(1));
+  });
+
+  it('asks for a fresh sign-in when the server refuses a renewed token (403)', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: 'Recent sign-in required', code: 'recent_auth_required' }),
+        {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      )
+    );
+
+    const onUnlock = vi.fn();
+    render(<SSOEagerUnlock onUnlock={onUnlock} onSocialRecovery={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText(/passphrase/i), {
+      target: { value: 'CorrectPassphrase!12' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /unlock/i }));
+
+    expect(await screen.findByText(/please sign in again to unlock/i)).toBeInTheDocument();
+    expect(mockE2eeInitialize).not.toHaveBeenCalled();
+    expect(onUnlock).not.toHaveBeenCalled();
+
+    // Retrying the passphrase cannot help a restored session, so the gate
+    // offers a real sign-out that ends at the sign-in screen.
+    expect(screen.queryByRole('button', { name: /^unlock$/i })).not.toBeInTheDocument();
+    // Enter cannot resubmit the doomed GET either.
+    expect(screen.getByLabelText(/passphrase/i)).toBeDisabled();
+    fireEvent.submit(screen.getByLabelText(/passphrase/i).closest('form') as HTMLFormElement);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const logout = vi.fn().mockResolvedValue(undefined);
+    useUserStore.setState({ logout });
+    fireEvent.click(screen.getByRole('button', { name: /sign in again/i }));
+    await waitFor(() => expect(logout).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('button', { name: /sign in again/i })).toBeDisabled();
+  });
+
+  it('keeps a sign-in failure retryable when logout rejects', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: 'Recent sign-in required', code: 'recent_auth_required' }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    render(<SSOEagerUnlock onUnlock={vi.fn()} onSocialRecovery={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText(/passphrase/i), {
+      target: { value: 'CorrectPassphrase!12' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /unlock/i }));
+    await screen.findByRole('button', { name: /sign in again/i });
+
+    useUserStore.setState({ logout: vi.fn().mockRejectedValue(new Error('ipc down')) });
+    fireEvent.click(screen.getByRole('button', { name: /sign in again/i }));
+
+    expect(await screen.findByText(/couldn't sign you out/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /sign in again/i })).toBeEnabled();
+  });
+
+  it('does not offer a fresh sign-in for an unrelated 403', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'Account suspended' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+    render(<SSOEagerUnlock onUnlock={vi.fn()} onSocialRecovery={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText(/passphrase/i), {
+      target: { value: 'CorrectPassphrase!12' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /unlock/i }));
+
+    expect(await screen.findByText(/couldn't load your encrypted keys/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in again/i })).not.toBeInTheDocument();
   });
 
   it('after 3 wrong attempts, offers Social Recovery', async () => {

@@ -43,6 +43,7 @@ import {
 } from '../../services/system/runtimeServerBase';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { persistE2EESessionKeys } from '../../utils/crypto/persistE2EESessionKeys';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import LoadingSpinner from './LoadingSpinner';
@@ -62,6 +63,24 @@ interface KeysResponse {
 }
 
 const MAX_ATTEMPTS = 3;
+
+/**
+ * Whether a 403 is the fresh-sign-in refusal. Other 403s (a suspended account,
+ * an attestation refusal) must not send the user round a sign-in that cannot
+ * help them.
+ */
+async function isRecentAuthRequired(res: Response): Promise<boolean> {
+  try {
+    const body: unknown = await res.json();
+    return (
+      typeof body === 'object' &&
+      body !== null &&
+      (body as { code?: unknown }).code === 'recent_auth_required'
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Wipe main-process/disk credentials that a pending persist IPC re-wrote
@@ -99,11 +118,14 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
   const [attemptCount, setAttemptCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // A restored session renews its token by refresh, so it can never read the
+  // wrapped key; only signing out and back in mints a token that can.
+  const [reauthRequired, setReauthRequired] = useState(false);
   const ssoCredentialOwner = useE2EEStore((state) => state.ssoCredentialOwner);
 
   const handleSubmit = async (ev: React.FormEvent) => {
     ev.preventDefault();
-    if (submitting || passphrase.length === 0) {
+    if (submitting || reauthRequired || passphrase.length === 0) {
       return;
     }
     setSubmitting(true);
@@ -158,6 +180,11 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     if (!res.ok) {
       if (res.status === 401) {
         setError('Your session expired. Please sign in again.');
+      } else if (res.status === 403 && (await isRecentAuthRequired(res))) {
+        // The server releases the wrapped key only to a fresh sign-in; a token
+        // renewed by refresh gets recent_auth_required.
+        setError('For your security, please sign in again to unlock your messages.');
+        setReauthRequired(true);
       } else {
         setError("Couldn't load your encrypted keys. Please try again.");
       }
@@ -294,6 +321,17 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     onSocialRecovery();
   };
 
+  const handleSignInAgain = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await useUserStore.getState().logout();
+    } catch {
+      setError("Couldn't sign you out. Please try again.");
+      setSubmitting(false);
+    }
+  };
+
   if (attemptCount >= MAX_ATTEMPTS) {
     return (
       <div className="sso-eager-unlock sso-eager-unlock--locked">
@@ -334,7 +372,7 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
           onChange={(ev) => setPassphrase(ev.target.value)}
           autoComplete="current-password"
           autoFocus
-          disabled={submitting}
+          disabled={submitting || reauthRequired}
         />
       </div>
 
@@ -344,20 +382,31 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
         </div>
       )}
 
-      <button
-        type="submit"
-        className="sso-eager-unlock__submit"
-        disabled={submitting || passphrase.length === 0}
-      >
-        {submitting ? (
-          <>
-            Unlocking…
-            <LoadingSpinner size="small" inline />
-          </>
-        ) : (
-          'Unlock'
-        )}
-      </button>
+      {reauthRequired ? (
+        <button
+          type="button"
+          className="sso-eager-unlock__submit"
+          onClick={() => void handleSignInAgain()}
+          disabled={submitting}
+        >
+          Sign in again
+        </button>
+      ) : (
+        <button
+          type="submit"
+          className="sso-eager-unlock__submit"
+          disabled={submitting || passphrase.length === 0}
+        >
+          {submitting ? (
+            <>
+              Unlocking…
+              <LoadingSpinner size="small" inline />
+            </>
+          ) : (
+            'Unlock'
+          )}
+        </button>
+      )}
     </form>
   );
 };

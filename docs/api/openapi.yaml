@@ -17730,7 +17730,7 @@ paths:
       summary: Get E2EE keys
       description: 'Retrieve wrapped private key and derivation salt for the current user.
 
-        Used during password change to re-wrap keys.
+        Only an access token minted by a primary sign-in (password, SSO, registration confirm or password-verified continuation), carrying `auth_time` within the 15-minute access-token lifetime, may read it. A token renewed by refresh rotation gets 403 `recent_auth_required`; mid-session callers use `POST /users/me/keys/reveal` with the current password instead.
 
         Rate limit: 5 requests per minute.
 
@@ -17747,6 +17747,19 @@ paths:
                 properties:
                   e2ee_keys:
                     $ref: '#/components/schemas/E2EEKeys'
+        '403':
+          description: The token was not minted by a recent primary sign-in (`code` is `recent_auth_required`)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - recent_auth_required
     put:
       tags:
       - Users
@@ -17824,6 +17837,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /users/me/keys/reveal:
+    post:
+      tags:
+      - Users
+      summary: Reveal E2EE keys with the current password
+      description: 'Return the wrapped private key and derivation salt to a caller that proves the current password. Used mid-session (password change), where the access token may have been renewed by refresh and so cannot use `GET /users/me/keys`.
+
+        Guarded like `POST /auth/step-up/password`: the per-IP auth-failure ban, and fail-closed per-IP and per-user limits of 10 requests per 15 minutes. A wrong password counts toward the IP ban.
+
+        '
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - current_password
+              properties:
+                current_password:
+                  type: string
+                  format: password
+                  maxLength: 1024
+      responses:
+        '200':
+          description: E2EE key material
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  e2ee_keys:
+                    $ref: '#/components/schemas/E2EEKeys'
+        '400':
+          description: Missing or oversized current_password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Current password is incorrect (`code` is `invalid_current_password`). A 403, not a 401, so a client never mistakes a typo for an expired token.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - invalid_current_password
+        '404':
+          description: User or keys not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Password verification or key read failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: The rate-limit backend is unavailable; the limiters fail closed
   /users/me/password:
     post:
       tags:

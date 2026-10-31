@@ -32,14 +32,15 @@ func lockMintUserTx(ctx context.Context, tx *sql.Tx, userID string) (loginfamily
 
 // prepareFamilyAccessTx binds precisely the deadline that Sign will emit. It
 // neither commits nor publishes credentials; the transaction owner does both.
-func prepareFamilyAccessTx(ctx context.Context, tx *sql.Tx, family loginfamily.LiveFamily, sid string, emailVerified bool, tier string) (PreparedAccessToken, error) {
+// primaryAuth is true for sign-in mints and false for refresh rotation.
+func prepareFamilyAccessTx(ctx context.Context, tx *sql.Tx, family loginfamily.LiveFamily, sid string, emailVerified bool, tier string, primaryAuth bool) (PreparedAccessToken, error) {
 	id, err := uuid.Parse(sid)
 	if err != nil {
 		return PreparedAccessToken{}, loginfamily.NewError(loginfamily.ReasonArgumentInvalid, err)
 	}
 	binding := family.Binding()
 	prepared, err := PrepareAccessToken(AccessTokenInput{UserID: binding.UserID, SID: id,
-		CredentialEpoch: binding.CredentialEpoch, EmailVerified: emailVerified, Tier: tier}, time.Now())
+		CredentialEpoch: binding.CredentialEpoch, EmailVerified: emailVerified, Tier: tier, PrimaryAuth: primaryAuth}, time.Now())
 	if err != nil {
 		return PreparedAccessToken{}, err
 	}

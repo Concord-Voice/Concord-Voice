@@ -174,7 +174,7 @@ describe('userStore - changePassword', () => {
     };
     useFriendOrgStore.getState()._hydrate(friendOrgSnapshot);
 
-    // Mock GET /api/v1/users/me/keys
+    // Mock POST /api/v1/users/me/keys/reveal
     mockApiFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -201,10 +201,16 @@ describe('userStore - changePassword', () => {
 
     expect(result).toEqual({ success: true });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    // Mid-session the token may be refresh-renewed, so the key read proves
+    // the current password instead of using GET /users/me/keys.
     expect(mockApiFetch).toHaveBeenNthCalledWith(
       1,
-      '/api/v1/users/me/keys',
-      expect.objectContaining({ signal: expect.any(AbortSignal) })
+      '/api/v1/users/me/keys/reveal',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ current_password: 'oldpass' }),
+        signal: expect.any(AbortSignal),
+      })
     );
     expect(mockApiFetch).toHaveBeenNthCalledWith(
       2,
@@ -678,7 +684,7 @@ describe('userStore - changePassword', () => {
   });
 
   it('returns error when current password is incorrect (401)', async () => {
-    // Mock GET /api/v1/users/me/keys - succeeds
+    // Mock POST /api/v1/users/me/keys/reveal - succeeds
     mockApiFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -704,8 +710,27 @@ describe('userStore - changePassword', () => {
     expect(useAuthStore.getState().accessToken).toBe('mock-access');
   });
 
+  it('reports a wrong current password from the reveal without touching the session', async () => {
+    // The reveal refuses a wrong password with 403, not 401, so apiFetch never
+    // treats the typo as an expired token.
+    mockApiFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 403,
+      json: async () => ({
+        error: 'Current password is incorrect',
+        code: 'invalid_current_password',
+      }),
+    } as Response);
+
+    const result = await useUserStore.getState().changePassword('wrongpass', 'newpass');
+
+    expect(result).toEqual({ success: false, error: 'Current password is incorrect' });
+    expect(useAuthStore.getState().accessToken).toBe('mock-access');
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+  });
+
   it('clears auth and returns session expired for generic 401', async () => {
-    // Mock GET /api/v1/users/me/keys - succeeds
+    // Mock POST /api/v1/users/me/keys/reveal - succeeds
     mockApiFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -732,7 +757,7 @@ describe('userStore - changePassword', () => {
   });
 
   it('handles general error (e.g., key fetch failure)', async () => {
-    // Mock GET /api/v1/users/me/keys - fails
+    // Mock POST /api/v1/users/me/keys/reveal - fails
     mockApiFetch.mockResolvedValueOnce({
       ok: false,
       status: 500,
@@ -747,7 +772,7 @@ describe('userStore - changePassword', () => {
   });
 
   it('handles crypto unwrap failure gracefully', async () => {
-    // Mock GET /api/v1/users/me/keys - succeeds
+    // Mock POST /api/v1/users/me/keys/reveal - succeeds
     mockApiFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -920,6 +945,16 @@ describe('userStore - changePassword', () => {
       });
       mockApiFetch.mockResolvedValueOnce(keysResponse);
       mockApiFetch.mockRejectedValueOnce(new TypeError('network dropped'));
+      // Reconcile: the commit made the old password wrong, so the reveal refuses
+      // it (403) and only the new password can read the persisted salt.
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({
+          error: 'Current password is incorrect',
+          code: 'invalid_current_password',
+        }),
+      } as Response);
       // Reconcile fetch: server already persisted the salt this attempt submitted
       // (arrayBufferToBase64 is mocked to a constant, so the submitted salt is 'mock-base64-string').
       mockApiFetch.mockResolvedValueOnce({
@@ -939,6 +974,14 @@ describe('userStore - changePassword', () => {
       expect(result.error).toContain('sign in again with your new password');
       expect(useAuthStore.getState().loginNotice).toContain('sign in again with your new password');
       expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+      const reveals = mockApiFetch.mock.calls.filter(
+        ([url]) => url === '/api/v1/users/me/keys/reveal'
+      );
+      expect(reveals.map(([, init]) => (init as RequestInit).body)).toEqual([
+        JSON.stringify({ current_password: 'oldpass' }), // pragma: allowlist secret
+        JSON.stringify({ current_password: 'oldpass' }), // pragma: allowlist secret
+        JSON.stringify({ current_password: 'newpass' }), // pragma: allowlist secret
+      ]);
       // Nothing sequenced after adoption may run on the fenced old token: no
       // reinit, no presence refetch.
       expect(e2eeService.initialize).not.toHaveBeenCalled();

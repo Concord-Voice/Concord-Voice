@@ -23,6 +23,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -289,14 +290,88 @@ func (h *Handler) GetPublicProfile(c *gin.Context) {
 	})
 }
 
-// GetMyKeys returns the current user's E2EE keys (for key re-wrapping during password change)
+// errCodeRecentAuthRequired tells the client the key read needs a fresh sign-in
+// (GET) or the current password (POST /users/me/keys/reveal).
+const errCodeRecentAuthRequired = "recent_auth_required"
+
+// GetMyKeys returns the current user's password-wrapped E2EE identity key.
+//
+// The wrapped key can be guessed offline, so only an access token minted by a
+// primary sign-in (password, SSO, step-up continuation) within the access-token
+// lifetime may read it. A token renewed by refresh rotation carries no
+// auth_time and is refused: a stolen refresh token must not yield the key.
+// Mid-session callers (password change) use RevealMyKeys instead.
 func (h *Handler) GetMyKeys(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
 		return
 	}
+	if !recentPrimaryAuth(c, time.Now()) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Recent sign-in required", "code": errCodeRecentAuthRequired})
+		return
+	}
+	h.writeMyKeys(c, userID)
+}
 
+// recentPrimaryAuth reports whether the request's access token came from a
+// primary sign-in no more than one access-token lifetime before now. A token
+// without a numeric auth_time (every refresh-minted one) fails.
+func recentPrimaryAuth(c *gin.Context, now time.Time) bool {
+	authTime, ok := middleware.TokenAuthTime(c)
+	return ok && now.Sub(authTime) <= auth.AccessTokenTTL
+}
+
+// RevealMyKeysRequest carries the current password for RevealMyKeys.
+type RevealMyKeysRequest struct {
+	// max bounds the Argon2id input; ValidatePasswordStrength caps new
+	// passwords at 128, so 1024 never refuses a real one.
+	CurrentPassword string `json:"current_password" binding:"required,max=1024"` // #nosec G117 -- False positive: request field, not stored secret
+}
+
+// errCodeInvalidCurrentPassword marks RevealMyKeys' wrong-password refusal.
+// It is a 403, not a 401: a renderer treats every 401 as an expired token and
+// refreshes and resends, which would spend a rate-limit slot and can sign the
+// user out over a typo.
+const errCodeInvalidCurrentPassword = "invalid_current_password" // pragma: allowlist secret
+
+// RevealMyKeys returns the wrapped identity key to a caller that proves the
+// current password. Knowing the password already unwraps the key, so this
+// releases nothing an attacker without the password could guess offline.
+func (h *Handler) RevealMyKeys(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
+		return
+	}
+	var req RevealMyKeysRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "current_password is required"})
+		return
+	}
+	_, status, msg := h.verifyCurrentPassword(userID, req.CurrentPassword)
+	switch status {
+	case 0:
+		h.writeMyKeys(c, userID)
+	case http.StatusUnauthorized:
+		// Feed the client IP's auth-failure ban, as the step-up mint does, so
+		// this route is never a cheaper oracle than /login.
+		middleware.MarkNightwatchVerdict(c, middleware.NightwatchVerdict{
+			EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied,
+			Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonInvalidCredentials,
+			AuthMethod: securityevent.AuthPassword,
+		})
+		outcome := middleware.RecordAuthFailure(c.Request.Context(), h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		middleware.MarkAuthFailureOutcome(c, outcome) // a ban it created supersedes the denial
+		c.JSON(http.StatusForbidden, gin.H{"error": msg, "code": errCodeInvalidCurrentPassword})
+	case http.StatusInternalServerError:
+		c.JSON(status, gin.H{"error": "Failed to verify password"})
+	default:
+		c.JSON(status, gin.H{"error": msg})
+	}
+}
+
+func (h *Handler) writeMyKeys(c *gin.Context, userID interface{}) {
 	var keys models.UserKeys
 	err := h.db.QueryRow(
 		`SELECT user_id, wrapped_private_key, key_derivation_salt, key_version, key_derivation_alg

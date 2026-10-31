@@ -490,6 +490,20 @@ async function assembleSyncDomainRotations(
 }
 
 /**
+ * Reads the wrapped identity key by proving the current password. GET
+ * /users/me/keys only serves a fresh sign-in, and a mid-session token has
+ * usually been renewed by refresh.
+ */
+function revealMyKeys(currentPassword: string, signal: AbortSignal): Promise<Response> {
+  return apiFetch('/api/v1/users/me/keys/reveal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_password: currentPassword }),
+    signal,
+  });
+}
+
+/**
  * Ambiguous-commit reconciliation (#2200): a transport failure on the password
  * POST proves nothing. The submitted KDF salt is unique per attempt, so
  * comparing the server's persisted salt decides commit-vs-not before reporting
@@ -497,10 +511,15 @@ async function assembleSyncDomainRotations(
  */
 async function reconcileAmbiguousPasswordCommit(
   submittedSaltBase64: string,
+  currentPassword: string,
+  newPassword: string,
   signal: AbortSignal
 ): Promise<'committed' | 'not-committed' | 'unknown'> {
   try {
-    const res = await apiFetch('/api/v1/users/me/keys', { signal });
+    let res = await revealMyKeys(currentPassword, signal);
+    // A committed change makes the old password wrong (403), so the reveal
+    // can only see the new salt by proving the new password.
+    if (res.status === 403) res = await revealMyKeys(newPassword, signal);
     if (!res.ok) return 'unknown';
     const raw: unknown = await res.json();
     const persistedSalt = asRecord(asRecord(raw).e2ee_keys).key_derivation_salt;
@@ -569,7 +588,12 @@ async function reconcileAfterTransportFailure(
   // A lifecycle abort surfaces as !isCurrent and rethrows as the cancelled
   // path; anything else is a genuinely ambiguous commit.
   assertPasswordChangeCurrent(ctx.isCurrent);
-  const outcome = await reconcileAmbiguousPasswordCommit(ctx.newSaltBase64, ctx.signal);
+  const outcome = await reconcileAmbiguousPasswordCommit(
+    ctx.newSaltBase64,
+    ctx.currentPassword,
+    ctx.newPassword,
+    ctx.signal
+  );
   assertPasswordChangeCurrent(ctx.isCurrent);
   if (outcome === 'committed') return { kind: 'committed-ambiguous' };
   if (outcome === 'not-committed') {
@@ -1009,9 +1033,7 @@ export const useUserStore = wrapStore(
           };
           try {
             // Step 1: Fetch current E2EE keys from the server
-            const keysRes = await apiFetch('/api/v1/users/me/keys', {
-              signal: lifecycle.controller.signal,
-            });
+            const keysRes = await revealMyKeys(currentPassword, lifecycle.controller.signal);
             assertPasswordChangeCurrent(isCurrent);
 
             if (!keysRes.ok) {

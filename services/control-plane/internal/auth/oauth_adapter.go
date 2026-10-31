@@ -137,7 +137,7 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 
 	// tokenID first so the access token carries it as the sid claim (#2201).
 	tokenID := uuid.New().String()
-	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, userState.emailVerified, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, userState.emailVerified, tier, true)
 	if err != nil {
 		return "", "", "", err
 	}

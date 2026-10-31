@@ -20,6 +20,11 @@ func TestLoginFamilyNormalAndGraceRefreshRetainIdentity(t *testing.T) {
 	access, refresh, _, err := rig.h.IssueTokenPair(mintContext, rig.user, "")
 	require.NoError(t, err)
 	family, originalSID := assertFamilyAccess(t, rig, access)
+	// IssueTokenPair is a password-verified continuation mint: it carries
+	// auth_time, so GET /users/me/keys serves it (#4223).
+	primary, err := ValidateAccessToken(access, familyTestSecret)
+	require.NoError(t, err)
+	require.NotNil(t, primary.AuthTime, "a continuation mint carries auth_time")
 	var originalExpiry string
 	require.NoError(t, rig.db.QueryRow(`SELECT access_expires_at::text FROM login_family_sids WHERE sid = $1`, originalSID).Scan(&originalExpiry))
 	for _, mode := range []string{"normal", "grace"} {
@@ -31,6 +36,11 @@ func TestLoginFamilyNormalAndGraceRefreshRetainIdentity(t *testing.T) {
 			rig.h.Refresh(c)
 			pair := familyResponse(t, w)
 			nextFamily, nextSID := assertFamilyAccess(t, rig, pair.Access)
+			// The whole F1 property: a refresh (normal or grace) never mints
+			// auth_time, so a stolen refresh token cannot read the wrapped key.
+			renewed, err := ValidateAccessToken(pair.Access, familyTestSecret)
+			require.NoError(t, err)
+			assert.Nil(t, renewed.AuthTime, "%s refresh must not carry auth_time", mode)
 			assert.Equal(t, family, nextFamily)
 			assert.NotEqual(t, originalSID, nextSID)
 			assert.NotEqual(t, refresh, pair.Refresh)

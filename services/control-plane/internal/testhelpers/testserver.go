@@ -309,7 +309,19 @@ func (ts *TestServer) createAccessOnlyFamilyFixture(t *testing.T, userID string,
 	return createAccessOnlyFamilyFixtureDB(t, ts.DB, userID, verifyEmail)
 }
 
+// RenewedAccessToken mints a verified access token shaped like a refresh
+// rotation: no auth_time claim, so it is not a recent primary sign-in.
+func (ts *TestServer) RenewedAccessToken(t *testing.T, userID string) string {
+	t.Helper()
+	return mintAccessOnlyFamilyFixtureDB(t, ts.DB, userID, true, false)
+}
+
 func createAccessOnlyFamilyFixtureDB(t testing.TB, db *sql.DB, userID string, verifyEmail bool) string {
+	t.Helper()
+	return mintAccessOnlyFamilyFixtureDB(t, db, userID, verifyEmail, true)
+}
+
+func mintAccessOnlyFamilyFixtureDB(t testing.TB, db *sql.DB, userID string, verifyEmail, primaryAuth bool) string {
 	t.Helper()
 	ctx := context.Background()
 	id, err := uuid.Parse(userID)
@@ -352,7 +364,7 @@ func createAccessOnlyFamilyFixtureDB(t testing.TB, db *sql.DB, userID string, ve
 		t.Fatalf("testhelpers: create access-only fixture family: %v", err)
 	}
 	sid := uuid.New()
-	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{UserID: id, SID: sid, CredentialEpoch: epoch, EmailVerified: verified}, time.Now())
+	prepared, err := auth.PrepareAccessToken(auth.AccessTokenInput{UserID: id, SID: sid, CredentialEpoch: epoch, EmailVerified: verified, PrimaryAuth: primaryAuth}, time.Now())
 	if err != nil {
 		t.Fatalf("testhelpers: prepare access-only fixture token: %v", err)
 	}

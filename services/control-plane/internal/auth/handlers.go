@@ -302,7 +302,7 @@ func (h *Handler) IssueTokenPair(c *gin.Context, userID, expectedEpoch string) (
 	if err != nil {
 		return "", "", "", err
 	}
-	prepared, err := prepareFamilyAccessTx(ctx, tx, family, sessionID, emailVerified, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, sessionID, emailVerified, tier, true)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -484,7 +484,7 @@ func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified
 	if err != nil {
 		return "", "", "", err
 	}
-	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, emailVerified, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, emailVerified, tier, true)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -1522,7 +1522,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgLoginFailed)
 		return false
 	}
-	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, user.EmailVerified, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, tokenID, user.EmailVerified, tier, true)
 	if err != nil {
 		writeLoginFamilyError(c, err, errMsgInvalidCredentials, errMsgLoginFailed)
 		return false
@@ -2340,7 +2340,7 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
 		return
 	}
-	prepared, err := prepareFamilyAccessTx(ctx, tx, family, newTokenID, refreshEmailVerified, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, newTokenID, refreshEmailVerified, tier, false)
 	if err != nil {
 		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
 		return
@@ -2547,7 +2547,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 	newTokenHash := HashRefreshToken(newRefreshToken)
 	newTokenID := uuid.New().String()
-	prepared, err := prepareFamilyAccessTx(ctx, tx, family, newTokenID, graceEmailVerified, tier)
+	prepared, err := prepareFamilyAccessTx(ctx, tx, family, newTokenID, graceEmailVerified, tier, false)
 	if err != nil {
 		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
 		return
