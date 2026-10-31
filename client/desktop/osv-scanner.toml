@@ -18,3 +18,12 @@
 # cannot express is "only these ids", so a NEW advisory against the same dev
 # package version is muted here too until effectiveUntil; the npm-audit gate,
 # which matches by id, still fails on a new HIGH/CRITICAL one.
+
+[[PackageOverrides]]
+name = "deepmerge"
+version = "4.3.1"
+ecosystem = "npm"
+group = "dev"
+ignore = true
+effectiveUntil = 2027-01-29T00:00:00Z
+reason = "GHSA-gcqx-w48m-w2h4 (mirror of the .audit-allowlist.json entry). No fixed release exists: deepmerge 4.3.1 is the latest and the advisory lists it as last_affected. Dev-only transitive, reached through build tooling that merges static, package-owned objects, never attacker-supplied input. Re-check for a patched deepmerge or a parent that drops it by review_by."

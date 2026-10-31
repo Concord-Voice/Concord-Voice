@@ -63,7 +63,7 @@ func newTestVerifier() *OIDCVerifier {
 		cfg: OIDCConfig{
 			Issuer:         "https://token.actions.githubusercontent.com",
 			Audience:       "https://api.concordvoice.chat",
-			SubjectPrefix:  "repo:Concord-Voice/Concord-Voice-Alpha:",
+			SubjectPrefix:  "repo:Concord-Voice/Hosted:",
 			SPAWorkflow:    "main-cd.yml",
 			SPARef:         "refs/heads/main",
 			BinaryWorkflow: "build-desktop.yml",
@@ -86,11 +86,11 @@ func newTestVerifier() *OIDCVerifier {
 const (
 	// canonicalSPAWorkflowRef matches the form GitHub emits in workflow_ref
 	// for a token minted by main-cd.yml on refs/heads/main.
-	canonicalSPAWorkflowRef = "Concord-Voice/Concord-Voice-Alpha/.github/workflows/main-cd.yml@refs/heads/main"
+	canonicalSPAWorkflowRef = "Concord-Voice/Hosted/.github/workflows/main-cd.yml@refs/heads/main"
 	// canonicalBinaryWorkflowRef likewise for build-desktop.yml.
-	canonicalBinaryWorkflowRef = "Concord-Voice/Concord-Voice-Alpha/.github/workflows/build-desktop.yml@refs/heads/main"
+	canonicalBinaryWorkflowRef = "Concord-Voice/Hosted/.github/workflows/build-desktop.yml@refs/heads/main"
 	// canonicalSubject mirrors the real GitHub OIDC `sub` claim shape.
-	canonicalSubject = "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"
+	canonicalSubject = "repo:Concord-Voice/Hosted:ref:refs/heads/main"
 )
 
 // ── SPA axis ───────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ func TestVerifySPA_HappyPath(t *testing.T) {
 func TestVerifySPA_RejectsWrongWorkflow(t *testing.T) {
 	err := newTestVerifier().applySPAPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/build-other.yml@refs/heads/main",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/build-other.yml@refs/heads/main",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow)
@@ -115,8 +115,8 @@ func TestVerifySPA_RejectsWrongWorkflow(t *testing.T) {
 
 func TestVerifySPA_RejectsWrongRef(t *testing.T) {
 	err := newTestVerifier().applySPAPolicy(ghOIDCClaims{
-		Sub:      "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/feature/xyz",
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/main-cd.yml@refs/heads/feature/xyz",
+		Sub:      "repo:Concord-Voice/Hosted:ref:refs/heads/feature/xyz",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/main-cd.yml@refs/heads/feature/xyz",
 		Ref:      "refs/heads/feature/xyz",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidRef)
@@ -147,7 +147,7 @@ func TestVerifyBinary_HappyPath(t *testing.T) {
 func TestVerifyBinary_RejectsWrongWorkflow(t *testing.T) {
 	err := newTestVerifier().applyBinaryPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/build-other.yml@refs/heads/main",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/build-other.yml@refs/heads/main",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow)
@@ -155,8 +155,8 @@ func TestVerifyBinary_RejectsWrongWorkflow(t *testing.T) {
 
 func TestVerifyBinary_RejectsWrongRef(t *testing.T) {
 	err := newTestVerifier().applyBinaryPolicy(ghOIDCClaims{
-		Sub:      "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/feature/xyz",
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/build-desktop.yml@refs/heads/feature/xyz",
+		Sub:      "repo:Concord-Voice/Hosted:ref:refs/heads/feature/xyz",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/build-desktop.yml@refs/heads/feature/xyz",
 		Ref:      "refs/heads/feature/xyz",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidRef)
@@ -217,7 +217,7 @@ func TestVerifySPA_RejectsBinaryWorkflow(t *testing.T) {
 func TestVerifySPA_RejectsAttackerSubstringWorkflow(t *testing.T) {
 	err := newTestVerifier().applySPAPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/attacker-main-cd.yml@refs/heads/main",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/attacker-main-cd.yml@refs/heads/main",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow,
@@ -232,7 +232,7 @@ func TestVerifySPA_RejectsAttackerSubstringWorkflow(t *testing.T) {
 func TestVerifySPA_RejectsAttackerSuffixWorkflow(t *testing.T) {
 	err := newTestVerifier().applySPAPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/foo-main-cd.yml@refs/heads/main",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/foo-main-cd.yml@refs/heads/main",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow,
@@ -244,7 +244,7 @@ func TestVerifySPA_RejectsAttackerSuffixWorkflow(t *testing.T) {
 func TestVerifyBinary_RejectsAttackerSubstringWorkflow(t *testing.T) {
 	err := newTestVerifier().applyBinaryPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/attacker-build-desktop.yml@refs/heads/main",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/attacker-build-desktop.yml@refs/heads/main",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow)
@@ -257,7 +257,7 @@ func TestVerifyBinary_RejectsAttackerSubstringWorkflow(t *testing.T) {
 func TestVerifySPA_RejectsWorkflowMissingPathSegment(t *testing.T) {
 	err := newTestVerifier().applySPAPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/main-cd.yml@refs/heads/main",
+		Workflow: "Concord-Voice/Hosted/main-cd.yml@refs/heads/main",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow,
@@ -271,7 +271,7 @@ func TestVerifySPA_RejectsWorkflowMissingPathSegment(t *testing.T) {
 func TestVerifySPA_RejectsClaimWithoutAtSeparator(t *testing.T) {
 	err := newTestVerifier().applySPAPolicy(ghOIDCClaims{
 		Sub:      canonicalSubject,
-		Workflow: "Concord-Voice/Concord-Voice-Alpha/.github/workflows/main-cd.yml",
+		Workflow: "Concord-Voice/Hosted/.github/workflows/main-cd.yml",
 		Ref:      "refs/heads/main",
 	})
 	require.ErrorIs(t, err, ErrOIDCInvalidWorkflow,
@@ -296,7 +296,7 @@ func TestNewOIDCVerifier_BadIssuer(t *testing.T) {
 	cfg := OIDCConfig{
 		Issuer:         "https://0.0.0.0:1/unreachable",
 		Audience:       "https://api.concordvoice.chat",
-		SubjectPrefix:  "repo:Concord-Voice/Concord-Voice-Alpha:",
+		SubjectPrefix:  "repo:Concord-Voice/Hosted:",
 		SPAWorkflow:    "main-cd.yml",
 		SPARef:         "refs/heads/main",
 		BinaryWorkflow: "build-desktop.yml",
@@ -324,7 +324,7 @@ func TestNewOIDCVerifier_EmptyFields(t *testing.T) {
 	base := OIDCConfig{
 		Issuer:         "https://token.actions.githubusercontent.com",
 		Audience:       "https://api.concordvoice.chat",
-		SubjectPrefix:  "repo:Concord-Voice/Concord-Voice-Alpha:",
+		SubjectPrefix:  "repo:Concord-Voice/Hosted:",
 		SPAWorkflow:    "main-cd.yml",
 		SPARef:         "refs/heads/main",
 		BinaryWorkflow: "build-desktop.yml",
@@ -531,7 +531,7 @@ func oidcAlgPinConfig(issuer string) OIDCConfig {
 	return OIDCConfig{
 		Issuer:         issuer,
 		Audience:       "https://api.concordvoice.chat",
-		SubjectPrefix:  "repo:Concord-Voice/Concord-Voice-Alpha:",
+		SubjectPrefix:  "repo:Concord-Voice/Hosted:",
 		SPAWorkflow:    "main-cd.yml",
 		SPARef:         "refs/heads/main",
 		BinaryWorkflow: "build-desktop.yml",

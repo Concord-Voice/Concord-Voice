@@ -19,6 +19,7 @@ import type {
   DMVoiceCallTimedOutPayload,
 } from '../../../types/ws-events';
 import { useVoiceStore } from '../../../stores/voice/voiceStore';
+import { useAuthStore } from '../../../stores/auth/authStore';
 import { useDMStore } from '../../../stores/chat/dmStore';
 import { apiFetch } from '../../system/apiClient';
 import { notificationSoundService } from '../../system/notificationSoundService';
@@ -114,6 +115,7 @@ type OutgoingRingingState = Extract<CallState, { kind: 'outgoing-ringing' }>;
 const RING_REQUEST_OWNERSHIP_TIMEOUT_MS = 45_000;
 
 interface PendingRingOperation {
+  authGeneration: number;
   state: OutgoingRingingState;
   cancelRequested: boolean;
   ownershipRevision: number;
@@ -336,7 +338,11 @@ function parseExistingCallId(body: string): string | null {
  * Joins the conversation's live call through the direct DM join path (the
  * same one the "Join voice call" button uses). joinChannel claims the joining
  * state itself from idle; the server binds the join to the leased call, and no
- * ring_id is sent because a direct call has no ring lease to match.
+ * ring_id is sent because a direct call has no ring lease to match. The
+ * caller checks the account fence synchronously right before this call. Do
+ * not pass expectedAuthGeneration: it also pins the voice-action generation,
+ * which joinChannel's own leave of an active server channel advances, so the
+ * join would abort after disconnecting the user.
  */
 async function joinExistingDMCall(conversationId: string): Promise<void> {
   try {
@@ -371,13 +377,18 @@ async function handleRingRefusal(
   const ownedAtResponse = ownsPendingRing(operation, optimisticState);
   rollbackPendingRing(conversationId, operation, optimisticState);
   const revision = callOwnershipRevision;
+  const idleAtResponse = useVoiceStore.getState().callState;
   const errBody = await response.text().catch(() => '');
-  // A cancel, ownership timeout or reset, or a new call started while the
-  // body was read, means this response no longer speaks for the user.
+  // A cancel, ownership timeout or reset, a new call, a logout or account
+  // switch, or any store reset (even idle to idle, which leaves the revision
+  // alone) while the body was read means this response no longer speaks for
+  // the user.
   const stillOwned =
     ownedAtResponse &&
     callOwnershipRevision === revision &&
-    useVoiceStore.getState().callState.kind === 'idle';
+    useAuthStore.getState().authGeneration === operation.authGeneration &&
+    useVoiceStore.getState().callState === idleAtResponse &&
+    idleAtResponse.kind === 'idle';
   // #4179: a 409 naming the live call means this conversation already has a
   // call (the peer is still in it, or our own pre-crash session has not been
   // reaped yet). Join it instead of dropping the ring silently.
@@ -422,6 +433,7 @@ export async function initiateDMCall(conversationId: string): Promise<void> {
     declinedUserIds: [],
   };
   const operation: PendingRingOperation = {
+    authGeneration: useAuthStore.getState().authGeneration,
     state: optimisticState,
     cancelRequested: false,
     ownershipRevision: 0,

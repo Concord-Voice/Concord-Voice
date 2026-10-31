@@ -4,6 +4,7 @@ import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useUnreadStore, type RecentUnreadTarget } from '../../stores/chat/unreadStore';
 import { useDMStore } from '../../stores/chat/dmStore';
+import { useServerStore } from '../../stores/chat/serverStore';
 import { useNotificationNavigationStore } from '../../stores/ui/notificationNavigationStore';
 import {
   useNotificationPrefsStore,
@@ -85,7 +86,10 @@ function isStillUnread(target: RecentUnreadTarget): boolean {
 /**
  * Unread restored at start-up or after a reload never passed through the live stack,
  * so fall back to the authoritative collections: the most active unread DM (the list
- * is kept sorted by activity), then any unread channel.
+ * is kept sorted by activity), then any unread channel. Channels are read the way
+ * computeBadgeTotal reads them: the active server from `unreadCounts` when that map
+ * owns it, every other server from `allUnreadCounts`. Otherwise a count the badge
+ * shows (e.g. set on leaving a scrolled-up channel) would have no target.
  */
 function restoredUnreadTarget(): RecentUnreadTarget | undefined {
   const dm = useDMStore
@@ -94,15 +98,27 @@ function restoredUnreadTarget(): RecentUnreadTarget | undefined {
       (c) => (c.unreadCount ?? 0) > 0 && !isMuted({ type: 'dm', targetId: c.id })
     );
   if (dm) return { type: 'dm', targetId: dm.id };
-  for (const [channelId, entry] of useUnreadStore.getState().allUnreadCounts) {
-    const target: RecentUnreadTarget = {
-      type: 'channel',
-      targetId: channelId,
-      serverId: entry.serverId,
-    };
-    if (entry.count > 0 && !isMuted(target)) return target;
+  return firstUnreadChannel();
+}
+
+/** Channel rows in badge order (see restoredUnreadTarget); the first unread, unmuted one. */
+function firstUnreadChannel(): RecentUnreadTarget | undefined {
+  const { unreadCounts, unreadCountsServerId, allUnreadCounts } = useUnreadStore.getState();
+  const activeServerId = useServerStore.getState().activeServerId;
+  const activeOwned = activeServerId !== null && unreadCountsServerId === activeServerId;
+  const rows: Array<[RecentUnreadTarget, number]> = [];
+  if (activeOwned) {
+    for (const [targetId, count] of unreadCounts) {
+      rows.push([{ type: 'channel', targetId, serverId: activeServerId }, count]);
+    }
   }
-  return undefined;
+  for (const [targetId, { serverId, count }] of allUnreadCounts) {
+    // Owned active-server rows above are authoritative; its bulk rows can be stale.
+    if (!activeOwned || serverId !== activeServerId) {
+      rows.push([{ type: 'channel', targetId, serverId }, count]);
+    }
+  }
+  return rows.find(([target, count]) => count > 0 && !isMuted(target))?.[0];
 }
 
 /** LIFO: the most recently received conversation that is still unread. */

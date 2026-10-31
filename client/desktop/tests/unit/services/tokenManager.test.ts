@@ -53,6 +53,10 @@ vi.mock('electron', () => ({
   net: { fetch: mockNetFetch },
 }));
 vi.mock('../../../src/main/machineId', () => ({ getMachineId: mockGetMachineId }));
+const mockClearAttestationToken = vi.hoisted(() => vi.fn());
+vi.mock('../../../src/main/attestationService', () => ({
+  clearAttestationToken: mockClearAttestationToken,
+}));
 vi.mock('fs', () => ({
   default: {
     writeFileSync: (...a: unknown[]) => {
@@ -1050,6 +1054,7 @@ describe('tokenManager', () => {
           previous_session_id: 'sid0',
         })
       );
+      mockClearAttestationToken.mockClear();
 
       const result = await performRefresh();
 
@@ -1067,6 +1072,21 @@ describe('tokenManager', () => {
       expect(opts.headers['X-Machine-Id']).toBe('mid');
       expect(opts.credentials).toBe('omit');
       expect(mockGetMachineId).toHaveBeenCalledWith('http://localhost:8080');
+      expect(mockClearAttestationToken).toHaveBeenCalledOnce();
+    });
+
+    it('keeps the attestation token when the refresh names no new session', async () => {
+      storeRefreshToken({
+        refreshToken: 'rt-abc',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      mockClearAttestationToken.mockClear();
+      const jwt = makeJwt(Math.floor(Date.now() / 1000) + 900);
+      mockNetFetch.mockResolvedValueOnce(jsonResponse({ access_token: jwt }));
+
+      expect((await performRefresh()).status).toBe('ok');
+      expect(mockClearAttestationToken).not.toHaveBeenCalled();
     });
 
     it('returns refresh_failed on non-ok HTTP status', async () => {

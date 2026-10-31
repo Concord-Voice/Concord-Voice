@@ -112,7 +112,7 @@ func publishBinaryBody(version, platform, certHash string) string {
 // ── PublishSPA ─────────────────────────────────────────────────────
 
 func TestPublishSPAHandler_HappyPath(t *testing.T) {
-	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"}
+	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Hosted:ref:refs/heads/main"}
 	h, cleanup := newPublishHandler(t, oidc)
 	defer cleanup()
 
@@ -247,7 +247,7 @@ func TestPublishSPAHandler_BadHashFormat_400(t *testing.T) {
 // ── PublishBinary ──────────────────────────────────────────────────
 
 func TestPublishBinaryHandler_HappyPath(t *testing.T) {
-	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"}
+	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Hosted:ref:refs/heads/main"}
 	h, cleanup := newPublishHandler(t, oidc)
 	defer cleanup()
 
@@ -450,7 +450,7 @@ func TestPublishBinary_DegradedMode_503(t *testing.T) {
 // TestPublishBinaryHandler_NoReleaseBinaryPlatform_400: ios and web are valid
 // verify platforms but never have a signed release binary (ADR-0010 D17).
 func TestPublishBinaryHandler_NoReleaseBinaryPlatform_400(t *testing.T) {
-	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"}
+	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Hosted:ref:refs/heads/main"}
 	h, cleanup := newPublishHandler(t, oidc)
 	defer cleanup()
 

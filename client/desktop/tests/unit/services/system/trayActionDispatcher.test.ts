@@ -26,6 +26,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useNotificationNavigationStore } from '@/renderer/stores/ui/notificationNavigationStore';
 
 function setVoice(over: Record<string, unknown> = {}, me: Record<string, unknown> = {}) {
@@ -51,6 +52,7 @@ describe('trayActionDispatcher', () => {
     } as never);
     useUnreadStore.getState().clearAll();
     useDMStore.setState({ conversations: [] });
+    useServerStore.setState({ activeServerId: null });
     useNotificationNavigationStore.setState({ pendingNavigation: null });
   });
   afterEach(() => vi.restoreAllMocks());
@@ -237,6 +239,67 @@ describe('trayActionDispatcher', () => {
         );
       } finally {
         useNotificationPrefsStore.setState({ mutedDMs: new Map(), mutedChannels: new Map() });
+      }
+    });
+
+    // Active-server unread lives only in `unreadCounts` (e.g. setUnreadCount on
+    // leaving a scrolled-up channel), so the fallback must read it like the badge does.
+    it('falls back to an active-server channel held only in unreadCounts', () => {
+      useServerStore.setState({ activeServerId: 's1' });
+      useUnreadStore.getState().setInitialUnreads(new Map([['c-active', 3]]), 's1');
+      handleTrayAction({ kind: 'open-unread' });
+      expect(useNotificationNavigationStore.getState().pendingNavigation).toEqual({
+        type: 'channel',
+        targetId: 'c-active',
+        serverId: 's1',
+      });
+    });
+
+    it('skips stale active-server bulk rows once unreadCounts owns the active server', () => {
+      useServerStore.setState({ activeServerId: 's1' });
+      useUnreadStore.getState().setInitialUnreads(new Map([['c-read', 0]]), 's1');
+      useUnreadStore.setState({
+        allUnreadCounts: new Map([
+          ['c-read', { serverId: 's1', count: 4 }],
+          ['c-bg', { serverId: 's2', count: 1 }],
+        ]),
+      });
+      handleTrayAction({ kind: 'open-unread' });
+      expect(useNotificationNavigationStore.getState().pendingNavigation?.targetId).toBe('c-bg');
+    });
+
+    it('ignores a previous server snapshot and falls back to the bulk map', () => {
+      useServerStore.setState({ activeServerId: 's2' });
+      useUnreadStore.getState().setInitialUnreads(new Map([['c-old-server', 5]]), 's1');
+      useUnreadStore.setState({
+        allUnreadCounts: new Map([['c-s2', { serverId: 's2', count: 1 }]]),
+      });
+      handleTrayAction({ kind: 'open-unread' });
+      expect(useNotificationNavigationStore.getState().pendingNavigation).toEqual({
+        type: 'channel',
+        targetId: 'c-s2',
+        serverId: 's2',
+      });
+    });
+
+    it('skips a muted active-server channel in unreadCounts', () => {
+      const muted = { muted: true, mutedUntil: null, updatedAt: new Date(0) };
+      useServerStore.setState({ activeServerId: 's1' });
+      useUnreadStore.getState().setInitialUnreads(
+        new Map([
+          ['c-muted', 2],
+          ['c-open', 1],
+        ]),
+        's1'
+      );
+      useNotificationPrefsStore.setState({ mutedChannels: new Map([['c-muted', muted]]) });
+      try {
+        handleTrayAction({ kind: 'open-unread' });
+        expect(useNotificationNavigationStore.getState().pendingNavigation?.targetId).toBe(
+          'c-open'
+        );
+      } finally {
+        useNotificationPrefsStore.setState({ mutedChannels: new Map() });
       }
     });
 

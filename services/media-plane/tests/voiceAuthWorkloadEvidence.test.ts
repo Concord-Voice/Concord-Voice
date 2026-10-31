@@ -47,6 +47,8 @@ function response(exchange: Exchange, unsigned = false): Response {
     status: signed.status, headers: unsigned ? [] : signed.headers.map(({ name, value }) => [name, value]),
   });
 }
+// Distinct accounts, so filling the shared budget never trips the per-user cap.
+const filler = (index: number) => `${index.toString(16).padStart(8, '0')}-9999-4999-8999-999999999999`;
 function fixture() {
   const calls: Exchange[] = [];
   let answer: (exchange: Exchange) => Response | Promise<Response> = exchange => response(exchange);
@@ -70,9 +72,9 @@ function fixture() {
   const owners = new VoiceAuthConnections({ nodeBootId: boot, secret,
     controlPlaneUrl: 'https://control.test.invalid', now: () => clock, fetch: boundary });
   const disconnects = new Map<string, ReturnType<typeof vi.fn>>();
-  const reserve = (socketId: string) => {
+  const reserve = (socketId: string, userId = user) => {
     const disconnect = vi.fn(); disconnects.set(socketId, disconnect);
-    return owners.reserve({ socketId, userId: user, credentialEpoch: epoch, token,
+    return owners.reserve({ socketId, userId, credentialEpoch: epoch, token,
       tokenExpiresAt: clock + 60_000, disconnect });
   };
   const session = (owner: ConnectionHandle, index: number): VoiceEnforcementSession => ({
@@ -108,7 +110,7 @@ describe('Task 8 retained workload measurements', () => {
       f.owners.reserveRoom(parent, first, close);
       await f.owners.attachRoom(parent, first, token);
       for (let n = 2; n <= 500; n++) f.owners.reserveRoom(parent, f.session(parent, n), async () => {});
-      const idle = Array.from({ length: 499 }, (_, n) => f.reserve(`idle-${round}-${n}`));
+      const idle = Array.from({ length: 499 }, (_, n) => f.reserve(`idle-${round}-${n}`, filler(n)));
       expect(f.owners.retainedIdentityCount()).toBe(1000);
       memory(`round${round}:mixed1000`, f.owners.retainedIdentityCount(), 0);
       const calls = f.calls.length;

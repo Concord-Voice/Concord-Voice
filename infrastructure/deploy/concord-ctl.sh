@@ -2658,6 +2658,26 @@ voice_enforcement_rollout_activate() (
   activation="$(printf '%s' "$status" | python3 "$SCRIPT_DIR/voice-boot-containment.py" status --field familyActivation)" || return 1
   if [[ "$activation" == active ]]; then
     # Maintenance reproves capability and preserves the first committed receipt.
+    # A blue/green handoff leaves only the active colour running (#4210).
+    inventory="$(voice_enforcement_rollout_inventory)" || return 1
+    [[ "$inventory" == *$'\n'* ]] || return 1
+    if [[ "${inventory#*$'\n'}" != media-plane ]]; then
+      slot="$(media_bluegreen_redis GET media:active_colour)" || return 1
+      case "$slot" in
+        blue) id=green ;;
+        green) id=blue ;;
+        *) return 1 ;;
+      esac
+      # The other colour must not run or crash-loop beside the active one.
+      observed="$(cd "$DEPLOY_DIR" && { $COMPOSE_CMD ps --status running -q "media-plane-$id" \
+        && $COMPOSE_CMD ps --status restarting -q "media-plane-$id"; })" || return 1
+      [[ -z "$observed" ]] || {
+        echo "voice-enforcement-rollout: ${id} runs beside active ${slot}; refusing" >&2
+        return 1
+      }
+      voice_enforcement_rollout_probe_slots either "media-plane-$slot"
+      return
+    fi
     voice_enforcement_rollout_probe_slots either
     return
   fi
@@ -3324,13 +3344,18 @@ media_bluegreen_preflight() {
 # preparation runs both colours. Retire the colour that promotion does not
 # use, so the single-standby preflight sees the state it expects.
 media_bluegreen_retire_unpromoted() {
-  local active ids inventory
+  local active colour ids inventory
   active="$(media_bluegreen_redis GET media:active_colour)" || return 1
-  [[ -z "$active" ]] || return 0
-  ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q media-plane-green)" || return 1
+  # Only one colour may hold the voice-command owner record (#4210).
+  case "$active" in
+    ''|blue) colour=green ;;
+    green) colour=blue ;;
+    *) return 1 ;;
+  esac
+  ids="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${colour}")" || return 1
   [[ -n "$ids" ]] || return 0
   inventory="$(voice_enforcement_rollout_inventory)" || return 1
-  voice_enforcement_rollout_retire_slot "${inventory%%$'\n'*}" media-plane-green
+  voice_enforcement_rollout_retire_slot "${inventory%%$'\n'*}" "media-plane-${colour}"
 }
 
 voice_enforcement_rollout_prepare_slots() {
@@ -3353,7 +3378,7 @@ voice_enforcement_rollout_prepare_slots() {
 }
 
 media_bluegreen_cutover_locked() {
-  local active standby old_colour active_port standby_port tombstone old_generation status deadline running drain_started result
+  local active standby old_colour active_port standby_port tombstone old_generation running
   # Refuse before a prepared family's slot preparation stops any media; the
   # second preflight re-reads the state that preparation replaced.
   media_bluegreen_preflight >/dev/null || return 1
@@ -3411,6 +3436,10 @@ media_bluegreen_cutover_locked() {
     return 1
   fi
   standby_port="$(media_bluegreen_port "$standby")" || return 1
+  if [[ -n "$active_port" ]]; then
+    media_bluegreen_handoff_locked "$old_colour" "$standby" "$active_port" "$standby_port" "$old_generation"
+    return
+  fi
   if ! running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${standby}")"; then
     echo "media-bluegreen: cannot inspect standby ${standby}; refusing cutover" >&2
     return 1
@@ -3423,46 +3452,18 @@ media_bluegreen_cutover_locked() {
     managed_compose_build up -d --build --no-deps --wait \
       --wait-timeout 180 "media-plane-${standby}" || return 1
   fi
-  if ! media_bluegreen_probe_ready "$standby" true "$standby_port" 1 true; then
+  if ! media_bluegreen_wait_ready "$standby" "$standby_port"; then
     echo "media-bluegreen: standby ${standby} failed its identity, worker, or readiness gate" >&2
     return 1
   fi
-  drain_started="$(date +%s)" || return 1
-  [[ "$drain_started" =~ ^[1-9][0-9]{9,14}$ ]] || {
-    echo 'media-bluegreen: cannot record the drain deadline; refusing promotion' >&2
-    return 1
-  }
-
-  if [[ -n "$active_port" ]]; then
-    voice_enforcement_rollout_probe_slots either || return 1
-  else
-    # Slot preparation retired the colour a first promotion does not use, so
-    # only the standby runs; probing the exited colour would always refuse.
-    voice_enforcement_rollout_probe_slots either "media-plane-${standby}" || return 1
-  fi
+  # Slot preparation retired the colour a first promotion does not use, so
+  # only the standby runs; probing the exited colour would always refuse.
+  voice_enforcement_rollout_probe_slots either "media-plane-${standby}" || return 1
   if ! media_bluegreen_redis SADD media:colours:registered "$standby" >/dev/null; then
     echo 'media-bluegreen: registry write failed before promotion; active color is unchanged' >&2
     return 1
   fi
-  if [[ -n "$active_port" ]]; then
-    # Promotion and its deadline are one Redis transaction, including on crash.
-    if ! result="$(media_bluegreen_redis EVAL '
-      if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
-      redis.call("SET", KEYS[1], ARGV[2])
-      redis.call("SET", KEYS[2], ARGV[3])
-      return 1
-    ' 2 media:active_colour "media:colour_draining:${old_colour}" "$old_colour" "$standby" "${drain_started}:${old_generation}")"; then
-      active="$(media_bluegreen_redis GET media:active_colour)" || return 1
-      tombstone="$(media_bluegreen_redis GET "media:colour_draining:${old_colour}")" || return 1
-      [[ "$active" == "$standby" && "$tombstone" == "${drain_started}:${old_generation}" ]] || {
-        echo 'media-bluegreen: promotion and drain deadline were not confirmed' >&2
-        return 1
-      }
-    elif [[ "$result" != 1 ]]; then
-      echo 'media-bluegreen: active color changed before atomic promotion; refusing cutover' >&2
-      return 1
-    fi
-  elif ! media_bluegreen_redis SET media:active_colour "$standby" >/dev/null; then
+  if ! media_bluegreen_redis SET media:active_colour "$standby" >/dev/null; then
     # The first colour has no prior colour to drain; resolve an unacknowledged SET.
     active="$(media_bluegreen_redis GET media:active_colour)" || return 1
     [[ "$active" == "$standby" ]] || {
@@ -3470,22 +3471,249 @@ media_bluegreen_cutover_locked() {
       return 1
     }
   fi
-  if [[ -n "$active_port" ]]; then
-    deadline=$(( $(date +%s) + 90 ))
-    while :; do
-      status="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
-        "http://127.0.0.1:${active_port}/readyz" 2>/dev/null || true)"
-      if media_bluegreen_probe_ready "$old_colour" false "$active_port"; then
-        break
-      fi
-      if (( $(date +%s) >= deadline )); then
-        echo "media-bluegreen: ${old_colour} did not acknowledge draining within 90 seconds; tombstone remains" >&2
-        return 1
-      fi
-      sleep 2
-    done
+  echo "media-bluegreen: promoted ${standby}"
+}
+
+# A fresh boot reaches readiness only after its owner acquire and first signed
+# health round (#4204), so poll rather than take one sample.
+media_bluegreen_wait_ready() {
+  local colour="$1" port="$2" empty="${3:-true}" accept="${4:-true}"
+  local attempts="${MEDIA_BLUEGREEN_READY_ATTEMPTS:-30}" i workers=1
+  # The worker check reads /health behind a 200, so a drained 503 skips it.
+  # Live rooms can scale the pool past one worker, so only an empty check counts.
+  [[ "$accept" == true && "$empty" == true ]] || workers=''
+  [[ "$attempts" =~ ^[1-9][0-9]{0,3}$ ]] || {
+    echo 'media-bluegreen: MEDIA_BLUEGREEN_READY_ATTEMPTS must be 1-9999' >&2
+    return 1
+  }
+  for (( i = 1; ; i++ )); do
+    media_bluegreen_probe_ready "$colour" "$accept" "$port" "$workers" "$empty" && return 0
+    (( i < attempts )) || return 1
+    sleep 2
+  done
+}
+
+# #4210: the voice-command owner record (#4135) admits one media process at a
+# time, and the serving colour holds it until it stops, so a standby cannot
+# boot beside it. Two live colours would also both answer the global
+# enforcement request subjects, so an empty colour could acknowledge a
+# disconnect it never performed. Hand over instead: build first, stop the old
+# colour (its graceful stop releases the record), then start the standby.
+# Calls on the old colour drop and rejoin the new one.
+# The interrupt trap's action. A trap action runs under set -e afresh, and the
+# signals it handles usually arrive with the session's descriptors already
+# gone, so the restore must not depend on writing to them: docker compose dies
+# on a dead stderr even when the shell ignores PIPE.
+media_bluegreen_handoff_interrupted() {
+  local old="$1" standby="$2" old_port="$3" log="${CONFIG_ROOT}/logs/media-bluegreen-handoff.log"
+  trap '' HUP INT TERM PIPE
+  set +e
+  echo "media-bluegreen: interrupted; restoring ${old} (log: ${log})" >&2 || true
+  { mkdir -p "${CONFIG_ROOT}/logs" && : >>"$log"; } 2>/dev/null || log=/dev/null
+  exec >>"$log" 2>&1
+  echo "media-bluegreen: interrupted at $(date -u '+%Y-%m-%dT%H:%M:%SZ'); restoring ${old}"
+  media_bluegreen_handoff_restore "$old" "$standby" "$old_port" \
+    || echo "media-bluegreen: restore of ${old} FAILED; media-reap and the next rebuild retry it"
+  exit 1
+}
+
+media_bluegreen_handoff_locked() {
+  local old="$1" standby="$2" old_port="$3" standby_port="$4" old_generation="$5"
+  local running drain_started result active tombstone saved_traps log rc=0 unconfirmed=0
+  if ! running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${standby}")"; then
+    echo "media-bluegreen: cannot inspect standby ${standby}; refusing cutover" >&2
+    return 1
   fi
-  echo "media-bluegreen: promoted ${standby}; prior color is serving existing rooms until reap"
+  if [[ -n "$running" ]]; then
+    echo "media-bluegreen: standby ${standby} is running beside active ${old}; stop it before a cutover" >&2
+    return 1
+  fi
+  # Everything that can refuse runs while the old colour still serves.
+  echo "media-bluegreen: building standby ${standby}"
+  managed_compose_build build "media-plane-${standby}" || return 1
+  (cd "$DEPLOY_DIR" && managed_compose_mutate rm -f "media-plane-${standby}") || {
+    echo "media-bluegreen: stopped ${standby} container cannot be removed; ${old} still serves." >&2
+    echo "media-bluegreen: a container stopped outside concord-ctl.sh has no retired association; inspect it, then: sudo docker rm concordvoice-media-plane-${standby}" >&2
+    return 1
+  }
+  drain_started="$(date +%s)" || return 1
+  [[ "$drain_started" =~ ^[1-9][0-9]{9,14}$ ]] || {
+    echo 'media-bluegreen: cannot record the drain deadline; refusing promotion' >&2
+    return 1
+  }
+  if ! media_bluegreen_redis SADD media:colours:registered "$standby" >/dev/null; then
+    echo 'media-bluegreen: registry write failed before promotion; active color is unchanged' >&2
+    return 1
+  fi
+  # Promotion and its drain marker are one Redis transaction, including on crash.
+  if ! result="$(media_bluegreen_redis EVAL '
+    if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+    redis.call("SET", KEYS[1], ARGV[2])
+    redis.call("SET", KEYS[2], ARGV[3])
+    return 1
+  ' 2 media:active_colour "media:colour_draining:${old}" "$old" "$standby" "${drain_started}:${old_generation}")"; then
+    # The reply was lost. Only a readback naming another colour proves the
+    # promotion did not commit; anything else is restored below.
+    active="$(media_bluegreen_redis GET media:active_colour)" || active=''
+    if [[ -n "$active" && "$active" != "$standby" ]]; then
+      echo 'media-bluegreen: promotion did not commit; active color is unchanged' >&2
+      return 1
+    fi
+    tombstone="$(media_bluegreen_redis GET "media:colour_draining:${old}")" || tombstone=''
+    [[ "$active" == "$standby" && "$tombstone" == "${drain_started}:${old_generation}" ]] || unconfirmed=1
+  elif [[ "$result" != 1 ]]; then
+    echo 'media-bluegreen: active color changed before atomic promotion; refusing cutover' >&2
+    return 1
+  fi
+  # From here the old colour is fenced; every failure and catchable signal
+  # restores it. A run killed outright is recovered by the next rebuild.
+  # A cancelled CD job closes stdout, so a write raises PIPE rather than HUP.
+  # The restore itself runs with these signals ignored, and logs to a file
+  # because a dropped session takes stdout and stderr with it.
+  saved_traps="$(trap -p HUP INT TERM PIPE)"
+  trap 'media_bluegreen_handoff_interrupted "$old" "$standby" "$old_port"' HUP INT TERM PIPE
+  if (( unconfirmed )); then
+    echo 'media-bluegreen: promotion and drain deadline were not confirmed' >&2
+    rc=1
+  else
+    media_bluegreen_handoff_finish "$old" "$standby" "$old_port" "$standby_port" || rc=$?
+  fi
+  if (( rc != 0 )); then
+    trap '' HUP INT TERM PIPE
+    # Tee stderr to the log: a session dropped mid-restore must not take
+    # docker compose down with it.
+    log="${CONFIG_ROOT}/logs/media-bluegreen-handoff.log"
+    { mkdir -p "${CONFIG_ROOT}/logs" && : >>"$log"; } 2>/dev/null || log=/dev/null
+    media_bluegreen_handoff_restore "$old" "$standby" "$old_port" 2> >(tee -a -p "$log" >&2) || echo \
+      "media-bluegreen: restore of ${old} FAILED; check media:active_colour, since no colour may be serving; media-reap and the next rebuild retry it ([internal]deploys.md)" >&2
+  fi
+  trap - HUP INT TERM PIPE
+  eval "$saved_traps"
+  (( rc == 0 )) || return 1
+  echo "media-bluegreen: handed over from ${old} to ${standby}; media-reap removes ${old}"
+}
+
+# The post-promotion half of a handoff; any non-zero return is restored.
+media_bluegreen_handoff_finish() {
+  local old="$1" standby="$2" old_port="$3" standby_port="$4" deadline result
+  # No new room starts on the old colour while it stops.
+  deadline=$(( $(date +%s) + 90 ))
+  until media_bluegreen_probe_ready "$old" false "$old_port"; do
+    if (( $(date +%s) >= deadline )); then
+      echo "media-bluegreen: ${old} did not acknowledge draining within 90 seconds" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  # Unregistered plus a drain marker is the reaper's stopped-colour state.
+  result="$(media_bluegreen_redis SREM media:colours:registered "$old")" || return 1
+  [[ "$result" =~ ^[01]$ ]] || return 1
+  echo "media-bluegreen: stopping ${old} to hand over voice-command ownership"
+  voice_enforcement_rollout_retire_named "media-plane-${old}" || {
+    echo "media-bluegreen: ${old} did not retire" >&2
+    return 1
+  }
+  # Rejoining calls must not meet the stopped colour's room markers. The
+  # standby is already active, so its readiness below allows their rooms.
+  media_bluegreen_sweep_markers "$old" "$standby" \
+    || echo "media-bluegreen: ${old} marker sweep failed; media-reap repeats it" >&2
+  echo "media-bluegreen: starting standby ${standby}"
+  if ! (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --no-deps --wait \
+      --wait-timeout 180 "media-plane-${standby}") \
+    || ! media_bluegreen_wait_ready "$standby" "$standby_port" false \
+    || ! voice_enforcement_rollout_probe_slots either "media-plane-${standby}"; then
+    echo "media-bluegreen: standby ${standby} did not take over" >&2
+    return 1
+  fi
+}
+
+# Stop a colour that may be crash-looping under its restart policy. Between
+# attempts it is "restarting", which retirement cannot hold, so end the loop
+# first (only the restart policy changes) and retire it only while it is up.
+media_bluegreen_stop_colour() {
+  local slot="media-plane-$1" inventory project id state i
+  inventory="$(voice_enforcement_rollout_inventory)" || return 1
+  project="${inventory%%$'\n'*}"
+  id="$(docker ps -a -q --no-trunc --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.service=$slot")" || return 1
+  [[ -n "$id" ]] || return 0
+  [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  docker update --restart=no "$id" >/dev/null || return 1
+  # A restart already scheduled in back-off (up to a minute) still happens
+  # once, and a boot too young to retire may still crash, so keep looking.
+  for (( i = 0; i < 45; i++ )); do
+    state="$(docker inspect --type container --format '{{.State.Status}}' "$id")" || return 1
+    case "$state" in
+      exited|dead|created) return 0 ;;
+      running) voice_enforcement_rollout_retire_named "$slot" && return 0 ;;
+    esac
+    sleep 2
+  done
+  return 1
+}
+
+# Put the old colour back after a failed handoff. Re-entrant: the drain marker
+# stays until the old colour runs again, so a restore that dies part-way still
+# looks stranded to media_bluegreen_recover_stranded.
+media_bluegreen_handoff_restore() {
+  local old="$1" standby="$2" old_port="$3" running result
+  media_bluegreen_stop_colour "$standby" || {
+    echo "media-bluegreen: ${standby} cannot be stopped, so ${old} cannot be restored; see [internal]deploys.md" >&2
+    return 1
+  }
+  media_bluegreen_redis SADD media:colours:registered "$old" >/dev/null || return 1
+  running="$(cd "$DEPLOY_DIR" && $COMPOSE_CMD ps --status running -q "media-plane-${old}")" || return 1
+  if [[ -z "$running" ]]; then
+    if ! (cd "$DEPLOY_DIR" && managed_compose_mutate up -d --no-build --no-deps --wait \
+        --wait-timeout 180 "media-plane-${old}") \
+      || ! media_bluegreen_wait_ready "$old" "$old_port" false false; then
+      echo "media-bluegreen: ${old} cannot start. If it lacks a retired association, inspect it, then: sudo docker rm concordvoice-media-plane-${old}." >&2
+      echo "media-bluegreen: if a crashed ${standby} boot still holds the voice-command owner record, recover it first ([internal]voice-command-transport.md)." >&2
+      return 1
+    fi
+  fi
+  # Idempotent: a promotion that never committed already names the old colour.
+  result="$(media_bluegreen_redis EVAL '
+    local active = redis.call("GET", KEYS[1])
+    if active ~= ARGV[1] and active ~= ARGV[2] then return 0 end
+    redis.call("SET", KEYS[1], ARGV[2])
+    redis.call("DEL", KEYS[2])
+    return 1
+  ' 2 media:active_colour "media:colour_draining:${old}" "$standby" "$old")" || return 1
+  [[ "$result" == 1 ]] || return 1
+  media_bluegreen_redis SREM media:colours:registered "$standby" >/dev/null || return 1
+  media_bluegreen_wait_ready "$old" "$old_port" false || {
+    echo "media-bluegreen: restored ${old} is not ready; see [internal]deploys.md" >&2
+    return 1
+  }
+  # Healthwatch restarts a colour only while its partner container is absent.
+  (cd "$DEPLOY_DIR" && managed_compose_mutate rm -f "media-plane-${standby}") \
+    || echo "media-bluegreen: stopped ${standby} kept; inspect it, then: sudo docker rm concordvoice-media-plane-${standby}" >&2
+  echo "media-bluegreen: restored ${old}; the cutover failed" >&2
+}
+
+# A handoff killed after promotion leaves the active colour not running while
+# the old colour keeps its drain marker. Restore it before anything else, then
+# stop so an operator sees the failed deploy before the next attempt.
+media_bluegreen_recover_stranded() {
+  local active old running tombstone port
+  active="$(media_bluegreen_redis GET media:active_colour)" || return 1
+  case "$active" in
+    blue) old=green ;;
+    green) old=blue ;;
+    *) return 0 ;;
+  esac
+  # A restarting active colour is not stranded; leave it to its policy.
+  running="$(cd "$DEPLOY_DIR" && { $COMPOSE_CMD ps --status running -q "media-plane-${active}" \
+    && $COMPOSE_CMD ps --status restarting -q "media-plane-${active}"; })" || return 1
+  [[ -z "$running" ]] || return 0
+  tombstone="$(media_bluegreen_redis EXISTS "media:colour_draining:${old}")" || return 1
+  [[ "$tombstone" == 1 ]] || return 0
+  port="$(media_bluegreen_port "$old")" || return 1
+  echo "media-bluegreen: active ${active} is not running and ${old} is drained; restoring ${old}" >&2
+  media_bluegreen_handoff_restore "$old" "$active" "$port" || return 1
+  echo "media-bluegreen: ${old} serves again; rerun the deploy to retry the cutover" >&2
+  return 1
 }
 
 media_bluegreen_sweep_markers() {
@@ -3534,6 +3762,12 @@ media_bluegreen_reap_one() {
   }
   [[ "$active" != "$colour" ]] || {
     echo "media-bluegreen: refusing to reap active color ${colour}" >&2
+    return 1
+  }
+  # Until the active colour is proven ready, a drained colour is the only one
+  # a restore can bring back (#4210); never reap it then.
+  media_bluegreen_probe_ready "$active" true "$(media_bluegreen_port "$active")" || {
+    echo "media-bluegreen: active ${active} is not ready; keeping ${colour} for recovery" >&2
     return 1
   }
   result="$(media_bluegreen_redis SISMEMBER media:colours:registered "$colour")" || return 1
@@ -3932,6 +4166,13 @@ media_bluegreen_reap() {
     echo 'media-bluegreen: no drained colors to reap'
     return 0
   }
+  # A handoff killed outright (#4210) heals within a minute, and alerts.
+  if ! media_bluegreen_recover_stranded; then
+    mkdir -p "${CONFIG_ROOT}/logs" 2>/dev/null || true
+    printf 'media reaper found a stranded handoff, or could not check for one, at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      >"${CONFIG_ROOT}/logs/media-reap-alert.flag" 2>/dev/null || true
+    return 1
+  fi
   active="$(media_bluegreen_redis GET media:active_colour)" || return 1
   [[ "$active" =~ ^(blue|green)$ ]] || {
     echo 'media-bluegreen: active color is absent or invalid; refusing reap' >&2
@@ -5143,6 +5384,7 @@ media_bluegreen_rebuild_locked() {
       [[ "$scope_token" == control-plane ]] && start_cp=1
     done
   fi
+  media_bluegreen_recover_stranded || return 1
   snapshot="$(media_bluegreen_preflight "$start_cp")" || return 1
   active="${snapshot%%:*}"
   standby="${snapshot#*:}"
@@ -5178,6 +5420,12 @@ media_bluegreen_rebuild_locked() {
     fi
     if (( $# != 1 || start_media != 1 )); then
       echo 'redis-managed: ordinary blue/green rebuild supports one media-colour scope only' >&2
+      return 1
+    fi
+    # Cold preparation starts the standby beside the active colour, which the
+    # single voice-command owner record forbids (#4210); refuse before it runs.
+    if [[ "$active" != none ]]; then
+      echo 'redis-managed: a cutover from an active colour is not supported on managed Redis yet (#4210); refusing before preparation' >&2
       return 1
     fi
   fi
@@ -5717,7 +5965,7 @@ case "${1:-help}" in
     selfhost_storage_start_guard || _storage_status_rc=1
     echo "=== Concord Service Status ==="
     # NOTE: Branch + commit info no longer surfaced — server has no .git/ post-#848.
-    # See `gh api repos/Concord-Voice/Concord-Voice-Alpha/deployments` for deploy history.
+    # See `gh api repos/Concord-Voice/Hosted/deployments` for deploy history.
     if [[ -f "${CONFIG_ROOT}/.deploy-meta" ]]; then
       echo "Last deploy:"
       cat "${CONFIG_ROOT}/.deploy-meta" | sed 's/^/  /'

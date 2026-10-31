@@ -15,7 +15,7 @@ import type { JoinRoomResult } from '../src/lib/roomManager.js';
 import type { MediasoupService } from '../src/lib/mediasoup.js';
 import { isCanonicalEnforcementUUID } from '../src/lib/enforcementCommand.js';
 import type { AuthenticatedSocketData } from '../src/middleware/auth.js';
-import { resolveParticipantIdentity } from '../src/middleware/auth.js';
+import { attestationRelayHeaders, resolveParticipantIdentity } from '../src/middleware/auth.js';
 import { createMockRouter, createRtpCapabilities } from './mocks/mediasoup.js';
 import type { VoiceEnforcementSession } from '../src/lib/voiceEnforcementSession.js';
 import { mediaPolicyCooldownAck } from '../src/lib/mediaPolicyWire.js';
@@ -58,6 +58,8 @@ function productionRegister(bindings: Record<string, unknown>) {
     .runInNewContext(bindings) as (socket: unknown, data: unknown, deps: unknown) => void;
 }
 
+// Distinct accounts, so filling the shared budget never trips the per-user cap.
+const filler = (index: number) => `${index.toString(16).padStart(8, '0')}-9999-4999-8999-999999999999`;
 async function fixture(identityCount: number) {
   const now = Date.now();
   const requests: protocol.Request[] = [];
@@ -100,11 +102,11 @@ async function fixture(identityCount: number) {
     controlPlaneUrl: 'https://control.test.invalid', now: () => now, fetch: fetchBoundary });
   const handles = new Map<string, ConnectionHandle>();
   const lease = new VoiceEnforcementLease(() => 0); lease.renew();
-  const reserve = (socketId: string) => owners.reserve({ socketId, userId: user, credentialEpoch: epoch,
+  const reserve = (socketId: string, userId = user) => owners.reserve({ socketId, userId, credentialEpoch: epoch,
     token, tokenExpiresAt: now + 60_000, disconnect: () => {} });
   const first = reserve('join-idle-a'); await owners.register(first); handles.set('join-idle-a', first);
   const second = reserve('join-idle-b'); await owners.register(second); handles.set('join-idle-b', second);
-  for (let index = 2; index < identityCount; index++) reserve(`retained-${index}`);
+  for (let index = 2; index < identityCount; index++) reserve(`retained-${index}`, filler(index));
   const authorization = deferred<Access>();
   const validateChannelAccess = vi.fn(() => authorization.promise);
   const nativeService = {
@@ -120,7 +122,7 @@ async function fixture(identityCount: number) {
   const joinRoom = vi.spyOn(manager, 'joinRoom');
   const register = productionRegister({ ...lifecycle, randomUUID, Date, Error, Promise,
     getVoiceAuthConnection: (socket: { id: string }) => handles.get(socket.id),
-    voiceEnforcementNodeBootId: boot, validateChannelAccess, getIdentityAuthorityReasonCode,
+    voiceEnforcementNodeBootId: boot, validateChannelAccess, attestationRelayHeaders, getIdentityAuthorityReasonCode,
     registerVoiceEnforcementSession: async (_token: string, session: Parameters<typeof owners.attachRoom>[1]) => {
       const handle = handles.get(session.socketId);
       if (!handle) throw new Error('Missing actual registered owner');

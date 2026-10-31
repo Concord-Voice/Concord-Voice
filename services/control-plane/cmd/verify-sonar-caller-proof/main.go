@@ -23,7 +23,7 @@ import (
 
 const (
 	githubIssuer = "https://token.actions.githubusercontent.com"
-	repository   = "Concord-Voice/Concord-Voice-Alpha"
+	repository   = "Concord-Voice/Hosted"
 	repositoryID = "1158152129"
 	// A ruleset-loaded required workflow signs its ref as @main, not
 	// @refs/heads/main (observed on the 2026-10-30 canary).

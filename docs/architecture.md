@@ -833,8 +833,11 @@ login-enabled role must revoke successfully, or startup fails closed.
 The optional two-colour rail uses the control plane's `internal/roomplacement`
 package to claim room ownership in Redis. `ROOM_PLACEMENT_ENABLED` defaults to
 `false`; managed deployment keeps the `media-single` profile until the explicit
-blue/green gate is cleared. First East activation remains separately gated by
-the quiescent-bootstrap procedure, and West remains staging-only. These source
+blue/green gate is cleared. Because the voice-command owner record admits one
+media process at a time, a cutover retires the old colour before the standby
+starts rather than draining it beside the new one (#4210).
+First East activation remains separately gated by the quiescent-bootstrap
+procedure, and West remains staging-only. These source
 defaults do not establish live host state; see [ADR-0042](adr/0042-blue-green-media-instances.md)
 and the [deploy runbook](runbooks/deploys.md).
 
@@ -1846,7 +1849,6 @@ Concord/
 │   ├── src/renderer/         # React app (stores/, services/, components/, hooks/)
 │   ├── src/shared/           # Cross-process types (clientBehavior, spaIpcTypes, spaUrlPattern)
 │   └── src/constants/        # Typed constants + build-time generators
-├── client/mobile/            # React Native iOS/Android client (pre-alpha; native/ConcordCrypto crypto pod)
 ├── services/
 │   ├── control-plane/        # Go backend (generated internal-package count; migrations/)
 │   │   ├── internal/erasureclear/  # Authenticated account-erasure audience batches

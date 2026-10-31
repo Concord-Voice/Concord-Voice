@@ -79,7 +79,7 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	t.Cleanup(fixture.server.Close)
 	fixture.claims = map[string]any{
 		"iss": fixture.server.URL, "aud": audienceBase + hex.EncodeToString(digest[:]),
-		"sub": "repo:Concord-Voice/Concord-Voice-Alpha:pull_request",
+		"sub": "repo:Concord-Voice/Hosted:pull_request",
 		// GitHub's live shape: nbf five minutes before iat, five-minute lifetime.
 		"iat": now.Add(-time.Minute).Unix(), "nbf": now.Add(-6 * time.Minute).Unix(),
 		"exp":           now.Add(4 * time.Minute).Unix(),

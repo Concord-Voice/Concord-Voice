@@ -38,6 +38,8 @@ import {
   createVoiceAuthConnectionMiddleware,
   getVoiceAuthConnection,
   createSocketTokenRenewal,
+  attestationRelayHeaders,
+  updateAttestationRelay,
   parsePermissionBitfield,
   releaseDMVoiceAuthorization,
   validateChannelAccess,
@@ -641,7 +643,12 @@ function registerJoinRoomHandler(
           closeEmptyRoom: (expectedCallId) => roomManager.closeEmptyDMRoom(roomId, expectedCallId),
           queuedJoinCount: dmJoinFence.pending(roomId),
           releaseAuthorization: (releaseCallId) =>
-            releaseDMVoiceAuthorization(roomId, token, releaseCallId),
+            releaseDMVoiceAuthorization(
+              roomId,
+              token,
+              releaseCallId,
+              attestationRelayHeaders(socket.handshake.auth)
+            ),
           room: room
             ? { callId: room.callId, participantCount: room.participants.size }
             : undefined,
@@ -673,7 +680,8 @@ function registerJoinRoomHandler(
             token,
             roomKind,
             requestedCallId,
-            admissionId ? { admissionId, socketId: socket.id, activate } : undefined
+            admissionId ? { admissionId, socketId: socket.id, activate } : undefined,
+            attestationRelayHeaders(socket.handshake.auth)
           );
           if (roomKind === 'dm') dmCallId.observe(access.callId);
           return access;
@@ -1730,6 +1738,11 @@ async function main() {
       event: RoomEventName,
       handler: H
     ): void => registerRateLimited(limitedSocket, event, handler, socketRateLimitDeps);
+    // A re-minted attestation token, sent just before refresh-auth so the
+    // renewal hop relays it (#4206). Older media planes ignore the event.
+    withRateLimit(socket, 'refresh-attestation', (attestationToken) => {
+      updateAttestationRelay(socket, attestationToken);
+    });
     withRateLimit(
       socket,
       'refresh-auth',

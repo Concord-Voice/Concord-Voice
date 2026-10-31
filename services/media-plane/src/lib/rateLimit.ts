@@ -34,6 +34,7 @@ export type Clock = () => number;
 /** Every client-invokable room event. `disconnect` is a lifecycle event and is excluded. */
 export type RoomEventName =
   | 'refresh-auth'
+  | 'refresh-attestation'
   | 'join-room'
   | 'update-rtp-capabilities'
   | 'create-transport'
@@ -63,6 +64,7 @@ export type RoomEventName =
  */
 export const EVENT_BUDGETS: Record<RoomEventName, RateBudget> = {
   'refresh-auth': { capacity: 5, refillPerSec: 0.1 },
+  'refresh-attestation': { capacity: 5, refillPerSec: 0.1 },
   'join-room': { capacity: 5, refillPerSec: 0.5 },
   'update-rtp-capabilities': { capacity: 5, refillPerSec: 0.5 },
   // 12, not 8. A stock join spends 3; a picture-in-picture window adds a 4th
@@ -104,7 +106,7 @@ export const FALLBACK_BUDGET: RateBudget = { capacity: 5, refillPerSec: 0.5 };
  * narrower rest type (`never[]` / `unknown[]`) makes a real `Socket`
  * unassignable to `RateLimitedSocket` under `strictFunctionTypes`, and — worse
  * — contextually types every wrapped handler's parameters as `never`, so
- * `callback(...)` stops being callable at all 18 registration sites. Mirroring
+ * `callback(...)` stops being callable at every registration site. Mirroring
  * the upstream type keeps each handler body type-checking exactly as it did
  * when it was registered through `socket.on` directly.
  *
@@ -114,7 +116,7 @@ export const FALLBACK_BUDGET: RateBudget = { capacity: 5, refillPerSec: 0.5 };
  * handler, so each body keeps its own parameter types, and the wrapper's own
  * listener takes `unknown[]`. No security decision reads a value typed `any`:
  * `consumeToken`, the budget lookup, and the overflow branch are unchanged.
- * The alternative — narrowing here and casting at all 18 registration sites —
+ * The alternative — narrowing here and casting at every registration site —
  * would spread `any` across the call sites instead of confining it to one
  * documented type alias.
  */

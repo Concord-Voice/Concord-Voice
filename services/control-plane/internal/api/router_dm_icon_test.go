@@ -139,7 +139,7 @@ func newDMIconRouterFixture(t *testing.T, configured bool) *dmIconRouterFixture 
 		ControlPlaneReplicaCountExplicit: true,
 		ClientMinVersion:                 "0.2.44", RequireClientAttestation: true,
 		OIDCIssuer: dmIconRouterDiscovery(t), OIDCAudience: "icon-router-tests",
-		OIDCSubjectPrefix: "repo:Concord-Voice/Concord-Voice-Alpha:",
+		OIDCSubjectPrefix: "repo:Concord-Voice/Hosted:",
 		OIDCSPAWorkflow:   "main-cd.yml", OIDCSPARef: "refs/heads/main",
 		OIDCBinaryWorkflow: "build-desktop.yml", OIDCBinaryRef: "refs/heads/main",
 	}

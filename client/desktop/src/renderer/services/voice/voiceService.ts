@@ -51,6 +51,12 @@ import {
 } from '../../stores/voice/videoSettingsStore';
 import { apiFetch } from '../system/apiClient';
 import {
+  getAttestationTokenSafe,
+  loadMediaAttestationRelay,
+  type MediaAttestationRelay,
+} from '../system/attestationToken';
+import { getApiBase } from '../system/runtimeServerBase';
+import {
   BYPASS_PROBE_DELAY_MS,
   buildDecryptCreationAttach,
   BYPASS_PROBE_MAX_ATTEMPTS,
@@ -863,6 +869,8 @@ class VoiceService {
   private mediaHandshake: { token: string | null; generation: number; admitted: boolean } | null =
     null;
   private authRenewalRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Relayed by the media plane on its control-plane hops (#4206).
+  private mediaAttestation: MediaAttestationRelay = {};
   private device: Device | null = null;
   private sendTransport: mediasoupTypes.Transport | null = null;
   // Split recv transports for E2EE channels — avoids BUNDLE codec collision (#291).
@@ -4258,6 +4266,9 @@ class VoiceService {
   ): Promise<void> {
     this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
     if (!useAuthStore.getState().accessToken) throw new Error('Not authenticated');
+    const attestationRelay = await loadMediaAttestationRelay(getApiBase());
+    this.requireJoinOwnership(recoveryOwner, cleanupGeneration);
+    this.mediaAttestation = attestationRelay;
 
     this.socket = io(joinData.media_server_url, {
       // Read the current token for the initial handshake and each Socket.IO reconnect.
@@ -4271,13 +4282,24 @@ class VoiceService {
           admitted: false,
         };
         // The JWT authorizes the participant; room_kind only selects the server validation path.
-        cb({
-          token: auth.accessToken,
-          username: user?.username || 'unknown',
-          displayName: user?.display_name || undefined,
-          avatarUrl: user?.avatar_url || undefined,
-          room_kind: joinType === 'dm' ? 'dm' : 'channel',
-        });
+        const send = () =>
+          cb({
+            token: auth.accessToken,
+            username: user?.username || 'unknown',
+            displayName: user?.display_name || undefined,
+            avatarUrl: user?.avatar_url || undefined,
+            room_kind: joinType === 'dm' ? 'dm' : 'channel',
+            // The media plane takes the session id from the bearer's own sid.
+            ...this.mediaAttestation,
+          });
+        // Re-read the attestation token on every attempt: one re-minted while
+        // the socket was down would otherwise be refused on reconnect.
+        void getAttestationTokenSafe()
+          .then((fresh) => {
+            const { attestation_token: _stale, ...rest } = this.mediaAttestation;
+            this.mediaAttestation = fresh ? { ...rest, attestation_token: fresh } : rest;
+          })
+          .finally(send);
       },
       transports: ['websocket', 'polling'],
       // Keep polling as fallback when the initial WebSocket transport cannot open.
@@ -9756,23 +9778,40 @@ class VoiceService {
       handshake.token !== token;
     if (!socket || !canRenew()) return;
     this.clearAuthRenewalRetry();
-    socket.timeout(5_000).emit('refresh-auth', token, (error: Error | null, response: unknown) => {
-      if (
-        retry ||
-        (!error &&
-          typeof response === 'object' &&
-          response !== null &&
-          'success' in response &&
-          response.success === true) ||
-        !canRenew()
-      ) {
-        return;
-      }
-      this.authRenewalRetryTimer = setTimeout(() => {
-        this.authRenewalRetryTimer = null;
-        if (canRenew()) this.refreshAuthentication(token, true);
-      }, 10_000);
-    });
+    // The renewal hop relays the attestation token the media plane holds, so
+    // read the current one first: a token re-minted since the join must reach
+    // the media plane before refresh-auth (events on one socket arrive in
+    // order). A null read means it expired or was cleared, so the media plane
+    // is told to drop its copy too rather than relay a token from the old session.
+    void getAttestationTokenSafe()
+      .then((fresh) => {
+        const { attestation_token: _stale, ...rest } = this.mediaAttestation;
+        this.mediaAttestation = fresh ? { ...rest, attestation_token: fresh } : rest;
+        if (!canRenew()) return;
+        socket.emit('refresh-attestation', fresh);
+        socket
+          .timeout(5_000)
+          .emit('refresh-auth', token, (error: Error | null, response: unknown) => {
+            if (
+              retry ||
+              (!error &&
+                typeof response === 'object' &&
+                response !== null &&
+                'success' in response &&
+                response.success === true) ||
+              !canRenew()
+            ) {
+              return;
+            }
+            // Two overlapping renewals can both land here; keep only one timer.
+            this.clearAuthRenewalRetry();
+            this.authRenewalRetryTimer = setTimeout(() => {
+              this.authRenewalRetryTimer = null;
+              if (canRenew()) this.refreshAuthentication(token, true);
+            }, 10_000);
+          });
+      })
+      .catch((err: unknown) => console.warn('[voice] auth renewal failed:', errorMessage(err)));
   }
 
   private setupSocketListeners(): void {

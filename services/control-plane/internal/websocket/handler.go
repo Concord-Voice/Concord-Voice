@@ -113,12 +113,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// Authenticate: prefer ticket-based auth, fall back to JWT for backward compat
 	userID, sessionID, err := h.authenticateWebSocket(c)
 	if err != nil {
-		status, message := http.StatusUnauthorized, "Unauthorized"
-		if errors.Is(err, loginfamily.ErrUnavailable) {
-			status, message = http.StatusServiceUnavailable, "Authentication temporarily unavailable"
-		} else if errors.Is(err, loginfamily.ErrContract) {
-			status = http.StatusInternalServerError
-		}
+		status, message := webSocketAuthFailure(err)
 		c.JSON(status, gin.H{"error": message})
 		return
 	}
@@ -248,21 +243,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 			return
 		}
 	}
-	// The theft sweep can complete and clear its temporary deny marker while an
-	// upgrade is waiting for hub registration. Compare the durable generation
-	// captured before the first theft check, then repeat the pending-state gate.
-	// A sweep after this check is ordered after registration and disconnects us.
-	generation, err := h.readTokenTheftGeneration(c.Request.Context(), userID)
-	if err == nil {
-		initial, ok := c.Get(wsTheftGenerationContextKey)
-		snapshot, valid := initial.(int64)
-		if !ok || !valid || generation != snapshot {
-			err = fmt.Errorf("token theft generation changed during WebSocket registration")
-		} else {
-			err = middleware.CheckTokenTheftBlocked(c.Request.Context(), h.redis, h.db, userID.String())
-		}
-	}
-	if err != nil {
+	if err := h.recheckTokenTheft(c, userID); err != nil {
 		client.stopTokenExpiry()
 		log.Printf("Evicting WebSocket client for user %s: token theft state changed: %v", sanitizeLogValue(userID.String()), err)
 		client.requestUnregister()
@@ -287,6 +268,38 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	client.admissionOwners.Add(2)
 	go client.writePump()
 	go client.readPump()
+}
+
+// webSocketAuthFailure maps an authentication error to its HTTP status and
+// client-facing message.
+func webSocketAuthFailure(err error) (int, string) {
+	switch {
+	case errors.Is(err, loginfamily.ErrUnavailable):
+		return http.StatusServiceUnavailable, "Authentication temporarily unavailable"
+	case errors.Is(err, loginfamily.ErrContract):
+		return http.StatusInternalServerError, "Unauthorized"
+	default:
+		return http.StatusUnauthorized, "Unauthorized"
+	}
+}
+
+// recheckTokenTheft repeats the theft gate after hub registration. The theft
+// sweep can complete and clear its temporary deny marker while an upgrade is
+// waiting for hub registration. Compare the durable generation captured before
+// the first theft check, then repeat the pending-state gate. A sweep after this
+// check is ordered after registration and disconnects us. A nil return is the
+// only admit.
+func (h *Handler) recheckTokenTheft(c *gin.Context, userID uuid.UUID) error {
+	generation, err := h.readTokenTheftGeneration(c.Request.Context(), userID)
+	if err != nil {
+		return err
+	}
+	initial, ok := c.Get(wsTheftGenerationContextKey)
+	snapshot, valid := initial.(int64)
+	if !ok || !valid || generation != snapshot {
+		return fmt.Errorf("token theft generation changed during WebSocket registration")
+	}
+	return middleware.CheckTokenTheftBlocked(c.Request.Context(), h.redis, h.db, userID.String())
 }
 
 func requestSupportsActivityRichPresence(request *http.Request) bool {

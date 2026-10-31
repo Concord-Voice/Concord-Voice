@@ -377,7 +377,7 @@ type Config struct {
 	AppAttestAllowDevelopment bool     // Accept development-environment keys; refused in production
 	OIDCIssuer                string   // GitHub Actions OIDC issuer (typically token.actions.githubusercontent.com)
 	OIDCAudience              string   // Expected OIDC audience claim
-	OIDCSubjectPrefix         string   // Required OIDC sub prefix (e.g. "repo:Concord-Voice/Concord-Voice-Alpha:")
+	OIDCSubjectPrefix         string   // Required OIDC sub prefix (e.g. "repo:Concord-Voice/Hosted:")
 	// Per-axis OIDC binding (W1, #677 reconciliation). The SPA publish path
 	// and binary publish path are issued from DIFFERENT GitHub Actions
 	// workflows (main-cd.yml vs build-desktop.yml). Each axis is bound to
@@ -583,7 +583,7 @@ func Load() (*Config, error) {
 		AppAttestAllowDevelopment: getEnv("APP_ATTEST_ALLOW_DEVELOPMENT", "false") == "true",
 		OIDCIssuer:                getEnv("ATTESTATION_OIDC_ISSUER", "https://token.actions.githubusercontent.com"),
 		OIDCAudience:              getEnv("ATTESTATION_OIDC_AUDIENCE", ""),
-		OIDCSubjectPrefix:         getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:Concord-Voice/Concord-Voice-Alpha:"),
+		OIDCSubjectPrefix:         getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:Concord-Voice/Hosted:"),
 		OIDCSPAWorkflow:           getEnv("ATTESTATION_OIDC_SPA_WORKFLOW", "main-cd.yml"),
 		OIDCSPARef:                getEnv("ATTESTATION_OIDC_SPA_REF", "refs/heads/main"),
 		// CAUTION (#2021 B3): the binary axis is dormant — nothing POSTs

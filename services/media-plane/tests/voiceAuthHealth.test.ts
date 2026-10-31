@@ -238,6 +238,8 @@ describe('real protocol-4 receiver and local readiness coordinator', () => {
 });
 
 import { VoiceAuthConnections } from '../src/lib/voiceAuthConnection.js';
+// Distinct accounts, so filling the shared budget never trips the per-user cap.
+const filler = (index: number) => `${index.toString(16).padStart(8, '0')}-9999-4999-8999-999999999999`;
 async function settle() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
 
 it('retains saturated real owners during hung native closure, then retries release under false productive authority', async () => {
@@ -268,7 +270,7 @@ it('retains saturated real owners during hung native closure, then retries relea
   await owner.register(handle);
   owner.reserveRoom(handle, { sessionGeneration: '00000007-1111-4111-8111-111111111111', nodeBootId: boot,
     roomId: '00000008-1111-4111-8111-111111111111', roomKind: 'channel', userId, credentialEpoch: '', socketId: 'health-native' }, closeNative);
-  for (let i = 2; i < 1000; i++) owner.reserve({ socketId: `health-capacity-${i}`, userId, credentialEpoch: '', token: 'test-health-token', tokenExpiresAt: wall + 60000, disconnect: () => {} });
+  for (let i = 2; i < 1000; i++) owner.reserve({ socketId: `health-capacity-${i}`, userId: filler(i), credentialEpoch: '', token: 'test-health-token', tokenExpiresAt: wall + 60000, disconnect: () => {} });
   expect(owner.retainedIdentityCount()).toBe(1000);
   const lease = new VoiceEnforcementLease(() => 0);
   const health = new VoiceEnforcementHealth({ lease, nodeBootId: boot,

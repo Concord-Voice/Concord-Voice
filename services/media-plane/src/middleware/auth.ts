@@ -43,6 +43,8 @@ interface JwtClaims {
   cred_epoch?: string;
   tier?: string;
   jti?: string;
+  /** Refresh-session id; the media plane relays it as X-Session-ID (bearerAttestationHeaders). */
+  sid?: string;
   iss?: string;
   iat?: number;
   exp?: number;
@@ -101,6 +103,8 @@ export function createVoiceAuthConnectionMiddleware(owner: VoiceAuthConnections,
       if (typeof token !== 'string' || !available()) throw new Error('Voice authentication unavailable');
       handle = owner.reserve({ socketId: socket.id, userId: data.userId,
         credentialEpoch: data.credentialEpoch, token, tokenExpiresAt: data.tokenExpiresAt,
+        // Read at each hop, so a refresh-attestation update reaches renewals.
+        relayHeaders: () => attestationRelayHeaders(socket.handshake.auth),
         disconnect: () => { socket.disconnect(true); } });
       voiceConnections.set(socket, { owner, handle });
       const exact = handle;
@@ -775,6 +779,77 @@ export function createServiceHopProofHeaders(
   };
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ATTESTATION_RELAY_FIELDS = [
+  ['attestation_token', 'X-Attestation-Token'],
+  ['machine_id', 'X-Machine-Id'],
+] as const;
+
+/**
+ * Relays the client's own attestation token and machine id on a hop that
+ * carries its bearer token (#4206, ADR-0010 D1 amendment 2026-09-02).
+ * RequireAttestation gates every authenticated route, and these values are
+ * what let the control plane find the token record. Relaying grants nothing
+ * the client lacks: the record is bound to the bearer's user, so a token
+ * belonging to another user is refused there (CV-CAN-013). Callers pass the
+ * SAME socket's handshake auth as the bearer they send, never another
+ * socket's. Only UUIDs pass, so a client cannot inject header syntax through
+ * the handshake. The session id is never taken from the client: see
+ * bearerAttestationHeaders.
+ */
+export function attestationRelayHeaders(auth: unknown): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (typeof auth !== 'object' || auth === null) return headers;
+  const fields = auth as Record<string, unknown>;
+  for (const [field, header] of ATTESTATION_RELAY_FIELDS) {
+    const value = fields[field];
+    if (typeof value === 'string' && UUID_PATTERN.test(value)) headers[header] = value;
+  }
+  if (headers['X-Attestation-Token'] && !headers['X-Machine-Id']) {
+    // Without a machine id the control plane looks under the web key and
+    // answers EXPIRED, which hides the real cause.
+    logger.warn('Attestation relay has a token but no usable machine id', {
+      event: 'attestation.relay_machine_id_unreadable',
+    });
+  }
+  return headers;
+}
+
+/**
+ * The relay as sent beside `token`. X-Session-ID comes from the bearer's own
+ * verified `sid`, so a client cannot point the lookup at another of its
+ * sessions (a revoked one, or another machine's), and a refresh that rotates
+ * the session moves the lookup with it. Without a relayed token nothing is
+ * added, and a bearer that does not verify gets no session header; the
+ * control plane refuses that bearer anyway.
+ */
+export function bearerAttestationHeaders(relay: Record<string, string>, token: string): Record<string, string> {
+  const headers = { ...relay };
+  delete headers['X-Session-ID'];
+  if (!headers['X-Attestation-Token']) return headers;
+  let sid: unknown;
+  try {
+    sid = verifySocketToken(token).sid;
+  } catch {
+    return headers;
+  }
+  if (typeof sid === 'string' && UUID_PATTERN.test(sid)) headers['X-Session-ID'] = sid;
+  return headers;
+}
+
+/**
+ * Accepts a re-minted attestation token for the next relayed hop on this
+ * socket. `null` means the client no longer holds one (expired, or cleared by
+ * a session rotation), so the stale copy is dropped instead of relayed.
+ */
+export function updateAttestationRelay(socket: Socket, attestationToken: unknown): void {
+  if (typeof attestationToken === 'string' && UUID_PATTERN.test(attestationToken)) {
+    socket.handshake.auth.attestation_token = attestationToken;
+  } else if (attestationToken === null) {
+    delete socket.handshake.auth.attestation_token;
+  }
+}
+
 // After the durable protocol is activated, the control plane accepts media
 // service hops only from a binary that proves it can register exact sessions.
 // The proof binds the raw request body so an attacker with a bearer token
@@ -854,7 +929,8 @@ function dmVoiceMediaRequest(
   method: 'POST' | 'DELETE',
   channelId: string,
   token: string,
-  callId?: string
+  callId?: string,
+  relay: Record<string, string> = {}
 ): RequestInit {
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const tokenDigest = createHash('sha256').update(token).digest('hex');
@@ -873,6 +949,7 @@ function dmVoiceMediaRequest(
       'Content-Type': 'application/json',
       'X-Concord-Media-Timestamp': timestamp,
       'X-Concord-Media-Proof': createHmac('sha256', proofKey).update(payload).digest('hex'),
+      ...bearerAttestationHeaders(relay, token),
       ...createServiceHopProofHeaders(method, dmVoiceAuthorizePath(channelId), token),
       ...(method === 'POST'
         ? createVoiceEnforcementCapabilityHeaders(
@@ -892,7 +969,8 @@ function channelAccessRequest(
   token: string,
   roomKind: RoomKind,
   requestedCallId?: string,
-  admission?: ChannelAdmissionHop
+  admission?: ChannelAdmissionHop,
+  relay: Record<string, string> = {}
 ): { endpoint: string; request: RequestInit } {
   const path =
     roomKind === 'dm' ? dmVoiceAuthorizePath(channelId) : channelVoiceJoinPath(channelId);
@@ -900,7 +978,7 @@ function channelAccessRequest(
   if (roomKind === 'dm') {
     return {
       endpoint,
-      request: dmVoiceMediaRequest('POST', channelId, token, requestedCallId),
+      request: dmVoiceMediaRequest('POST', channelId, token, requestedCallId, relay),
     };
   }
   // RequireMediaCapability hashes the raw bytes it reads before the channel
@@ -923,6 +1001,7 @@ function channelAccessRequest(
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
+        ...bearerAttestationHeaders(relay, token),
         ...createServiceHopProofHeaders('POST', path, token),
         ...createVoiceEnforcementCapabilityHeaders('POST', path, token, body),
       },
@@ -934,14 +1013,15 @@ function channelAccessRequest(
 export async function releaseDMVoiceAuthorization(
   conversationId: string,
   token: string,
-  callId: string
+  callId: string,
+  relay: Record<string, string> = {}
 ): Promise<void> {
   // Carries the same service-hop proof as the admission hop: this DELETE runs
   // under the identical `authRequired` chain, so without it a client-facing
   // gate 403s the RELEASE and strands the call lease.
   const response = await fetch(
     `${config.controlPlaneUrl}${dmVoiceAuthorizePath(conversationId)}`,
-    dmVoiceMediaRequest('DELETE', conversationId, token, callId)
+    dmVoiceMediaRequest('DELETE', conversationId, token, callId, relay)
   );
   if (!response.ok) {
     throw new Error(`Control plane rejected DM voice authorization release (${response.status})`);
@@ -1073,7 +1153,8 @@ export async function validateChannelAccess(
   token: string,
   roomKind: RoomKind = 'channel',
   requestedCallId?: string,
-  admission?: ChannelAdmissionHop
+  admission?: ChannelAdmissionHop,
+  relay: Record<string, string> = {}
 ): Promise<ChannelAccessResult> {
   try {
     // Route to the appropriate control-plane endpoint based on room kind.
@@ -1086,7 +1167,8 @@ export async function validateChannelAccess(
       token,
       roomKind,
       requestedCallId,
-      admission
+      admission,
+      relay
     );
     const channelRes = await fetch(endpoint, request);
 

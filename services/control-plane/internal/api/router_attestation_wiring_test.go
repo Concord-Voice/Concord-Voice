@@ -128,6 +128,7 @@ func TestRouterAttestationWiring_EnabledValidToken_200OK(t *testing.T) {
 		Version:    "0.2.7",
 		SpaVersion: "20260529",
 		IssuedAt:   time.Now(),
+		UserID:     attestation.HashUserID("test-user-id"),
 	}
 	bs, err := json.Marshal(rec)
 	require.NoError(t, err)
@@ -158,6 +159,7 @@ func TestRouterAttestationWiring_EnabledRevokedToken_403Revoked(t *testing.T) {
 		Token:    "rv-wiring-token",
 		Version:  "0.2.5",
 		IssuedAt: time.Now(),
+		UserID:   attestation.HashUserID("test-user-id"),
 	}
 	bs, err := json.Marshal(rec)
 	require.NoError(t, err)

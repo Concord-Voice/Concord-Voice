@@ -675,15 +675,127 @@ describe('VoiceService', () => {
     const { sendTransport, recvTransport, micProducer } = await joinVoiceChannel();
     mockSocket.emit.mockClear();
     useAuthStore.setState({ accessToken: 'refreshed-access-token' });
-    expect(mockSocket.emit).toHaveBeenCalledWith(
-      'refresh-auth',
-      'refreshed-access-token',
-      expect.any(Function)
+    await vi.waitFor(() =>
+      expect(mockSocket.emit).toHaveBeenCalledWith(
+        'refresh-auth',
+        'refreshed-access-token',
+        expect.any(Function)
+      )
     );
     expect(sendTransport.close).not.toHaveBeenCalled();
     expect(recvTransport.close).not.toHaveBeenCalled();
     expect(micProducer.close).not.toHaveBeenCalled();
     expect(mockSocket.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('hands the media plane its attestation triple and relays a re-minted token before renewal (#4206)', async () => {
+    const { io } = await import('socket.io-client');
+    const attestationToken = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const reminted = '11111111-2222-4333-8444-555555555555';
+    const machineId = '9e8d7c6b-5a49-4382-9716-05f4e3d2c1b0';
+    const sessionId = '0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b1c2d3';
+    const getToken = vi.fn().mockResolvedValue(attestationToken);
+    const origElectron = globalThis.electron;
+    (globalThis as any).electron = {
+      ...origElectron,
+      attestation: { getToken },
+      getMachineId: vi.fn().mockResolvedValue(machineId),
+    };
+    try {
+      await joinVoiceChannel();
+      getToken.mockResolvedValue(reminted);
+      mockSocket.emit.mockClear();
+      useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+      // The token is re-read before renewal, so a re-mint since the join is
+      // relayed ahead of refresh-auth on the very first renewal.
+      await vi.waitFor(() =>
+        expect(mockSocket.emit.mock.calls.map(([event]) => event)).toEqual([
+          'refresh-attestation',
+          'refresh-auth',
+        ])
+      );
+      expect(mockSocket.emit).toHaveBeenCalledWith('refresh-attestation', reminted);
+
+      // A reconnect handshake carries the newest token; the session id is
+      // never sent, because the media plane takes it from the bearer.
+      useAuthStore.setState({ sessionId });
+      const options = vi.mocked(io).mock.calls.at(-1)?.[1] as {
+        auth: (cb: (payload: Record<string, unknown>) => void) => void;
+      };
+      let payload: Record<string, unknown> = {};
+      options.auth((p) => (payload = p));
+      // The handshake re-reads the attestation token before calling back.
+      await vi.waitFor(() => expect(payload).toHaveProperty('token'));
+      expect(payload).toMatchObject({
+        attestation_token: reminted,
+        machine_id: machineId,
+      });
+
+      // A token re-minted while the socket was down reaches the next attempt
+      // even though no renewal ran in between.
+      const whileDown = '22222222-3333-4444-8555-666666666666';
+      getToken.mockResolvedValue(whileDown);
+      payload = {};
+      options.auth((p) => (payload = p));
+      await vi.waitFor(() => expect(payload).toHaveProperty('attestation_token', whileDown));
+      expect(payload).not.toHaveProperty('session_id');
+    } finally {
+      globalThis.electron = origElectron;
+    }
+  });
+
+  it('stops relaying an attestation token that expired or was cleared (#4206)', async () => {
+    const { io } = await import('socket.io-client');
+    const getToken = vi.fn().mockResolvedValue('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+    const origElectron = globalThis.electron;
+    (globalThis as any).electron = { ...origElectron, attestation: { getToken } };
+    try {
+      await joinVoiceChannel();
+      getToken.mockResolvedValue(null);
+      mockSocket.emit.mockClear();
+      useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+      // The media plane is told to drop its copy, not left relaying it.
+      await vi.waitFor(() =>
+        expect(mockSocket.emit.mock.calls.map(([event]) => event)).toEqual([
+          'refresh-attestation',
+          'refresh-auth',
+        ])
+      );
+      expect(mockSocket.emit).toHaveBeenCalledWith('refresh-attestation', null);
+      const options = vi.mocked(io).mock.calls.at(-1)?.[1] as {
+        auth: (cb: (payload: Record<string, unknown>) => void) => void;
+      };
+      let payload: Record<string, unknown> = {};
+      options.auth((p) => (payload = p));
+      // The handshake re-reads the attestation token before calling back.
+      await vi.waitFor(() => expect(payload).toHaveProperty('token'));
+      expect(payload).not.toHaveProperty('attestation_token');
+    } finally {
+      globalThis.electron = origElectron;
+    }
+  });
+
+  it('sends no attestation fields when the desktop bridge has none', async () => {
+    const { io } = await import('socket.io-client');
+    await joinVoiceChannel();
+    mockSocket.emit.mockClear();
+    useAuthStore.setState({ accessToken: 'refreshed-access-token' });
+    await vi.waitFor(() =>
+      expect(mockSocket.emit.mock.calls.map(([event]) => event)).toEqual([
+        'refresh-attestation',
+        'refresh-auth',
+      ])
+    );
+    expect(mockSocket.emit).toHaveBeenCalledWith('refresh-attestation', null);
+    const options = vi.mocked(io).mock.calls.at(-1)?.[1] as {
+      auth: (cb: (payload: Record<string, unknown>) => void) => void;
+    };
+    let payload: Record<string, unknown> = {};
+    options.auth((p) => (payload = p));
+    // The handshake re-reads the attestation token before calling back.
+    await vi.waitFor(() => expect(payload).toHaveProperty('token'));
+    expect(payload).not.toHaveProperty('attestation_token');
+    expect(payload).not.toHaveProperty('machine_id');
   });
 
   it('does not buffer token renewal on a disconnected media socket', async () => {
@@ -879,7 +991,7 @@ describe('VoiceService', () => {
     mockSocket.emit.mockClear();
     useAuthStore.setState({ accessToken: 'refreshed-access-token' });
     const renewals = () => mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth');
-    expect(renewals()).toHaveLength(1);
+    await vi.waitFor(() => expect(renewals()).toHaveLength(1));
     expect(mockSocket.timeout).toHaveBeenCalledWith(5_000);
     renewals()[0][2](null, { error: 'Authentication failed' });
     await vi.advanceTimersByTimeAsync(10_000);
@@ -895,6 +1007,7 @@ describe('VoiceService', () => {
     mockSocket.emit.mockClear();
     useAuthStore.setState({ accessToken: 'refreshed-access-token' });
     const renewals = () => mockSocket.emit.mock.calls.filter(([event]) => event === 'refresh-auth');
+    await vi.waitFor(() => expect(renewals()).toHaveLength(1));
     renewals()[0][2](new Error('timeout'));
     useAuthStore.setState((state) => ({
       accessToken: 'successor-login',

@@ -22,6 +22,7 @@ import { safeStorage, net } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getMachineId } from './machineId';
+import { clearAttestationToken } from './attestationService';
 import { encryptForDisk, isSecureStorageAvailable, isUnprotectedCiphertext } from './secureStorage';
 import type { CredentialOwner, RefreshResult } from './ipcContract';
 import {
@@ -885,6 +886,11 @@ function performOwnedRefresh(): Promise<OwnedRefreshResult> {
       scheduleProactiveRefresh(newAccessToken);
 
       cachedAccessToken = newAccessToken;
+      // The cached attestation token is keyed to the session this refresh
+      // just retired, so relaying it under the new sid only earns
+      // ATTESTATION_INVALID (#4211 review). Re-attesting here under the new
+      // session lands with the attest() caller (#4208).
+      if (newSessionId) clearAttestationToken();
       return {
         result: {
           status: 'ok',

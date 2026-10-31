@@ -76,10 +76,7 @@ describe('ChangelogModal (presentational)', () => {
       <ChangelogModal
         currentVersion="0.2.21"
         sections={[
-          section(
-            '0.2.21',
-            'See [#2000](https://example.invalid/pull/2000).'
-          ),
+          section('0.2.21', 'See [#2000](https://example.invalid/pull/2000).'),
         ]}
         onDismiss={() => {}}
       />

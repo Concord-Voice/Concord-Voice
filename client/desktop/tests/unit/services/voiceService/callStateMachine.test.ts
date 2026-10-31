@@ -43,10 +43,11 @@ import { apiFetch } from '@/renderer/services/system/apiClient';
 import { notificationSoundService } from '@/renderer/services/system/notificationSoundService';
 import { voiceService } from '@/renderer/services/voice/voiceService';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 import type { CallState } from '@/renderer/services/voice/voiceService/callStateMachine';
-import { deferred } from '../../../helpers/deferred';
+import { deferred, type Deferred } from '../../../helpers/deferred';
 
 import {
   initiateDMCall,
@@ -408,6 +409,83 @@ describe('initiateDMCall', () => {
     await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow('bad json');
     expect(useVoiceStore.getState().joinError).toBe(RING_FAILED_ERROR);
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  // A 409 whose body is still being read when the account changes must not
+  // start a call for whoever is signed in by the time it resolves.
+  function slow409(): { body: Deferred<string>; response: Response } {
+    const body = deferred<string>();
+    const response = {
+      ok: false,
+      status: 409,
+      text: () => body.promise,
+      json: async () => ({}),
+    } as unknown as Response;
+    return { body, response };
+  }
+
+  it('does not join when the user logs out while the 409 body is read', async () => {
+    seedConversation();
+    const { body, response } = slow409();
+    mockApiFetch.mockResolvedValueOnce(response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState.kind).toBe('idle'));
+    useAuthStore.getState().clearAccessToken();
+    body.resolve(JSON.stringify({ existing_call_id: EXISTING_CALL_ID }));
+
+    await expect(initiation).rejects.toThrow('HTTP 409');
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().joinError).toBeNull();
+  });
+
+  it('does not join when another account signs in while the 409 body is read', async () => {
+    seedConversation();
+    useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+    const { body, response } = slow409();
+    mockApiFetch.mockResolvedValueOnce(response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState.kind).toBe('idle'));
+    useAuthStore.getState().clearAccessToken();
+    useAuthStore.getState().beginAuthLifecycle('token-b', 'session-b');
+    body.resolve(JSON.stringify({ existing_call_id: EXISTING_CALL_ID }));
+
+    await expect(initiation).rejects.toThrow('HTTP 409');
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+  });
+
+  it('does not join when the voice store resets while the 409 body is read', async () => {
+    seedConversation();
+    const { body, response } = slow409();
+    mockApiFetch.mockResolvedValueOnce(response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState.kind).toBe('idle'));
+    // An idle-to-idle reset does not move the ownership revision.
+    useVoiceStore.getState().reset();
+    body.resolve(JSON.stringify({ existing_call_id: EXISTING_CALL_ID }));
+
+    await expect(initiation).rejects.toThrow('HTTP 409');
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+  });
+
+  it('still joins after a token refresh during the 409 body read', async () => {
+    seedConversation();
+    const generation = useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+    const { body, response } = slow409();
+    mockApiFetch.mockResolvedValueOnce(response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState.kind).toBe('idle'));
+    // A refresh rotation keeps the auth generation.
+    expect(useAuthStore.getState().rotateAuthCredentials(generation, 'token-a2', 'session-a')).toBe(
+      true
+    );
+    body.resolve(JSON.stringify({ existing_call_id: EXISTING_CALL_ID }));
+
+    await expect(initiation).resolves.toBeUndefined();
+    expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
   });
 
   it('does not join when another call starts while the 409 body is read', async () => {

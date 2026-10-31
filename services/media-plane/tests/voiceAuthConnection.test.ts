@@ -64,11 +64,13 @@ function signed(exchange: Exchange, mutate?: (wire: protocol.HTTPResponse) => vo
     status: wire.status, headers: wire.headers.map(header => [header.name, header.value]),
   });
 }
+// Distinct accounts, so filling the shared budget never trips the per-user cap.
+const filler = (index: number) => `${index.toString(16).padStart(8, '0')}-9999-4999-8999-999999999999`;
 function fixture() {
   const remote = cp();
   const owners = new VoiceAuthConnections({ nodeBootId: boot, secret, controlPlaneUrl: 'https://cp.test.invalid', fetch: remote.fetcher, now: () => now });
   const disconnect = vi.fn();
-  const reserve = (socketId = 'connection-test') => owners.reserve({ socketId, userId: user, credentialEpoch: epoch, token, tokenExpiresAt: now + 60000, disconnect });
+  const reserve = (socketId = 'connection-test', userId = user) => owners.reserve({ socketId, userId, credentialEpoch: epoch, token, tokenExpiresAt: now + 60000, disconnect });
   return { owners, remote, disconnect, reserve };
 }
 
@@ -102,11 +104,22 @@ describe('private auth connection ownership', () => {
 
   it('refuses the 1001st retained connection before any network effect', () => {
     const f = fixture();
-    for (let i = 0; i < 1000; i++) f.reserve(`capacity-${i}`);
+    for (let i = 0; i < 1000; i++) f.reserve(`capacity-${i}`, filler(i));
     expect(f.owners.retainedIdentityCount()).toBe(1000);
     expect(() => f.reserve('over-capacity')).toThrow();
     expect(f.remote.calls).toHaveLength(0);
     expect(f.owners.retainedIdentityCount()).toBe(1000);
+  });
+
+  it('caps one account at 16 live connections without touching other accounts', async () => {
+    const f = fixture();
+    const held = Array.from({ length: 16 }, (_, i) => f.reserve(`per-user-${i}`));
+    expect(() => f.reserve('per-user-over')).toThrow(/for user/);
+    expect(f.owners.retainedIdentityCount()).toBe(16);
+    expect(() => f.reserve('other-account', filler(1))).not.toThrow();
+    await f.owners.terminate(held[0]);
+    expect(() => f.reserve('per-user-freed')).not.toThrow();
+    expect(f.remote.calls.filter(call => call.request.endpoint() === 'connection_register')).toHaveLength(0);
   });
 
   it('shares the same 1000 identity budget between connections and rooms before native effects', async () => {

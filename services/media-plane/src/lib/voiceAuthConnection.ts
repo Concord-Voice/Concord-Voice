@@ -4,7 +4,7 @@ import {
   type Binding, type Command, type Endpoint, type ExpectedResponse, type Target,
 } from './voiceAuthProtocol.js';
 import { logger } from './logger.js';
-import { createServiceHopProofHeaders } from '../middleware/auth.js';
+import { bearerAttestationHeaders, createServiceHopProofHeaders } from '../middleware/auth.js';
 import type { VoiceEnforcementSession } from './voiceEnforcementSession.js';
 
 const connectionBrand = Symbol();
@@ -30,6 +30,7 @@ interface ConnectionState {
   userId: string;
   binding?: Binding;
   token: string;
+  relayHeaders: () => Record<string, string>;
   body: Uint8Array;
   tokenDigest: string;
   bodyDigest: string;
@@ -56,6 +57,10 @@ interface LegacyRoomState {
   started: boolean;
 }
 const CAPACITY = 1000;
+// Connection identities one account may hold, so a few accounts cannot fill CAPACITY
+// with idle sockets. Twice the control plane's 8-per-user WebSocket admission, so
+// reconnect overlap fits. ponytail: fixed cap; make it configurable if real multi-device use nears it.
+const PER_USER_CONNECTIONS = 16;
 // Three signed-release timeouts: an ordinary leave finishes well inside this.
 const TERMINATION_STALL_MS = 15_000;
 const bytes = (value: unknown): Uint8Array => Buffer.from(JSON.stringify(value), 'utf8');
@@ -103,6 +108,7 @@ export class VoiceAuthConnections {
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
   private retained = 0;
+  private readonly userConnections = new Map<string, number>();
   private reservationHorizon: object = Object.freeze({});
   private readonly legacyRooms = new Map<string, LegacyRoomState>();
   private readonly legacyReferences = new WeakMap<VoiceEnforcementSession, LegacyRoomState>();
@@ -188,9 +194,11 @@ export class VoiceAuthConnections {
 
   reserve(input: {
     socketId: string; userId: string; credentialEpoch: string; token: string;
-    tokenExpiresAt: number; disconnect: () => void;
+    tokenExpiresAt: number; disconnect: () => void; relayHeaders?: () => Record<string, string>;
   }): ConnectionHandle {
     if (this.retained >= CAPACITY) throw new Error('Voice identity capacity exhausted');
+    const held = this.userConnections.get(input.userId) ?? 0;
+    if (held >= PER_USER_CONNECTIONS) throw new Error('Voice identity capacity exhausted for user');
     if (!Number.isSafeInteger(input.tokenExpiresAt) || input.tokenExpiresAt <= this.now())
       throw new Error('Expired voice connection');
     const target: Target = {
@@ -204,11 +212,13 @@ export class VoiceAuthConnections {
     const handle = Object.freeze({}) as ConnectionHandle;
     const state: ConnectionState = {
       handle, target, body, token: input.token, userId: input.userId,
+      relayHeaders: input.relayHeaders ?? (() => ({})),
       tokenDigest: digest(input.token), bodyDigest: digest(body),
       tokenExpiresAt: input.tokenExpiresAt, disconnect: input.disconnect,
       state: 'provisional', rooms: new Map(),
     };
     this.retained++;
+    this.userConnections.set(input.userId, held + 1);
     this.handles.set(handle, state);
     this.connections.set(target.connectionGeneration, state);
     this.reservationHorizon = Object.freeze({});
@@ -219,12 +229,17 @@ export class VoiceAuthConnections {
     return { timestamp: Math.floor(this.now() / 1000).toString(), nonce: randomBytes(32).toString('hex') };
   }
 
-  private async request(endpoint: Endpoint, body: Uint8Array, token: string, expected: ExpectedResponse) {
+  private async request(endpoint: Endpoint, body: Uint8Array, token: string, expected: ExpectedResponse,
+    relayHeaders: () => Record<string, string> = () => ({})) {
     const { wire, request } = signHttpRequest(endpoint, body, token, this.attempt(), this.secret);
     const context = newRequestContext(request, expected);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     for (const header of wire.headers) headers[header.name] = header.value;
-    if (token) Object.assign(headers, createServiceHopProofHeaders('POST', wire.path, token));
+    // Only bearer hops reach RequireAttestation; the relay never rides a service-signed one.
+    if (token) {
+      Object.assign(headers, bearerAttestationHeaders(relayHeaders(), token),
+        createServiceHopProofHeaders('POST', wire.path, token));
+    }
     const response = await this.fetcher(`${this.options.controlPlaneUrl}${wire.path}`, {
       method: 'POST', headers, body: Buffer.from(wire.body), signal: AbortSignal.timeout(5_000),
     });
@@ -244,7 +259,7 @@ export class VoiceAuthConnections {
   private async registerOwned(state: ConnectionState): Promise<void> {
     const result = (await this.request('connection_register', state.body, state.token, {
       userId: state.userId,
-    })).registration();
+    }, state.relayHeaders)).registration();
     if (!result) throw new Error('Missing voice binding');
     // The binding remains useful to terminal cleanup; it never grants revival.
     state.binding = { userId: result.userId, familyId: result.familyId, target: { ...result.target } };
@@ -358,7 +373,7 @@ export class VoiceAuthConnections {
       const result = (await this.request('room_register', bytes({
         schema: 'concord.auth-room-binding', version: 1, mode,
         ...state.target, ...roomTuple(room.session),
-      }), token, { binding })).roomRegistration();
+      }), token, { binding }, state.relayHeaders)).roomRegistration();
       if (!result) throw new Error('Missing voice room binding');
     });
   }
@@ -432,6 +447,9 @@ export class VoiceAuthConnections {
     state.token = '';
     this.connections.delete(state.target.connectionGeneration);
     this.retained--;
+    const held = (this.userConnections.get(state.userId) ?? 1) - 1;
+    if (held > 0) this.userConnections.set(state.userId, held);
+    else this.userConnections.delete(state.userId);
   }
 
   private start(task: Completion, effect: () => Promise<void>): void {

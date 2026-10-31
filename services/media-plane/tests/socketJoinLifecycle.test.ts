@@ -7,7 +7,7 @@ import * as lifecycle from '../src/lib/socketJoinLifecycle.js';
 import * as protocol from '../src/lib/voiceAuthProtocol.js';
 import { VoiceAuthConnections } from '../src/lib/voiceAuthConnection.js';
 import type { MediasoupService } from '../src/lib/mediasoup.js';
-import { resolveParticipantIdentity } from '../src/middleware/auth.js';
+import { attestationRelayHeaders, resolveParticipantIdentity } from '../src/middleware/auth.js';
 import { getIdentityAuthorityReasonCode } from '../src/lib/identityAuthority.js';
 import { mediaPolicyCooldownAck } from '../src/lib/mediaPolicyWire.js';
 import {
@@ -84,6 +84,8 @@ describe('room creation refusal acknowledgement', () => {
             { status: signed.status, headers: signed.headers.map(({ name, value }) => [name, value]) });
         } });
       const token = 'test-placement-token';
+      const attestationHandshake = { attestation_token: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        session_id: '0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b1c2d3', machine_id: '9e8d7c6b-5a49-4382-9716-05f4e3d2c1b0' };
       const handle = owners.reserve({ socketId: 'placement-socket', userId: user, credentialEpoch: epoch,
         token, tokenExpiresAt: now + 60_000, disconnect: () => {} });
       await owners.register(handle);
@@ -112,12 +114,12 @@ describe('room creation refusal acknowledgement', () => {
       const register = new Script(`${compiled}\nregisterJoinRoomHandler;`).runInNewContext({
         ...lifecycle, randomUUID, Date, Error, Promise,
         getVoiceAuthConnection: () => handle, voiceEnforcementNodeBootId: boot,
-        validateChannelAccess, releaseDMVoiceAuthorization, registerVoiceEnforcementSession,
+        validateChannelAccess, attestationRelayHeaders, releaseDMVoiceAuthorization, registerVoiceEnforcementSession,
         isCanonicalEnforcementUUID, parseMediaFrameCryptoVersion, resolveParticipantIdentity,
         RoomCreationRefusedError, CryptoVersionMismatchError, MediaPolicyCooldownError, mediaPolicyCooldownAck,
         getIdentityAuthorityReasonCode, logger: { info() {}, debug() {}, warn() {}, error() {} },
       }) as (socket: unknown, data: unknown, deps: unknown) => void;
-      const socket = { id: 'placement-socket', connected: true, handshake: { auth: { token, room_kind: 'dm' } },
+      const socket = { id: 'placement-socket', connected: true, handshake: { auth: { token, room_kind: 'dm', ...attestationHandshake } },
         emit: vi.fn(), join: vi.fn(), leave: vi.fn(), to: () => ({ emit: vi.fn() }) };
       type Handler = (request: object, callback: (value: unknown) => void) => Promise<void>;
       let handler: Handler | undefined;
@@ -132,7 +134,12 @@ describe('room creation refusal acknowledgement', () => {
       try {
         if (!handler) throw new Error('Actual handler was not registered');
         await handler({ roomId, callId, rtpCapabilities: {}, mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION }, callback);
-        expect(validateChannelAccess).toHaveBeenCalledExactlyOnceWith(user, roomId, token, 'dm', callId, undefined);
+        // The admission hop relays this socket's own attestation token and machine id
+        // (#4206); the client's session_id is never relayed.
+        expect(validateChannelAccess).toHaveBeenCalledExactlyOnceWith(user, roomId, token, 'dm', callId, undefined, {
+          'X-Attestation-Token': attestationHandshake.attestation_token,
+          'X-Machine-Id': attestationHandshake.machine_id,
+        });
         expect(placement).toHaveBeenCalledExactlyOnceWith(roomId);
         expect(callback).toHaveBeenCalledExactlyOnceWith({ error: code, code });
         expect(closeEmpty).not.toHaveBeenCalled();

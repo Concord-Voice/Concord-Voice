@@ -68,7 +68,6 @@ lerna-debug.log*
 package-lock.json
 !client/desktop/package-lock.json
 !services/media-plane/package-lock.json
-!client/mobile/package-lock.json
 !.github/tools/license-checker/package-lock.json
 yarn.lock
 pnpm-lock.yaml
@@ -291,3 +290,7 @@ graphify-out/*
 # Tri-Harness Concord Bridge worktrees and audit traces
 .worktrees/
 .agent-bus/
+
+# Redis persistence written by a redis-server started from a source directory
+appendonlydir/
+dump.rdb

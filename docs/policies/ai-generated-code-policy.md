@@ -111,7 +111,7 @@ password*       e2ee*
 These paths are defined in [`CODEOWNERS`](../../CODEOWNERS), which routes each of them to `@Concord-Voice/security`. The org ruleset on `main` carries `require_code_owner_review: true`, so the routing is the whole mechanism behind the gate.
 
 > **🛑 The gate is declared but currently enforces nothing.** Measured 2026-08-28:
-> `gh api repos/Concord-Voice/Concord-Voice-Alpha/codeowners/errors --jq '.errors | length'`
+> `gh api repos/Concord-Voice/Hosted/codeowners/errors --jq '.errors | length'`
 > returns **37**, every one reading *"Unknown owner … make sure the team
 > @Concord-Voice/security exists, is publicly visible, and has write access to the
 > repository."* GitHub ignores an unknown-owner rule, so no review is requested and
@@ -137,7 +137,7 @@ If AI-generated code introduces **new usage** of crypto, secrets, or auth APIs t
 
 ### 7.3 Activation
 
-The CODEOWNERS framework is in place and the paths above are written into it. Activation was originally deferred to a post-org-migration step tracked by #448; that issue closed **NOT_PLANNED** on 2026-04-15, and the repository now lives at `Concord-Voice/Concord-Voice-Alpha` regardless. The one thing still outstanding is the team's write access, per the notice in §7.1 — that, not a migration, is what activates the gate.
+The CODEOWNERS framework is in place and the paths above are written into it. Activation was originally deferred to a post-org-migration step tracked by #448; that issue closed **NOT_PLANNED** on 2026-04-15, and the repository now lives at `Concord-Voice/Hosted` regardless. The one thing still outstanding is the team's write access, per the notice in §7.1 — that, not a migration, is what activates the gate.
 
 ---
 

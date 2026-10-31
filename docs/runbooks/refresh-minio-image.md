@@ -320,7 +320,7 @@ Classify package state first:
 - **Initial release:** both stable packages are absent. Dispatch the workflow.
   GHCR creates the runtime, source, and staging packages private. After the run
   succeeds, and before Section 3, restrict all four packages to
-  `Concord-Voice/Concord-Voice-Alpha` Actions at `Write`. Then remove every
+  `Concord-Voice/Hosted` Actions at `Write`. Then remove every
   other repository, team, or user writer.
 - **Later release:** both packages are already public. Record legal approval.
   Verify that same four-package access restriction before dispatch, because the

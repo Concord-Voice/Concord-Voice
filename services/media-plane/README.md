@@ -255,6 +255,31 @@ MEDIASOUP_LOG_LEVEL=warn
 
 ### Client → Server
 
+**Handshake attestation fields**
+
+The handshake `auth` may carry `attestation_token` and `machine_id`. The media
+plane relays them as `X-Attestation-Token` and `X-Machine-Id` on every
+control-plane hop that carries the user's bearer, so voice works when
+`REQUIRE_CLIENT_ATTESTATION=true` (#4206). It sets `X-Session-ID` from the
+verified `sid` of that bearer; a client-supplied `session_id` is ignored.
+Service-signed hops carry no bearer and never carry them. Only UUID values are
+kept.
+
+**refresh-attestation**
+
+```typescript
+socket.emit('refresh-attestation', attestationToken); // or null
+```
+
+Replaces the relayed attestation token. Desktop reads its current token and
+sends this event before each `refresh-auth`, so the renewal hop relays a
+re-minted token. `null` drops the relayed token, which desktop sends when it
+holds none (expired, or cleared because a refresh rotated the session). Other
+non-UUID values are ignored. A relayed token without a usable machine id is
+logged as `attestation.relay_machine_id_unreadable`. Older media planes ignore the
+event. There is no acknowledgement; if the rate limit is exceeded, the socket
+gets an `error` event with `{ error: 'rate_limited' }` instead.
+
 **refresh-auth**
 
 ```typescript

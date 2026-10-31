@@ -20,10 +20,12 @@ import {
   type RuntimeServerSelection,
 } from './runtimeServerBase';
 import { recordChallengeIssuer } from './challengeIssuer';
+import { getAttestationTokenSafe } from './attestationToken';
 import { getDesktopClientVersion } from '../../utils/runtime/clientVersion';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import type { TerminalAttestationCode } from '../../stores/auth/attestationFailureStore';
 import type { ApiRequestContext } from './requestContext';
+import type { RefreshResult } from '../../../main/ipcContract';
 import { methodsForOptions, webauthnOptionsOrNull } from '../../utils/webauthnOptions';
 
 export { API_BASE } from '../../config';
@@ -338,7 +340,7 @@ function sameOrigin(a: string, b: string): boolean {
  * `refreshSelection` is the server selection the refresh was sent under.
  */
 async function handleMfaChallengeIfNeeded(
-  result: import('../../../main/ipcContract').RefreshResult,
+  result: RefreshResult,
   lifecycle: AuthLifecycleSnapshot,
   refreshSelection: RuntimeServerSelection
 ): Promise<string | null> {
@@ -623,30 +625,6 @@ async function buildAttestationRetryHeaders(
   await setClientVersionHeader(headers);
   headers.set('X-Attestation-Token', freshAttToken);
   return headers;
-}
-
-/**
- * Fetch the cached attestation token WITHOUT letting an IPC failure brick the
- * request. `X-Attestation-Token` is an OPTIONAL header — the server is the gate
- * that enforces attestation and returns 403 (handled separately) when it is
- * required. A rejected `attestation:get-token` IPC must therefore degrade to
- * "no token attached", never propagate up and fail the whole request.
- *
- * Defense-in-depth for the bundled-build outage: a sender-frame regression made
- * this IPC throw on every call, and the unguarded `await` cascaded an optional
- * header into total connectivity loss. The optional-chain still skips the call
- * entirely on the web/test path where `globalThis.electron` is undefined.
- */
-async function getAttestationTokenSafe(): Promise<string | null> {
-  try {
-    return (await globalThis.electron?.attestation?.getToken()) ?? null;
-  } catch (err) {
-    console.warn(
-      'Attestation token fetch failed; proceeding without X-Attestation-Token:',
-      err instanceof Error ? err.message : 'unknown error'
-    );
-    return null;
-  }
 }
 
 /**
