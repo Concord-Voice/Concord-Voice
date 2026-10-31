@@ -1073,7 +1073,7 @@ values before rendering, and its JavaScript does not persist fetched samples,
 counter baselines, node IDs, or health changes. Compose supplies `client/admin`
 as the named `admin_ui` build context while the primary control-plane context
 remains `services/control-plane`. See
-[ADR-0031](adr/0031-admin-portal-frontend.md).
+ADR-0031 (in the Self-Hosted repository).
 
 ### Aggregate Operations Metrics
 
@@ -1721,7 +1721,7 @@ recovery-JTI hash and explicitly labelled public keys. Separate HKDF labels deri
 the AES-256-GCM transport key and fingerprint; transcript SHA-256 is both HKDF
 salt and AES-GCM AAD. The envelope is `02 || 12-byte IV || ciphertext/tag` with a
 128-bit tag and no legacy fallback. Exact bytes and labels are in the
-[protocol guide](design/trusted-device-recovery.md).
+[protocol guide](https://github.com/Concord-Voice/Self-Hosted/blob/main/docs/design/trusted-device-recovery.md).
 
 | State transition                 | Required boundary                                                                                                                                    |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |

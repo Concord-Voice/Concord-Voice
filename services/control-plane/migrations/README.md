@@ -469,7 +469,7 @@ empty prior schema without reconstructing raw JTIs or approval ciphertext.
 Schema rollback must preserve v1 refusal and never restore the old vulnerable
 approval binary. Stage schema/control plane before desktop rollout; older
 clients need update/restart and a fresh request. See the
-[trusted-recovery protocol and release checklist](../../../docs/design/trusted-device-recovery.md).
+[trusted-recovery protocol and release checklist](https://github.com/Concord-Voice/Self-Hosted/blob/main/docs/design/trusted-device-recovery.md).
 
 Migration 000167 creates the singleton `voice_command_transport` receipt before
 command transport bootstrap starts. Its generation never changes. Bootstrap
