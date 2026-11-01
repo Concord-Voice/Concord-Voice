@@ -24,7 +24,12 @@ info:
       stable ASCII `X.Y.Z` compatibility declarations, not signed attestation,
       authentication, authorization, entitlement, or cryptographic evidence. When
       a deployment configures a minimum, missing, malformed, or older declarations
-      receive 403 `CLIENT_VERSION_TOO_OLD`. Public config, authentication, update,
+      receive 403 `CLIENT_VERSION_TOO_OLD`. Mobile clients add `X-Concord-Client-Platform`
+      (or `client_platform` on WebSocket admission) set to `ios` or `android` and are
+      checked against that platform''s own floor (`CLIENT_MIN_VERSION_IOS` /
+      `CLIENT_MIN_VERSION_ANDROID`); an absent platform means desktop
+      (`CLIENT_MIN_VERSION`). Any other platform value gets 400
+      `Unsupported client platform`, even when no floor is set. Public config, authentication, update,
       and recovery routes remain available; `/attestation/verify` is AuthRequired-only
       and outside this floor.
 
@@ -2346,6 +2351,7 @@ paths:
       - BearerAuth: []
       parameters:
       - $ref: '#/components/parameters/ClientVersionHeader'
+      - $ref: '#/components/parameters/ClientPlatformHeader'
       responses:
         '200':
           description: Ticket issued
@@ -2357,10 +2363,12 @@ paths:
                   ticket:
                     type: string
                     description: Single-use ticket (TTL is the shorter of 30 seconds or the issuing access token's remaining lifetime)
-        '429':
-          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/UnsupportedClientPlatform'
         '403':
           $ref: '#/components/responses/ClientVersionTooOld'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /categories/{id}/overrides:
     get:
       tags:
@@ -19626,6 +19634,7 @@ paths:
       - BearerAuth: []
       parameters:
       - $ref: '#/components/parameters/ClientVersionQuery'
+      - $ref: '#/components/parameters/ClientPlatformQuery'
       - name: activity_rich_presence
         in: query
         required: false
@@ -19641,6 +19650,8 @@ paths:
       responses:
         '101':
           description: Switching Protocols (WebSocket upgrade)
+        '400':
+          $ref: '#/components/responses/UnsupportedClientPlatform'
         '403':
           $ref: '#/components/responses/ClientVersionTooOld'
         '429':
@@ -19731,6 +19742,26 @@ components:
         maxLength: 32
         pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
       description: Untrusted compatibility declaration used for authenticated WebSocket admission; exact stable ASCII X.Y.Z.
+    ClientPlatformHeader:
+      name: X-Concord-Client-Platform
+      in: header
+      required: false
+      schema:
+        type: string
+        enum:
+        - ios
+        - android
+      description: Selects the mobile version floor (CLIENT_MIN_VERSION_IOS / CLIENT_MIN_VERSION_ANDROID). Absent means desktop; any other value is refused with 400.
+    ClientPlatformQuery:
+      name: client_platform
+      in: query
+      required: false
+      schema:
+        type: string
+        enum:
+        - ios
+        - android
+      description: WebSocket-admission form of X-Concord-Client-Platform. Absent means desktop; any other value is refused with 400.
     ServerId:
       name: id
       in: path
@@ -19874,6 +19905,12 @@ components:
                 enum: [voice_command_queue_full]
     BadRequest:
       description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedClientPlatform:
+      description: The client platform is neither absent (desktop), `ios`, nor `android`.
       content:
         application/json:
           schema:
@@ -24983,7 +25020,7 @@ components:
       properties:
         minVersion:
           type: string
-          description: Minimum client version allowed to connect
+          description: Minimum desktop client version allowed to connect (`CLIENT_MIN_VERSION`). The iOS and Android floors are not reported here.
           example: 0.1.50
         featureFlags:
           type: object

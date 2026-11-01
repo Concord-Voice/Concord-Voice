@@ -147,6 +147,7 @@ func TestCORSPreflightAllowsClientVersionHeader(t *testing.T) {
 
 	assert.Equal(t, 204, w.Code)
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), middleware.ClientVersionHeader)
+	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), middleware.ClientPlatformHeader)
 }
 
 func TestCORSPreflightEmptyOrigin(t *testing.T) {

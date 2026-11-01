@@ -186,7 +186,7 @@ func TestLoad(t *testing.T) {
 	envVars := []string{
 		"ENVIRONMENT", "PORT", "DATABASE_URL", "REDIS_URL", "JWT_SECRET", "NATS_URL",
 		"ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS", "HSTS_HEADER_VALUE",
-		"CLIENT_MIN_VERSION",
+		"CLIENT_MIN_VERSION", "CLIENT_MIN_VERSION_IOS", "CLIENT_MIN_VERSION_ANDROID",
 		"ACTIVITY_HISTORY_CLUSTER_ENABLED",
 		"ROOM_PLACEMENT_ENABLED",
 		"CONTROL_PLANE_REPLICA_COUNT", "ACTIVITY_HISTORY_OPERATOR_NAME",
@@ -271,6 +271,34 @@ func TestClientVersionLoad(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "0.2.44", cfg.ClientMinVersion)
 	})
+
+	t.Run("mobile minimums load separately", func(t *testing.T) {
+		t.Setenv("CLIENT_MIN_VERSION", "0.2.46")
+		t.Setenv("CLIENT_MIN_VERSION_IOS", " 1.0.0 ")
+		t.Setenv("CLIENT_MIN_VERSION_ANDROID", "1.1.0")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "0.2.46", cfg.ClientMinVersion)
+		assert.Equal(t, "1.0.0", cfg.ClientMinVersionIOS)
+		assert.Equal(t, "1.1.0", cfg.ClientMinVersionAndroid)
+	})
+}
+
+func TestMobileClientVersionValidationRejectsMalformedValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"CLIENT_MIN_VERSION_IOS", Config{Environment: "development", ClientMinVersionIOS: "1.0"}},
+		{"CLIENT_MIN_VERSION_ANDROID", Config{Environment: "development", ClientMinVersionAndroid: "1.0.0-pilot.0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.name)
+		})
+	}
 }
 
 func TestClientVersionValidationRejectsMalformedValuesInEveryEnvironment(t *testing.T) {

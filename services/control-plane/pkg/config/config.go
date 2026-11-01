@@ -242,10 +242,14 @@ type Config struct {
 	TURNRealm      string // TURN realm (e.g. "concordvoice.chat")
 
 	// Client config (#155 Tier 2 + Tier 3)
-	ClientMinVersion string // Minimum client version allowed (e.g. "0.1.3"); empty = no enforcement
-	SpaURL           string // Remote SPA URL for Tier 3 hot updates (e.g. "https://app.concordvoice.chat/v1/"); empty = use bundled
-	SpaIpcContract   int    // Minimum IPC contract version required by the remote SPA; 0 = no remote SPA
-	SpaConfigFile    string // Path to mounted spa.env for hot-reload; empty = static config from env vars
+	ClientMinVersion string // Minimum desktop client version allowed (e.g. "0.1.3"); empty = no enforcement
+	// Minimum mobile versions, selected by the X-Concord-Client-Platform header
+	// or the WebSocket client_platform param; empty = no enforcement.
+	ClientMinVersionIOS     string
+	ClientMinVersionAndroid string
+	SpaURL                  string // Remote SPA URL for Tier 3 hot updates (e.g. "https://app.concordvoice.chat/v1/"); empty = use bundled
+	SpaIpcContract          int    // Minimum IPC contract version required by the remote SPA; 0 = no remote SPA
+	SpaConfigFile           string // Path to mounted spa.env for hot-reload; empty = static config from env vars
 
 	// Absolute public origin for server-authored media URLs, e.g.
 	// "https://api.concordvoice.chat". Used to embed bug-report screenshots into
@@ -492,6 +496,8 @@ func Load() (*Config, error) {
 		TURNRealm:                 getEnv("TURN_REALM", "localhost"),
 		AllowedOrigins:            parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,app://concord-mobile,spa-cache://concord")),
 		ClientMinVersion:          strings.TrimSpace(getEnv("CLIENT_MIN_VERSION", "")),
+		ClientMinVersionIOS:       strings.TrimSpace(getEnv("CLIENT_MIN_VERSION_IOS", "")),
+		ClientMinVersionAndroid:   strings.TrimSpace(getEnv("CLIENT_MIN_VERSION_ANDROID", "")),
 		SpaURL:                    getEnv("SPA_URL", ""),
 		SpaIpcContract:            getEnvInt("SPA_IPC_CONTRACT", 0),
 		SpaConfigFile:             getEnv("SPA_CONFIG_FILE", ""),
@@ -872,9 +878,16 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
-	if c.ClientMinVersion != "" {
-		if _, err := clientversion.Parse(c.ClientMinVersion); err != nil {
-			return fmt.Errorf("CLIENT_MIN_VERSION must be a stable X.Y.Z version: %w", err)
+	for _, floor := range []struct{ name, value string }{
+		{"CLIENT_MIN_VERSION", c.ClientMinVersion},
+		{"CLIENT_MIN_VERSION_IOS", c.ClientMinVersionIOS},
+		{"CLIENT_MIN_VERSION_ANDROID", c.ClientMinVersionAndroid},
+	} {
+		if floor.value == "" {
+			continue
+		}
+		if _, err := clientversion.Parse(floor.value); err != nil {
+			return fmt.Errorf("%s must be a stable X.Y.Z version: %w", floor.name, err)
 		}
 	}
 	// Ordered before validateActivityHistory for the same reason as in

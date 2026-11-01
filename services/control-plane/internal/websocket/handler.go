@@ -28,8 +28,8 @@ type Handler struct {
 	redis          *redis.Client
 	jwtSecret      string
 	allowedOrigins []string
-	// minimumClientVersion is optional: empty preserves the existing admission path.
-	minimumClientVersion string
+	// clientMinimums is optional: empty values preserve the existing admission path.
+	clientMinimums middleware.ClientMinimums
 	// fence enforces the per-user credential epoch on both WS auth paths
 	// (#2201) so ticket redemption and the JWT fallback carry the same
 	// revocation semantics as HTTP bearer auth. nil disables (tests only).
@@ -85,9 +85,9 @@ func NewHandler(hub *Hub, db *sql.DB, redisClient *redis.Client, jwtSecret strin
 	return h
 }
 
-// SetMinimumClientVersion configures the optional client-version admission floor.
-func (h *Handler) SetMinimumClientVersion(minimum string) {
-	h.minimumClientVersion = minimum
+// SetClientMinimums configures the optional per-platform client-version admission floors.
+func (h *Handler) SetClientMinimums(minimums middleware.ClientMinimums) {
+	h.clientMinimums = minimums
 }
 
 // liveWebSocketDeadline is the authenticated credential's expiry, when it is
@@ -117,7 +117,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		c.JSON(status, gin.H{"error": message})
 		return
 	}
-	if !middleware.EnforceClientVersion(c, h.minimumClientVersion, c.Query("client_version")) {
+	if !middleware.EnforceClientVersion(c, h.clientMinimums, c.Query("client_platform"), c.Query("client_version")) {
 		return
 	}
 	release, admitted := h.hub.reserveConnection(userID)

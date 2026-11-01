@@ -28,7 +28,7 @@ func relayRouter(rdb *redis.Client, caller string) (*gin.Engine, *bool) {
 	authed := r.Group("/")
 	authed.Use(func(c *gin.Context) { c.Set("user_id", caller); c.Next() })
 	authed.Use(middleware.MediaPlaneServiceHop(hopSecret, nil))
-	authed.Use(middleware.RequireClientVersion(pinnedMinimum))
+	authed.Use(middleware.RequireClientVersion(middleware.ClientMinimums{Desktop: pinnedMinimum}))
 	authed.Use(middleware.RequireAttestation(true, rdb, logger.NewWithWriter(&bytes.Buffer{})))
 	authed.POST(channelJoinTemplate, func(c *gin.Context) { *reached = true; c.Status(http.StatusNoContent) })
 	return r, reached

@@ -55,7 +55,7 @@ func hopRouter(secret, minimum string) (*gin.Engine, map[string]*bool) {
 	authed := r.Group("/")
 	authed.Use(func(c *gin.Context) { c.Set("user_id", "u-1"); c.Next() })
 	authed.Use(middleware.MediaPlaneServiceHop(secret, nil))
-	authed.Use(middleware.RequireClientVersion(minimum))
+	authed.Use(middleware.RequireClientVersion(middleware.ClientMinimums{Desktop: minimum}))
 	authed.POST(channelJoinTemplate, handler("channel"))
 	authed.POST(dmAuthorizeTemplate, handler("dm"))
 	authed.DELETE(dmAuthorizeTemplate, handler("dm-delete"))
@@ -261,7 +261,7 @@ func TestProofIsIgnoredWhenNoAuthenticatedUserIsOnTheContext(t *testing.T) {
 	r := gin.New()
 	reached := new(bool)
 	r.Use(middleware.MediaPlaneServiceHop(hopSecret, nil))
-	r.Use(middleware.RequireClientVersion(pinnedMinimum))
+	r.Use(middleware.RequireClientVersion(middleware.ClientMinimums{Desktop: pinnedMinimum}))
 	r.POST(channelJoinTemplate, func(c *gin.Context) { *reached = true; c.Status(http.StatusNoContent) })
 	h := freshHop(http.MethodPost, channelJoinPath).signed(hopSecret)
 

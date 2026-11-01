@@ -8,6 +8,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,7 +17,7 @@ import (
 func clientVersionRouter(minimum string) (*gin.Engine, *bool) {
 	r := gin.New()
 	called := new(bool)
-	r.GET("/test", middleware.RequireClientVersion(minimum), func(c *gin.Context) {
+	r.GET("/test", middleware.RequireClientVersion(middleware.ClientMinimums{Desktop: minimum}), func(c *gin.Context) {
 		*called = true
 		c.Status(http.StatusNoContent)
 	})
@@ -96,4 +97,73 @@ func TestRequireClientVersion_PilotCompatibility(t *testing.T) {
 			assert.Equal(t, tc.allowed, *called)
 		})
 	}
+}
+
+func requestClientPlatform(minimums middleware.ClientMinimums, platform, version string) (*httptest.ResponseRecorder, bool) {
+	r := gin.New()
+	called := false
+	r.GET("/test", middleware.RequireClientVersion(minimums), func(c *gin.Context) {
+		called = true
+		c.Status(http.StatusNoContent)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set(middleware.ClientPlatformHeader, platform)
+	if version != "" {
+		req.Header.Set(middleware.ClientVersionHeader, version)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w, called
+}
+
+func TestRequireClientVersion_PlatformMinimums(t *testing.T) {
+	minimums := middleware.ClientMinimums{Desktop: "0.2.46", IOS: "1.0.0", Android: "1.2.0"}
+	for _, tc := range []struct {
+		name, platform, version string
+		wantStatus              int
+		wantMinimum             string
+	}{
+		{"desktop below its floor", "", "0.2.45", http.StatusForbidden, "0.2.46"},
+		{"desktop at its floor", "", "0.2.46", http.StatusNoContent, ""},
+		{"ios ignores desktop floor", "ios", "1.0.0", http.StatusNoContent, ""},
+		{"ios below its floor", "ios", "0.9.9", http.StatusForbidden, "1.0.0"},
+		{"ios missing version", "ios", "", http.StatusForbidden, "1.0.0"},
+		{"android below its floor", "android", "1.1.9", http.StatusForbidden, "1.2.0"},
+		{"android at its floor", "android", "1.2.0", http.StatusNoContent, ""},
+		{"unknown platform", "web", "9.9.9", http.StatusBadRequest, ""},
+		{"platform is case-sensitive", "iOS", "1.0.0", http.StatusBadRequest, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, called := requestClientPlatform(minimums, tc.platform, tc.version)
+
+			require.Equal(t, tc.wantStatus, w.Code)
+			assert.Equal(t, tc.wantStatus == http.StatusNoContent, called)
+			if tc.wantStatus == http.StatusForbidden {
+				var response attestation.ErrorResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+				assert.Equal(t, attestation.ErrVersionTooOld, response.Code)
+				assert.Equal(t, tc.wantMinimum, response.RequiredMinVersion)
+			}
+		})
+	}
+}
+
+func TestRequireClientVersion_EmptyPlatformMinimumSkipsCheck(t *testing.T) {
+	w, called := requestClientPlatform(middleware.ClientMinimums{Desktop: "0.2.46"}, "android", "")
+
+	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.True(t, called)
+}
+
+func TestRequireClientVersion_UnknownPlatformRejectedWhenDisabled(t *testing.T) {
+	w, called := requestClientPlatform(middleware.ClientMinimums{}, "web", "")
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.False(t, called)
+}
+
+func TestClientMinimumsFromConfig(t *testing.T) {
+	cfg := &config.Config{ClientMinVersion: "0.2.46", ClientMinVersionIOS: "1.0.0", ClientMinVersionAndroid: "1.1.0"}
+
+	assert.Equal(t, middleware.ClientMinimums{Desktop: "0.2.46", IOS: "1.0.0", Android: "1.1.0"}, middleware.ClientMinimumsFromConfig(cfg))
 }

@@ -21,7 +21,7 @@ func TestRouterClientVersionWiring(t *testing.T) {
 	source := string(sourceBytes)
 
 	authIndex := strings.Index(source, "authRequired.Use(middleware.AuthRequired")
-	versionIndex := strings.Index(source, "authRequired.Use(middleware.RequireClientVersion(cfg.ClientMinVersion))")
+	versionIndex := strings.Index(source, "authRequired.Use(middleware.RequireClientVersion(middleware.ClientMinimumsFromConfig(cfg)))")
 	attestationIndex := strings.Index(source, "authRequired.Use(middleware.RequireAttestation")
 	require.NotEqual(t, -1, authIndex)
 	require.NotEqual(t, -1, versionIndex)
@@ -94,7 +94,7 @@ func TestRouterClientVersionWiring_Behavior(t *testing.T) {
 
 	authRequired := v1.Group("/")
 	authRequired.Use(fakeAuth)
-	authRequired.Use(middleware.RequireClientVersion("0.2.44"))
+	authRequired.Use(middleware.RequireClientVersion(middleware.ClientMinimums{Desktop: "0.2.44"}))
 	authRequired.GET("/users/me", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	request := func(method, path, version string) *httptest.ResponseRecorder {

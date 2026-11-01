@@ -662,7 +662,7 @@ func TestAuthenticateWebSocketBlacklistedJWT(t *testing.T) {
 func TestHandleWebSocketUnauthorized(t *testing.T) {
 	hub := NewHub(nil, nil)
 	h := NewHandler(hub, nil, nil, testJWTSecret, []string{"*"}, nil, nil)
-	h.SetMinimumClientVersion("3.0.0")
+	h.SetClientMinimums(middleware.ClientMinimums{Desktop: "3.0.0"})
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -674,12 +674,13 @@ func TestHandleWebSocketUnauthorized(t *testing.T) {
 	assert.JSONEq(t, `{"error":"Unauthorized"}`, w.Body.String())
 }
 
-func TestHandlerSetMinimumClientVersion(t *testing.T) {
+func TestHandlerSetClientMinimums(t *testing.T) {
 	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
+	minimums := middleware.ClientMinimums{Desktop: "3.0.0", IOS: "1.0.0", Android: "1.1.0"}
 
-	h.SetMinimumClientVersion("3.0.0")
+	h.SetClientMinimums(minimums)
 
-	assert.Equal(t, "3.0.0", h.minimumClientVersion)
+	assert.Equal(t, minimums, h.clientMinimums)
 }
 
 func TestHandleWebSocketClientVersionFloorTicket(t *testing.T) {
@@ -710,9 +711,17 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 	tests := []struct {
 		name          string
 		minimum       string
+		ios           string
+		android       string
+		platform      string
 		clientVersion string
 		wantStatus    int
 	}{
+		{name: "iOS uses its own floor", minimum: "3.0.0", ios: "1.0.0", platform: "ios", clientVersion: "1.0.0", wantStatus: http.StatusSwitchingProtocols},
+		{name: "iOS older", minimum: "0.1.0", ios: "1.0.0", platform: "ios", clientVersion: "0.9.0", wantStatus: http.StatusForbidden},
+		{name: "Android uses its own floor", minimum: "3.0.0", android: "1.0.0", platform: "android", clientVersion: "1.0.0", wantStatus: http.StatusSwitchingProtocols},
+		{name: "Android older", minimum: "0.1.0", android: "1.0.0", platform: "android", clientVersion: "0.9.0", wantStatus: http.StatusForbidden},
+		{name: "unknown platform", platform: "web", clientVersion: "3.0.0", wantStatus: http.StatusBadRequest},
 		{name: "Pilot equal", minimum: "1.0.0", clientVersion: "1.0.0-pilot.0", wantStatus: http.StatusSwitchingProtocols},
 		{name: "Pilot newer", minimum: "1.0.0", clientVersion: "1.1.0-pilot.2", wantStatus: http.StatusSwitchingProtocols},
 		{name: "Pilot older", minimum: "1.0.0", clientVersion: "0.9.0-pilot.99", wantStatus: http.StatusForbidden},
@@ -729,8 +738,11 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 
 	for _, test := range tests {
 		t.Run(authPathName+"/"+test.name, func(t *testing.T) {
-			handler.SetMinimumClientVersion(test.minimum)
+			handler.SetClientMinimums(middleware.ClientMinimums{Desktop: test.minimum, IOS: test.ios, Android: test.android})
 			wsURL := "ws" + server.URL[4:] + authPath(t, db, redisClient, access) + "&client_version=" + test.clientVersion
+			if test.platform != "" {
+				wsURL += "&client_platform=" + test.platform
+			}
 
 			conn, response, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
 			if test.wantStatus == http.StatusSwitchingProtocols {
@@ -747,14 +759,24 @@ func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, au
 				assert.NoError(t, response.Body.Close())
 			}()
 			assert.Equal(t, test.wantStatus, response.StatusCode)
+			if test.wantStatus == http.StatusBadRequest {
+				return
+			}
 
+			wantMinimum := test.minimum
+			switch test.platform {
+			case "ios":
+				wantMinimum = test.ios
+			case "android":
+				wantMinimum = test.android
+			}
 			var body attestation.ErrorResponse
 			require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
 			assert.Equal(t, attestation.ErrorResponse{
 				Error:              "Client version too old",
 				Code:               attestation.ErrVersionTooOld,
 				UpdateAvailable:    true,
-				RequiredMinVersion: test.minimum,
+				RequiredMinVersion: wantMinimum,
 				DownloadHelpURL:    attestation.DownloadHelpURLDefault,
 			}, body)
 		})
