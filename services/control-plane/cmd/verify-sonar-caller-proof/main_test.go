@@ -111,17 +111,48 @@ func (f *oidcFixture) proof(t *testing.T, key *rsa.PrivateKey, claims map[string
 
 func TestVerifyProofAcceptsSignedCanonicalPayload(t *testing.T) {
 	f := newOIDCFixture(t)
-	raw := f.proof(t, f.key, f.claims, f.raw)
-	out, err := verifyProof(context.Background(), raw, f.server.URL, func() time.Time { return f.now })
-	require.NoError(t, err)
-	require.NotContains(t, string(out), "oidc_jwt")
-	var got verifiedOutput
-	require.NoError(t, json.Unmarshal(out, &got))
-	require.Equal(t, f.raw, []byte(got.Payload))
-	require.Equal(t, repositoryID, got.Claims.RepositoryID)
-	require.Equal(t, "12345", got.Claims.RunID)
-	require.Equal(t, workflowRef, got.Claims.WorkflowRef)
-	require.Equal(t, strings.Repeat("c", 40), got.Claims.WorkflowSHA)
+	for _, ref := range []string{
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@main",
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@refs/heads/main",
+	} {
+		t.Run(ref, func(t *testing.T) {
+			f.claims["workflow_ref"] = ref
+			raw := f.proof(t, f.key, f.claims, f.raw)
+			out, err := verifyProof(context.Background(), raw, f.server.URL, func() time.Time { return f.now })
+			require.NoError(t, err)
+			require.NotContains(t, string(out), "oidc_jwt")
+			var got verifiedOutput
+			require.NoError(t, json.Unmarshal(out, &got))
+			require.Equal(t, f.raw, []byte(got.Payload))
+			require.Equal(t, repositoryID, got.Claims.RepositoryID)
+			require.Equal(t, "12345", got.Claims.RunID)
+			require.Equal(t, ref, got.Claims.WorkflowRef)
+			require.Equal(t, strings.Repeat("c", 40), got.Claims.WorkflowSHA)
+		})
+	}
+}
+
+func TestVerifyProofRejectsUntrustedSignedWorkflowRefs(t *testing.T) {
+	f := newOIDCFixture(t)
+	for _, ref := range []string{
+		"other/Hosted/.github/workflows/required-pr-build.yml@main",
+		"other/Hosted/.github/workflows/required-pr-build.yml@refs/heads/main",
+		"Concord-Voice/Hosted/.github/workflows/attacker.yml@main",
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@refs/heads/feature",
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@refs/pull/7/merge",
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@refs/tags/main",
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@main-extra",
+		"Concord-Voice/Hosted/.github/workflows/required-pr-build.yml@refs/heads/main\n",
+		"",
+	} {
+		t.Run(ref, func(t *testing.T) {
+			f.claims["workflow_ref"] = ref
+			raw := f.proof(t, f.key, f.claims, f.raw)
+			_, err := verifyProof(context.Background(), raw, f.server.URL, func() time.Time { return f.now })
+			require.ErrorContains(t, err, "OIDC claims rejected")
+			require.NotContains(t, err.Error(), "eyJ")
+		})
+	}
 }
 
 func TestVerifyProofRejectsBadProofs(t *testing.T) {
@@ -197,8 +228,8 @@ func TestVerifyProofRejectsBadProofs(t *testing.T) {
 			c["workflow_ref"] = repository + "/.github/workflows/pr-ci.yml@refs/heads/main"
 			return f.key
 		}},
-		{"branch-form workflow ref", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
-			c["workflow_ref"] = repository + "/.github/workflows/required-pr-build.yml@refs/heads/main"
+		{"feature-branch workflow ref", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {
+			c["workflow_ref"] = repository + "/.github/workflows/required-pr-build.yml@refs/heads/feature"
 			return f.key
 		}},
 		{"pull-request workflow ref", func(_ *testing.T, c map[string]any, _ *[]byte) *rsa.PrivateKey {

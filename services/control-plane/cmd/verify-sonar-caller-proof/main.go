@@ -25,14 +25,14 @@ const (
 	githubIssuer = "https://token.actions.githubusercontent.com"
 	repository   = "Concord-Voice/Hosted"
 	repositoryID = "1158152129"
-	// A ruleset-loaded required workflow signs its ref as @main, not
-	// @refs/heads/main (observed on the 2026-10-30 canary).
-	workflowRef  = repository + "/.github/workflows/required-pr-build.yml@main"
-	audienceBase = "concord-voice:protected-sonar:sha256:"
-	maxProofSize = 64 << 10
-	maxPayload   = 24 << 10
-	maxTokenSize = 32 << 10
-	maxOutput    = 32 << 10
+	// Ruleset-loaded workflows can sign either exact main-ref representation.
+	workflowRef          = repository + "/.github/workflows/required-pr-build.yml@main"
+	qualifiedWorkflowRef = repository + "/.github/workflows/required-pr-build.yml@refs/heads/main"
+	audienceBase         = "concord-voice:protected-sonar:sha256:"
+	maxProofSize         = 64 << 10
+	maxPayload           = 24 << 10
+	maxTokenSize         = 32 << 10
+	maxOutput            = 32 << 10
 	// GitHub backdates nbf five minutes before iat (observed 2026-10-30); allow
 	// up to the lifetime bound so a modest change in that offset still verifies.
 	maxNotBeforeSkew = 10 * time.Minute
@@ -233,7 +233,8 @@ func validClaims(token *oidc.IDToken, c signedClaims, p payload, now time.Time) 
 	if c.RepositoryID != repositoryID || c.Repository != repository || c.EventName != "pull_request" ||
 		c.RunID != strconv.FormatInt(p.CallerRunID, 10) ||
 		c.RunAttempt != strconv.FormatInt(p.CallerRunAttempt, 10) ||
-		c.WorkflowRef != workflowRef || !shaPattern.MatchString(c.WorkflowSHA) || c.Subject == "" {
+		(c.WorkflowRef != workflowRef && c.WorkflowRef != qualifiedWorkflowRef) ||
+		!shaPattern.MatchString(c.WorkflowSHA) || c.Subject == "" {
 		return false
 	}
 	if token.IssuedAt.IsZero() || token.Expiry.IsZero() || c.NotBefore <= 0 {
