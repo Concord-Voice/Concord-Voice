@@ -1813,8 +1813,47 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		"same_ip", ipKnown && ipOk, "same_ua", uaKnown && uaOk,
 		"revoked_ago_ms", time.Since(revokedAt).Milliseconds())
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonRefreshReplay, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+	h.logReplayWouldRevoke(c, revokedTokenID, revokedUserID)
 	c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
 	return true
+}
+
+// replayLineageMaxDepth bounds the predecessor walk. A 30-day session rotating
+// every 15 minutes is about 2,900 rows deep.
+const replayLineageMaxDepth = 10000
+
+// logReplayWouldRevoke is replay revocation K, stage 1 (log only). A loud
+// replay of a rotated-out token means two parties hold the lineage; stage 2
+// will revoke every live row descended from the replayed one. This stage only
+// walks predecessor_id forward and logs what that revocation would hit, so two
+// weeks of data can show how often it would sign out a legitimate user.
+//
+// ponytail: log-only by design; enforcement is a separate PR after review of the data.
+func (h *Handler) logReplayWouldRevoke(c *gin.Context, replayedTokenID, userID string) {
+	var live, depth int
+	err := h.db.QueryRowContext(c.Request.Context(), `
+		WITH RECURSIVE lineage(id, revoked_at, expires_at, depth) AS (
+			SELECT id, revoked_at, expires_at, 0 FROM refresh_tokens WHERE id = $1 AND user_id = $2
+			UNION ALL
+			SELECT rt.id, rt.revoked_at, rt.expires_at, l.depth + 1
+			FROM refresh_tokens rt JOIN lineage l ON rt.predecessor_id = l.id
+			WHERE rt.user_id = $2 AND l.depth < $3
+		)
+		SELECT COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at > NOW()), COALESCE(MAX(depth), 0)
+		FROM lineage`,
+		replayedTokenID, userID, replayLineageMaxDepth,
+	).Scan(&live, &depth)
+	if err != nil {
+		h.log.Warn("Replay lineage walk failed", "error_class", "replay_lineage_walk", "user_id", userID)
+		return
+	}
+	h.log.Warn("Refresh replay would revoke lineage",
+		"request_id", c.GetString(middleware.RequestIDContextKey),
+		"user_id", userID,
+		"would_revoke", live > 0,
+		"live_successors", live,
+		"lineage_depth", depth,
+		"mode", "log_only")
 }
 
 // checkRememberMeExpiry checks if a remember-me token has expired due to prolonged offline inactivity.

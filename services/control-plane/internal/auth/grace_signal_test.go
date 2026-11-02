@@ -304,3 +304,28 @@ func TestGraceRecovery_KnownUserAgentMissingRequestRefuses(t *testing.T) {
 	assert.Equal(t, 1, revoked)
 	assert.Equal(t, 1, live)
 }
+
+// Replay revocation K, stage 1: a loud replay logs the live successors it would
+// revoke, and revokes nothing yet.
+func TestReplayLogsWouldRevokeLineageWithoutRevoking(t *testing.T) {
+	ts := setupTS(t)
+	refresh, _ := registerAndGetRefreshToken(t, ts, "replay-would-revoke", "")
+	var logBuffer bytes.Buffer
+	h := auth.NewHandler(ts.DB, ts.Redis, logger.NewWithWriter(&logBuffer), testhelpers.TestJWTSecret, nil)
+	require.Equal(t, http.StatusOK, refreshDirect(t, h, refresh, "", "198.51.100.10:1234", "agent-a").Code)
+	_, err := ts.DB.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '31 seconds' WHERE token_hash = $1`, auth.HashRefreshToken(refresh))
+	require.NoError(t, err)
+
+	w := refreshDirect(t, h, refresh, "", "198.51.100.99:1234", "agent-b")
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	logs := logBuffer.String()
+	assert.Contains(t, logs, "Refresh replay would revoke lineage")
+	assert.Contains(t, logs, "would_revoke=true")
+	assert.Contains(t, logs, "live_successors=1")
+	assert.Contains(t, logs, "lineage_depth=1")
+	assert.Contains(t, logs, "mode=log_only")
+	var live int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE predecessor_id = (SELECT id FROM refresh_tokens WHERE token_hash = $1) AND revoked_at IS NULL`, auth.HashRefreshToken(refresh)).Scan(&live))
+	assert.Equal(t, 1, live, "log-only stage must not revoke the successor")
+}
