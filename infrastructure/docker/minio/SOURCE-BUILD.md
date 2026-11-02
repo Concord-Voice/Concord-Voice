@@ -93,35 +93,40 @@ release above. It changes only `go.mod` and `go.sum`; no application source is
 changed. Publication, consumer updates, and live cutover each remain subject to
 their separate gates in the refresh runbook.
 
-The most recently recorded publication is
-`RELEASE.2025-10-15T17-29-55Z.CONCORD.88c88a5bea7d`, with its corresponding
-source, as recorded in the internal development reference omitted.
-The shared Compose consumer still pins `823f9aa2bd62`; publication alone did
-not change that consumer. The Thrift correction `ee1b8c5b1ed7` is superseded unpublished;
-its privileged publisher execution was not performed. The current #3716 recipe
-below preserves its thirteen reviewed module versions and changes the Go
-compiler to 1.26.10. Its new identity has not been published or consumed. Merge,
-release-specific legal approval, publisher dispatch and consumer/cutover approval
-remain separate gates. The integrated #3482 change selects BuildKit 0.34.1 for
-this recipe without changing the derivative source, compiler, thirteen module
-versions, runtime base, Buildx or source archive identity.
+The previous compiler recipe `512ec76c0c95` was published by protected-main
+internal development reference omitted.
+Its runtime index is
+`sha256:19933ca8355fb1c2470f30ef75e799e166b95b968bdc5c39853d70e6bf63c5f3`
+and corresponding source is
+`sha256:2d225f7e8a8216c1c394c7209f3c558d4eba12d384ca3ae0f258800986e68787`.
+Anonymous pulls verified that pair and its source/runtime binding. The shared
+Compose consumer still pins `823f9aa2bd62`; publication did not update it.
+
+The candidate below responds to the fresh post-publication scan. It updates
+AMQP to 1.14.0, go-jose/v4 to 4.1.6 and x/net to 0.62.0, with the resolved
+transitive changes listed below. The previous module floors remain satisfied;
+Go 1.26.10, the BuildKit 0.34.1 pin, runtime base, Buildx, compilation flags,
+ports, authentication, volumes and license files remain unchanged. This candidate
+is unpublished and has no release-specific legal approval. Security/design
+review and that explicit approval must precede any publisher dispatch; consumer
+updates and live cutover keep their separate gates.
 
 | Input or output | Exact value |
 | --- | --- |
 | Upstream tag | `RELEASE.2025-10-15T17-29-55Z` |
 | Upstream commit | `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` |
-| Module targets | `github.com/rabbitmq/amqp091-go v1.13.0`; `google.golang.org/grpc v1.83.2`; `github.com/apache/thrift v0.25.0`; `github.com/buger/jsonparser v1.1.2`; `github.com/eclipse/paho.mqtt.golang v1.5.1`; `github.com/Azure/go-ntlmssp v0.1.1`; `go.mongodb.org/mongo-driver v1.17.7`; `golang.org/x/crypto v0.56.0`; `filippo.io/edwards25519 v1.1.1`; `github.com/klauspost/compress v1.18.7`; `go.etcd.io/etcd/client/pkg/v3 v3.5.33` |
+| Module targets | `github.com/rabbitmq/amqp091-go v1.14.0`; `github.com/go-jose/go-jose/v4 v4.1.6`; `golang.org/x/net v0.62.0`; `google.golang.org/grpc v1.83.2`; `github.com/apache/thrift v0.25.0`; `github.com/buger/jsonparser v1.1.2`; `github.com/eclipse/paho.mqtt.golang v1.5.1`; `github.com/Azure/go-ntlmssp v0.1.1`; `go.mongodb.org/mongo-driver v1.17.7`; `golang.org/x/crypto v0.58.0`; `filippo.io/edwards25519 v1.1.1`; `github.com/klauspost/compress v1.18.7`; `go.etcd.io/etcd/client/pkg/v3 v3.5.33` |
 | Manifest directives | `go 1.26.0`, `toolchain go1.26.10` |
 | Deliberately unchanged | `github.com/prometheus/prometheus v0.303.0`; `go.opentelemetry.io/otel/sdk v1.44.0` |
 | Go builder | `golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af` |
 | BuildKit | `moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c` |
-| Derivative tree | `6c22e62a4893205c4e7d86a4a702e5cf5bd80fd9` |
-| Derivative commit | `512ec76c0c95c9b4947c43f3c820811cae6fa10e` |
-| Derivative tag | `RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95` |
-| Patch SHA-256 | `9372ea296d67a1c4640ed1bbf94070ab7aa16b9d625361090199fd721281b264` |
-| `go.mod` SHA-256 | `9e9094cdd73f3cdaeb888ab7efcb7a18727d9cf238ed2b03bc98fa19671a6704` |
-| `go.sum` SHA-256 | `b2917a1758ed5ac48c97ea6b66e9dd1c45f0a4a594ffe1afa14475e26dfadec1` |
-| Source archive SHA-256 | `be5589c09a506ec467619973cfdd03fcfc4a33cdac3b40b01eb77121ce583fed` |
+| Derivative tree | `02a0f6c098c96088d2e46d7fb19286d79269d674` |
+| Derivative commit | `c7d942fa52807929e119bcb4531e21d099ccd1a8` |
+| Derivative tag | `RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280` |
+| Patch SHA-256 | `4b27aac2247f59fbe60ca02ad507cf2775dfa74f0bf78d559afa3024e1137642` |
+| `go.mod` SHA-256 | `8da7dd5cb011e71491c39350ef0014817acfa6ae983c6d212e5802d5508cae1d` |
+| `go.sum` SHA-256 | `b6ebc303ee7255db47ed2610b9271876da1146b734ce92ac99ea519a244b9fcc` |
+| Source archive SHA-256 | `7097139b7d2db54fda66c1e6fe18dd743a5baac67a0a3900372bdc37f8d17cca` |
 
 The [BuildKit artifact evidence](../../../[internal]specs/2026-10-25-3482-buildkit-artifact-evidence.md)
 records both regular and rootless images on linux/amd64 and linux/arm64.
@@ -130,40 +135,47 @@ containerd/v2 2.4.1. Positive binary scans omit CVE-2026-53493 and
 CVE-2026-95838, but retain six findings per client and seven per daemon,
 including HIGH x/net findings and HIGH go-archive findings in the daemons.
 Residual security disposition remains required; these results are neither a
-clean full-image scan nor runtime evidence. Execution of the final publisher
-recipe with Buildx 0.35.0 and this BuildKit remains **UNVERIFIED**. The managed
-rootless builder needs its separate native admission/network proof before host
-activation. Earlier build outputs and publication receipts do not validate
-either upgraded builder. The proposed final #3716/#3482 boundary in `REVIEW.md`
-requires explicit security/deployment acceptance for the final integrated head.
+clean full-image scan nor runtime evidence. The completed `512ec76c0c95`
+publication established ordinary Buildx 0.35.0 / regular BuildKit 0.34.1
+compatibility and source-first promotion. Execution of the unpublished
+`c7d942fa5280` publisher recipe remains **UNVERIFIED**. The managed rootless
+builder still needs its separate native admission/network proof before host
+activation; the ordinary publisher does not validate that profile. The
+#3716/#3482 boundary in `REVIEW.md` requires explicit security/deployment
+acceptance for the final integrated head.
 
 The pinned patch uses the repository whitespace hook's normalized blank context lines. It applies to the same manifests and reproduces the same derivative tree, commit, and Linux archive.
 
-The final archive hash was measured with Linux GNU gzip 1.13 and reproduced
-with GNU gzip 1.12. An independent pristine replay reproduced the final source
-identity. The publisher must reproduce this exact checksum.
+The candidate archive was generated with Linux GNU gzip 1.12. A second pristine
+upstream clone executed the actual publisher source-verification block and
+reproduced the tree, commit, patch, manifest and archive checksums. Independent
+review of that replay remains required; the publisher must reproduce this exact
+checksum.
 The uncompressed `git archive` tar SHA-256 is
-`dd2a99e2aafaaa1f5c30857f7f5f15704e0a7cd835f9337b4eab5108b82a71a9`.
+`bce609568c2c45885f3927f873b399343dffbdbf468911bb26c191a0e6ac7ac6`.
 The commit uses parent `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`, subject
-`Concord dependency and compiler remediation for #3441 #3469 #3527 #3528 #3530-#3534 #3716`, and
+`Concord fresh dependency remediation for #3441 #3469 #3527 #3528 #3530-#3534 #3716`, and
 fixed author and committer `Concord Voice <build@concordvoice.com>` at
-`2026-10-25T00:00:00Z`. The upstream release time and
+`2026-11-02T00:00:00Z`. The upstream release time and
 `SOURCE_DATE_EPOCH=1760549395` remain compatibility timestamps; they do not
 identify the derivative source. Runtime base, Buildx, ports, credentials,
 volume, licenses, and compile flags remain at their existing pins; the
 derivative uses the BuildKit pin listed above.
 
-The patch was regenerated from the exact upstream checkout after applying the
-reviewed `ee1b8c5b1ed7` manifest patch. Under the pinned Go 1.26.10 compiler:
+The cumulative upstream-relative patch was regenerated from the exact upstream
+checkout after applying the published `512ec76c0c95` manifest patch. Under the
+pinned Go 1.26.10 toolchain:
 
 ```bash
-GOTOOLCHAIN=local go mod edit -toolchain=go1.26.10
+GOTOOLCHAIN=local go get github.com/rabbitmq/amqp091-go@v1.14.0 \
+  github.com/go-jose/go-jose/v4@v4.1.6 golang.org/x/net@v0.62.0
+GOTOOLCHAIN=local go mod tidy
 ```
 
-The resulting `go.mod` differs from that intermediate only in the toolchain
-line; `go 1.26.0`, all module requirements and the entire `go.sum` are unchanged.
-No `go get` or `go mod tidy` was used for this compiler continuation. The
-cumulative upstream-relative patch still modifies only `go.mod` and `go.sum`.
+Compared with the published compiler recipe, the resolved graph also advances
+x/crypto to 0.58.0, x/sync to 0.24.0, x/sys to 0.49.0, x/term to 0.47.0,
+x/mod to 0.41.0, x/text to 0.43.0 and x/tools to 0.51.0. The manifest keeps
+`go 1.26.0` and `toolchain go1.26.10`. Only `go.mod` and `go.sum` change.
 Blank context lines are normalized by removing their single context space,
 as in the existing repository whitespace convention.
 
@@ -181,7 +193,7 @@ test "$(git -C minio-source rev-parse HEAD)" = \
 SOURCE_STATUS="$(git -C minio-source status --porcelain --untracked-files=all --ignored)"
 test -z "$SOURCE_STATUS"
 printf '%s  %s\n' \
-  9372ea296d67a1c4640ed1bbf94070ab7aa16b9d625361090199fd721281b264 \
+  4b27aac2247f59fbe60ca02ad507cf2775dfa74f0bf78d559afa3024e1137642 \
   infrastructure/docker/minio/dependencies.patch | sha256sum -c -
 git -C minio-source apply --check --whitespace=error \
   "$PWD/infrastructure/docker/minio/dependencies.patch"
@@ -191,24 +203,24 @@ PATCHED_STATUS="$(git -C minio-source status --porcelain --untracked-files=all -
 test "$PATCHED_STATUS" = $' M go.mod\n M go.sum'
 test "$(git -C minio-source diff --name-only --no-renames)" = $'go.mod\ngo.sum'
 printf '%s  %s\n' \
-  9e9094cdd73f3cdaeb888ab7efcb7a18727d9cf238ed2b03bc98fa19671a6704 minio-source/go.mod \
-  b2917a1758ed5ac48c97ea6b66e9dd1c45f0a4a594ffe1afa14475e26dfadec1 minio-source/go.sum \
+  8da7dd5cb011e71491c39350ef0014817acfa6ae983c6d212e5802d5508cae1d minio-source/go.mod \
+  b6ebc303ee7255db47ed2610b9271876da1146b734ce92ac99ea519a244b9fcc minio-source/go.sum \
   | sha256sum -c -
 git -C minio-source add -- go.mod go.sum
 DERIVATIVE_TREE="$(git -C minio-source write-tree)"
-test "$DERIVATIVE_TREE" = 6c22e62a4893205c4e7d86a4a702e5cf5bd80fd9
+test "$DERIVATIVE_TREE" = 02a0f6c098c96088d2e46d7fb19286d79269d674
 DERIVATIVE_COMMIT="$(GIT_AUTHOR_NAME='Concord Voice' GIT_AUTHOR_EMAIL='build@concordvoice.com' \
-  GIT_AUTHOR_DATE='2026-10-25T00:00:00Z' GIT_COMMITTER_NAME='Concord Voice' \
-  GIT_COMMITTER_EMAIL='build@concordvoice.com' GIT_COMMITTER_DATE='2026-10-25T00:00:00Z' \
+  GIT_AUTHOR_DATE='2026-11-02T00:00:00Z' GIT_COMMITTER_NAME='Concord Voice' \
+  GIT_COMMITTER_EMAIL='build@concordvoice.com' GIT_COMMITTER_DATE='2026-11-02T00:00:00Z' \
   git -C minio-source -c commit.gpgsign=false commit-tree "$DERIVATIVE_TREE" \
     -p 9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a \
-    -m 'Concord dependency and compiler remediation for #3441 #3469 #3527 #3528 #3530-#3534 #3716')"
-test "$DERIVATIVE_COMMIT" = 512ec76c0c95c9b4947c43f3c820811cae6fa10e
+    -m 'Concord fresh dependency remediation for #3441 #3469 #3527 #3528 #3530-#3534 #3716')"
+test "$DERIVATIVE_COMMIT" = c7d942fa52807929e119bcb4531e21d099ccd1a8
 test "$(git -C minio-source show -s --format=%P "$DERIVATIVE_COMMIT")" = \
   9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
 git -C minio-source archive --format=tar "$DERIVATIVE_COMMIT" | gzip -n > minio-source.tar.gz
 printf '%s  %s\n' \
-  be5589c09a506ec467619973cfdd03fcfc4a33cdac3b40b01eb77121ce583fed \
+  7097139b7d2db54fda66c1e6fe18dd743a5baac67a0a3900372bdc37f8d17cca \
   minio-source.tar.gz | sha256sum -c -
 mkdir minio-build-context
 tar -xzf minio-source.tar.gz -C minio-build-context
@@ -216,24 +228,24 @@ sha256sum minio-source.tar.gz > minio-source.tar.gz.sha256
 cp infrastructure/docker/minio/dependencies.patch dependencies.patch
 sha256sum dependencies.patch > dependencies.patch.sha256
 printf '%s  %s\n' \
-  9372ea296d67a1c4640ed1bbf94070ab7aa16b9d625361090199fd721281b264 \
+  4b27aac2247f59fbe60ca02ad507cf2775dfa74f0bf78d559afa3024e1137642 \
   dependencies.patch | sha256sum -c -
 printf '%s  %s\n' \
-  9e9094cdd73f3cdaeb888ab7efcb7a18727d9cf238ed2b03bc98fa19671a6704 minio-build-context/go.mod \
+  8da7dd5cb011e71491c39350ef0014817acfa6ae983c6d212e5802d5508cae1d minio-build-context/go.mod \
   > go.mod.sha256
 printf '%s  %s\n' \
-  b2917a1758ed5ac48c97ea6b66e9dd1c45f0a4a594ffe1afa14475e26dfadec1 minio-build-context/go.sum \
+  b6ebc303ee7255db47ed2610b9271876da1146b734ce92ac99ea519a244b9fcc minio-build-context/go.sum \
   > go.sum.sha256
 cat > source-provenance.txt <<'EOF'
 upstream_tag=RELEASE.2025-10-15T17-29-55Z
 upstream_commit=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
-derivative_tag=RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95
-derivative_commit=512ec76c0c95c9b4947c43f3c820811cae6fa10e
-derivative_tree=6c22e62a4893205c4e7d86a4a702e5cf5bd80fd9
-patch_sha256=9372ea296d67a1c4640ed1bbf94070ab7aa16b9d625361090199fd721281b264
-go_mod_sha256=9e9094cdd73f3cdaeb888ab7efcb7a18727d9cf238ed2b03bc98fa19671a6704
-go_sum_sha256=b2917a1758ed5ac48c97ea6b66e9dd1c45f0a4a594ffe1afa14475e26dfadec1
-source_archive_sha256=be5589c09a506ec467619973cfdd03fcfc4a33cdac3b40b01eb77121ce583fed
+derivative_tag=RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280
+derivative_commit=c7d942fa52807929e119bcb4531e21d099ccd1a8
+derivative_tree=02a0f6c098c96088d2e46d7fb19286d79269d674
+patch_sha256=4b27aac2247f59fbe60ca02ad507cf2775dfa74f0bf78d559afa3024e1137642
+go_mod_sha256=8da7dd5cb011e71491c39350ef0014817acfa6ae983c6d212e5802d5508cae1d
+go_sum_sha256=b6ebc303ee7255db47ed2610b9271876da1146b734ce92ac99ea519a244b9fcc
+source_archive_sha256=7097139b7d2db54fda66c1e6fe18dd743a5baac67a0a3900372bdc37f8d17cca
 go_builder=golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af
 EOF
 cp infrastructure/docker/minio/Dockerfile Dockerfile
@@ -250,35 +262,77 @@ for PLATFORM in linux/amd64 linux/arm64; do
   docker buildx build \
     --platform "$PLATFORM" \
     --build-arg SOURCE_DATE_EPOCH=1760549395 \
-    --build-arg DERIVATIVE_COMMIT=512ec76c0c95c9b4947c43f3c820811cae6fa10e \
-    --build-arg DERIVATIVE_TAG=RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95 \
+    --build-arg DERIVATIVE_COMMIT=c7d942fa52807929e119bcb4531e21d099ccd1a8 \
+    --build-arg DERIVATIVE_TAG=RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280 \
     --build-arg UPSTREAM_COMMIT=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a \
     --load \
     --file "$PWD/infrastructure/docker/minio/Dockerfile" \
-    --tag "concord-minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95-$ARCH" \
+    --tag "concord-minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280-$ARCH" \
     minio-build-context
 done
 ```
 
-The current Dockerfile requires `go1.26.10`. Final native amd64 and cross-built
-arm64 binaries have SHA-256
-`fc6d516f633474d452c4b1a70f53ad8aa724fbbc95591f2896db423cbb39e672` and
-`c3197fd2b0fb6495f4b6995c1915106f5a6c4d045b6fe49508e59668b66f8327`,
-respectively. Both report Go 1.26.10 and all thirteen expected module versions,
-without replacements or a range-limit override. The native amd64 CLI reports
-the final derivative identity. Its bounded console Range check, disposable
-S3 lifecycle, Parquet probe and s3select tests passed. Native arm64 execution
-and protected-main publisher/image attestations remain outstanding.
+The current Dockerfile requires `go1.26.10`. The candidate compiled natively
+on linux/amd64 under that exact toolchain from the source archive, retaining the
+Dockerfile's target, trimpath, build tags, CGO setting and linker metadata. The
+resulting binary SHA-256 is
+`6849c95cf8dfb6276e30061900a262ee2f863ac77406e9181c2253c6033d6f25`;
+its CLI reports `c7d942fa52807929e119bcb4531e21d099ccd1a8`. The arm64
+cross-build has SHA-256
+`2338f91735e6a52aa003c7e1a4d500bd35ea30482231e89d73f355c39c695576`. Both
+binaries report Go 1.26.10 and the fifteen expected module versions, without
+replacements, and pass the actual publisher module-metadata grep gates. These
+are local binary builds, not image builds or native arm64 execution.
 
-Trivy 0.74.0 with database updated `2026-10-25T01:20:33.190884269Z` reported
-twelve findings on each final binary; CVE-2026-78667 and CVE-2026-111943 were
-absent. The residuals comprise six findings represented in historical
-digest-bound VEX, AMQP CVE-2026-107386 and five x/net HTTP/2 findings. Historical
-VEX and configuration-dependent dispositions do not attest these new binaries
-or the current fleet. govulncheck remains incomplete because its database
-request returned HTTP Forbidden. String-name controls passed, but do not
-establish call-graph reachability. The bounded Range harness and its
-module-directive requirement are documented in
+Trivy 0.74.0 with database updated `2026-11-02T01:14:05.640637121Z`
+positively analyzed each candidate binary and reported six library findings:
+the four Prometheus advisories, the OpenTelemetry SDK advisory and
+GO-2026-5932 at the new x/crypto 0.58.0 version. The AMQP, go-jose and x/net
+findings present in the published predecessor were absent. Both complete Go
+function-name tables, including inlined names, retain zero matches for the
+affected Prometheus remote/web packages, OpenTelemetry trace and x/crypto
+OpenPGP packages. Nonexistent canary checks remain zero; histogram ZeroBucket,
+SDK metric and chacha20poly1305 Open controls are present. These measurements
+support later digest-specific VEX review; the old product/version statements
+do not cover the new image or x/crypto version.
+
+On disposable local storage, the actual native amd64 candidate passed S3 bucket
+creation, object PUT/HEAD/GET with exact payload comparison, object deletion,
+missing-object 404 and bucket deletion. Its actual console JavaScript asset
+(2,419,831 bytes) returned full 200, single-byte Range 206, and 201-range 200
+with the exact full body, without a GODEBUG override. The candidate module graph
+also passed the existing valid/malformed Parquet reader and separately labeled
+Thrift TMemoryBuffer discriminator harness. That discriminator does not prove
+a small allocation bound on the production StreamTransport path.
+
+Native arm64 execution, protected-main publisher/image evidence, anonymous
+pulls, fresh full-image scans and new digest-bound VEX verification remain
+future gates. No previous recipe measurement transfers automatically.
+
+For the published `512ec76c0c95` recipe, the exact amd64 and arm64 binary hashes
+were `fc6d516f633474d452c4b1a70f53ad8aa724fbbc95591f2896db423cbb39e672`
+and `c3197fd2b0fb6495f4b6995c1915106f5a6c4d045b6fe49508e59668b66f8327`.
+Both reported Go 1.26.10 and the thirteen then-pinned module versions. Fresh
+post-publication Trivy 0.74.0 scans with database updated
+`2026-11-02T01:14:05.640637121Z` found 17 library advisories and 92 OS-package
+findings per architecture. Six library findings had absent-code measurements;
+additional AMQP, go-jose and x/net findings require this dependency refresh or
+new evidence-backed dispositions. The unchanged UBI 9.6 base retains 8 HIGH,
+65 MEDIUM and 19 LOW OS findings; 62 had reported fixes and 30 did not. This
+candidate does not claim to remediate those base findings. A successful build
+or the old VEX record is not a clean full-image scan or fleet attestation.
+The current canonical Go vulnerability database request remains unavailable
+(HTTP Forbidden). A supplementary govulncheck 1.9.0 assessment used the official
+v1 database generator and validator at golang/vulndb commit
+`8f7e390a0ff7345d74ecd7a056a1073214466db9`, modified
+`2026-10-27T21:16:18Z`: both published binaries reported fourteen advisory IDs,
+both candidates six. This older snapshot lacks the three newer go-jose
+advisories, which the newer Trivy database covers. Because these binaries are
+stripped, govulncheck falls back to module precision and synthesizes advisory
+function frames; those frames do not establish linkage or reachability. JSON
+mode exits zero despite findings, while the candidate text control exits three.
+This is supplementary assessment evidence, not a clean or current canonical
+verdict. The bounded Range harness and module-directive requirement are in
 [`scripts/tests/minio/README.md`](../../../scripts/tests/minio/README.md).
 
 ### Superseded compiler trial: `c250402a45d2` (2026-10-25)
@@ -303,9 +357,10 @@ The Dockerfile requires `go1.26.8` and builds with `GOTOOLCHAIN=local`,
 `-trimpath`. Rebuilt locally on 2026-10-16, the binaries have SHA-256
 `e91bdd478ce9bb36b15d0a27a2f72a636e0bfe30cd6ad85885e69f4c5dfffe41` (amd64) and
 `e37deb932c97b9e62f7dfdb44691247bb4845761919f11ab3e87f34568448c21` (arm64).
-`go version -m` on both reports Go 1.26.8 and all thirteen module versions: the
-eleven module targets in the table above, plus `prometheus` v0.303.0 and
-`otel/sdk` v1.44.0, which are unchanged. These binary hashes and metadata are
+`go version -m` on both reports Go 1.26.8 and the thirteen module versions
+recorded in the retained PR #3912 evidence below: its eleven remediation
+targets, plus `prometheus` v0.303.0 and `otel/sdk` v1.44.0. Those historical
+versions are independent of the current candidate table. These binary hashes and metadata are
 the local build report for this correction. An independent source replay
 reproduced the patch, manifests, tree, commit, tar and gzip hashes; it did not
 rebuild the binaries. The internal development reference omitted
@@ -361,29 +416,29 @@ APIs ignore a random `io.Reader` supplied by the caller (`cryptocustomrand`).
 The S3 lifecycle runs recorded below passed with these defaults.
 
 For each locally built image, check `--version` for derivative tag
-`RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95` and full commit
-`512ec76c0c95c9b4947c43f3c820811cae6fa10e`. The source archive is the build
+`RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280` and full commit
+`c7d942fa52807929e119bcb4531e21d099ccd1a8`. The source archive is the build
 context; do not build from the checkout directory.
 
 ## Verify the derivative output
 
 ```bash
-EXPECTED_VERSION_LINE='minio version RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95 (commit-id=512ec76c0c95c9b4947c43f3c820811cae6fa10e)'
+EXPECTED_VERSION_LINE='minio version RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280 (commit-id=c7d942fa52807929e119bcb4531e21d099ccd1a8)'
 for ARCH in amd64 arm64; do
-  IMAGE="concord-minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95-$ARCH"
+  IMAGE="concord-minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280-$ARCH"
   VERSION_OUTPUT="$(docker run --rm "$IMAGE" --version)"
   test "$(printf '%s\n' "$VERSION_OUTPUT" | sed -n '1p')" = "$EXPECTED_VERSION_LINE"
 done
 
 docker image inspect \
-  concord-minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95-amd64 \
+  concord-minio:RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280-amd64 \
   --format '{{json .Config.Labels}}'
 ```
 
 Both images' first output line must be:
 
 ```text
-minio version RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95 (commit-id=512ec76c0c95c9b4947c43f3c820811cae6fa10e)
+minio version RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280 (commit-id=c7d942fa52807929e119bcb4531e21d099ccd1a8)
 ```
 
 The publisher runs the S3 lifecycle on native amd64 only. On native arm64 it
@@ -432,8 +487,8 @@ the registry with Trivy 0.74.0, all six findings were suppressed on each child
 digest, none on the index digest, and none with a wrong-digest control. When a
 new derivative is published, the consumer PR adds that derivative's platform
 digests and the measured subcomponent versions, after measuring the published
-binaries. For this derivative that includes the `x/crypto` v0.56.0
-subcomponent. The steps are in
+binaries. For this candidate that requires measuring the `x/crypto` v0.58.0
+subcomponent before deciding whether the existing statement still applies. The steps are in
 [the runbook](../../../[internal]refresh-minio-image.md#3a-vex-verification).
 
 Every subcomponent is pinned to an exact module version

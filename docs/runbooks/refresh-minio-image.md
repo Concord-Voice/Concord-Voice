@@ -1,8 +1,8 @@
 # Concord MinIO Source Publication and Cutover Gate
 
-> **Status:** Existing release published, consumed and cut over (2026-10-01); #3716/#3482 compiler and builder refresh not yet published or consumed
+> **Status:** Compiler/builder recipe `512ec76c0c95` published; fresh dependency candidate `c7d942fa5280` remains unpublished and unconsumed
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-10-25 (Go 1.26.10 and BuildKit 0.34.1 recipe; historical publication and cutover receipts retained)
+> **Last updated:** 2026-11-02 (fresh post-publication findings and proposed dependency continuation; historical cutover receipts retained)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
 
@@ -67,52 +67,66 @@ thirteen module versions and `go 1.26.0`, changes only the toolchain directive
 to `go1.26.10`, and pins the Go 1.26.10 builder. Its new synthetic commit and
 archive checksums are recorded in `SOURCE-BUILD.md`.
 
-The current recipe is
-`RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95`. It is not a publication
-receipt. The integrated #3482 recipe uses the verified BuildKit 0.34.1 pin in
-`SOURCE-BUILD.md`, retaining the same source/archive, compiler and module
-identities. The final #3716/#3482 proposal in `REVIEW.md` requires explicit final-head
-security/deployment acceptance of any post-merge publisher-runtime validation,
-independent source replay, new-binary and bounded Range/Parquet evidence,
-actual publisher-step contract tests, and fresh scans/symbol evidence or
-explicit dispositions. The #3527 and #3692 dispositions do not transfer
-automatically to the final integrated recipe.
-This proposal supplies neither legal approval nor dispatch authorization.
+The compiler/builder recipe
+`RELEASE.2025-10-15T17-29-55Z.CONCORD.512ec76c0c95` was published by
+internal development reference omitted.
+That run passed the native amd64 S3 lifecycle, native arm64 version/readiness/
+shutdown checks and source-first final promotion. It does not supply native
+arm64 full S3 coverage or the managed rootless builder's separate commissioning
+proof. Anonymous reads verified the runtime index
+`sha256:19933ca8355fb1c2470f30ef75e799e166b95b968bdc5c39853d70e6bf63c5f3`,
+source manifest
+`sha256:2d225f7e8a8216c1c394c7209f3c558d4eba12d384ca3ae0f258800986e68787`,
+all source blobs and the source/runtime binding. The two published binaries
+report Go 1.26.10 and all thirteen then-pinned module versions. The actual
+published amd64 console passed full-asset 200, one-byte Range 206 and 201-range
+full-body 200 checks without a GODEBUG range-limit override.
 
-The final recipe's independent source replay, native amd64 console/S3 checks,
-Parquet tests and compiler contracts passed. Both architecture binaries report
-Go 1.26.10. Fresh Trivy scans omit the two targeted compiler findings and
-retain twelve findings per binary; historical conditional dispositions do not
-attest the current fleet. govulncheck, native arm64 execution and privileged
-publisher/image evidence remain incomplete. These local results are not a
-publication receipt or final reviewer acceptance.
+Fresh unfiltered Trivy scans using the 2026-11-02 database report 17 library
+findings and 92 OS-package findings on each platform. The six existing
+absent-code findings have fresh symbol controls, but historical digest-bound
+VEX does not cover these new images. Additional AMQP, go-jose and x/net findings
+block the zero-unsuppressed-library gate in § 3a. The unchanged UBI 9.6 base
+also requires separate assessment of its 8 HIGH, 65 MEDIUM and 19 LOW findings;
+62 have reported fixes and 30 do not. Neither successful publication nor
+static linking establishes a clean full-image result. A current canonical-database govulncheck assessment remains
+incomplete because its database request returned HTTP Forbidden; supplementary
+local-database results and their limits are recorded in `SOURCE-BUILD.md`.
+
+The proposed next recipe is
+`RELEASE.2025-10-15T17-29-55Z.CONCORD.c7d942fa5280`. It changes only the
+upstream `go.mod` and `go.sum`, updating AMQP to 1.14.0, go-jose/v4 to 4.1.6,
+x/net to 0.62.0 and their resolved transitive requirements. It retains Go
+1.26.10, BuildKit 0.34.1, the existing runtime base, Buildx and runtime
+interfaces. Its exact source identities and reproduction commands are in
+`SOURCE-BUILD.md`. This is a candidate for design/security review, not an
+extension of the previous release's legal approval. No source application,
+authentication, consumer or host change is included.
+
+The candidate's second pristine source replay reproduced all locked identities.
+Native amd64 and cross-compiled arm64 builds passed all fifteen module gates.
+Fresh binary scans retain six findings per architecture; their absent-code and
+positive-control measurements, actual amd64 console/S3 checks and Parquet
+results are recorded in `SOURCE-BUILD.md`. These are pre-publication checks,
+not registry image or native arm64 execution receipts.
+
+Before dispatch, require independent source replay, candidate build/module and
+bounded console/S3/Parquet evidence, native architecture checks or explicit
+reviewer dispositions, fresh scans and symbols, actual publisher-step contract
+tests, final-head security/deployment review and **release-specific recorded
+legal approval** for `c7d942fa52807929e119bcb4531e21d099ccd1a8`. No prior
+approval, design exception, not-affected record or generic batch authorization
+supplies that legal approval. After publication, repeat anonymous digest pulls,
+measure the actual new platform binaries, update only supported digest-bound
+VEX statements and prove § 3a before opening the consumer PR.
 
 Separate [BuildKit artifact evidence](../superpowers/specs/2026-10-25-3482-buildkit-artifact-evidence.md)
-covers both pinned variants and both architectures: the eight extracted binaries
-report containerd/v2 2.4.1 and Go 1.26.10, with positive binary scans omitting both
-#3482 target CVEs. Six findings per client and seven per daemon remain, including
-HIGH findings. The same-database amd64 binary comparison found no introduced
-advisory/component pairs against the corresponding old images; retained findings
-still require security disposition, and no arm64 baseline or full-image comparison
-is claimed.
-This evidence does not establish a clean full-image scan, Buildx/runtime
-compatibility or execution of the integrated publisher recipe. Those execution
-results remain **UNVERIFIED**. Retain final-recipe publisher evidence from its
-next separately authorized protected-main publication, after explicit exact-head
-security/deployment acceptance of the proposed boundary. The rootless managed
-builder's native-network proof and host transition follow their separate
-[commissioning runbook](managed-egress.md); publisher evidence cannot replace them.
-
-The `88c88a5bea7d` publication receipt remains historical evidence, and the
-shared Compose consumer still uses `823f9aa2bd62`. Neither validates the new
-binaries. No application edits, authentication changes or live cutover are
-authorized by this compiler continuation. New published platform digests must
-receive fresh measurements before the digest-bound OpenVEX products or shared
-Compose consumer change.
-
-A design exception, a not-affected record or generic automated-batch approval
-does not supply legal approval. Record the release-specific approval before any
-dispatch or visibility change that requires it.
+covers both pinned variants and both architectures. Fresh full-image findings
+and the managed rootless builder's native/network proof need their own
+security/deployment disposition and
+[commissioning procedure](managed-egress.md); the ordinary publisher does not
+validate that managed builder. The shared Compose consumer remains on
+`823f9aa2bd62`, and no production cutover is established for either refresh.
 
 ## Publisher Engine Prerequisite
 
