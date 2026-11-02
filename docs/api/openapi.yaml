@@ -453,7 +453,11 @@ paths:
 
         Account locks after 5 failed attempts (escalating: 15m, 30m, 60m).
 
+        A DPoP proof (no rth) binds the new session to the device key; a refused proof is 401 with a SessionProofError.
+
         '
+      parameters:
+      - $ref: '#/components/parameters/DPoPProof'
       security: []
       requestBody:
         required: true
@@ -488,6 +492,9 @@ paths:
                       expires_in:
                         type: integer
                         example: 900
+                      token_type:
+                        type: string
+                        enum: [DPoP, Bearer]
                       remember_me:
                         type: boolean
                       user:
@@ -664,8 +671,12 @@ paths:
 
         Rate limit: 10 requests per 15 minutes (IP-based).
 
+        On a login challenge, a DPoP proof (no rth) binds the new session as on /auth/login.
+
         '
       operationId: authMfaVerify
+      parameters:
+      - $ref: '#/components/parameters/DPoPProof'
       security: []
       requestBody:
         required: true
@@ -1377,6 +1388,7 @@ paths:
         schema:
           type: string
         description: Optional machine ID. During grace recovery, this header must exactly match any ID recorded on the revoked token or its live successor.
+      - $ref: '#/components/parameters/DPoPProof'
       security:
       - CookieAuth: []
       - RefreshTokenHeaderAuth: []
@@ -1402,6 +1414,10 @@ paths:
                   expires_in:
                     type: integer
                     example: 900
+                  token_type:
+                    type: string
+                    enum: [DPoP, Bearer]
+                    description: DPoP when the new session is bound to a device key (ADR-0050), else Bearer
           headers:
             Set-Cookie:
               description: New HttpOnly refresh token cookie (rotation)
@@ -1419,11 +1435,13 @@ paths:
                 - $ref: '#/components/schemas/MfaChallenge'
                 - $ref: '#/components/schemas/AccountDisabledError'
         '401':
-          description: Invalid or expired refresh token, including a grace retry with an omitted or mismatched recorded X-Machine-Id, a pending theft block, or completed theft revocation
+          description: Invalid or expired refresh token, including a grace retry with an omitted or mismatched recorded X-Machine-Id, a pending theft block, or completed theft revocation. A refused DPoP proof carries a SessionProofError code and leaves the session live; a bound session recovers from a lost rotation with a valid proof and no time window.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/SessionProofError'
         '429':
           $ref: '#/components/responses/RateLimited'
         '500':
@@ -1433,7 +1451,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          description: Token theft was detected but authoritative refresh-token revocation has not completed
+          description: Token theft was detected but authoritative refresh-token revocation has not completed, or the DPoP replay store is unavailable
           content:
             application/json:
               schema:
@@ -4515,6 +4533,18 @@ paths:
                         type: boolean
                       samlEnabled:
                         type: boolean
+                      sessionBinding:
+                        type: object
+                        description: Present only while the server binds new sessions to a device key (ADR-0050,
+                          SESSION_BINDING_ENABLED). A client sends DPoP proofs only after it sees this.
+                        required:
+                        - dpopAlgs
+                        properties:
+                          dpopAlgs:
+                            type: array
+                            items:
+                              type: string
+                              enum: [ES256]
                   features:
                     type: object
                     required:
@@ -19724,6 +19754,19 @@ components:
         (Role is per-server only); this is the closest existing privileged-auth gate.
         When REDEMPTION_ADMIN_TOKEN is unset the endpoint is disabled (503).'
   parameters:
+    DPoPProof:
+      name: DPoP
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 2048
+      description: 'Secure Enclave session proof (ADR-0050): a compact JWS, header {"typ":"dpop+jwt","alg":"ES256","jwk":<P-256
+        public JWK>} with no kid, claims jti (at most 64 chars, single use for 5 minutes), htm (POST), htu (absolute URL whose
+        path is this route; no query or fragment), iat (Unix seconds, within 60 s of server time) and, on refresh only, rth
+        (base64url SHA-256 of the presented refresh token). Signature is raw R||S. Required on a bound session; on an unbound
+        session or at sign-in it binds the new session, and is ignored while the server does not advertise
+        auth.sessionBinding. Shared vectors: services/control-plane/internal/auth/testdata/dpop_vectors.json.'
     ClientVersionHeader:
       name: X-Concord-Client-Version
       in: header
@@ -21429,6 +21472,25 @@ components:
           type: string
       required:
       - error
+    SessionProofError:
+      type: object
+      description: A refused DPoP session proof (ADR-0050). The session stays live; nothing is revoked.
+      required:
+      - error
+      - code
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum:
+          - refresh_pop_required
+          - refresh_pop_invalid
+          - refresh_pop_stale_iat
+          - refresh_pop_replayed
+        server_time:
+          type: integer
+          description: Server Unix time, on refresh_pop_stale_iat only. The client retries once with this offset.
     UnissuedKeyEpochError:
       type: object
       description: A key_version above the scope's newest issued epoch. The client

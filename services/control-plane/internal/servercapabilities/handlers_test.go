@@ -483,3 +483,22 @@ func TestGetCapabilities_ExpirationPinnedPolicySupported(t *testing.T) {
 		})
 	}
 }
+
+// ADR-0050: a client sends DPoP proofs only after it sees sessionBinding, so
+// the field must be absent, not empty, while the server binds nothing.
+func TestGetCapabilities_SessionBindingAdvertisedOnlyWhenEnabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		w, c := newTestContext()
+		servercapabilities.NewHandler(&config.Config{SessionBindingEnabled: enabled}).GetCapabilities(c)
+		require.Equal(t, http.StatusOK, w.Code)
+		var raw struct {
+			Auth map[string]json.RawMessage `json:"auth"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+		got, present := raw.Auth["sessionBinding"]
+		assert.Equal(t, enabled, present)
+		if enabled {
+			assert.JSONEq(t, `{"dpopAlgs":["ES256"]}`, string(got))
+		}
+	}
+}

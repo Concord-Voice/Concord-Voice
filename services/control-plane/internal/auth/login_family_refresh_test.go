@@ -97,7 +97,7 @@ func TestLoginFamilyRevocationWinsAgainstFetchedRefresh(t *testing.T) {
 	require.NoError(t, tx.QueryRow(`SELECT pg_backend_pid()`).Scan(&blocker))
 	c, w := familyTestContext()
 	done := make(chan struct{})
-	go func() { defer close(done); rig.h.rotateAndRespond(c, source, "") }()
+	go func() { defer close(done); rig.h.rotateAndRespond(c, source, "", "") }()
 	require.Eventually(t, func() bool {
 		var n int
 		err := rig.db.QueryRow(`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))`, blocker).Scan(&n)

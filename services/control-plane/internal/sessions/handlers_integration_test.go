@@ -295,7 +295,13 @@ func TestRefreshTokensNullableColumns(t *testing.T) {
 		assert.Contains(t, cols, want,
 			"a rename or query typo must fail loudly here, not silently narrow the fixture")
 	}
-	assert.Len(t, cols, 6,
+	// pop_jkt and pop_alg (000195) are ruled NEITHER: they are not optional
+	// metadata. Absent means "unbound", a real state that is enforced exactly
+	// (pop_jkt IS NOT DISTINCT FROM ...), so they never go through signalMatch
+	// and are never displayed.
+	assert.Contains(t, cols, "pop_jkt")
+	assert.Contains(t, cols, "pop_alg")
+	assert.Len(t, cols, 8,
 		"a new nullable-no-default column on refresh_tokens needs a DISPLAY-or-EQUALITY "+
 			"ruling — see signalMatch in internal/auth/signal.go. Do not edit this number "+
 			"to match; find out which column appeared and rule on it.")

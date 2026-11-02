@@ -134,7 +134,7 @@ func TestRefreshMintsRejectPendingTheftInsideUserLock(t *testing.T) {
 			}
 			before := snapshot()
 			c, rec = familyTestContext()
-			rig.h.rotateAndRespond(c, models.RefreshToken{ID: sourceID, UserID: rig.user, ExpiresAt: expiry}, "")
+			rig.h.rotateAndRespond(c, models.RefreshToken{ID: sourceID, UserID: rig.user, ExpiresAt: expiry}, "", "")
 			if pending {
 				require.Equal(t, http.StatusUnauthorized, rec.Code)
 				require.JSONEq(t, `{"error":"`+errMsgInvalidRefreshToken+`"}`, rec.Body.String())
@@ -147,7 +147,7 @@ func TestRefreshMintsRejectPendingTheftInsideUserLock(t *testing.T) {
 				require.Equal(t, sourceFamily, family)
 			}
 			c, rec = familyTestContext()
-			rig.h.handleGracePeriodRefresh(c, rig.user, revokedID, time.Now())
+			rig.h.handleGracePeriodRefresh(c, rig.user, revokedID, "")
 			if pending {
 				require.Equal(t, http.StatusUnauthorized, rec.Code)
 				require.JSONEq(t, `{"error":"`+errMsgInvalidRefreshToken+`"}`, rec.Body.String())

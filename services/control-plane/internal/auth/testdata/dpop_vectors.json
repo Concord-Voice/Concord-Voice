@@ -1,0 +1,235 @@
+{
+  "cases": [
+    {
+      "name": "refresh_valid",
+      "note": "a refresh proof covering the presented refresh token",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000001\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "PfIMyvO3UccAILosMBe6wOIERlEtVuPGByWdW2IRbmSGcj3XCBiw6dCeXEpJj5QoOpe_1u9wnKQxCTBR9Hp5fw"
+      ],
+      "expect": "ok"
+    },
+    {
+      "name": "login_valid",
+      "note": "a login proof carries no rth",
+      "method": "POST",
+      "path": "/api/v1/auth/login",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000002\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/login\",\"iat\":1798761600}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvbG9naW4iLCJpYXQiOjE3OTg3NjE2MDB9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvbG9naW4iLCJpYXQiOjE3OTg3NjE2MDB9",
+        "-eqwsyBMR_Hc4kqfy2gbm-9PndY8uPU6l4KE-0Mxk3sXWRt97CJfVrrTStyybql8mE1UXiw2zQz5QCONNI_8Ow"
+      ],
+      "expect": "ok"
+    },
+    {
+      "name": "refresh_iat_edge",
+      "note": "iat exactly 60 s behind the server is accepted",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000003\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761540,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTU0MCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTU0MCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "9a416bNU-2QlxN7u_p4LkabHq43_2EEyNOgwd9DYtoAECIj6hLOtTOqrPTSykSyA6D_G06CLw97EMmQdnWSqrQ"
+      ],
+      "expect": "ok"
+    },
+    {
+      "name": "refresh_stale_iat",
+      "note": "iat 61 s ahead of the server",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000004\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761661,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTY2MSwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTY2MSwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "lFQ-cZdCA2bXK7ysQZ24-a8bgyzd0R3KqoeLzY16CKB0zceKbVyOXtfrcxeNQbSAYFFr5reMRtC8ca2pOXyzGg"
+      ],
+      "expect": "refresh_pop_stale_iat"
+    },
+    {
+      "name": "bad_signature",
+      "note": "last signature byte flipped",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000005\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDUiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDUiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "h5VC3vgB665BvaSGLYziYQOY8CYpTJur3KN07Krn4imo0MLywtr3xqyqqw7XyMwVpEIrbpOhu3FOo4URcU3szw"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "rth_mismatch",
+      "note": "rth covers a different refresh token",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000006\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"Mpak4Vf48T1iO3rIX1cjE9d11nG1Q6iEdtiYkT3XYq8\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDYiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiTXBhazRWZjQ4VDFpTzNySVgxY2pFOWQxMW5HMVE2aUVkdGlZa1QzWFlxOCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDYiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiTXBhazRWZjQ4VDFpTzNySVgxY2pFOWQxMW5HMVE2aUVkdGlZa1QzWFlxOCJ9",
+        "gqHp3xJd-3QZ0MygifCE1Nu7G1M1o0_lADHe-AQpmtjj74Z7lYmxS2_00cvmeOAp8t-JyNqHXnk7_SlzeP7NBg"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "rth_missing",
+      "note": "a refresh proof without rth",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000007\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDciLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMH0",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDciLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMH0",
+        "bEyHPTzA4fwBKBuHn9Dy_CHZdOxuy3zna2F0HojPGI2w9i-Rqas9mzMHebdax_7G6qYgDsBORdw_U05xbZPOYQ"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "rth_on_login",
+      "note": "a login proof must not carry rth",
+      "method": "POST",
+      "path": "/api/v1/auth/login",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000008\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/login\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvbG9naW4iLCJpYXQiOjE3OTg3NjE2MDAsInJ0aCI6IkE5a1lwN3lYNjRta1dvZmVmVXZnblZISGdqcC1BWU5LamZnLVUzSm5OYjQifQ",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvbG9naW4iLCJpYXQiOjE3OTg3NjE2MDAsInJ0aCI6IkE5a1lwN3lYNjRta1dvZmVmVXZnblZISGdqcC1BWU5LamZnLVUzSm5OYjQifQ",
+        "Hj--1qOFeVbCpeLuAUiXEZRuAMTxba7b0V4_EtpBgtjjctuneqSOsd0zo6NoIxTKgkCKBTkyVUaqiontH4R7zQ"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "wrong_path",
+      "note": "htu names another route",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000009\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/login\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDkiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvbG9naW4iLCJpYXQiOjE3OTg3NjE2MDAsInJ0aCI6IkE5a1lwN3lYNjRta1dvZmVmVXZnblZISGdqcC1BWU5LamZnLVUzSm5OYjQifQ",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDkiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvbG9naW4iLCJpYXQiOjE3OTg3NjE2MDAsInJ0aCI6IkE5a1lwN3lYNjRta1dvZmVmVXZnblZISGdqcC1BWU5LamZnLVUzSm5OYjQifQ",
+        "RakvgZoNn4nl2dbm9eIKNa86XvtH0lGppU6pFq5nmSSHWbZ1XATJ20HwoFBETiKrAGIpIkCqcmkTNcaBnexCyw"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "htu_query",
+      "note": "htu carries a query string",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000010\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh?a=1\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTAiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaD9hPTEiLCJpYXQiOjE3OTg3NjE2MDAsInJ0aCI6IkE5a1lwN3lYNjRta1dvZmVmVXZnblZISGdqcC1BWU5LamZnLVUzSm5OYjQifQ",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTAiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaD9hPTEiLCJpYXQiOjE3OTg3NjE2MDAsInJ0aCI6IkE5a1lwN3lYNjRta1dvZmVmVXZnblZISGdqcC1BWU5LamZnLVUzSm5OYjQifQ",
+        "5WrptzldiGBTslzhaU6HtleIU2FLuRNISj59yo8-QsAAB6avBv6gZYnIzT6bkFoQUn-HD5zQ6P6g-OIEEbCulA"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "wrong_htm",
+      "note": "htm is not the request method",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000011\",\"htm\":\"GET\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJodG0iOiJHRVQiLCJodHUiOiJodHRwczovL2FwaS5jb25jb3Jkdm9pY2UuY2hhdC9hcGkvdjEvYXV0aC9yZWZyZXNoIiwiaWF0IjoxNzk4NzYxNjAwLCJydGgiOiJBOWtZcDd5WDY0bWtXb2ZlZlV2Z25WSEhnanAtQVlOS2pmZy1VM0puTmI0In0",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIn19",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJodG0iOiJHRVQiLCJodHUiOiJodHRwczovL2FwaS5jb25jb3Jkdm9pY2UuY2hhdC9hcGkvdjEvYXV0aC9yZWZyZXNoIiwiaWF0IjoxNzk4NzYxNjAwLCJydGgiOiJBOWtZcDd5WDY0bWtXb2ZlZlV2Z25WSEhnanAtQVlOS2pmZy1VM0puTmI0In0",
+        "XjSHBgbptO7wbsMEKG0cHp2x5k57ZVTA0flippQVo32SCuu9GJ3OIIbe1mvBP0vtMJUWy7NCzHplw3MdoR67MA"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "header_kid",
+      "note": "a kid in the protected header",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"kid\":\"k1\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000012\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2Iiwia2lkIjoiazEiLCJqd2siOnsia3R5IjoiRUMiLCJjcnYiOiJQLTI1NiIsIngiOiJyWUpGd1FoSERQazNtdHlLbGUtVUVFb1hwekcwYnVELThLUzNmdUNSczdVIiwieSI6ImJfQU01X0xuaHRaNm1LQXdOdmZLYUpjUTZLbFJaRDZ4d1RvUmJuV0NPNVkifX0.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTIiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2Iiwia2lkIjoiazEiLCJqd2siOnsia3R5IjoiRUMiLCJjcnYiOiJQLTI1NiIsIngiOiJyWUpGd1FoSERQazNtdHlLbGUtVUVFb1hwekcwYnVELThLUzNmdUNSczdVIiwieSI6ImJfQU01X0xuaHRaNm1LQXdOdmZLYUpjUTZLbFJaRDZ4d1RvUmJuV0NPNVkifX0",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTIiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "zGD6oDBXxIXYBZr8RzayoRu6Rka2HdrfLkYfNH0TrSitD5ZBNmvIZJ9hiq7FQbPcvR4CE7_VALbHm7AW6FwA_w"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "wrong_typ",
+      "note": "typ is plain JWT",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"JWT\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000013\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImp3ayI6eyJrdHkiOiJFQyIsImNydiI6IlAtMjU2IiwieCI6InJZSkZ3UWhIRFBrM210eUtsZS1VRUVvWHB6RzBidUQtOEtTM2Z1Q1JzN1UiLCJ5IjoiYl9BTTVfTG5odFo2bUtBd052ZkthSmNRNktsUlpENnh3VG9SYm5XQ081WSJ9fQ.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTMiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImp3ayI6eyJrdHkiOiJFQyIsImNydiI6IlAtMjU2IiwieCI6InJZSkZ3UWhIRFBrM210eUtsZS1VRUVvWHB6RzBidUQtOEtTM2Z1Q1JzN1UiLCJ5IjoiYl9BTTVfTG5odFo2bUtBd052ZkthSmNRNktsUlpENnh3VG9SYm5XQ081WSJ9fQ",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTMiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "OZP2MTKl41DGU7X84lSpiCZeDFmmTB6GmEZkP8xQq--VaKH3VKAog8Yg-Z-FOr7df7BtXYz7c1kvOEGdP7G0Qg"
+      ],
+      "expect": "refresh_pop_invalid"
+    },
+    {
+      "name": "private_jwk",
+      "note": "the JWK carries its private scalar",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "refresh_token": "test-refresh-token-0123456789abcdef",
+      "protected_header": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U\",\"y\":\"b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y\",\"d\":\"vPH0I7UYn8TaXpwUOkUciKbDO_wa-Jo9OmFtSeV0T_M\"}}",
+      "claims": "{\"jti\":\"00000000-0000-4000-8000-000000000014\",\"htm\":\"POST\",\"htu\":\"https://api.concordvoice.chat/api/v1/auth/refresh\",\"iat\":1798761600,\"rth\":\"A9kYp7yX64mkWofefUvgnVHHgjp-AYNKjfg-U3JnNb4\"}",
+      "signing_input": "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIiwiZCI6InZQSDBJN1VZbjhUYVhwd1VPa1VjaUtiRE9fd2EtSm85T21GdFNlVjBUX00ifX0.eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTQiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+      "jws_parts": [
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicllKRndRaEhEUGszbXR5S2xlLVVFRW9YcHpHMGJ1RC04S1MzZnVDUnM3VSIsInkiOiJiX0FNNV9Mbmh0WjZtS0F3TnZmS2FKY1E2S2xSWkQ2eHdUb1JibldDTzVZIiwiZCI6InZQSDBJN1VZbjhUYVhwd1VPa1VjaUtiRE9fd2EtSm85T21GdFNlVjBUX00ifX0",
+        "eyJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTQiLCJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9hcGkuY29uY29yZHZvaWNlLmNoYXQvYXBpL3YxL2F1dGgvcmVmcmVzaCIsImlhdCI6MTc5ODc2MTYwMCwicnRoIjoiQTlrWXA3eVg2NG1rV29mZWZVdmduVkhIZ2pwLUFZTktqZmctVTNKbk5iNCJ9",
+        "1J5tzg1QdES06rtHLTjxFAdXkA2lUOJzUeKl43nlqJT1G3KQOr13sa1Jj7pQV5PmEQr2uBn7R_iBSnpkYfIE0A"
+      ],
+      "expect": "refresh_pop_invalid"
+    }
+  ],
+  "description": "Shared DPoP proof vectors for the Secure Enclave session binding (ADR-0050). TEST KEY ONLY: the private scalar is not stored; derive it as SHA-256(\"concord dpop test vector key v1\") as a 32-byte big-endian P-256 scalar. It is never a real key. ECDSA signatures are randomised, so a client checks that it builds the same signing_input for the same key, jti and iat, and that the server-side verifier accepts its own proof; member order inside the JSON is not significant to the server. jws_parts are the three compact-JWS segments, kept apart so the file does not read as a credential to secret scanners; join them with \".\" to get the DPoP header value. Replay (refresh_pop_replayed) and a missing header (refresh_pop_required) are request-level and covered by the handler tests.",
+  "jkt": "0pvVwE1e2zo382fcTr6G07PGM9HEb4bcEft1ioGw8D4",
+  "key": {
+    "crv": "P-256",
+    "kty": "EC",
+    "x": "rYJFwQhHDPk3mtyKle-UEEoXpzG0buD-8KS3fuCRs7U",
+    "y": "b_AM5_LnhtZ6mKAwNvfKaJcQ6KlRZD6xwToRbnWCO5Y"
+  },
+  "now": 1798761600
+}

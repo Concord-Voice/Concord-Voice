@@ -83,6 +83,14 @@ type AuthInfo struct {
 	OAuthProviders            []string `json:"oauthProviders"`
 	LDAPEnabled               bool     `json:"ldapEnabled"`
 	SAMLEnabled               bool     `json:"samlEnabled"`
+	// Present only while the server binds new sessions to a device key
+	// (ADR-0050). A client sends DPoP proofs only after it sees this.
+	SessionBinding *SessionBindingInfo `json:"sessionBinding,omitempty"`
+}
+
+// SessionBindingInfo lists the proof algorithms the server accepts.
+type SessionBindingInfo struct {
+	DPoPAlgs []string `json:"dpopAlgs"`
 }
 
 // FeaturesInfo advertises the feature surface the client clamps to.
@@ -189,6 +197,9 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			MFAEnforcedDangerousActions:     h.mfaEnforcedDangerousActions,
 		},
 		PolicyVersion: policyVersion,
+	}
+	if h.cfg.SessionBindingEnabled {
+		resp.Auth.SessionBinding = &SessionBindingInfo{DPoPAlgs: []string{"ES256"}}
 	}
 	if h.chunkedAttachmentUpload {
 		// Route reachability is the outer gate. v3 additionally requires the

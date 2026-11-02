@@ -206,15 +206,31 @@ func TestHTTPServerParameters(t *testing.T) {
 // S1 (carry 2): net/http's error lines carry a peer's address and a panic's
 // stack. Each becomes one fixed line that carries neither.
 func TestHTTPErrorLogDropsTheText(t *testing.T) {
+	// A real timestamp's fractional seconds can contain the port sentinel.
+	// Freeze only the clock; scan every byte of the emitted log as before.
+	opts := &slog.HandlerOptions{ReplaceAttr: func(groups []string, attr slog.Attr) slog.Attr {
+		if len(groups) == 0 && attr.Key == slog.TimeKey {
+			return slog.Time(slog.TimeKey, time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC))
+		}
+		return attr
+	}}
+	sentinels := []string{"10.9.8.7", "4321", "goroutine", "boom", "WriteHeader"}
+	findLeaks := func(data []byte) []string {
+		var leaks []string
+		for _, sentinel := range sentinels {
+			if bytes.Contains(data, []byte(sentinel)) {
+				leaks = append(leaks, sentinel)
+			}
+		}
+		return leaks
+	}
 	buf := &syncBuffer{}
-	hs := newHTTPServer(http.NotFoundHandler(), func(net.Conn) {}, slog.New(slog.NewJSONHandler(buf, nil)))
+	hs := newHTTPServer(http.NotFoundHandler(), func(net.Conn) {}, slog.New(slog.NewJSONHandler(buf, opts)))
 	hs.ErrorLog.Printf("http: panic serving 10.9.8.7:4321: boom\ngoroutine 7 [running]:\nmain.f()")
 	hs.ErrorLog.Printf("http: superfluous response.WriteHeader call from 10.9.8.7:4321")
 	got := buf.Bytes()
-	for _, leak := range []string{"10.9.8.7", "4321", "goroutine", "boom", "WriteHeader"} {
-		if bytes.Contains(got, []byte(leak)) {
-			t.Errorf("the log carries %q: %s", leak, got)
-		}
+	for _, leak := range findLeaks(got) {
+		t.Errorf("the log carries %q: %s", leak, got)
 	}
 	ls := logLines(t, got)
 	if len(ls) != 2 || ls[0]["msg"] != "authority.http" || ls[0]["op"] != "authority.http" ||
@@ -222,6 +238,17 @@ func TestHTTPErrorLogDropsTheText(t *testing.T) {
 		t.Fatalf("lines %v, want two authority.http lines", ls)
 	}
 	checkLogConvention(t, got)
+	// Positive controls: the same byte scan must catch each sentinel in an
+	// attribute, even when the message itself follows the fixed convention.
+	for _, sentinel := range sentinels {
+		t.Run("detects_"+sentinel, func(t *testing.T) {
+			leaked := &syncBuffer{}
+			slog.New(slog.NewJSONHandler(leaked, opts)).Error("authority.http", "detail", sentinel)
+			if leaks := findLeaks(leaked.Bytes()); len(leaks) != 1 || leaks[0] != sentinel {
+				t.Fatalf("leak scan found %v, want %q", leaks, sentinel)
+			}
+		})
+	}
 }
 
 // countingConnector is a database that counts dials and never connects.

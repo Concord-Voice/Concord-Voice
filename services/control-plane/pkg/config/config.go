@@ -371,6 +371,10 @@ type Config struct {
 	// API key then no longer resets every user's Recent tab.
 	KlipyCustomerIDKey string
 
+	// Secure Enclave session binding (ADR-0050). Off: no new session is bound
+	// and the capability is not advertised; rows already bound stay enforced.
+	SessionBindingEnabled bool
+
 	// Client attestation (#677)
 	RequireClientAttestation bool          // Gate authenticated routes on signed-client attestation
 	AttestationTokenTTL      time.Duration // Lifetime of issued attestation tokens; range 30m-24h
@@ -583,6 +587,7 @@ func Load() (*Config, error) {
 		// endpoint; production guard enforces it when generation is enabled.
 		RedemptionAdminToken:      strings.TrimSpace(getEnv("REDEMPTION_ADMIN_TOKEN", "")), // #nosec G101 -- env var name, not a secret
 		RequireClientAttestation:  getEnv("REQUIRE_CLIENT_ATTESTATION", "false") == "true",
+		SessionBindingEnabled:     getEnv("SESSION_BINDING_ENABLED", "false") == "true",
 		AttestationTokenTTL:       parseAttestationTokenTTL(getEnv("ATTESTATION_TOKEN_TTL", "2h")),
 		AttestationPruneInterval:  parseAttestationPruneInterval(getEnv("ATTESTATION_PRUNE_INTERVAL", "6h")),
 		AppAttestAppIDs:           parseAppAttestAppIDs(getEnv("APP_ATTEST_APP_IDS", "")),

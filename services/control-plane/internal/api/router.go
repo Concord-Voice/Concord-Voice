@@ -1082,6 +1082,7 @@ func NewRouter(
 		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 	authHandler.SetSecurityEvents(securityEvents)
+	authHandler.SetSessionBinding(cfg.SessionBindingEnabled)
 	authHandler.SetPresenceHistory(presenceHistoryService)
 	authHandler.SetEmailService(emailSvc)
 	authHandler.SetCredentialFence(credFence)

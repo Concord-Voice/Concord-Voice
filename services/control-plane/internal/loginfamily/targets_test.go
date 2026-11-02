@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"testing"
+	"time"
 )
 
 func TestCapturePreservesWholeFamilyAndDistinguishesUnavailable(t *testing.T) {
@@ -17,8 +18,10 @@ func TestCapturePreservesWholeFamilyAndDistinguishesUnavailable(t *testing.T) {
 	u := authority(t, tx, user, lf.UserNoKeyUpdate)
 	f, err := lf.GuardRefreshSIDTx(ctx, tx, u, preserve.SID)
 	require.NoError(t, err)
-	sibling := uuid.New()
-	require.NoError(t, lf.BindSIDTx(ctx, tx, f, sibling, expires()))
+	siblingIdentity := preserve
+	siblingIdentity.SID = uuid.New()
+	siblingIdentity.AccessExpiresAt = preserve.AccessExpiresAt.Add(time.Second)
+	require.NoError(t, lf.BindSIDTx(ctx, tx, f, siblingIdentity.SID, siblingIdentity.AccessExpiresAt))
 	targets, err := lf.CaptureUserTargetsTx(ctx, tx, u, &preserve)
 	require.NoError(t, err)
 	result, err := lf.RevokeFamiliesTx(ctx, tx, targets, lf.AuthCause{Scope: lf.ScopeUser, Reason: lf.ReasonExplicitRevoke})
@@ -27,8 +30,6 @@ func TestCapturePreservesWholeFamilyAndDistinguishesUnavailable(t *testing.T) {
 	require.NoError(t, tx.Commit())
 	_, err = lf.ResolveVerifiedAccess(ctx, db, preserve)
 	require.NoError(t, err)
-	siblingIdentity := preserve
-	siblingIdentity.SID = sibling
 	_, err = lf.ResolveVerifiedAccess(ctx, db, siblingIdentity)
 	require.NoError(t, err)
 	_, err = lf.ResolveVerifiedAccess(ctx, db, selected)

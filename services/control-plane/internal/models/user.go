@@ -127,6 +127,7 @@ type RefreshToken struct {
 	IPAddress  string     `json:"ip_address" db:"ip_address"`
 	UserAgent  string     `json:"user_agent" db:"user_agent"`
 	MachineID  string     `json:"machine_id,omitempty" db:"machine_id"`
+	PopJKT     string     `json:"-" db:"pop_jkt"` // ADR-0050 device-key thumbprint; "" when unbound
 	ExpiresAt  time.Time  `json:"expires_at" db:"expires_at"`
 	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
 	LastUsedAt time.Time  `json:"last_used_at" db:"last_used_at"`

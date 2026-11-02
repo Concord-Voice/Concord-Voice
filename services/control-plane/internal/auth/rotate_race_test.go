@@ -62,7 +62,7 @@ func TestRotateAndRespond_RejectsRevokedSourceToken(t *testing.T) {
 		ID:        tokenID.String(),
 		UserID:    userID.String(),
 		ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
-	}, "")
+	}, "", "")
 
 	assert.Equal(t, http.StatusUnauthorized, resp.Code,
 		"a refresh whose source token a reset already revoked must be rejected")

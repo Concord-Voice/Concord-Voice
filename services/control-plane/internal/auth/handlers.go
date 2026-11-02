@@ -186,6 +186,7 @@ type Handler struct {
 	initialDistributorChecker keyrotation.InitialDistributorChecker
 	securityEvents            securityevent.Emitter
 	theftRetryMu              sync.Mutex
+	sessionBinding            bool
 	theftRetries              map[string][]*tokenTheftRetryTask
 }
 
@@ -199,6 +200,13 @@ type tokenTheftRetryTask struct {
 // Call once during router setup, before requests start.
 func (h *Handler) SetManagedRedisRecovery(runtime *managedredis.Runtime, endpoint string, tlsConfig *tls.Config) {
 	h.recoveryWatchClient = database.NewRecoveryWatchClientFactory(runtime, endpoint, tlsConfig)
+}
+
+// SetSessionBinding turns on new Secure Enclave session binding (ADR-0050).
+// Rows already bound are enforced whatever this says, so turning it off stops
+// binding without unbinding anyone.
+func (h *Handler) SetSessionBinding(enabled bool) {
+	h.sessionBinding = enabled
 }
 
 // SetSecurityEvents injects bounded Nightwatch telemetry without widening this
@@ -1425,6 +1433,12 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
 		return false
 	}
+	// ADR-0050: an optional proof (no rth, no refresh token yet) binds the new
+	// session at once, closing the window before its first refresh.
+	loginJKT, ok := h.sessionProof(c, "", nil)
+	if !ok {
+		return false
+	}
 	// #2418: bind this mint to the epoch the login was AUTHORIZED under — the epoch
 	// read alongside the password verification (direct path) or stamped into the MFA
 	// challenge at issuance (MFA path). The whole mint runs in ONE transaction holding
@@ -1553,10 +1567,11 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		"user_id", userID,
 	)
 
+	popJKT, popAlg := popColumns(loginJKT)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		tokenID, userID, tokenHash, deviceName, ipAddress, userAgent, expiresAt, rememberMe, nilIfEmpty(machineID),
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, pop_jkt, pop_alg)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		tokenID, userID, tokenHash, deviceName, ipAddress, userAgent, expiresAt, rememberMe, nilIfEmpty(machineID), popJKT, popAlg,
 	); err != nil {
 		h.log.Error("Failed to store refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
@@ -1590,6 +1605,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		"refresh_token": refreshToken,
 		"session_id":    tokenID,
 		"expires_in":    900,
+		"token_type":    tokenTypeFor(loginJKT),
 		"remember_me":   rememberMe,
 		"user":          user.PublicUser(entitlements.For(tier).UsernameChangeIntervalMonths),
 		"e2ee_keys": gin.H{
@@ -1647,6 +1663,15 @@ func (h *Handler) Refresh(c *gin.Context) {
 		return
 	}
 
+	// ADR-0050: the proof is checked before the machine-ID theft check, so a
+	// missing or bad proof is a 401 that leaves the session live and can never
+	// set off theft revocation.
+	rth := sha256.Sum256([]byte(refreshToken))
+	successorJKT, ok := h.sessionProof(c, token.PopJKT, rth[:])
+	if !ok {
+		return
+	}
+
 	requestMachineID := c.GetHeader(headerMachineID)
 	if h.checkMachineIDTheft(c, token, requestMachineID) {
 		return
@@ -1656,7 +1681,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 		return
 	}
 
-	h.rotateAndRespond(c, token, requestMachineID)
+	h.rotateAndRespond(c, token, requestMachineID, successorJKT)
 }
 
 // extractRefreshToken gets the refresh token from cookie or X-Refresh-Token header.
@@ -1689,7 +1714,8 @@ func (h *Handler) fetchActiveRefreshToken(tokenHash string) (models.RefreshToken
 	err := h.db.QueryRow(
 		`SELECT rt.id, rt.user_id, rt.token_hash,
 		        COALESCE(rt.device_name, ''), COALESCE(host(rt.ip_address), ''), COALESCE(rt.user_agent, ''),
-		        rt.expires_at, rt.created_at, rt.last_used_at, rt.remember_me, COALESCE(rt.machine_id, '')
+		        rt.expires_at, rt.created_at, rt.last_used_at, rt.remember_me, COALESCE(rt.machine_id, ''),
+		        COALESCE(rt.pop_jkt, '')
 		 FROM refresh_tokens rt
 		 JOIN users u ON u.id = rt.user_id
 		 WHERE rt.token_hash = $1 AND rt.revoked_at IS NULL AND u.disabled = FALSE`,
@@ -1697,7 +1723,7 @@ func (h *Handler) fetchActiveRefreshToken(tokenHash string) (models.RefreshToken
 	).Scan(
 		&token.ID, &token.UserID, &token.TokenHash, &token.DeviceName,
 		&token.IPAddress, &token.UserAgent, &token.ExpiresAt, &token.CreatedAt,
-		&token.LastUsedAt, &token.RememberMe, &storedMachineID,
+		&token.LastUsedAt, &token.RememberMe, &storedMachineID, &token.PopJKT,
 	)
 	if storedMachineID.Valid {
 		token.MachineID = storedMachineID.String
@@ -1724,10 +1750,26 @@ func (h *Handler) handleRefreshTokenNotFound(c *gin.Context, err error, tokenHas
 	c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
 }
 
+// graceSessionProof runs the session proof check for a replayed token. The
+// proof's rth covers the presented token, whose SHA-256 the stored hex hash
+// already is. A hash that does not decode cannot satisfy a bound row. It writes
+// the response and returns ok=false on refusal.
+func (h *Handler) graceSessionProof(c *gin.Context, tokenHash, revokedJKT string) (string, bool) {
+	rth, hashErr := hex.DecodeString(tokenHash)
+	if hashErr == nil && len(rth) == sha256.Size {
+		return h.sessionProof(c, revokedJKT, rth)
+	}
+	if revokedJKT != "" {
+		writePoPError(c, errPoPInvalid)
+		return "", false
+	}
+	return "", true
+}
+
 // attemptGracePeriodRecovery checks if a revoked token is within the grace period for crash recovery.
 // Returns true if recovery was attempted (response already written), false to continue with rejection.
 func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) bool {
-	var revokedUserID, revokedIP, revokedUA, revokedMachineID string
+	var revokedUserID, revokedIP, revokedUA, revokedMachineID, revokedJKT string
 	var revokedAt time.Time
 	var revokedTokenID string
 	revokeErr := h.db.QueryRow(
@@ -1735,10 +1777,11 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		// same commit: this reader is unreachable today only because that one
 		// returns first, so fixing it alone arms this one (#3290).
 		`SELECT id, user_id, revoked_at,
-		        COALESCE(host(ip_address), ''), COALESCE(user_agent, ''), COALESCE(machine_id, '')
+		        COALESCE(host(ip_address), ''), COALESCE(user_agent, ''), COALESCE(machine_id, ''),
+		        COALESCE(pop_jkt, '')
 		 FROM refresh_tokens WHERE token_hash = $1 AND revoked_at IS NOT NULL`,
 		tokenHash,
-	).Scan(&revokedTokenID, &revokedUserID, &revokedAt, &revokedIP, &revokedUA, &revokedMachineID)
+	).Scan(&revokedTokenID, &revokedUserID, &revokedAt, &revokedIP, &revokedUA, &revokedMachineID, &revokedJKT)
 	// A missing lineage row is "not a replay, carry on"; a real DB error is not.
 	// This used to be `revokeErr != nil || revokedUserID == ""`, which collapsed
 	// both into a silent 401 and made an outage indistinguishable from a stale
@@ -1753,6 +1796,21 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		return true
 	}
 	if h.rejectTheftBlockedRefresh(c, revokedUserID) {
+		return true
+	}
+
+	proofJKT, ok := h.graceSessionProof(c, tokenHash, revokedJKT)
+	if !ok {
+		return true
+	}
+	if revokedJKT != "" {
+		// ADR-0050: a valid proof by the bound key is stronger evidence than the
+		// window, IP and user-agent heuristics below, so a bound row recovers
+		// without them. The family guard and the live-successor lookup still
+		// apply, so logout or a password reset ends recovery.
+		h.log.Info("Bound refresh token replayed with a valid proof, recovering session",
+			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds())
+		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, proofJKT)
 		return true
 	}
 
@@ -1783,7 +1841,7 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		// and a disable committing before the tx's locked read yields a 403 there.
 		h.log.Info("Refresh token replay within grace period, recovering session",
 			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds())
-		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, revokedAt)
+		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, proofJKT)
 		return true
 	}
 
@@ -2307,7 +2365,9 @@ func computeRecoveryOnlyMethods(allMethods, loginMethods []string) []string {
 }
 
 // rotateAndRespond completes the refresh: revokes the old token, issues a new one, and responds.
-func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, requestMachineID string) {
+// successorJKT is the thumbprint the new row is bound to: the source row's own
+// when it is bound, a newly proved key when this refresh binds it, else "".
+func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, requestMachineID, successorJKT string) {
 	newRefreshToken, err := GenerateRefreshToken()
 	if err != nil {
 		h.log.Error(errMsgFailedRefreshToken, "error", err)
@@ -2398,10 +2458,13 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		token.ID,
 	).Scan(&revokedID)
 	if err == nil {
+		// The binding the proof was checked against is part of the predicate,
+		// so consumption and enforcement are one statement (ADR-0050).
 		err = tx.QueryRowContext(ctx,
 			`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW()
-			 WHERE id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp() RETURNING id`,
-			token.ID,
+			 WHERE id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp()
+			   AND pop_jkt IS NOT DISTINCT FROM $2 RETURNING id`,
+			token.ID, nilIfEmpty(token.PopJKT),
 		).Scan(&revokedID)
 	}
 	if err != nil {
@@ -2415,12 +2478,13 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		return
 	}
 
+	popJKT, popAlg := popColumns(successorJKT)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id, pop_jkt, pop_alg)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		newTokenID, token.UserID, newTokenHash, token.DeviceName,
 		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
-		newExpiry, token.RememberMe, nilIfEmpty(propagatedMachineID), token.ID,
+		newExpiry, token.RememberMe, nilIfEmpty(propagatedMachineID), token.ID, popJKT, popAlg,
 	); err != nil {
 		h.log.Error("Failed to store new refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -2446,6 +2510,7 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		"session_id":          newTokenID,
 		"previous_session_id": token.ID,
 		"expires_in":          900,
+		"token_type":          tokenTypeFor(successorJKT),
 	})
 }
 
@@ -2456,7 +2521,10 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 // pair, all inside one users FOR NO KEY UPDATE transaction so it composes with the
 // #2201 credential-epoch fence. The 30s window check already happened in the caller
 // (attemptGracePeriodRecovery); recovery keys on revokedTokenID, not the timestamp.
-func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, _ time.Time) {
+//
+// proofJKT is the thumbprint a valid proof on this request was made with, or "".
+// A bound successor recovers only under a proof by its own key.
+func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, proofJKT string) {
 	ctx := c.Request.Context()
 	tier := h.entCache.GetTier(ctx, userID)
 	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -2511,14 +2579,15 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		// the column is "" rather than NULL — but it is the same latent shape one
 		// arming away, and the carry-forward at :2118 propagates whatever it
 		// reads (#3290).
-		`SELECT id, user_id, COALESCE(device_name, ''), expires_at, remember_me, COALESCE(machine_id, '')
+		`SELECT id, user_id, COALESCE(device_name, ''), expires_at, remember_me, COALESCE(machine_id, ''),
+		        COALESCE(pop_jkt, '')
 		 FROM refresh_tokens
 		 WHERE predecessor_id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp()
 		 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
 		revokedTokenID,
 	).Scan(
 		&successor.ID, &successor.UserID, &successor.DeviceName,
-		&successor.ExpiresAt, &successor.RememberMe, &successorMachineID,
+		&successor.ExpiresAt, &successor.RememberMe, &successorMachineID, &successor.PopJKT,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No live successor in this lineage — nothing to recover; stale replay.
@@ -2535,6 +2604,12 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 	if successorMachineID.Valid {
 		successor.MachineID = successorMachineID.String
+	}
+	// The rotation that minted the successor may have bound it. Then only a
+	// proof by that key recovers it; without one this is a 401, not a replay.
+	if successor.PopJKT != "" && subtle.ConstantTimeCompare([]byte(successor.PopJKT), []byte(proofJKT)) != 1 {
+		writePoPError(c, errPoPRequired)
+		return
 	}
 	// Rotation may have first recorded a machine binding on this successor.
 	graceMachineID := c.GetHeader(headerMachineID)
@@ -2557,8 +2632,9 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	var revokedSuccessorID string
 	revokeErr := tx.QueryRowContext(ctx,
 		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW()
-		 WHERE id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp() RETURNING id`,
-		successor.ID,
+		 WHERE id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp()
+		   AND pop_jkt IS NOT DISTINCT FROM $2 RETURNING id`,
+		successor.ID, nilIfEmpty(successor.PopJKT),
 	).Scan(&revokedSuccessorID)
 	if errors.Is(revokeErr, sql.ErrNoRows) {
 		// The successor was revoked or expired before locked consumption.
@@ -2596,12 +2672,15 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
 		return
 	}
+	// Binding is one-way: proofJKT equals a bound successor's key (checked
+	// above), and on an unbound successor a valid proof binds the new row.
+	popJKT, popAlg := popColumns(proofJKT)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id, pop_jkt, pop_alg)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		newTokenID, userID, newTokenHash, successor.DeviceName,
 		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
-		newExpiry, successor.RememberMe, nilIfEmpty(graceMachineID), successor.ID,
+		newExpiry, successor.RememberMe, nilIfEmpty(graceMachineID), successor.ID, popJKT, popAlg,
 	); err != nil {
 		h.log.Error("Failed to store new refresh token during grace recovery", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -2625,6 +2704,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		"session_id":          newTokenID,
 		"previous_session_id": revokedTokenID,
 		"expires_in":          900,
+		"token_type":          tokenTypeFor(proofJKT),
 	})
 }
 

@@ -264,7 +264,7 @@ func TestRefreshBranchesEmitOnlyTheirAuthoritativeOutcomes(t *testing.T) {
 		failingHandler.db = failingDB
 		require.NoError(t, failingDB.Close())
 		failingContext, failingResponse := newContext()
-		failingHandler.rotateAndRespond(failingContext, models.RefreshToken{ID: uuid.NewString(), UserID: failingUserID.String(), ExpiresAt: time.Now().Add(time.Hour)}, "")
+		failingHandler.rotateAndRespond(failingContext, models.RefreshToken{ID: uuid.NewString(), UserID: failingUserID.String(), ExpiresAt: time.Now().Add(time.Hour)}, "", "")
 		require.Equal(t, http.StatusInternalServerError, failingResponse.Code)
 		require.Empty(t, failingRecorder.events, "a failed refresh transaction must not emit refresh_rotated")
 
@@ -277,7 +277,7 @@ func TestRefreshBranchesEmitOnlyTheirAuthoritativeOutcomes(t *testing.T) {
 		successRecorder := &securityEventRecorder{}
 		rig.h.SetSecurityEvents(successRecorder)
 		successContext, successResponse := newContext()
-		rig.h.rotateAndRespond(successContext, models.RefreshToken{ID: sourceID, UserID: rig.user, ExpiresAt: expiry}, "")
+		rig.h.rotateAndRespond(successContext, models.RefreshToken{ID: sourceID, UserID: rig.user, ExpiresAt: expiry}, "", "")
 		require.Equal(t, http.StatusOK, successResponse.Code, successResponse.Body.String())
 		pair := familyResponse(t, successResponse)
 		successorFamily, successorID := assertFamilyAccess(t, rig, pair.Access)
