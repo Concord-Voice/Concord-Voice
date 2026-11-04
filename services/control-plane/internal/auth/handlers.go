@@ -1902,7 +1902,21 @@ func (h *Handler) logReplayWouldRevoke(c *gin.Context, replayedTokenID, userID s
 		replayedTokenID, userID, replayLineageMaxDepth,
 	).Scan(&live, &depth)
 	if err != nil {
-		h.log.Warn("Replay lineage walk failed", "error_class", "replay_lineage_walk", "user_id", userID)
+		h.log.Warn("Replay lineage walk failed",
+			"request_id", c.GetString(middleware.RequestIDContextKey),
+			"error_class", "replay_lineage_walk",
+			"user_id", userID)
+		return
+	}
+	// Reaching the bound cannot establish whether further live descendants exist.
+	// Keep this observation out of the completed would-revoke measurements.
+	if depth >= replayLineageMaxDepth {
+		h.log.Warn("Replay lineage observation incomplete",
+			"request_id", c.GetString(middleware.RequestIDContextKey),
+			"user_id", userID,
+			"failure_class", "replay_lineage_depth_limit",
+			"lineage_depth", depth,
+			"mode", "log_only")
 		return
 	}
 	h.log.Warn("Refresh replay would revoke lineage",

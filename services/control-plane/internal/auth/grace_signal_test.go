@@ -312,9 +312,23 @@ func TestReplayLogsWouldRevokeLineageWithoutRevoking(t *testing.T) {
 	refresh, _ := registerAndGetRefreshToken(t, ts, "replay-would-revoke", "")
 	var logBuffer bytes.Buffer
 	h := auth.NewHandler(ts.DB, ts.Redis, logger.NewWithWriter(&logBuffer), testhelpers.TestJWTSecret, nil)
-	require.Equal(t, http.StatusOK, refreshDirect(t, h, refresh, "", "198.51.100.10:1234", "agent-a").Code)
+	rotated := refreshDirect(t, h, refresh, "", "198.51.100.10:1234", "agent-a")
+	require.Equal(t, http.StatusOK, rotated.Code)
+	var successor struct {
+		RefreshToken string `json:"refresh_token"`
+		SessionID    string `json:"session_id"`
+	}
+	testhelpers.ParseJSON(t, rotated, &successor)
+	require.NotEmpty(t, successor.RefreshToken)
+	rotated = refreshDirect(t, h, successor.RefreshToken, "", "198.51.100.10:1234", "agent-a")
+	require.Equal(t, http.StatusOK, rotated.Code)
+	testhelpers.ParseJSON(t, rotated, &successor)
+	require.NotEmpty(t, successor.SessionID)
 	_, err := ts.DB.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '31 seconds' WHERE token_hash = $1`, auth.HashRefreshToken(refresh))
 	require.NoError(t, err)
+	const snapshot = `SELECT row_to_json(rt)::text FROM refresh_tokens rt WHERE id = $1`
+	var before, after string
+	require.NoError(t, ts.DB.QueryRow(snapshot, successor.SessionID).Scan(&before))
 
 	w := refreshDirect(t, h, refresh, "", "198.51.100.99:1234", "agent-b")
 
@@ -323,9 +337,25 @@ func TestReplayLogsWouldRevokeLineageWithoutRevoking(t *testing.T) {
 	assert.Contains(t, logs, "Refresh replay would revoke lineage")
 	assert.Contains(t, logs, "would_revoke=true")
 	assert.Contains(t, logs, "live_successors=1")
-	assert.Contains(t, logs, "lineage_depth=1")
+	assert.Contains(t, logs, "lineage_depth=2")
 	assert.Contains(t, logs, "mode=log_only")
-	var live int
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE predecessor_id = (SELECT id FROM refresh_tokens WHERE token_hash = $1) AND revoked_at IS NULL`, auth.HashRefreshToken(refresh)).Scan(&live))
-	assert.Equal(t, 1, live, "log-only stage must not revoke the successor")
+	require.NoError(t, ts.DB.QueryRow(snapshot, successor.SessionID).Scan(&after))
+	assert.Equal(t, before, after, "log-only stage must leave the final successor unchanged")
+
+	_, err = ts.DB.Exec(`UPDATE refresh_tokens SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, successor.SessionID)
+	require.NoError(t, err)
+	require.NoError(t, ts.DB.QueryRow(snapshot, successor.SessionID).Scan(&before))
+	logBuffer.Reset()
+
+	w = refreshDirect(t, h, refresh, "", "198.51.100.99:1234", "agent-b")
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	logs = logBuffer.String()
+	assert.Contains(t, logs, "Refresh replay would revoke lineage")
+	assert.Contains(t, logs, "would_revoke=false")
+	assert.Contains(t, logs, "live_successors=0")
+	assert.Contains(t, logs, "lineage_depth=2")
+	assert.Contains(t, logs, "mode=log_only")
+	require.NoError(t, ts.DB.QueryRow(snapshot, successor.SessionID).Scan(&after))
+	assert.Equal(t, before, after, "log-only stage must leave the expired successor unchanged")
 }
