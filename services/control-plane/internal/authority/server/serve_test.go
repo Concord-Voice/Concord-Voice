@@ -207,9 +207,11 @@ func TestHTTPServerParameters(t *testing.T) {
 // stack. Each becomes one fixed line that carries neither.
 func TestHTTPErrorLogDropsTheText(t *testing.T) {
 	// A real timestamp's fractional seconds can contain the port sentinel.
-	// Freeze only the clock; scan every byte of the emitted log as before.
+	// Freeze only the handler's clock; scan every byte of the emitted log as
+	// before. The Kind check keeps a non-time attribute logged under the
+	// "time" key visible to the scan instead of overwriting it.
 	opts := &slog.HandlerOptions{ReplaceAttr: func(groups []string, attr slog.Attr) slog.Attr {
-		if len(groups) == 0 && attr.Key == slog.TimeKey {
+		if len(groups) == 0 && attr.Key == slog.TimeKey && attr.Value.Kind() == slog.KindTime {
 			return slog.Time(slog.TimeKey, time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC))
 		}
 		return attr
@@ -239,15 +241,18 @@ func TestHTTPErrorLogDropsTheText(t *testing.T) {
 	}
 	checkLogConvention(t, got)
 	// Positive controls: the same byte scan must catch each sentinel in an
-	// attribute, even when the message itself follows the fixed convention.
-	for _, sentinel := range sentinels {
-		t.Run("detects_"+sentinel, func(t *testing.T) {
-			leaked := &syncBuffer{}
-			slog.New(slog.NewJSONHandler(leaked, opts)).Error("authority.http", "detail", sentinel)
-			if leaks := findLeaks(leaked.Bytes()); len(leaks) != 1 || leaks[0] != sentinel {
-				t.Fatalf("leak scan found %v, want %q", leaks, sentinel)
-			}
-		})
+	// attribute, even when the message itself follows the fixed convention,
+	// including under the "time" key the clock freeze rewrites.
+	for _, key := range []string{"detail", slog.TimeKey} {
+		for _, sentinel := range sentinels {
+			t.Run("detects_"+key+"_"+sentinel, func(t *testing.T) {
+				leaked := &syncBuffer{}
+				slog.New(slog.NewJSONHandler(leaked, opts)).Error("authority.http", key, sentinel)
+				if leaks := findLeaks(leaked.Bytes()); len(leaks) != 1 || leaks[0] != sentinel {
+					t.Fatalf("leak scan found %v under %q, want %q", leaks, key, sentinel)
+				}
+			})
+		}
 	}
 }
 
