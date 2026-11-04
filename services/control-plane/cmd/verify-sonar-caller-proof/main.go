@@ -208,10 +208,16 @@ func parsePayload(raw []byte) (payload, error) {
 			return p, errors.New("invalid job verdict")
 		}
 	}
-	if p.Jobs["build"] != "success" || len(p.Jobs) != 5 || len(p.Coverage) != 4 {
+	// ponytail: transition only. The pinned pr-ci still reports the desktop component
+	// until the pin moves past the client/desktop removal (epic #3947); drop it then.
+	components := []string{"control_plane", "media_plane", "admin"}
+	if _, legacy := p.Coverage["desktop"]; legacy {
+		components = append(components, "desktop")
+	}
+	if p.Jobs["build"] != "success" || len(p.Jobs) != 5 || len(p.Coverage) != len(components) {
 		return p, errors.New("invalid report shape")
 	}
-	for _, name := range []string{"desktop", "control_plane", "media_plane", "admin"} {
+	for _, name := range components {
 		flag, ok := p.Coverage[name]
 		if !ok || (!bytes.Equal(flag, []byte("true")) && !bytes.Equal(flag, []byte("false"))) {
 			return p, errors.New("invalid coverage shape")

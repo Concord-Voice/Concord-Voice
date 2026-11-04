@@ -48,7 +48,7 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 			"eslint": "success", "govulncheck": "success",
 		},
 		"coverage": map[string]any{
-			"desktop": true, "control_plane": true, "media_plane": true, "admin": true,
+			"control_plane": true, "media_plane": true, "admin": true,
 		},
 	}
 	raw, err := json.Marshal(payload)
@@ -297,6 +297,12 @@ func TestParsePayloadRejectsInvalidCallerVerdictsAndReports(t *testing.T) {
 		{"invalid coverage", func(p map[string]any) {
 			p["coverage"] = map[string]any{"desktop": true, "control_plane": true, "media_plane": true, "admin": nil}
 		}, "invalid coverage shape"},
+		{"desktop replaces a component", func(p map[string]any) {
+			p["coverage"] = map[string]any{"desktop": true, "control_plane": true, "media_plane": true}
+		}, "invalid report shape"},
+		{"unknown component", func(p map[string]any) {
+			p["coverage"] = map[string]any{"desktop2": true, "control_plane": true, "media_plane": true, "admin": true}
+		}, "invalid report shape"},
 		{"unknown field", func(p map[string]any) { p["surprise"] = true }, "invalid payload"},
 	}
 	for _, tc := range tests {
@@ -312,6 +318,23 @@ func TestParsePayloadRejectsInvalidCallerVerdictsAndReports(t *testing.T) {
 	}
 	_, err := parsePayload(append(bytes.Clone(f.raw), []byte(`{}`)...))
 	require.ErrorContains(t, err, "invalid payload")
+}
+
+// The pinned pr-ci reports the desktop component until the pin moves past the
+// client/desktop removal (epic #3947), so that shape stays valid until then.
+func TestParsePayloadAcceptsPinnedDesktopCoverageShape(t *testing.T) {
+	f := newOIDCFixture(t)
+	var candidate map[string]any
+	require.NoError(t, json.Unmarshal(f.raw, &candidate))
+	coverage, ok := candidate["coverage"].(map[string]any)
+	require.True(t, ok, "fixture coverage must be an object")
+	for _, desktop := range []bool{false, true} {
+		coverage["desktop"] = desktop
+		raw, err := json.Marshal(candidate)
+		require.NoError(t, err)
+		_, err = parsePayload(raw)
+		require.NoError(t, err, "desktop=%v", desktop)
+	}
 }
 
 func TestRunWritesBoundedVerifiedFileOnlyOnSuccess(t *testing.T) {
