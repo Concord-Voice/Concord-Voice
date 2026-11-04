@@ -76,10 +76,51 @@ func (s *WebAuthnService) FinishLogin(user *WebAuthnUser, sessionData webauthn.S
 
 // FinishLoginWithBytes completes the WebAuthn authentication ceremony using raw assertion bytes.
 // Use this when the request body has already been consumed (e.g., by JSON binding).
+// It is ValidateAssertion without the per-assertion flags.
 func (s *WebAuthnService) FinishLoginWithBytes(user *WebAuthnUser, sessionData webauthn.SessionData, assertionBytes []byte) (*webauthn.Credential, error) {
-	parsed, err := protocol.ParseCredentialRequestResponseBytes(assertionBytes)
+	res, err := s.ValidateAssertion(user, sessionData, assertionBytes)
+	return res.Credential, err
+}
+
+// AssertionResult is a validated WebAuthn assertion and what THIS assertion proved.
+//
+// UserVerified and DeviceBound are read from the assertion's own authenticator data, which
+// the verified signature covers, never from a credential. go-webauthn latches UserVerified
+// on the credential it returns (CredentialFlags.Update keeps the stored value), so the
+// credential's Flags can report a past verification for an assertion that verified nobody,
+// and can equally clear the UV this assertion did report when the stored value is false.
+// Reading UV from the credential is wrong in both directions.
+type AssertionResult struct {
+	// Credential is the matched credential after go-webauthn's counter update: SignCount
+	// advanced, or Authenticator.CloneWarning set when the counter did not increase (an
+	// authenticator whose counter stays zero gets neither).
+	Credential *webauthn.Credential
+	// UserVerified is the assertion's UV flag: the authenticator verified the user.
+	UserVerified bool
+	// DeviceBound is the assertion's BE flag clear: the authenticator reports the credential
+	// as not backup-eligible. This is self-reported and not attested (no attestation or MDS
+	// policy is configured); it does not prove a hardware-bound key.
+	DeviceBound bool
+}
+
+// ValidateAssertion completes the WebAuthn authentication ceremony using raw assertion bytes
+// and reports the assertion's UV and BE flags. Any error returns the zero AssertionResult.
+//
+// A BE=1 assertion verifies only if the stored credential records BackupEligible;
+// go-webauthn refuses a mismatch.
+func (s *WebAuthnService) ValidateAssertion(user *WebAuthnUser, session webauthn.SessionData, assertion []byte) (AssertionResult, error) {
+	parsed, err := protocol.ParseCredentialRequestResponseBytes(assertion)
 	if err != nil {
-		return nil, err
+		return AssertionResult{}, err
 	}
-	return s.wan.ValidateLogin(user, sessionData, parsed)
+	cred, err := s.wan.ValidateLogin(user, session, parsed)
+	if err != nil {
+		return AssertionResult{}, err
+	}
+	flags := parsed.Response.AuthenticatorData.Flags
+	return AssertionResult{
+		Credential:   cred,
+		UserVerified: flags.HasUserVerified(),
+		DeviceBound:  !flags.HasBackupEligible(),
+	}, nil
 }

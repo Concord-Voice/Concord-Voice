@@ -28,6 +28,8 @@
 # shard 1 job 115728676196. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
 # internal/accountguard/decide was added 2026-10-30 from Required PR build run 41004033007, head 5e6021236
 # (#3680 PR2): shard 2 job 123895091368. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
+# internal/accountguard was added 2026-11-04 from Required PR build run 41908590154, head bd5a59fd8
+# (#3680 PR3): shard 1 job 126851019637. Without an entry it weighed CI_SHARD_DEFAULT_WEIGHT (5 s).
 #
 # Packages without test files remain absent and use the default weight.
 cmd/account-authority             4.742
@@ -35,6 +37,7 @@ cmd/issue-codes                   1.030
 cmd/mfa-rekey                     2.563
 cmd/migrate-media                 7.709
 cmd/server                        4.817
+internal/accountguard             84.502
 internal/accountguard/decide      15.838
 internal/activepresence           16.729
 internal/admin                    30.598

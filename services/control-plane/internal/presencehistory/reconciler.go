@@ -143,7 +143,7 @@ func (s *Service) boundDelivery() (Delivery, error) {
 
 // WithReadySender retains one sender gate through reconciliation and work.
 func (s *Service) WithReadySender(ctx context.Context, senderID uuid.UUID, work func() error) error {
-	return s.withReadySenderMode(ctx, senderID, OrdinaryAudienceWrite, nil, work)
+	return s.withReadySenderMode(ctx, senderID, OrdinaryAudienceWrite, 0, nil, work)
 }
 
 // WithReadySenderMode retains the same single sender gate while allowing a
@@ -154,7 +154,27 @@ func (s *Service) WithReadySenderMode(
 	mode OperationMode,
 	work func() error,
 ) error {
-	return s.withReadySenderMode(ctx, senderID, mode, nil, work)
+	return s.withReadySenderMode(ctx, senderID, mode, 0, nil, work)
+}
+
+// WithReadySenderModeWithin is WithReadySenderMode with the wait for the
+// sender gate bounded by wait as well as ctx. The gates are striped across
+// senders, so the gate may be held by another sender or by the caller itself.
+// A wait that runs out returns ErrSenderGateBusy before reconciliation or work
+// runs, so nothing is written. Only the acquire is bounded: reconciliation and
+// work run under ctx however long they take. A wait that is not positive is
+// refused, so this entry point is never unbounded.
+func (s *Service) WithReadySenderModeWithin(
+	ctx context.Context,
+	senderID uuid.UUID,
+	mode OperationMode,
+	wait time.Duration,
+	work func() error,
+) error {
+	if wait <= 0 {
+		return errors.New("presence history sender gate wait must be positive")
+	}
+	return s.withReadySenderMode(ctx, senderID, mode, wait, nil, work)
 }
 
 // WithReadySenderModeBeforeReconcile retains one sender gate while running a
@@ -170,13 +190,16 @@ func (s *Service) WithReadySenderModeBeforeReconcile(
 	if beforeReconcile == nil {
 		return errors.New("presence history pre-reconcile step unavailable")
 	}
-	return s.withReadySenderMode(ctx, senderID, mode, beforeReconcile, work)
+	return s.withReadySenderMode(ctx, senderID, mode, 0, beforeReconcile, work)
 }
 
+// withReadySenderMode holds senderID's gate through readiness and work. A
+// positive wait bounds the gate acquire and nothing after it (withSender).
 func (s *Service) withReadySenderMode(
 	ctx context.Context,
 	senderID uuid.UUID,
 	mode OperationMode,
+	wait time.Duration,
 	beforeReconcile func() error,
 	work func() error,
 ) error {
@@ -186,7 +209,7 @@ func (s *Service) withReadySenderMode(
 	if mode != OrdinaryAudienceWrite && mode != ForcedSecurityClear {
 		return errors.New("invalid presence history ready sender mode")
 	}
-	return s.WithSender(ctx, senderID, func() error {
+	return s.withSender(ctx, senderID, wait, func() error {
 		return s.runReadySenderMode(ctx, senderID, mode, beforeReconcile, work)
 	})
 }

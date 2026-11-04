@@ -553,7 +553,7 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	normalizedEmail := strings.ToLower(strings.TrimSpace(req.Email))
+	normalizedEmail := email.NormalizeAddress(req.Email)
 	normalizedUsername := NormalizeUsername(req.Username)
 
 	pendingID, expiresAt, _, err := h.pending.InsertOrTakeover(
@@ -1067,7 +1067,7 @@ func (h *Handler) ChangeRegistrationEmail(c *gin.Context) {
 	}
 
 	h.clearVerificationCode(ctx, req.PendingID)
-	newEmailLower := strings.ToLower(strings.TrimSpace(req.NewEmail))
+	newEmailLower := email.NormalizeAddress(req.NewEmail)
 	codeExpires, err := h.sendInitialCode(ctx, req.PendingID, newEmailLower)
 	if err != nil {
 		if errors.Is(err, ErrPendingExpired) {
@@ -3108,7 +3108,7 @@ func (h *Handler) RecoveryBegin(c *gin.Context) {
 		return
 	}
 
-	email := strings.ToLower(strings.TrimSpace(req.Email))
+	addr := email.NormalizeAddress(req.Email)
 
 	// Always return 200 to prevent email enumeration
 	successMsg := gin.H{"message": "If an account exists with that email, a recovery code has been sent"}
@@ -3116,7 +3116,7 @@ func (h *Handler) RecoveryBegin(c *gin.Context) {
 	// Look up user by email
 	var userID string
 	err := h.db.QueryRow(
-		`SELECT id FROM users WHERE LOWER(email) = LOWER($1)`, email,
+		`SELECT id FROM users WHERE LOWER(email) = LOWER($1)`, addr,
 	).Scan(&userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3155,25 +3155,25 @@ func (h *Handler) RecoveryBegin(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.redis.Set(ctx, recoveryRedisKey(email), data, recoveryCodeTTL).Err(); err != nil {
+	if err := h.redis.Set(ctx, recoveryRedisKey(addr), data, recoveryCodeTTL).Err(); err != nil {
 		h.log.Error("Failed to store recovery code in Redis", "error", err)
 		c.JSON(http.StatusOK, successMsg)
 		return
 	}
 
 	// Send code via email
-	if err := h.emailSvc.SendRecoveryCode(email, code); err != nil {
-		h.log.Error("Failed to send recovery code email", "error", err, "email", email)
+	if err := h.emailSvc.SendRecoveryCode(addr, code); err != nil {
+		h.log.Error("Failed to send recovery code email", "error", err)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		if delErr := h.redis.Del(cleanupCtx, recoveryRedisKey(email)).Err(); delErr != nil {
+		if delErr := h.redis.Del(cleanupCtx, recoveryRedisKey(addr)).Err(); delErr != nil {
 			h.log.Warn("Failed to clear unsent recovery code", "error", delErr)
 		}
 		c.JSON(http.StatusOK, successMsg)
 		return
 	}
 
-	h.log.Info("Recovery code sent", "email", email)
+	h.log.Info("Recovery code sent")
 	c.JSON(http.StatusOK, successMsg)
 }
 
@@ -3372,7 +3372,7 @@ func parseRecoveryVerifyCodeRequest(c *gin.Context) (string, string, bool) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return "", "", false
 	}
-	return strings.ToLower(strings.TrimSpace(req.Email)), code, true
+	return email.NormalizeAddress(req.Email), code, true
 }
 
 // CompleteRecovery is called only after the recovery policy's required proofs.

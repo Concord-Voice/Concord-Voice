@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/accountguard/decide"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
@@ -33,11 +34,13 @@ import (
 // other way round, or as a defer, the TRUNCATE waits on the open transaction's
 // locks and deadlocks.
 
-const agDeltaCP = 72 * time.Hour // PR3 rebinds this to decide.DeltaCP.
+// agDeltaCP is bound to the decision core's Δ_cp, so the SQL stamp interval, the
+// request delay and the maturity interval cannot drift apart unnoticed (spec §6.1).
+const agDeltaCP = decide.DeltaCP
 
 var (
-	agLegacyMaturity = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC) // PR3 rebinds this to decide's legacy sentinel.
-	agAwaitingNotice = time.Date(2999, 1, 1, 0, 0, 0, 0, time.UTC) // PR3 rebinds this to decide's awaiting-notice sentinel.
+	agLegacyMaturity = decide.LegacyMaturity()
+	agAwaitingNotice = decide.AwaitingNoticeMaturity()
 )
 
 const (
@@ -250,7 +253,7 @@ func agSavepoint(t *testing.T, tx *sql.Tx, fn func()) {
 	require.NoError(t, err)
 }
 
-// agNow and agStamp read the transaction's now() and now() + 72 hours from the
+// agNow and agStamp read the transaction's now() and now() + decide.DeltaCP from the
 // database, so the comparison never depends on the Go clock.
 func agNow(t *testing.T, tx *sql.Tx) time.Time {
 	t.Helper()
@@ -262,7 +265,7 @@ func agNow(t *testing.T, tx *sql.Tx) time.Time {
 func agStamp(t *testing.T, tx *sql.Tx) time.Time {
 	t.Helper()
 	var stamp time.Time
-	require.NoError(t, tx.QueryRow(`SELECT now() + interval '72 hours'`).Scan(&stamp))
+	require.NoError(t, tx.QueryRow(`SELECT now() + make_interval(secs => $1)`, agDeltaCP.Seconds()).Scan(&stamp))
 	return stamp
 }
 

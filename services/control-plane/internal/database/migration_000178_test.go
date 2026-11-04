@@ -96,13 +96,21 @@ func migrationRequirePQError(t *testing.T, err error, code, constraint string) {
 	}
 }
 
-// migrationRequireGuardRunsUnderLock proves a guarded down takes its ACCESS
-// EXCLUSIVE lock on table BEFORE it looks for blocking rows. insertBlocker
-// writes a blocking row in a transaction that is still open when the down
-// starts; the down parks on its LOCK TABLE, the row commits, and the down must
-// then refuse with wantMessage. A down that checked first would find nothing,
-// wait on the lock, and then drop.
+// migrationRequireGuardRunsUnderLock proves a guarded down that refuses with
+// SQLSTATE 23001 takes its ACCESS EXCLUSIVE lock on table BEFORE it looks for
+// blocking rows. See migrationRequireGuardRunsUnderLockCode.
 func migrationRequireGuardRunsUnderLock(t *testing.T, db *sql.DB, down, table, wantMessage string, insertBlocker func(tx *sql.Tx) error) {
+	t.Helper()
+	migrationRequireGuardRunsUnderLockCode(t, db, down, table, "23001", wantMessage, insertBlocker)
+}
+
+// migrationRequireGuardRunsUnderLockCode is migrationRequireGuardRunsUnderLock
+// for a down whose refusal carries the given SQLSTATE (a RAISE EXCEPTION with no
+// USING ERRCODE is P0001). insertBlocker writes a blocking row in a transaction
+// that is still open when the down starts; the down parks on its LOCK TABLE, the
+// row commits, and the down must then refuse with wantMessage. A down that
+// checked first would find nothing, wait on the lock, and then drop.
+func migrationRequireGuardRunsUnderLockCode(t *testing.T, db *sql.DB, down, table, sqlstate, wantMessage string, insertBlocker func(tx *sql.Tx) error) {
 	t.Helper()
 	probe, err := sql.Open("postgres", testdb.DatabaseURL())
 	require.NoError(t, err)
@@ -131,7 +139,7 @@ func migrationRequireGuardRunsUnderLock(t *testing.T, db *sql.DB, down, table, w
 
 	err = <-result
 	require.Error(t, err, "the down must refuse a row that committed while it waited for its lock")
-	migrationRequirePQError(t, err, "23001", "")
+	migrationRequirePQError(t, err, sqlstate, "")
 	assert.Contains(t, err.Error(), wantMessage)
 }
 

@@ -57,6 +57,12 @@ const (
 // eligible marker to reconciliation before starting a fresh operation.
 var ErrPendingOperationEligible = errors.New("pending presence operation requires reconciliation")
 
+// ErrSenderGateBusy means a bounded wait for a sender gate ran out
+// (WithReadySenderModeWithin). The gates are striped, so the holder may be
+// another sender on the same stripe. Neither reconciliation nor work ran, so
+// nothing was written, and a retry may succeed.
+var ErrSenderGateBusy = errors.New("presence history sender gate busy")
+
 // OperationMode distinguishes ordinary audience writes from privacy-narrowing
 // security clears that may supersede an existing pending operation.
 type OperationMode uint8
@@ -184,17 +190,48 @@ func (s *Service) WithSender(
 	senderID uuid.UUID,
 	work func() error,
 ) error {
+	return s.withSender(ctx, senderID, 0, work)
+}
+
+// withSender is WithSender with the wait for the gate also bounded by wait
+// when wait is positive. Only the acquire is bounded: work runs under ctx
+// however long it takes. A zero wait leaves ctx the only bound.
+func (s *Service) withSender(
+	ctx context.Context,
+	senderID uuid.UUID,
+	wait time.Duration,
+	work func() error,
+) error {
 	gate := s.senderGates[senderGateIndex(senderID)]
-	select {
-	case gate <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := acquireSenderGate(ctx, gate, wait); err != nil {
+		return err
 	}
 	defer func() { <-gate }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return work()
+}
+
+// acquireSenderGate takes gate, waiting until ctx ends or, when wait is
+// positive, until wait has passed (ErrSenderGateBusy). With a zero wait the
+// timer channel stays nil, and a receive from a nil channel never proceeds, so
+// ctx is the only bound.
+func acquireSenderGate(ctx context.Context, gate chan struct{}, wait time.Duration) error {
+	var expired <-chan time.Time
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-expired:
+		return ErrSenderGateBusy
+	}
 }
 
 // WithSenders holds every process-local sender stripe named by senderIDs for

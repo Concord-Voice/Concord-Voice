@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 )
 
 // Policy constants for pending registrations.
@@ -400,7 +402,7 @@ func (r *PendingRepo) UpdateEmail(ctx context.Context, id, newEmail string) erro
 		return ErrPendingExpired
 	}
 
-	lowerEmail := strings.ToLower(strings.TrimSpace(newEmail))
+	lowerEmail := email.NormalizeAddress(newEmail)
 
 	// Uniqueness check: pending table (excluding self)
 	var pendingExists bool

@@ -165,10 +165,21 @@ func LoadSubject(ctx context.Context, q RowQuerier, userID string) (Subject, *Er
 //     FOR NO KEY UPDATE before its servers lock.
 //   - The login-family writer barrier (a FOR SHARE on the rollout singleton)
 //     MAY precede it and MUST precede every users lock; a caller that locks
-//     users before this gate takes the barrier itself first.
+//     users before this gate takes the barrier itself first. This function
+//     claims the barrier when the transaction has not (EnsureWriterBarrierTx),
+//     so a caller that wants the WriterBarrier value (the account-guard
+//     runner) must call AcquireWriterBarrierTx BEFORE calling here: a later
+//     AcquireWriterBarrierTx fails on the already-set marker.
 //   - Advisory locks and SET LOCAL (lock_timeout) MAY precede it. Under READ
 //     COMMITTED neither leaves a snapshot that a later statement reads
-//     through, and neither takes a row lock.
+//     through, and neither takes a row lock. The one advisory lock that may
+//     NOT precede it is the account-guard address lock
+//     (concord.accountguard.address:, #3680 E15): it comes AFTER users and
+//     BEFORE any account_pending_requests or factor-credential row, and the
+//     runner's order is SET LOCAL, the login-family barrier, users, this gate,
+//     the accountguard_state marker, the address locks, then the C4 rows. Its
+//     holders lock only C4 request, credential, notice and job rows after it,
+//     so it never waits on anything that waits on users.
 //
 // Hazard recorded for #3454: a family that holds the actor's users row at FOR
 // KEY SHARE (an FK check takes it implicitly) and gates only after its servers

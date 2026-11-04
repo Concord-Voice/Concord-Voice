@@ -12,9 +12,10 @@
 //
 // Decide is only as sound as the snapshot it is given and the way its outcome is applied.
 //
-//   - Snapshot. Input.Creds is the pre-action snapshot of the account's LIVE credentials only:
-//     verified addresses, confirmed TOTP, registered WebAuthn, and the password, SSO links,
-//     backup-code sets and anchors. The credential an Enrol adds is not in it; an Enrol whose
+//   - Snapshot. The runner's loadInputTx builds Input under its locks. Input.Creds is the
+//     pre-action snapshot of the account's LIVE credentials only: verified addresses,
+//     confirmed TOTP, registered WebAuthn, and the password, SSO links, backup-code sets
+//     and anchors. The credential an Enrol adds is not in it; an Enrol whose
 //     slot is already present is refused (architect ruling 7).
 //   - Now. Input.Now is the database clock. A zero Now is refused with RowNone and no effects
 //     (red-team F3): at a zero instant nothing counts, so every mature credential would read
@@ -37,11 +38,13 @@
 //     accounts store a real hash. Its zero value is a password account, so a dropped load
 //     denies an SSO-only owner rather than letting an SSO assertion alone meet a password
 //     account's floor.
-//   - MatureNoticesSettled and GuessableBudgetClear (H1) are true only when the runner read
-//     them: every notice to a mature address accepted or permanently failed, and every
+//   - AcceptedAddressNotice, MatureNoticesSettled and GuessableBudgetClear (H1) are true only
+//     when the runner read them: a provider accepted one of the request's address notices,
+//     every notice to a mature address accepted or permanently failed, and every
 //     guessable-proof budget read and unlocked. Their zero values hold the request. Until PR4
-//     builds the outbox and the budget, PR3 sets both to true explicitly, with a comment: a
-//     visible stub, not a silent zero.
+//     builds the outbox and the budget, PR3's loadInputTx sets all three to true explicitly,
+//     with a comment: a visible stub, not a silent zero. The stub fields are
+//     Req.AcceptedAddressNotice, Req.MatureNoticesSettled and Input.GuessableBudgetClear.
 //   - EnrolledAt and EnrolClass (D20) come from the 000189 enrolled_at and enrol_class
 //     columns; a NULL enrol_class is ClassNone. A zero EnrolledAt or a zero MaturesAt makes a
 //     credential uncontestable, and a zero MaturesAt makes it count for nothing.
@@ -82,8 +85,10 @@
 //     that filter is wrong in both directions: it drops a code that does not prove the
 //     primary, and it keeps a code that proves the targeted backup. Cred must then carry the
 //     email-MFA delivery slot, and selfVetoFiltered must test that slot against the targets.
-//   - A Complete refused with RowNone wedges its request silently; PR3 should count those
-//     refusals, and may add CHECK (held_ms >= 0) to its own migration. A row whose CompletesAt is before
+//   - A Complete refused with RowNone wedges its request silently, so PR3's runner logs each
+//     such refusal once, as a WARN with the fixed failure_class complete_refused and the user
+//     id only (no metric: the operations-metrics catalog is closed); PR3 may add
+//     CHECK (held_ms >= 0) to its own migration. A row whose CompletesAt is before
 //     OpenedAt + Δ_cp is one of them (H3), so PR5's dev fast-forward verb must shift
 //     opened_at and completes_at together.
 //   - Requests. Every Req has a unique, non-empty ID, or Decide refuses the action.

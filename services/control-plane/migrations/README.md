@@ -82,7 +82,7 @@ ALTER TABLE users ADD COLUMN status VARCHAR(20) DEFAULT 'active';
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000195)
+## Existing Migrations (000001–000196)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -303,6 +303,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000193 | seat_end_reason_pair_ineligible | Widens `subscription_seats_end_reason_check` to admit `pair_ineligible`, the end of a seat its pair's friendship no longer supports (an unfriend or block ends a pending invite; a block by either side ends an active seat); down refuses while any seat carries it. 000192 is unused: #4135 took 000194 instead (#4133 follow-up) |
 | 000194 | add_login_family_authority | Logical login families and immutable SID membership, sealed revocation frontiers, exact media connection/room associations and closure evidence, permanent boot fences and one-way activation receipt; down refuses activation or retained authority/delivery evidence (#2272; 000190 belongs to #4131 and 000191 to #4137). |
 | 000195 | add_refresh_token_session_binding | Nullable `refresh_tokens.pop_jkt`/`pop_alg` binding a session to a device P-256 key (ADR-0050), both-or-neither CHECK admitting only ES256, added NOT VALID; down refuses while any row is bound (the rollback floor). |
+| 000196 | accountguard_requests | The account guard's five request tables, dormant until the runner is activated: `account_pending_requests` (eight named `apr_*` per-status CHECKs plus `apr_pending_address_normalized`; a partial UNIQUE allows one pending `break_glass` per user; no index on `(dispute_group_id, origin_fingerprint)`, A-20), `account_pending_request_origins`, `user_credential_history`, `account_address_reservations` and `accountguard_hmac_keys`; stored addresses must be `lower(btrim(x))` with no white space anywhere (`aar_address_normalized`, `uch_address_normalized`); down runs under `lock_timeout = '3s'` and refuses while a request is pending or disputed, a `proof`/`dispute_resolved` cancel or a history row is younger than 30 days, or any reservation exists (#3680) |
 
 ### Logical login authority (migration 000194, #2272)
 
