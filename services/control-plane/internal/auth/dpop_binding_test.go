@@ -201,3 +201,265 @@ func TestSessionBindingAtLogin(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 	assert.Equal(t, errCodePoPInvalid, out.Code, "a login proof must not carry rth")
 }
+
+// liveTokens counts the user's unrevoked refresh tokens.
+func liveTokens(t *testing.T, rig familyTestRig) int {
+	t.Helper()
+	var live int
+	require.NoError(t, rig.db.QueryRow(`SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, rig.user).Scan(&live))
+	return live
+}
+
+func TestSessionBindingUnboundReplayWrongKeyLeavesBoundSuccessor(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	key := newDPoPTestKey(t)
+	unbound, bound := bindSession(t, rig, key)
+	other := newDPoPTestKey(t)
+
+	// A valid proof, by a key that is not the successor's.
+	w, out := dpopRefresh(t, rig, unbound, other.proof(t, "POST", dpopRefreshHTU, &unbound, time.Now()))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Equal(t, errCodePoPRequired, out.Code)
+	jkt, revoked := rowJKT(t, rig, bound)
+	assert.False(t, revoked, "the bound successor stays live")
+	assert.Equal(t, key.jkt, jkt.String, "and keeps its key")
+	assert.Equal(t, 1, liveTokens(t, rig), "nothing was minted")
+
+	// Positive control: the successor's own key recovers it.
+	w, out = dpopRefresh(t, rig, unbound, key.proof(t, "POST", dpopRefreshHTU, &unbound, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, tokenTypeDPoP, out.TokenType)
+}
+
+func TestSessionBindingProofRefusalPrecedesTheftCheck(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	key := newDPoPTestKey(t)
+	_, bound := bindSession(t, rig, key)
+	other := newDPoPTestKey(t)
+	_, err := rig.db.Exec(`UPDATE refresh_tokens SET machine_id = 'stored-machine' WHERE token_hash = $1`, HashRefreshToken(bound))
+	require.NoError(t, err)
+
+	// A different machine ID and a different IP would be theft, but the proof
+	// is refused first, so neither revocation nor a theft event follows.
+	theftRefresh := func(proof string) *httptest.ResponseRecorder {
+		c, w := familyTestContext()
+		c.Request.RemoteAddr = "198.51.100.7:1234"
+		c.Request.Header.Set("X-Refresh-Token", bound)
+		c.Request.Header.Set(headerMachineID, "other-machine")
+		if proof != "" {
+			c.Request.Header.Set(dpopHeader, proof)
+		}
+		rig.h.Refresh(c)
+		return w
+	}
+	for name, tc := range map[string]struct {
+		proof func() string
+		code  string
+	}{
+		"no proof":  {func() string { return "" }, errCodePoPRequired},
+		"wrong key": {func() string { return other.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()) }, errCodePoPInvalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := theftRefresh(tc.proof())
+			require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var out dpopRefreshResult
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+			assert.Equal(t, tc.code, out.Code, "a proof refusal, not a theft refusal")
+			_, revoked := rowJKT(t, rig, bound)
+			assert.False(t, revoked)
+			assert.Equal(t, 1, liveTokens(t, rig))
+		})
+	}
+
+	// Positive control: with a valid proof the same request reaches the
+	// theft check, which revokes the session.
+	w := theftRefresh(key.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()))
+	assert.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
+	_, revoked := rowJKT(t, rig, bound)
+	assert.True(t, revoked, "the control must reach theft revocation")
+}
+
+func TestSessionBindingGraceRecoversBoundSuccessorWhileDormant(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	key := newDPoPTestKey(t)
+	unbound, bound := bindSession(t, rig, key)
+
+	// Binding is switched off after the bound successor's response was lost.
+	rig.h.SetSessionBinding(false)
+	w, out := dpopRefresh(t, rig, unbound, "")
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Equal(t, errCodePoPRequired, out.Code, "a bound successor still needs its key")
+	w, out = dpopRefresh(t, rig, unbound, key.proof(t, "POST", dpopRefreshHTU, &unbound, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, tokenTypeDPoP, out.TokenType)
+	_, revoked := rowJKT(t, rig, bound)
+	assert.True(t, revoked, "recovery consumed the undelivered successor")
+	jkt, _ := rowJKT(t, rig, out.Refresh)
+	assert.Equal(t, key.jkt, jkt.String, "the recovered session keeps the key")
+}
+
+func TestSessionBindingDormantGraceNeverBindsNewSession(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	key := newDPoPTestKey(t)
+	mint, _ := familyTestContext()
+	_, first, _, err := rig.h.IssueTokenPair(mint, rig.user, "")
+	require.NoError(t, err)
+	w, _ := dpopRefresh(t, rig, first, "")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// A valid proof on a dormant replay of an unbound lineage binds nothing.
+	w, out := dpopRefresh(t, rig, first, key.proof(t, "POST", dpopRefreshHTU, &first, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, tokenTypeBearer, out.TokenType)
+	jkt, _ := rowJKT(t, rig, out.Refresh)
+	assert.False(t, jkt.Valid)
+
+	// An invalid proof on a dormant replay of an unbound lineage is ignored,
+	// as on the dormant refresh path: the replay still recovers, unbound.
+	_, second, _, err := rig.h.IssueTokenPair(mint, rig.user, "")
+	require.NoError(t, err)
+	w, _ = dpopRefresh(t, rig, second, "")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	s := "wrong"
+	w, out = dpopRefresh(t, rig, second, key.proof(t, "POST", dpopRefreshHTU, &s, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, tokenTypeBearer, out.TokenType)
+	jkt, _ = rowJKT(t, rig, out.Refresh)
+	assert.False(t, jkt.Valid)
+}
+
+func TestSessionBindingDormantGraceReturnsBoundSuccessorProofError(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	key := newDPoPTestKey(t)
+	unbound, bound := bindSession(t, rig, key)
+	rig.h.SetSessionBinding(false)
+
+	// The right key with a skewed clock gets the stale-iat answer and the
+	// server's time, not pop_required, so the client can retry once.
+	w, out := dpopRefresh(t, rig, unbound, key.proof(t, "POST", dpopRefreshHTU, &unbound, time.Now().Add(-time.Hour)))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Equal(t, errCodePoPStaleIAT, out.Code)
+	assert.NotZero(t, out.Server)
+	_, revoked := rowJKT(t, rig, bound)
+	assert.False(t, revoked, "the bound successor stays live")
+}
+
+func TestSessionBindingJunkProofKeepsReplayDetection(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	mint, _ := familyTestContext()
+	_, first, _, err := rig.h.IssueTokenPair(mint, rig.user, "")
+	require.NoError(t, err)
+	w, _ := dpopRefresh(t, rig, first, "")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// Inside the window a bad proof on an unbound lineage is still refused.
+	w, out := dpopRefresh(t, rig, first, "junk.junk.junk")
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Equal(t, errCodePoPInvalid, out.Code)
+	assert.Equal(t, 1, liveTokens(t, rig), "nothing was minted")
+
+	// Outside it, a junk proof must not hide the stale replay from detection.
+	_, err = rig.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '5 minutes' WHERE token_hash = $1`, HashRefreshToken(first))
+	require.NoError(t, err)
+	rec := &securityEventRecorder{}
+	rig.h.SetSecurityEvents(rec)
+	w, out = dpopRefresh(t, rig, first, "junk.junk.junk")
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Empty(t, out.Code, "the replay refusal, not a proof refusal")
+	replays := 0
+	for _, e := range rec.events {
+		if e.ReasonCode == securityevent.ReasonRefreshReplay {
+			replays++
+		}
+	}
+	assert.Equal(t, 1, replays)
+}
+
+func TestSessionBindingGraceRecoveryOwesPreMFAUpgrade(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	key := newDPoPTestKey(t)
+	_, bound := bindSession(t, rig, key)
+	w, lost := dpopRefresh(t, rig, bound, key.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var lostID string
+	require.NoError(t, rig.db.QueryRow(`SELECT id FROM refresh_tokens WHERE token_hash = $1`, HashRefreshToken(lost.Refresh)).Scan(&lostID))
+
+	// MFA was enabled after the undelivered successor was created.
+	_, err := rig.db.Exec(`UPDATE refresh_tokens SET created_at = NOW() - INTERVAL '1 hour' WHERE user_id = $1`, rig.user)
+	require.NoError(t, err)
+	_, err = rig.db.Exec(`UPDATE users SET mfa_enabled_at = NOW() WHERE id = $1`, rig.user)
+	require.NoError(t, err)
+	mfa := &mfaMethodsStub{loginMethods: []string{"totp"}, enabledMethods: []string{"totp"}, challengeTok: "upgrade-token"}
+	rig.h.SetMFAChecker(mfa)
+
+	w, _ = dpopRefresh(t, rig, bound, key.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()))
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "mfa_upgrade_required")
+	assert.Equal(t, lostID, mfa.upgradeSession, "the challenge is bound to the successor recovery would replace")
+	_, revoked := rowJKT(t, rig, lost.Refresh)
+	assert.False(t, revoked, "the successor stays live")
+	assert.Equal(t, 1, liveTokens(t, rig), "nothing was minted")
+
+	// A completed upgrade for that successor lets recovery through.
+	require.NoError(t, rig.h.redis.Set(t.Context(), MFAUpgradeBypassKey(rig.user, lostID), "1", time.Minute).Err())
+	w, out := dpopRefresh(t, rig, bound, key.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, tokenTypeDPoP, out.TokenType)
+}
+
+func TestSessionBindingGraceRecoveryAfterMFAOwesNothing(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	rig.h.SetSessionBinding(true)
+	key := newDPoPTestKey(t)
+	_, bound := bindSession(t, rig, key)
+	w, _ := dpopRefresh(t, rig, bound, key.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// MFA was enabled before the successor was created: no upgrade is owed.
+	_, err := rig.db.Exec(`UPDATE users SET mfa_enabled_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, rig.user)
+	require.NoError(t, err)
+	mfa := &mfaMethodsStub{loginMethods: []string{"totp"}, enabledMethods: []string{"totp"}, challengeTok: "upgrade-token"}
+	rig.h.SetMFAChecker(mfa)
+
+	w, out := dpopRefresh(t, rig, bound, key.proof(t, "POST", dpopRefreshHTU, &bound, time.Now()))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, tokenTypeDPoP, out.TokenType)
+	assert.Empty(t, mfa.upgradeSession, "no challenge was issued")
+}
+
+func TestUnboundGraceRecoveryOfPreMFASessionEndsQuietly(t *testing.T) {
+	rig := newFamilyTestRig(t)
+	mint, _ := familyTestContext()
+	_, first, _, err := rig.h.IssueTokenPair(mint, rig.user, "")
+	require.NoError(t, err)
+	w, lost := dpopRefresh(t, rig, first, "")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	_, err = rig.db.Exec(`UPDATE refresh_tokens SET created_at = NOW() - INTERVAL '1 hour' WHERE user_id = $1`, rig.user)
+	require.NoError(t, err)
+	_, err = rig.db.Exec(`UPDATE users SET mfa_enabled_at = NOW() WHERE id = $1`, rig.user)
+	require.NoError(t, err)
+	mfa := &mfaMethodsStub{loginMethods: []string{"totp"}, enabledMethods: []string{"totp"}, challengeTok: "upgrade-token"}
+	rig.h.SetMFAChecker(mfa)
+	rec := &securityEventRecorder{}
+	rig.h.SetSecurityEvents(rec)
+
+	// The 30 s window would close before an MFA ceremony finished, so the
+	// session ends with a plain 401: no challenge and no replay alert.
+	w, _ = dpopRefresh(t, rig, first, "")
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "mfa_upgrade_required")
+	assert.Empty(t, mfa.upgradeSession)
+	for _, e := range rec.events {
+		assert.NotEqual(t, securityevent.ReasonRefreshReplay, e.ReasonCode)
+	}
+	_, revoked := rowJKT(t, rig, lost.Refresh)
+	assert.False(t, revoked, "the successor stays live")
+	assert.Equal(t, 1, liveTokens(t, rig), "nothing was minted")
+}

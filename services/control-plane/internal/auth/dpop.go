@@ -235,6 +235,34 @@ func (h *Handler) sessionProof(c *gin.Context, boundJKT string, rthDigest []byte
 	return jkt, true
 }
 
+// graceProof is sessionProof for a replayed row. A bound replayed row gets the
+// strict check. An unbound one still has a supplied proof verified, because
+// the successor it recovers may already be bound and only that key recovers
+// it, but a failure is returned rather than written: the caller judges it
+// against the successor, after the replay heuristics have run, so a junk proof
+// can neither hide a stale replay from detection nor mask why a bound
+// successor refused (stale iat, replay store down). The caller must not bind a
+// new row from the result while binding is off.
+func (h *Handler) graceProof(c *gin.Context, boundJKT string, rthDigest []byte) (graceReplayProof, bool) {
+	proof := graceReplayProof{bound: boundJKT != ""}
+	header := c.GetHeader(dpopHeader)
+	if proof.bound || header == "" {
+		var ok bool
+		proof.jkt, ok = h.sessionProof(c, boundJKT, rthDigest)
+		return proof, ok
+	}
+	jkt, jti, err := verifyDPoP(header, c.Request.Method, c.Request.URL.Path, rthDigest, time.Now())
+	if err == nil {
+		err = h.consumeDPoPJTI(c.Request.Context(), jkt, jti)
+	}
+	if err != nil {
+		proof.err = err
+		return proof, true
+	}
+	proof.jkt = jkt
+	return proof, true
+}
+
 // writePoPError answers a refused proof. A refusal never revokes anything and
 // never logs the proof, its thumbprint or rth (AC14).
 func writePoPError(c *gin.Context, err error) {

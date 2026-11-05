@@ -1753,17 +1753,28 @@ func (h *Handler) handleRefreshTokenNotFound(c *gin.Context, err error, tokenHas
 // graceSessionProof runs the session proof check for a replayed token. The
 // proof's rth covers the presented token, whose SHA-256 the stored hex hash
 // already is. A hash that does not decode cannot satisfy a bound row. It writes
-// the response and returns ok=false on refusal.
-func (h *Handler) graceSessionProof(c *gin.Context, tokenHash, revokedJKT string) (string, bool) {
+// the response and returns ok=false on refusal; an unbound row's proof failure
+// is carried in the result instead (see graceProof).
+func (h *Handler) graceSessionProof(c *gin.Context, tokenHash, revokedJKT string) (graceReplayProof, bool) {
 	rth, hashErr := hex.DecodeString(tokenHash)
 	if hashErr == nil && len(rth) == sha256.Size {
-		return h.sessionProof(c, revokedJKT, rth)
+		return h.graceProof(c, revokedJKT, rth)
 	}
-	if revokedJKT != "" {
+	proof := graceReplayProof{bound: revokedJKT != ""}
+	if proof.bound {
 		writePoPError(c, errPoPInvalid)
-		return "", false
+		return proof, false
 	}
-	return "", true
+	return proof, true
+}
+
+// graceReplayProof is what a replayed row's proof established. bound reports
+// that the replayed row itself was bound, which recovers without the grace
+// window. err is an unbound row's deferred proof failure.
+type graceReplayProof struct {
+	jkt   string
+	err   error
+	bound bool
 }
 
 // attemptGracePeriodRecovery checks if a revoked token is within the grace period for crash recovery.
@@ -1799,7 +1810,7 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		return true
 	}
 
-	proofJKT, ok := h.graceSessionProof(c, tokenHash, revokedJKT)
+	proof, ok := h.graceSessionProof(c, tokenHash, revokedJKT)
 	if !ok {
 		return true
 	}
@@ -1810,7 +1821,7 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		// apply, so logout or a password reset ends recovery.
 		h.log.Info("Bound refresh token replayed with a valid proof, recovering session",
 			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds())
-		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, proofJKT)
+		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, proof)
 		return true
 	}
 
@@ -1841,7 +1852,7 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		// and a disable committing before the tx's locked read yields a 403 there.
 		h.log.Info("Refresh token replay within grace period, recovering session",
 			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds())
-		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, proofJKT)
+		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, proof)
 		return true
 	}
 
@@ -2227,6 +2238,12 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 // checkPreMFASessionLock checks if a pre-MFA session needs an upgrade challenge.
 // Returns true if the response was written (MFA upgrade required).
 func (h *Handler) checkPreMFASessionLock(c *gin.Context, token models.RefreshToken) bool {
+	return h.preMFASessionLock(c, token, true)
+}
+
+// preMFASessionLock is checkPreMFASessionLock; with challenge false a session
+// that owes the upgrade is refused with a plain 401 and no challenge.
+func (h *Handler) preMFASessionLock(c *gin.Context, token models.RefreshToken, challenge bool) bool {
 	if h.mfaChecker == nil {
 		return false
 	}
@@ -2255,6 +2272,14 @@ func (h *Handler) checkPreMFASessionLock(c *gin.Context, token models.RefreshTok
 	}
 	if !mfaEnabledAt.Valid || !token.CreatedAt.Before(mfaEnabledAt.Time) {
 		return false
+	}
+	if !challenge {
+		h.log.Info("Grace recovery refused: session predates MFA",
+			"request_id", c.GetString(middleware.RequestIDContextKey),
+			"user_id", token.UserID,
+			"failure_class", "pre_mfa_session")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
+		return true
 	}
 
 	challengeToken, jti, mfaErr := h.mfaChecker.GenerateUpgradeChallenge(ctx, token.UserID, token.ID)
@@ -2528,6 +2553,32 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 	})
 }
 
+// refuseGraceProof writes the refusal when the grace replay's proof cannot
+// recover a successor bound to successorJKT, and reports whether it did.
+// The rotation that minted the successor may have bound it. Then only a
+// proof by that key recovers it; without one this is a 401, not a replay.
+// A deferred proof failure is the client's real answer (a stale iat
+// carries server_time, a replay-store outage is a 503); a bad proof on an
+// unbound lineage is refused only while binding is on.
+func (h *Handler) refuseGraceProof(c *gin.Context, successorJKT string, proof graceReplayProof) bool {
+	if successorJKT == "" {
+		if proof.err == nil || !h.sessionBinding {
+			return false
+		}
+		writePoPError(c, proof.err)
+		return true
+	}
+	if subtle.ConstantTimeCompare([]byte(successorJKT), []byte(proof.jkt)) == 1 {
+		return false
+	}
+	if proof.err != nil {
+		writePoPError(c, proof.err)
+	} else {
+		writePoPError(c, errPoPRequired)
+	}
+	return true
+}
+
 // handleGracePeriodRefresh recovers a session when a recently-revoked refresh token
 // is replayed within the grace period — the client process was killed between the
 // server revoking the old token and the client persisting the rotated one. It selects
@@ -2538,7 +2589,8 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 //
 // proofJKT is the thumbprint a valid proof on this request was made with, or "".
 // A bound successor recovers only under a proof by its own key.
-func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, proofJKT string) {
+func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, proof graceReplayProof) {
+	proofJKT := proof.jkt
 	ctx := c.Request.Context()
 	tier := h.entCache.GetTier(ctx, userID)
 	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -2593,7 +2645,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		// the column is "" rather than NULL — but it is the same latent shape one
 		// arming away, and the carry-forward at :2118 propagates whatever it
 		// reads (#3290).
-		`SELECT id, user_id, COALESCE(device_name, ''), expires_at, remember_me, COALESCE(machine_id, ''),
+		`SELECT id, user_id, COALESCE(device_name, ''), expires_at, created_at, remember_me, COALESCE(machine_id, ''),
 		        COALESCE(pop_jkt, '')
 		 FROM refresh_tokens
 		 WHERE predecessor_id = $1 AND revoked_at IS NULL AND expires_at > clock_timestamp()
@@ -2601,7 +2653,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		revokedTokenID,
 	).Scan(
 		&successor.ID, &successor.UserID, &successor.DeviceName,
-		&successor.ExpiresAt, &successor.RememberMe, &successorMachineID, &successor.PopJKT,
+		&successor.ExpiresAt, &successor.CreatedAt, &successor.RememberMe, &successorMachineID, &successor.PopJKT,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No live successor in this lineage — nothing to recover; stale replay.
@@ -2619,10 +2671,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	if successorMachineID.Valid {
 		successor.MachineID = successorMachineID.String
 	}
-	// The rotation that minted the successor may have bound it. Then only a
-	// proof by that key recovers it; without one this is a 401, not a replay.
-	if successor.PopJKT != "" && subtle.ConstantTimeCompare([]byte(successor.PopJKT), []byte(proofJKT)) != 1 {
-		writePoPError(c, errPoPRequired)
+	if h.refuseGraceProof(c, successor.PopJKT, proof) {
 		return
 	}
 	// Rotation may have first recorded a machine binding on this successor.
@@ -2639,6 +2688,19 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 	if err := verifyRefreshFamilySIDTx(ctx, tx, family, successor.ID); err != nil {
 		writeLoginFamilyError(c, err, errMsgInvalidRefreshToken, errMsgRefreshFailed)
+		return
+	}
+	// The replacement row gets a fresh created_at, so without this check a
+	// session rotated before MFA was enabled would leave recovery as a
+	// post-MFA session. Recovery owes the upgrade that ordinary refresh owes,
+	// judged on the successor it replaces; a completed upgrade challenge is
+	// bound to that successor's ID. A refusal rolls the transaction back, but
+	// a consumed upgrade bypass stays consumed even if recovery then fails.
+	//
+	// Only a bound replay can answer the challenge: an unbound one recovers
+	// inside the 30 s window, which an MFA ceremony outlasts, so its retry would
+	// land on the loud replay refusal. That session simply ends instead.
+	if h.preMFASessionLock(c, successor, proof.bound) {
 		return
 	}
 
@@ -2687,7 +2749,11 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 		return
 	}
 	// Binding is one-way: proofJKT equals a bound successor's key (checked
-	// above), and on an unbound successor a valid proof binds the new row.
+	// above), and on an unbound successor a valid proof binds the new row, but
+	// only while binding is on: graceProof verifies proofs whatever the flag.
+	if successor.PopJKT == "" && !h.sessionBinding {
+		proofJKT = ""
+	}
 	popJKT, popAlg := popColumns(proofJKT)
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id, pop_jkt, pop_alg)

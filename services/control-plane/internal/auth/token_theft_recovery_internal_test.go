@@ -147,7 +147,7 @@ func TestRefreshMintsRejectPendingTheftInsideUserLock(t *testing.T) {
 				require.Equal(t, sourceFamily, family)
 			}
 			c, rec = familyTestContext()
-			rig.h.handleGracePeriodRefresh(c, rig.user, revokedID, "")
+			rig.h.handleGracePeriodRefresh(c, rig.user, revokedID, graceReplayProof{})
 			if pending {
 				require.Equal(t, http.StatusUnauthorized, rec.Code)
 				require.JSONEq(t, `{"error":"`+errMsgInvalidRefreshToken+`"}`, rec.Body.String())

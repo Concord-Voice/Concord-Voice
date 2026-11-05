@@ -519,11 +519,13 @@ paths:
                 type: string
                 format: uuid
         '401':
-          description: Invalid credentials
+          description: Invalid credentials, or a refused DPoP proof (a SessionProofError code; no session is minted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/SessionProofError'
         '423':
           description: Account locked due to too many failed attempts
           content:
@@ -533,7 +535,7 @@ paths:
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
-          description: Two-factor verification is required but no method can answer it right now — a security key is the only login method and its ceremony could not begin. Retry. A challenge offers `webauthn` only together with `webauthn_options`.
+          description: Two-factor verification is required but no method can answer it right now — a security key is the only login method and its ceremony could not begin. Retry. A challenge offers `webauthn` only together with `webauthn_options`. Also returned when a supplied DPoP proof could not be checked because its replay store is unavailable; retry with a new proof.
           content:
             application/json:
               schema:
@@ -719,6 +721,9 @@ paths:
                     expires_in:
                       type: integer
                       example: 900
+                    token_type:
+                      type: string
+                      enum: [DPoP, Bearer]
                     remember_me:
                       type: boolean
                     user:
@@ -786,11 +791,13 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
-          description: Invalid, expired, or already-used MFA challenge token
+          description: Invalid, expired, or already-used MFA challenge token, or a refused DPoP proof on a login challenge (a SessionProofError code). The proof is checked after the challenge and code are spent, so a proof refusal ends this challenge; retry with a new login and MFA ceremony, applying any `server_time` offset to the new proof.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/SessionProofError'
         '403':
           description: Invalid MFA code
           content:
@@ -810,7 +817,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          description: Recovery completion could not confirm current policy or commit after a reserved factor was accepted. The recovery challenge is spent; restart at email verification.
+          description: Recovery completion could not confirm current policy or commit after a reserved factor was accepted. The recovery challenge is spent; restart at email verification. On a login challenge, also returned when a supplied DPoP proof could not be checked because its replay store is unavailable; the challenge is spent, so start a new login.
           content:
             application/json:
               schema:
@@ -1427,7 +1434,7 @@ paths:
           description: 'Either an MFA challenge instead of a rotation, or a disabled account (error_code: account_disabled,
             when the account is disabled after the token lookup or during grace-period recovery). The challenge''s error is
             suspicious_session_mfa (a same-IP refresh from a different machine) or mfa_upgrade_required (a session that predates
-            MFA enrolment); answer it at /auth/mfa/verify.'
+            MFA enrolment, judged on the successor during a bound session''s grace recovery); answer it at /auth/mfa/verify.'
           content:
             application/json:
               schema:
@@ -1435,17 +1442,17 @@ paths:
                 - $ref: '#/components/schemas/MfaChallenge'
                 - $ref: '#/components/schemas/AccountDisabledError'
         '401':
-          description: Invalid or expired refresh token, including a grace retry with an omitted or mismatched recorded X-Machine-Id, a pending theft block, or completed theft revocation. A refused DPoP proof carries a SessionProofError code and leaves the session live; a bound session recovers from a lost rotation with a valid proof and no time window.
+          description: Invalid or expired refresh token, including a grace retry with an omitted or mismatched recorded X-Machine-Id, a pending theft block, completed theft revocation, or an unbound grace retry of a session that predates MFA enrolment (the session ends; sign in again). A refused DPoP proof carries a SessionProofError code and leaves the session live; a bound session recovers from a lost rotation with a valid proof and no time window.
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                 - $ref: '#/components/schemas/Error'
                 - $ref: '#/components/schemas/SessionProofError'
         '429':
           $ref: '#/components/responses/RateLimited'
         '500':
-          description: Refresh could not verify the theft-recovery state because PostgreSQL or Redis is unavailable
+          description: Refresh could not verify the theft-recovery state or complete the pre-MFA session check because PostgreSQL or Redis is unavailable
           content:
             application/json:
               schema:
@@ -21490,7 +21497,7 @@ components:
           - refresh_pop_replayed
         server_time:
           type: integer
-          description: Server Unix time, on refresh_pop_stale_iat only. The client retries once with this offset.
+          description: Server Unix time, on refresh_pop_stale_iat only. The client retries once with this offset. On /auth/refresh and /auth/login the retry repeats the request; on /auth/mfa/verify the challenge is already spent, so the retry is a new login and MFA ceremony.
     UnissuedKeyEpochError:
       type: object
       description: A key_version above the scope's newest issued epoch. The client
