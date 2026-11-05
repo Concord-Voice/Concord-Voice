@@ -206,6 +206,7 @@ func krKeyResetFixture(t *testing.T, name string) (*testhelpers.TestServer, test
 	mh := krMFAHandler(t, ts.DB, ts.Redis)
 	// router.go wiring: the users handler's MFAVerifier is the *mfa.Handler.
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, mh, nil, testCredFence(t, ts.DB), nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	service := presencehistory.NewService(ts.DB, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(immediatePresenceDelivery{}))
 	h.SetPresenceHistory(service)

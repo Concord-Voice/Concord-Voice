@@ -110,6 +110,7 @@ func newActivitySettingsCleanupHandler(
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
 	handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	handler.SetPresenceHistory(service)
 	if suppressor != nil {
 		handler.SetActivitySettingsSuppressor(suppressor)
@@ -282,6 +283,7 @@ func TestUpdatePresenceSettingsCleanupFailureIsRetryableAfterCommit(t *testing.T
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(&task9Delivery{}))
 	handler := users.NewHandler(db, logger.NewWithWriter(&logs), nil, nil, nil, nil, nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	handler.SetPresenceHistory(service)
 	handler.SetActivitySettingsSuppressor(suppressor)
 
@@ -330,6 +332,7 @@ func TestUpdatePresenceSettingsCleanupFailureIsRetryableAfterCommit(t *testing.T
 	retryService := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, retryService.BindDelivery(&task9Delivery{}))
 	retryHandler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	retryHandler.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	retryHandler.SetPresenceHistory(retryService)
 	retryHandler.SetActivitySettingsSuppressor(suppressor)
 	retry := invokePresenceSettingsPATCH(retryHandler, senderID, request)
@@ -819,6 +822,7 @@ func TestUpdatePresenceSettingsConfirmedCommitRunsCleanupAfterCustomDeliveryFail
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(&task9Delivery{err: deliveryErr}))
 	handler := users.NewHandler(db, logger.NewWithWriter(&logs), nil, nil, nil, nil, nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	handler.SetPresenceHistory(service)
 	handler.SetActivitySettingsSuppressor(suppressor)
 

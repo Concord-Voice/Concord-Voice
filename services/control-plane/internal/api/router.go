@@ -1111,6 +1111,7 @@ func NewRouter(
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
 	usersHandler.SetInstanceType(cfg.InstanceType)
 	usersHandler.SetRedis(redis)
+	usersHandler.SetPasswordVerifier(authHandler)
 	usersHandler.SetTier1ErasureWake(dependencies.Tier1ErasureWake)
 	requireStepUpBudgetWired(log, usersHandler)
 	usersHandler.SetPresenceHistory(presenceHistoryService)

@@ -39,6 +39,7 @@ func TestChangePassword_FenceMissingFailsClosed(t *testing.T) {
 	user := ts.CreateTestUser(t, "fencemisscp")
 	// nil credFence: the handler must 503 before touching credential state.
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 
 	_, wrappedKey, salt := testhelpers.E2EETestKeys()
 	c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
@@ -60,6 +61,7 @@ func TestReplaceMyKeys_FenceMissingFailsClosed(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	user := ts.CreateTestUser(t, "fencemissrk")
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	h.SetPresenceHistory(ts.PresenceHistory)
 
 	pub, wrappedKey, salt := testhelpers.E2EETestKeys()
@@ -95,6 +97,7 @@ func TestChangePassword_ContinuationMintFailureDegrades(t *testing.T) {
 	user := ts.CreateTestUser(t, "contmintfail")
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
 		testCredFence(t, ts.DB), failingPairIssuer{})
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 
 	_, wrappedKey, salt := testhelpers.E2EETestKeys()
 	c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
@@ -116,6 +119,7 @@ func TestChangePassword_NoPairIssuerStillSucceeds(t *testing.T) {
 	user := ts.CreateTestUser(t, "contnilissuer")
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
 		testCredFence(t, ts.DB), nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 
 	_, wrappedKey, salt := testhelpers.E2EETestKeys()
 	c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
@@ -136,6 +140,7 @@ func TestChangePassword_GenericTxFailureRollsBackFence(t *testing.T) {
 	user := ts.CreateTestUser(t, "chpwtxfail")
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
 		testCredFence(t, ts.DB), nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 
 	var beforeHash string
 	require.NoError(t, ts.DB.QueryRow(`SELECT password_hash FROM users WHERE id = $1`, user.ID).Scan(&beforeHash))

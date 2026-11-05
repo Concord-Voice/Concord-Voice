@@ -93,7 +93,10 @@ type Handler struct {
 	// redis backs the fail-closed step-up attempt budget (#2765). Nil DENIES
 	// that one branch rather than skipping the bound; no other handler in this
 	// package reads it.
-	redis                              *redis.Client
+	redis *redis.Client
+	// passwords verifies current passwords (reveal, password change, key reset,
+	// security patch) against the account lockout /login shares. Nil refuses (500).
+	passwords                          stepup.PasswordVerifier
 	log                                *logger.Logger
 	instanceType                       string
 	hub                                *websocket.Hub
@@ -143,6 +146,12 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier 
 // SetInstanceType injects deployment policy before the handler serves requests.
 func (h *Handler) SetInstanceType(instanceType string) {
 	h.instanceType = config.NormalizeInstanceType(instanceType)
+}
+
+// SetPasswordVerifier wires the lockout-sharing verifier the password routes use.
+// *auth.Handler satisfies it.
+func (h *Handler) SetPasswordVerifier(v stepup.PasswordVerifier) {
+	h.passwords = v
 }
 
 // SetRedis wires the client backing the fail-closed step-up attempt budget
@@ -335,6 +344,16 @@ type RevealMyKeysRequest struct {
 // user out over a typo.
 const errCodeInvalidCurrentPassword = "invalid_current_password" // pragma: allowlist secret
 
+// RevealMyKeys' other refusal codes and its fixed log class.
+const (
+	errCodeAccountLocked     = "account_locked"
+	errCodeNoPassword        = "no_password" // pragma: allowlist secret
+	failureClassRevealVerify = "key_reveal_password_verify_failed"
+
+	errMsgFailedVerifyPassword     = "Failed to verify password"     // pragma: allowlist secret
+	errMsgCurrentPasswordIncorrect = "Current password is incorrect" // pragma: allowlist secret
+)
+
 // RevealMyKeys returns the wrapped identity key to a caller that proves the
 // current password. Knowing the password already unwraps the key, so this
 // releases nothing an attacker without the password could guess offline.
@@ -346,16 +365,47 @@ func (h *Handler) RevealMyKeys(c *gin.Context) {
 	}
 	var req RevealMyKeysRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "current_password is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "current_password is missing or too long"})
 		return
 	}
-	_, status, msg := h.verifyCurrentPassword(userID, req.CurrentPassword)
-	switch status {
-	case 0:
+	uid := fmt.Sprint(userID)
+	var hasPassword bool
+	err := h.db.QueryRowContext(c.Request.Context(),
+		`SELECT password_hash <> '' FROM users WHERE id = $1`, uid).Scan(&hasPassword)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotFound})
+		return
+	case err != nil:
+		h.log.Error("Failed to load password state for key reveal", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPassword})
+		return
+	case !hasPassword:
+		// An SSO-only account has no password to prove; never hand the
+		// verifier an empty hash.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "This account has no password", "code": errCodeNoPassword})
+		return
+	}
+	if h.passwords == nil { // pragma: allowlist secret
+		h.log.Error("Key reveal refused: password verifier not wired", "failure_class", failureClassRevealVerify)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPassword})
+		return
+	}
+	// The shared verifier applies the email-keyed lockout /login uses, so a
+	// stolen session cannot keep guessing here while /login is locked.
+	_, err = h.passwords.VerifyPassword(c.Request.Context(), uid, req.CurrentPassword)
+	switch {
+	case err == nil:
 		h.writeMyKeys(c, userID)
-	case http.StatusUnauthorized:
-		// Feed the client IP's auth-failure ban, as the step-up mint does, so
-		// this route is never a cheaper oracle than /login.
+	case errors.Is(err, auth.ErrAccountLocked):
+		middleware.MarkNightwatchVerdict(c, middleware.NightwatchVerdict{
+			EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied,
+			Severity: securityevent.SeverityHigh, Reason: securityevent.ReasonAccountLocked,
+			AuthMethod: securityevent.AuthPassword,
+		})
+		c.JSON(http.StatusLocked, gin.H{"error": stepup.ErrMsgStepUpLocked, "code": errCodeAccountLocked})
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		// Feed the client IP's auth-failure ban, as the step-up mint does.
 		middleware.MarkNightwatchVerdict(c, middleware.NightwatchVerdict{
 			EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied,
 			Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonInvalidCredentials,
@@ -363,11 +413,12 @@ func (h *Handler) RevealMyKeys(c *gin.Context) {
 		})
 		outcome := middleware.RecordAuthFailure(c.Request.Context(), h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
 		middleware.MarkAuthFailureOutcome(c, outcome) // a ban it created supersedes the denial
-		c.JSON(http.StatusForbidden, gin.H{"error": msg, "code": errCodeInvalidCurrentPassword})
-	case http.StatusInternalServerError:
-		c.JSON(status, gin.H{"error": "Failed to verify password"})
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgCurrentPasswordIncorrect, "code": errCodeInvalidCurrentPassword})
 	default:
-		c.JSON(status, gin.H{"error": msg})
+		// err is deliberately not logged: a hash decode failure can embed the
+		// hash (observability.md principle 1).
+		h.log.Error("Key reveal password verification failed", "failure_class", failureClassRevealVerify)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPassword})
 	}
 }
 
@@ -474,6 +525,13 @@ func (h *Handler) replaceMyKeysCoordinated(
 	req ReplaceKeysRequest,
 	wrappedKeyBytes, saltBytes, publicKeyBytes []byte,
 ) {
+	// Check the password through the shared lockout first, so this route
+	// cannot keep guessing once the account is locked. The locked re-check
+	// inside the transaction still guards against a concurrent recovery.
+	if _, status, msg := h.verifyCurrentPassword(senderID.String(), req.CurrentPassword, errMsgFailedReplaceKeys); status != 0 {
+		c.JSON(status, gin.H{"error": msg})
+		return
+	}
 	// Credential-epoch fence (#2201): publish the blocked marker before the
 	// rotating transaction. Fail closed if the fence is unwired — a destructive
 	// key replacement must never run without epoch rotation.
@@ -1385,7 +1443,9 @@ func validateChangePasswordPresenceOverride(rotation *changePasswordPresenceOver
 
 // verifyCurrentPassword fetches the user's password hash and checks it against the provided password.
 // Returns the password hash on success, or an HTTP status + error message on failure.
-func (h *Handler) verifyCurrentPassword(userID interface{}, currentPassword string) (string, int, string) {
+//
+// failMsg is the calling route's own 500 message.
+func (h *Handler) verifyCurrentPassword(userID interface{}, currentPassword, failMsg string) (string, int, string) {
 	var passwordHash string
 	err := h.db.QueryRow(
 		`SELECT password_hash FROM users WHERE id = $1`,
@@ -1396,18 +1456,27 @@ func (h *Handler) verifyCurrentPassword(userID interface{}, currentPassword stri
 	}
 	if err != nil {
 		h.log.Error("Failed to fetch password hash", "error", err)
-		return "", http.StatusInternalServerError, errMsgFailedChangePassword
+		return "", http.StatusInternalServerError, failMsg
 	}
 
-	match, err := auth.VerifyPassword(currentPassword, passwordHash)
-	if err != nil {
-		h.log.Error("Failed to verify password", "error", err)
-		return "", http.StatusInternalServerError, errMsgFailedChangePassword
+	// The shared verifier applies the /login account lockout, so this route
+	// cannot be used to keep guessing once the account is locked.
+	if h.passwords == nil { // pragma: allowlist secret
+		h.log.Error("Password change refused: password verifier not wired", "failure_class", "password_verify_failed")
+		return "", http.StatusInternalServerError, failMsg
 	}
-	if !match {
-		return "", http.StatusUnauthorized, "Current password is incorrect"
+	_, err = h.passwords.VerifyPassword(context.Background(), fmt.Sprint(userID), currentPassword)
+	switch {
+	case err == nil:
+		return passwordHash, 0, ""
+	case errors.Is(err, auth.ErrAccountLocked):
+		return "", http.StatusLocked, stepup.ErrMsgStepUpLocked
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		return "", http.StatusUnauthorized, errMsgCurrentPasswordIncorrect
+	default:
+		h.log.Error(errMsgFailedVerifyPassword, "failure_class", "password_verify_failed")
+		return "", http.StatusInternalServerError, failMsg
 	}
-	return passwordHash, 0, ""
 }
 
 // mfaRequiredMessage is the human-readable half of the mfa_required refusal for
@@ -1511,7 +1580,7 @@ func (h *Handler) verifyStepUpWithLockedUser(
 	if !match {
 		return &stepUpReauthenticationError{
 			status: http.StatusUnauthorized,
-			body:   gin.H{"error": "Current password is incorrect"},
+			body:   gin.H{"error": errMsgCurrentPasswordIncorrect},
 		}
 	}
 
@@ -1889,7 +1958,7 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		return
 	}
 
-	passwordHash, status, msg := h.verifyCurrentPassword(userID, req.CurrentPassword)
+	passwordHash, status, msg := h.verifyCurrentPassword(userID, req.CurrentPassword, errMsgFailedChangePassword)
 	if status != 0 {
 		c.JSON(status, gin.H{"error": msg})
 		return
@@ -3055,17 +3124,30 @@ func (h *Handler) verifyCurrentPassphrase(c *gin.Context, userID, plaintext stri
 		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "lookup_failed"})
 		return false
 	}
-	match, err := auth.VerifyPassword(plaintext, passwordHash)
-	if err != nil {
-		h.log.Error("Failed to verify passphrase for security patch", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "verify_failed"})
-		return false
-	}
-	if !match {
+	// An SSO-only account has no passphrase to prove.
+	if passwordHash == "" { // pragma: allowlist secret
 		c.JSON(http.StatusUnauthorized, gin.H{"error_code": "invalid_credentials"})
 		return false
 	}
-	return true
+	// The shared verifier applies the /login account lockout.
+	if h.passwords == nil { // pragma: allowlist secret
+		h.log.Error("Security patch refused: password verifier not wired", "failure_class", "password_verify_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "verify_failed"})
+		return false
+	}
+	_, err = h.passwords.VerifyPassword(c.Request.Context(), userID, plaintext)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, auth.ErrAccountLocked):
+		c.JSON(http.StatusLocked, gin.H{"error_code": "account_locked"})
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		c.JSON(http.StatusUnauthorized, gin.H{"error_code": "invalid_credentials"})
+	default:
+		h.log.Error("Failed to verify passphrase for security patch", "failure_class", "password_verify_failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "verify_failed"})
+	}
+	return false
 }
 
 // PatchSecurity flips the two SSO-related security flags. Any change requires

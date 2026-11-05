@@ -17876,6 +17876,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '423':
+          description: The account is locked after repeated wrong passwords. A wrong `current_password` here counts toward the same lockout as `/auth/login`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Key replacement transaction failed or its commit result was ambiguous
           content:
@@ -17889,7 +17895,7 @@ paths:
       summary: Reveal E2EE keys with the current password
       description: 'Return the wrapped private key and derivation salt to a caller that proves the current password. Used mid-session (password change), where the access token may have been renewed by refresh and so cannot use `GET /users/me/keys`.
 
-        Guarded like `POST /auth/step-up/password`: the per-IP auth-failure ban, and fail-closed per-IP and per-user limits of 10 requests per 15 minutes. A wrong password counts toward the IP ban.
+        Guarded like `POST /auth/step-up/password`: the per-IP auth-failure ban, and fail-closed per-IP and per-user limits of 10 requests per 15 minutes. A wrong password counts toward the IP ban and toward the same per-account lockout as `/auth/login`: after five wrong passwords the account is locked (423) at both.
 
         '
       security:
@@ -17918,13 +17924,19 @@ paths:
                   e2ee_keys:
                     $ref: '#/components/schemas/E2EEKeys'
         '400':
-          description: Missing or oversized current_password
+          description: Missing or oversized current_password, or the account has no password (`code` is `no_password`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or stale bearer token (including a credential epoch superseded by a password change). Never a wrong password.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Current password is incorrect (`code` is `invalid_current_password`). A 403, not a 401, so a client never mistakes a typo for an expired token.
+          description: Refusals include an incorrect current password (`code` is `invalid_current_password`). A wrong password is a 403, not a 401, so a client never mistakes a typo for an expired token.
           content:
             application/json:
               schema:
@@ -17942,6 +17954,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '423':
+          description: The account is locked after repeated wrong passwords (`code` is `account_locked`). No key material is returned, even for the correct password.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - account_locked
         '429':
           $ref: '#/components/responses/RateLimited'
         '500':
@@ -17983,6 +18008,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           description: Current password incorrect
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: The account is locked after repeated wrong passwords (here, at `/auth/login`, the step-up mint or key reveal). No change is made, even for the correct password.
           content:
             application/json:
               schema:
@@ -19090,6 +19121,12 @@ paths:
                 $ref: '#/components/schemas/ErrorCode'
         '403':
           description: Self-hosted instances require password login (`password_login_required_self_hosted`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorCode'
+        '423':
+          description: The account is locked after repeated wrong passwords (`account_locked`). Wrong passphrases here count toward the same lockout as `/auth/login`.
           content:
             application/json:
               schema:

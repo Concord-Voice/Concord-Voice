@@ -208,6 +208,7 @@ func TestUpdateMeProfileAudienceFailureDoesNotUndoSaveOrBroadcast(t *testing.T) 
 	hook.Arm([]string{"WITH profile_recipients AS"}, func() error { fired = true; return nil }, stmthook.ErrInjected)
 
 	h := users.NewHandler(db, logger.New("test"), ts.Hub, nil, profileMediaTierResolver{}, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	w := invokeProfilePatch(t, h, owner.ID, map[string]string{"display_name": "Saved despite delivery failure"})
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.True(t, fired, "the audience read must fail")
@@ -236,6 +237,7 @@ func TestUpdateMeProfileAudienceSurvivesRequestCancellationAfterCommit(t *testin
 	}, nil)
 
 	h := users.NewHandler(db, logger.New("test"), ts.Hub, nil, profileMediaTierResolver{}, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	body, err := json.Marshal(map[string]string{"display_name": "Committed before disconnect"})
 	require.NoError(t, err)
 	w := httptest.NewRecorder()
@@ -257,6 +259,7 @@ func TestUpdateMeProfileAudienceQueueSaturationIsBounded(t *testing.T) {
 		require.True(t, stalledHub.BroadcastToUserContext(t.Context(), uuid.MustParse(owner.ID), concordws.OutgoingMessage{Type: "queue_filler"}))
 	}
 	h := users.NewHandler(ts.DB, logger.New("test"), stalledHub, nil, profileMediaTierResolver{}, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	body, err := json.Marshal(map[string]string{"display_name": "Saved despite full queue"})
 	require.NoError(t, err)
 	done := make(chan *httptest.ResponseRecorder, 1)

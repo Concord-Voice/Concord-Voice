@@ -13,6 +13,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -60,6 +61,7 @@ func seedProfileAvatar(t *testing.T, db *sql.DB, userID string) string {
 
 func newProfileMediaHandler(db *sql.DB, wake func()) *users.Handler {
 	h := users.NewHandler(db, logger.New("test"), nil, nil, profileMediaTierResolver{}, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetTier1ErasureWake(wake)
 	return h
 }

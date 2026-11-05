@@ -167,6 +167,7 @@ func TestPurgeFenceStepUp_RedisOutageDenies(t *testing.T) {
 	unreachable := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { require.NoError(t, unreachable.Close()) })
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	h.SetRedis(unreachable)
 
 	// Correct credentials: only the unavailable budget may reject this.

@@ -1786,6 +1786,7 @@ func TestChangePasswordContinuationPairIsNotALivenessGuarantee(t *testing.T) {
 	issuer := auth.NewHandler(ts.DB, ts.Redis, log, testhelpers.TestJWTSecret, nil)
 	h := users.NewHandler(ts.DB, log, nil, nil, nil,
 		credepoch.New(ts.DB, handlerRedis, log), issuer)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 
 	_, wrappedKey, salt := testhelpers.E2EETestKeys()
 	c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
@@ -1927,6 +1928,7 @@ func TestDestructiveFlowsCommitFamilyTerminalBeforeResponseBody(t *testing.T) {
 			user := securityUser(t, ts, "terminalorder")
 			h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
 				testCredFence(t, ts.DB), nil)
+			h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 			h.SetPresenceHistory(ts.PresenceHistory)
 			publicKey, wrappedKey, salt := testhelpers.E2EETestKeys()
 			payload := map[string]interface{}{

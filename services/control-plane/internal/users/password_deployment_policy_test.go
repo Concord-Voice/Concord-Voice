@@ -250,6 +250,7 @@ func TestSecurityFallback_DatabaseFailurePreservesState(t *testing.T) {
 			require.NoError(t, err)
 			hook, hookedDB := stmthook.Open(t)
 			h := users.NewHandler(hookedDB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+			h.SetPasswordVerifier(testhelpers.HashVerifier{DB: hookedDB})
 			if tc.commitFailure {
 				// ArmCommit(false) rolls back the transaction before returning the
 				// injected error, so unchanged state is a determinate expectation.
@@ -331,6 +332,7 @@ func TestDeleteSSOIdentity_SelfHostedFinalUnlinkFailurePreservesPreference(t *te
 			require.NoError(t, err)
 			hook, hookedDB := stmthook.Open(t)
 			h := users.NewHandler(hookedDB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+			h.SetPasswordVerifier(testhelpers.HashVerifier{DB: hookedDB})
 			h.SetInstanceType("self-hosted")
 			if tc.commitFailure {
 				hook.ArmCommit(false, stmthook.ErrInjected)

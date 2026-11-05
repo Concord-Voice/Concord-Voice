@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
@@ -63,6 +64,7 @@ func TestReplaceMyKeysCommitAmbiguityAcknowledgesClearAndCommitsFamilyTerminal(t
 	})
 	t.Cleanup(restore)
 	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	handler.SetPresenceHistory(service)
 	users.SetKeyResetSessionDisconnectorForTest(handler, observer)
 
@@ -101,6 +103,7 @@ func TestReplaceMyKeysConfirmedRollbackSendsNothingAndKeepsSession(t *testing.T)
 	})
 	t.Cleanup(restore)
 	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	handler.SetPresenceHistory(service)
 	users.SetKeyResetSessionDisconnectorForTest(handler, observer)
 

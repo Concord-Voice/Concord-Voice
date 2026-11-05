@@ -386,6 +386,7 @@ func newConcurrencyHandler(
 	service := presencehistory.NewService(db, task9Disclosure(), true)
 	require.NoError(t, service.BindDelivery(delivery))
 	handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, db), nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	handler.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(handler)
 	return handler, service

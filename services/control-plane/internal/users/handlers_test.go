@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -983,4 +985,70 @@ func TestListSSOIdentities_EmptyList_ReturnsEmptyArray(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &resp)
 	assert.NotNil(t, resp.Identities, "identities must be a non-nil array even when empty")
 	assert.Len(t, resp.Identities, 0)
+}
+
+// Five wrong reveals lock the account the way five wrong logins do: the
+// correct password then gets 423 at reveal and is refused at /login.
+//
+// Mutant killed: verifying with auth.VerifyPassword directly instead of the
+// lockout-sharing verifier (the sixth reveal returns 200).
+func TestRevealMyKeys_WrongPasswordsLockTheAccount(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "keysrevlock")
+	renewed := testhelpers.AuthHeaders(ts.RenewedAccessToken(t, user.ID))
+	reveal := func(pw string) *httptest.ResponseRecorder {
+		return ts.DoRequest("POST", urlUsersMeKeys+"/reveal", map[string]string{"current_password": pw}, renewed)
+	}
+
+	for range 5 {
+		require.Equal(t, http.StatusForbidden, reveal("WrongPassword123!").Code) // pragma: allowlist secret
+	}
+
+	w := reveal(user.Password)
+	assert.Equal(t, http.StatusLocked, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "wrapped_private_key")
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "account_locked", body["code"])
+
+	login := ts.DoRequest("POST", "/api/v1/auth/login",
+		map[string]string{"email": user.Email, "password": user.Password}, nil)
+	assert.Equal(t, http.StatusUnauthorized, login.Code, "five failed reveals must lock /login too")
+}
+
+// A wrong password feeds the IP ban counter, and a banned IP is refused
+// before the password is checked.
+func TestRevealMyKeys_FeedsAndHonoursTheAuthBan(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "keysrevban")
+	renewed := testhelpers.AuthHeaders(ts.RenewedAccessToken(t, user.ID))
+	ctx := context.Background()
+	const ip = "192.0.2.1" // httptest.NewRequest's RemoteAddr
+
+	w := ts.DoRequest("POST", urlUsersMeKeys+"/reveal", map[string]string{"current_password": "WrongPassword123!"}, renewed) // pragma: allowlist secret
+	require.Equal(t, http.StatusForbidden, w.Code)
+	count, err := ts.Redis.Get(ctx, "auth_failures:ip:"+ip).Int()
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	require.NoError(t, ts.Redis.Set(ctx, "auth_ban:ip:"+ip, "1", time.Minute).Err())
+	w = ts.DoRequest("POST", urlUsersMeKeys+"/reveal", map[string]string{"current_password": user.Password}, renewed)
+	assert.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "wrapped_private_key")
+}
+
+// An account with no password (OAuth-only) gets 400, not a 403 that would
+// make the client prompt for a password that does not exist.
+func TestRevealMyKeys_NoPasswordAccount(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "keysrevnopw")
+	renewed := testhelpers.AuthHeaders(ts.RenewedAccessToken(t, user.ID))
+	_, err := ts.DB.Exec(`UPDATE users SET password_hash = '' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", urlUsersMeKeys+"/reveal", map[string]string{"current_password": "anything"}, renewed) // pragma: allowlist secret
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "no_password", body["code"])
 }

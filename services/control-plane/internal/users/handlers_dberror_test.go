@@ -29,6 +29,7 @@ func TestUpdatePrivacySettingsDBError(t *testing.T) {
 
 	// nil tier resolver is safe: UpdatePrivacySettings never resolves entitlements (#1298).
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -49,6 +50,7 @@ func TestGetPresenceOverridesDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		t.Fatal(err)
@@ -71,6 +73,7 @@ func TestReplacePresenceOverridesDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		t.Fatal(err)
@@ -98,6 +101,7 @@ func TestUpdatePresenceSettingsDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		t.Fatal(err)

@@ -97,6 +97,7 @@ func TestUpdatePresenceSettingsCompletesPostCommitClaimAfterRequestCancellation(
 			service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 			require.NoError(t, service.BindDelivery(delivery))
 			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+			h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 			h.SetPresenceHistory(service)
 			bindNoopActivitySettingsSuppressor(h)
 
@@ -141,6 +142,7 @@ func TestUpdatePresenceSettingsClaimBeginFailureRunsConservativeResetAndRetainsQ
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 	claimBeginCause := errors.New("claim transaction unavailable")
@@ -203,6 +205,7 @@ func newTask9Handler(
 ) *users.Handler {
 	t.Helper()
 	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	service := presencehistory.NewService(ts.DB, presencehistory.DisclosureState{
 		Available: true,
 		RequiredConsent: &presencehistory.RequiredConsent{
@@ -237,6 +240,7 @@ func TestUpdatePresenceSettingsRequiresBoundPresenceHistory(t *testing.T) {
 			db, _ := testhelpers.SetupTestDB(t)
 			senderID := testhelpers.CreateUser(t, db)
 			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+			h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 			bindNoopActivitySettingsSuppressor(h)
 			if test.bind != nil {
 				test.bind(h, db)
@@ -360,6 +364,7 @@ func TestPresenceWriterValidationPrecedesPresenceService(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	senderID := testhelpers.CreateUser(t, db)
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 
 	settings := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
 		"custom_text_tier": 9,
@@ -549,6 +554,7 @@ func TestUpdatePresenceSettings_MasterOffSupersedesUnexpiredOrdinaryPendingConse
 	require.NoError(t, err)
 	require.NoError(t, service.CommitTx(ordinaryTx))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -602,6 +608,7 @@ func TestUpdatePresenceSettings_MasterOffSupersedesEligiblePendingWhenDeliveryFa
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -660,6 +667,7 @@ func TestUpdatePresenceSettings_MasterOffDeliveryFailureReturns503AndRetainsQuar
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -751,6 +759,7 @@ func TestUpdatePresenceSettingsRecorderFailureRollsBackSettingsMarkerAndHistory(
 	})
 	t.Cleanup(restore)
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -801,6 +810,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		})
 		t.Cleanup(restore)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+		h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 		h.SetPresenceHistory(service)
 		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
@@ -826,6 +836,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		})
 		t.Cleanup(restore)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+		h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 		h.SetPresenceHistory(service)
 		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
@@ -860,6 +871,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		})
 		t.Cleanup(restore)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+		h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 		h.SetPresenceHistory(service)
 		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
@@ -899,6 +911,7 @@ func TestUpdatePresenceSettingsUnexpiredPendingReturnsRetryAfterWithoutMutation(
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -964,6 +977,7 @@ func TestUpdatePresenceSettingsUnresolvedCommitRunsMarkerPreservingEmergencyRese
 	})
 	t.Cleanup(restore)
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 	h.SetPresenceHistory(service)
 	h.SetActivitySettingsSuppressor(suppressor)
 
@@ -984,6 +998,7 @@ func TestPresenceSettingsDirectErrorBoundaries(t *testing.T) {
 		db, cleanup := testhelpers.SetupTestDB(t)
 		cleanup()
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+		h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Set("user_id", uuid.NewString())
@@ -993,6 +1008,7 @@ func TestPresenceSettingsDirectErrorBoundaries(t *testing.T) {
 	t.Run("malformed authenticated id", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+		h.SetPasswordVerifier(testhelpers.HashVerifier{DB: db})
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Set("user_id", "not-a-uuid")

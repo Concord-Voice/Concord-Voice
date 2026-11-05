@@ -317,6 +317,7 @@ func TestLoginFamilySecurityErasureSortedUsersBeforeFamiliesAndConversations(t *
 		require.NoError(t, err)
 	}
 	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
+	handler.SetPasswordVerifier(testhelpers.HashVerifier{DB: ts.DB})
 	handler.SetPresenceHistory(ts.PresenceHistory)
 	handler.SetActivitySettingsSuppressor(noopActivitySettingsSuppressor{})
 	service := users.NewAccountService(ts.DB, logger.New("test"))
