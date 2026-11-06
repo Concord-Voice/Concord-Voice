@@ -515,12 +515,13 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 // read out of some other bucket.
 func (h *Handler) DownloadAttachment(c *gin.Context) {
 	userID := c.GetString("user_id")
-	fileID := c.Param("file_id")
-
-	if _, err := uuid.Parse(fileID); err != nil {
+	parsedID, err := uuid.Parse(c.Param("file_id"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file ID"})
 		return
 	}
+	// Canonical form, so every spelling of one UUID shares one cold-read counter.
+	fileID := parsedID.String()
 
 	// Fetch file metadata and verify access
 	var storageKey, mimeType, uploaderID string
@@ -537,7 +538,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version, storage_backend, uploader_id
 	          FROM media_files
 	          WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`
-	err := h.db.QueryRow(query, fileID).
+	err = h.db.QueryRow(query, fileID).
 		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion, &storageBackend, &uploaderID)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
@@ -557,7 +558,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	obj, contentType, err := store.GetObject(c.Request.Context(), storageKey)
+	obj, contentType, storageClass, err := getAttachmentObject(c.Request.Context(), store, storageKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "File not found in storage"})
@@ -568,6 +569,9 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 	defer func() { _ = obj.Close() }()
+	if ts, ok := store.(coldTierStore); ok && isColdClass(storageClass) {
+		h.goColdRead(ts, fileID, storageKey)
+	}
 
 	// E2EE attachments are opaque ciphertext — use stored MIME type hint for the
 	// client but serve as octet-stream since the content is encrypted
@@ -1046,6 +1050,50 @@ func lockMediaMembership(ctx context.Context, tx *sql.Tx, channelID, conversatio
 	return tx.QueryRowContext(ctx, `SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR KEY SHARE`, conversationID.String, userID).Scan(&member)
 }
 
+// lockMediaDeletion takes DeleteMedia's first locks in DM retirement's order:
+// the uploader, then the file's DM conversation (if any). It writes the error
+// response itself and reports false when the caller must stop. Split out of
+// DeleteMedia to keep that handler's cognitive complexity in bounds.
+func (h *Handler) lockMediaDeletion(c *gin.Context, tx *sql.Tx, fileID, userID string) (sql.NullString, bool) {
+	var uploader int
+	err := tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM users WHERE id = $1 FOR SHARE`, userID).Scan(&uploader)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return sql.NullString{}, false
+	}
+	if err != nil {
+		h.log.Error("Failed to lock media uploader", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return sql.NullString{}, false
+	}
+	// DM retirement locks the conversation before cascading to participants and
+	// media. Read its ID without taking the media row lock, then share that order.
+	var expectedConversationID sql.NullString
+	err = tx.QueryRowContext(c.Request.Context(), `SELECT conversation_id FROM media_files
+		WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL`, fileID, userID).Scan(&expectedConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return sql.NullString{}, false
+	}
+	if err != nil {
+		h.log.Error("Failed to locate file for deletion", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return sql.NullString{}, false
+	}
+	err = lockMediaConversation(c.Request.Context(), tx, expectedConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
+		return sql.NullString{}, false
+	}
+	if err != nil {
+		h.log.Error("Failed to lock media conversation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+		return sql.NullString{}, false
+	}
+
+	return expectedConversationID, true
+}
+
 // DeleteMedia soft-deletes a media file and removes it from object storage.
 // DELETE /api/v1/media/:file_id
 // Only the uploader can delete their own Tier 2 (attachment) files while they
@@ -1074,39 +1122,8 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		}
 	}()
 
-	var uploader int
-	err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM users WHERE id = $1 FOR SHARE`, userID).Scan(&uploader)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to lock media uploader", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
-		return
-	}
-	// DM retirement locks the conversation before cascading to participants and
-	// media. Read its ID without taking the media row lock, then share that order.
-	var expectedConversationID sql.NullString
-	err = tx.QueryRowContext(c.Request.Context(), `SELECT conversation_id FROM media_files
-		WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL`, fileID, userID).Scan(&expectedConversationID)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to locate file for deletion", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
-		return
-	}
-	err = lockMediaConversation(c.Request.Context(), tx, expectedConversationID)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to lock media conversation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteFile})
+	expectedConversationID, ok := h.lockMediaDeletion(c, tx, fileID, userID)
+	if !ok {
 		return
 	}
 

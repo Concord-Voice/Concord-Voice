@@ -57,7 +57,10 @@ LABEL org.opencontainers.image.description="Concord Voice control-plane service"
 LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
 LABEL org.concord.redis-credential-modes="legacy,managed"
 
+# zlib is upgraded past the pinned base for CVE-2026-85091 (fixed in 1.3.2-r1).
+# Drop the upgrade once the alpine digest above ships r1 or later.
 RUN apk --no-cache add ca-certificates \
+    && apk --no-cache upgrade zlib \
     && addgroup -S -g 10006 appuser && adduser -S -u 10006 -G appuser appuser
 
 # Run as non-root user. UID/GID 10006 is fixed and differs from media-plane

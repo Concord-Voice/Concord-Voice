@@ -257,19 +257,63 @@ func (c *Client) PutObject(ctx context.Context, key string, reader io.Reader, si
 // GetObject retrieves an object from the configured bucket.
 // The caller is responsible for closing the returned reader.
 func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
+	obj, contentType, _, err := c.GetObjectWithClass(ctx, key)
+	return obj, contentType, err
+}
+
+// StorageClassInfrequentAccess is the S3 name for R2's Infrequent Access class.
+const StorageClassInfrequentAccess = "STANDARD_IA"
+
+// GetObjectWithClass is GetObject plus the object's storage class, read from
+// the same response. It is "" when the backend reports none, which is what
+// MinIO and every Standard-class object do.
+func (c *Client) GetObjectWithClass(ctx context.Context, key string) (io.ReadCloser, string, string, error) {
 	obj, err := c.minio.Client.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
-		return nil, "", fmt.Errorf("storage: failed to get object %q: %w", key, mapNotFound(err))
+		return nil, "", "", fmt.Errorf("storage: failed to get object %q: %w", key, mapNotFound(err))
 	}
 
 	// minio-go's GetObject is lazy — a missing object surfaces NoSuchKey at Stat().
 	info, err := obj.Stat()
 	if err != nil {
 		_ = obj.Close()
-		return nil, "", fmt.Errorf("storage: failed to stat object %q: %w", key, mapNotFound(err))
+		return nil, "", "", fmt.Errorf("storage: failed to stat object %q: %w", key, mapNotFound(err))
 	}
 
-	return obj, info.ContentType, nil
+	// From the header, not info.StorageClass: minio-go fills that field only
+	// from listings, and leaves it empty on a GET (verified against v7.4.1).
+	return obj, info.ContentType, info.Metadata.Get("X-Amz-Storage-Class"), nil
+}
+
+// StorageClass reports an object's storage class with a HEAD, for callers
+// that never GET the bytes themselves (the presigned-URL path). "" as in
+// GetObjectWithClass.
+func (c *Client) StorageClass(ctx context.Context, key string) (string, error) {
+	info, err := c.minio.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("storage: failed to stat object %q: %w", key, mapNotFound(err))
+	}
+	return info.Metadata.Get("X-Amz-Storage-Class"), nil
+}
+
+// PromoteToStandard copies an object onto itself in the Standard class.
+//
+// The copy is a new write, so it also restarts the object's lifecycle age:
+// the bucket rule moves it back to Infrequent Access only after another full
+// transition period. Metadata (including Content-Type) is kept, because a
+// storage-class change is a legal in-place copy under the default COPY
+// directive.
+//
+// Core.CopyObject, not the .Client hop: the low-level form is the one that
+// takes raw headers, and the storage class is a header.
+func (c *Client) PromoteToStandard(ctx context.Context, key string) error {
+	_, err := c.minio.CopyObject(ctx, c.bucket, key, c.bucket, key,
+		map[string]string{"x-amz-storage-class": "STANDARD"},
+		minio.CopySrcOptions{}, minio.PutObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("storage: failed to promote %q to Standard: %w", key, mapNotFound(err))
+	}
+	return nil
 }
 
 // PresignedGetURL generates a time-limited download URL for an object.
