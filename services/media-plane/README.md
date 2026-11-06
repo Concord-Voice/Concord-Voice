@@ -319,7 +319,7 @@ Anything else — a missing value, or a legacy declaration such as `2` — is
 rejected at the admission gate. A room keeps one version for its lifetime, so a
 joiner that advertises a different one gets `CryptoVersionMismatchError`. The
 desktop client sends `5` (`MEDIA_E2EE_FRAME_CRYPTO_VERSION`,
-`client/desktop/src/renderer/services/e2ee/mediaEncryption.ts:84`).
+`Concord-Voice/Desktop:desktop/src/renderer/services/e2ee/mediaEncryption.ts:84`).
 
 **create-transport**
 

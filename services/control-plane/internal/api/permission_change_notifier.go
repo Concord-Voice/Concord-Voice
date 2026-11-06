@@ -63,7 +63,7 @@ func (n *permissionChangeNotifier) NotifyPermissionsChanged(ctx context.Context,
 // permissionsChangedMessage is the permissions_changed frame. Data is a
 // non-nil empty map, never nil: OutgoingMessage.Data has no omitempty, so a
 // nil map would go out as "data":null, which PermissionsChangedSchema in
-// client/desktop/src/renderer/types/ws-events.ts rejects (heartbeatAckFrame is
+// Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts rejects (heartbeatAckFrame is
 // the byte-pinned precedent). Keep the two in sync.
 func permissionsChangedMessage() websocket.OutgoingMessage {
 	return websocket.OutgoingMessage{

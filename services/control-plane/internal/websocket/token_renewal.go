@@ -36,7 +36,7 @@ const (
 
 // Constant acknowledgement frames. No failure reason is sent: the client
 // cannot act on one, and a reason would be an oracle. Keep the shape in sync
-// with AuthRenewResultSchema in client/desktop/src/renderer/types/ws-events.ts.
+// with AuthRenewResultSchema in Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts.
 var (
 	authRenewAcceptedFrame = []byte(`{"type":"auth_renew_result","data":{"ok":true}}`)
 	authRenewRejectedFrame = []byte(`{"type":"auth_renew_result","data":{"ok":false}}`)

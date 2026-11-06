@@ -1466,6 +1466,14 @@ verb_up() {
     esac
   done
 
+  # The desktop client moved to Concord-Voice/Desktop (epic #3947). Without a
+  # client/desktop tree here, bring up the backend only and say so.
+  # ponytail: legacy in-repo path only; point the client leg at a Desktop checkout if local multi-client runs need it back.
+  if [[ "$skip_client" -eq 0 && ! -d "$PROJECT_ROOT/client/desktop" ]]; then
+    echo -e "${YELLOW}note:${NC} No client/desktop tree; starting the backend only. Run the client from Concord-Voice/Desktop." >&2
+    skip_client=1
+  fi
+
   mkdir -p "$LOG_DIR" || return 1
   voice_native_paths || return 1
   if [[ -e "$VOICE_NATIVE_CONTROL_RUNTIME" || -e "$VOICE_NATIVE_MEDIA_RUNTIME" ]]; then

@@ -296,7 +296,7 @@ tick, and as an echo answering each client `heartbeat`. The unsolicited form is
 the one that actually guarantees origin→client application traffic, because the
 echo depends on a throttleable renderer timer — see Connection Lifecycle step 7.
 Envelope-only and deliberately consumer-less. Keep in sync with
-`HeartbeatAckSchema` in `client/desktop/src/renderer/types/ws-events.ts`, which
+`HeartbeatAckSchema` in `Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts`, which
 records that the frame MUST NOT be used as a liveness or RTT signal.
 
 #### Connection Confirmation

@@ -444,7 +444,7 @@ func (h *Handler) announceServerPermissionsChanged(ctx context.Context, serverID
 // serverPermissionsChangedMessage is the server_permissions_changed frame:
 // {"type":"server_permissions_changed","data":{"server_id":"<uuid>"}}. Keep it
 // in sync with ServerPermissionsChangedSchema in
-// client/desktop/src/renderer/types/ws-events.ts.
+// Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts.
 func serverPermissionsChangedMessage(serverID uuid.UUID) websocket.OutgoingMessage {
 	return websocket.OutgoingMessage{
 		Type: "server_permissions_changed",

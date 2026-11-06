@@ -372,7 +372,7 @@ MFA is available now. Enable it in your account security settings.
 
 **Status:** ✅ Implemented — both providers shipped (Google via #808, Apple via #824).
 
-The desktop app's Login screen renders both `Sign in with Google` and `Sign in with Apple` buttons (`client/desktop/src/renderer/components/Auth/Login.tsx`, `SSOButton.tsx`), wired through the loopback OAuth flow in `client/desktop/src/main/ssoLoopback.ts`. Apple's privacy-relay email addresses are detected server-side and excluded from auto-link to avoid attaching an existing account to an opaque relay alias.
+The desktop app's Login screen renders both `Sign in with Google` and `Sign in with Apple` buttons (`Concord-Voice/Desktop:desktop/src/renderer/components/Auth/Login.tsx`, `SSOButton.tsx`), wired through the loopback OAuth flow in `Concord-Voice/Desktop:desktop/src/main/ssoLoopback.ts`. Apple's privacy-relay email addresses are detected server-side and excluded from auto-link to avoid attaching an existing account to an opaque relay alias.
 
 ---
 
@@ -432,9 +432,11 @@ See [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) for detailed instructio
 
 ### What's the project structure?
 
+The desktop app lives in its own repository, [Concord-Voice/Desktop](https://github.com/Concord-Voice/Desktop). This repository holds the services:
+
 ```
 Concord/
-├── client/desktop/          # Electron desktop application
+├── client/admin/            # Admin portal
 ├── services/
 │   ├── control-plane/       # Go backend (auth, channels, billing)
 │   └── media-plane/         # Node.js WebRTC SFU (voice/video)
@@ -498,7 +500,7 @@ go tool cover -html=coverage.out
 **Frontend tests:**
 
 ```bash
-cd client/desktop
+cd ../Desktop/desktop   # a Concord-Voice/Desktop checkout
 npm test
 ```
 
@@ -825,8 +827,7 @@ go test -race ./...
 **For frontend tests:**
 
 ```bash
-cd client/desktop
-
+cd ../Desktop/desktop   # a Concord-Voice/Desktop checkout
 # Clear cache and retry
 rm -rf node_modules package-lock.json
 npm install
@@ -852,13 +853,13 @@ npm test
 **Check:**
 
 1. Vite dev server is running: `curl http://localhost:5173`
-2. Node modules installed: `cd client/desktop && npm install`
+2. Node modules installed: `cd ../Desktop/desktop && npm install`
 3. Console output: Look for errors in terminal
 
 **Rebuild:**
 
 ```bash
-cd client/desktop
+cd ../Desktop/desktop   # a Concord-Voice/Desktop checkout
 npm run build
 npm run dev
 ```

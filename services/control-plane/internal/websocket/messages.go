@@ -51,7 +51,7 @@ type OutgoingMessage struct {
 // closing production sockets with 1006 every few minutes. Echoing the client's
 // 30s heartbeat as data guarantees origin→client application traffic on every
 // hop at well under the idle threshold. Keep the shape in sync with
-// HeartbeatAckSchema in client/desktop/src/renderer/types/ws-events.ts.
+// HeartbeatAckSchema in Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts.
 //
 // It is ALSO sent UNSOLICITED: writePump emits it on its existing 54s ticker
 // whenever the socket has been idle since the previous tick. The echo above put

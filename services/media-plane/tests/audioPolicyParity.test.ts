@@ -19,13 +19,13 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FEC_HEADROOM } from '@/lib/mediaPolicer';
 import { AUDIO_TIER_OPUS_BITRATE_CEILING_BPS } from '@/lib/roomManager';
-import { AUDIO_QUALITY_TIERS } from '../../../client/desktop/src/renderer/stores/voice/audioQualityTiers';
+import { AUDIO_QUALITY_TIERS } from '../../../tests/fixtures/desktop/src/renderer/stores/voice/audioQualityTiers';
 import {
   FEC_MAX_HEADROOM_PERCENT,
   calculateFecBitrate,
-} from '../../../client/desktop/src/renderer/services/voice/fecHeadroom';
+} from '../../../tests/fixtures/desktop/src/renderer/services/voice/fecHeadroom';
 
-const CLIENT_VOICE = resolve(__dirname, '..', '..', '..', 'client', 'desktop', 'src', 'renderer');
+const CLIENT_VOICE = resolve(__dirname, '..', '..', '..', 'tests', 'fixtures', 'desktop', 'src', 'renderer');
 
 describe('audio policy parity (#2153)', () => {
   it('gives every desktop tier a server ceiling equal to its maxBitrate, and no others', () => {

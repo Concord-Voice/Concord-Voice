@@ -143,9 +143,9 @@ flowchart TB
 
 #### Desktop Client (Electron + React + TypeScript)
 
-The desktop client is the only shipping client. Source: `client/desktop/`.
+The desktop client is the only shipping client. Source: `Concord-Voice/Desktop:desktop/`.
 
-- **Process layout** (`client/desktop/src/` has five top-level source dirs):
+- **Process layout** (`Concord-Voice/Desktop:desktop/src/` has five top-level source dirs):
   - `main/` — the Electron main process:
     - packaged-macOS `/Applications` placement gate, before `BrowserWindow` creation (`applicationsFolderGate.ts`)
     - `BrowserWindow` creation, `app://` scheme registration, IPC dispatch, updater wiring, and quit lifecycle (`main.ts`)
@@ -186,7 +186,7 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
 
 The desktop topology is main / renderer plus a third, narrowly-scoped process: an Electron
 **`utilityProcess`** that hosts the first-party `concord-audiocap` native addon
-(`client/desktop/native/concord-audiocap/`). It exists so a memory-safety bug in that native code
+(`Concord-Voice/Desktop:desktop/native/concord-audiocap/`). It exists so a memory-safety bug in that native code
 cannot own the main process, which holds SSO tokens and the update path (ADR-0043 D5); the
 renderer is not a candidate host either, since `nodeIntegration` stays off there.
 
@@ -211,7 +211,7 @@ Two independent `MessagePort` pairs carry the two things that cross this boundar
   (#3394).
 - **Child → preload → main world, PCM only** — the child hands its PCM port to **preload**
   (`audiocap:port`; the current shell version is authoritative in
-  `client/desktop/src/main/ipcContract.ts`), which validates every 3872-byte quantum and
+  `Concord-Voice/Desktop:desktop/src/main/ipcContract.ts`), which validates every 3872-byte quantum and
   relays it over a **second, preload-created `MessageChannel`** to the main world, delivered
   exactly once (`src/preload/audiocapRelay.ts`). The main world builds the `AudioData` and
   `MediaStreamTrackGenerator` (`src/renderer/services/voice/screenAudioBridge.ts`); it never holds
@@ -601,7 +601,7 @@ already within bounds" optimisation would take.
 **Tier 2 (message attachments) — client-side, before encryption.** These are
 end-to-end encrypted, so the server never sees plaintext and cannot strip
 anything; a GPS-tagged photo would reach every recipient intact and could not be
-remediated after the fact. `client/desktop/src/renderer/utils/ui/imageMetadata/`
+remediated after the fact. `Concord-Voice/Desktop:desktop/src/renderer/utils/ui/imageMetadata/`
 rewrites the container byte-for-byte before `encryptFile` runs.
 
 That module parses containers rather than re-encoding pixels, which keeps the
@@ -1035,7 +1035,7 @@ the owner held and commands pending.
 
 #### Media E2EE (frame encryption)
 
-Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates _at_ the SFU). Implementation: `client/desktop/src/renderer/services/e2ee/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
+Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates _at_ the SFU). Implementation: `Concord-Voice/Desktop:desktop/src/renderer/services/e2ee/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
 
 - **Cipher/transform path:** per-frame **AES-256-GCM** runs before frames leave the sender. Every outbound producer attaches encryption synchronously through mediasoup-client's `onRtpSender` callback, before offer creation and server-side producer signaling. Setup failure aborts publish and cleans up the owning source. `encodedTransformSupport.ts` prefers `RTCRtpScriptTransform` (Web Worker) whenever present and falls back to `createEncodedStreams` (main thread) only when the Worker API is absent. The mediasoup-client `encodedInsertableStreams` transport option is set only for that legacy fallback. Neither transform API means media initialization fails closed.
 - **Frame keys:** derived `HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)` from the **same channel CSK** used for text messages — so media encryption shares the `channel_keys` / `key_revocations` epoch ledger and rotates on member join/leave (with a short overlap window), and ratchets via `HKDF(oldKey, "concord-e2ee-ratchet")`.
@@ -1135,7 +1135,7 @@ sequenceDiagram
     B->>B: e2eeService.decryptForChannel(channel_id, ciphertext) → plaintext
 ```
 
-> **Client-side dispatch validation (PR #1184, closes #709).** Every inbound envelope is validated by `WebSocketEventSchema` (a zod 4 discriminated union over `type`) before any per-handler dispatch in `client/desktop/src/renderer/services/messaging/websocketService.ts`. Failed envelopes are dropped with a PII-scrubbed structural log (`scrubZodIssues`) and `connectionStore.wireViolationCount` is incremented. Handlers in `useWebSocketMessages.ts` operate on already-narrowed payloads. The `isInitialized` guard on `e2eeService` makes decryption fail-closed (render-as-error) when keys are not ready, and never leaks ciphertext.
+> **Client-side dispatch validation (PR #1184, closes #709).** Every inbound envelope is validated by `WebSocketEventSchema` (a zod 4 discriminated union over `type`) before any per-handler dispatch in `Concord-Voice/Desktop:desktop/src/renderer/services/messaging/websocketService.ts`. Failed envelopes are dropped with a PII-scrubbed structural log (`scrubZodIssues`) and `connectionStore.wireViolationCount` is incremented. Handlers in `useWebSocketMessages.ts` operate on already-narrowed payloads. The `isInitialized` guard on `e2eeService` makes decryption fail-closed (render-as-error) when keys are not ready, and never leaks ciphertext.
 
 `encryptForChannelWithVersion` encrypts edited channel and DM content. It returns the ciphertext and the exact epoch it selected before asynchronous WebCrypto work yields. The renderer sends that pair to the REST edit endpoint. A `409 epoch_revoked` response invalidates the cached channel key and permits one re-encryption attempt. Missing, zero, or repeatedly revoked epochs fail closed.
 
@@ -1835,20 +1835,17 @@ Core logging rules (enforced by lint + AST regression tests, not convention):
 
 - **No key material** — channel/DM/session keys, RSA private keys, JWT/refresh tokens, password hashes never reach any log sink, in any form. Locked in `services/control-plane/internal/auth/` by an AST-walking test (`log_emissions_test.go`).
 - **No PII** — error paths redact emails, real-name fields, and IP addresses where avoidable.
-- **No `Error.cause` propagation** (Electron main) — never pass a raw `err` object to `console.error` or `console.warn`, because ES2022 `Error.cause` can carry secrets upward. An ESLint `no-restricted-syntax` rule scoped to `client/desktop/src/main/**` enforces this.
+- **No `Error.cause` propagation** (Electron main) — never pass a raw `err` object to `console.error` or `console.warn`, because ES2022 `Error.cause` can carry secrets upward. An ESLint `no-restricted-syntax` rule scoped to `Concord-Voice/Desktop:desktop/src/main/**` enforces this.
 - **No raw wire-violation payloads** — WebSocket schema-rejection logs emit only a bounded, deduplicated `issue_codes` list from `scrubZodIssues`, never the envelope `type`, Zod paths or messages, received field values, or rejected envelopes.
 - **No unsanitized control characters (CWE-117)** — route user-derived strings through `sanitizeLogValue` (`internal/websocket/logsanitize.go`) before interpolating them into stdlib `log.Printf`.
 
 ## Key Directories
 
+The desktop client (`desktop/` in [Concord-Voice/Desktop](https://github.com/Concord-Voice/Desktop)) is a separate repository.
+
 ```text
 Concord/
-├── client/desktop/           # Electron + React + TypeScript (the shipping client)
-│   ├── src/main/             # Electron main process (IPC, updater trust chain, app:// scheme, tokens)
-│   ├── src/preload/          # Secure contextBridge IPC bridge
-│   ├── src/renderer/         # React app (stores/, services/, components/, hooks/)
-│   ├── src/shared/           # Cross-process types (clientBehavior, spaIpcTypes, spaUrlPattern)
-│   └── src/constants/        # Typed constants + build-time generators
+├── client/admin/             # Admin portal (React + TypeScript + Vite)
 ├── services/
 │   ├── control-plane/        # Go backend (generated internal-package count; migrations/)
 │   │   ├── internal/erasureclear/  # Authenticated account-erasure audience batches
@@ -1856,7 +1853,7 @@ Concord/
 │   └── media-plane/          # Node.js mediasoup WebRTC SFU (src/lib/ RoomManager, mediasoup)
 ├── infrastructure/
 │   ├── deploy/               # deploy-spa.sh, copy-certs.sh, provisioning
-│   └── docker/               # postgres, coturn, buildtools base images
+│   └── docker/               # postgres, coturn, minio images
 ├── scripts/                  # Dev scripts, git hooks, count generator, drift lints
 └── docs/                     # architecture.md (this file), adr/, api/, policies/, runbooks/
 ```

@@ -5,7 +5,7 @@
   "spec": "[internal]specs/2026-08-21-2359-role-reorder-ui-design.md",
   "consumers": [
     "services/control-plane/internal/rbac/reorder_contract_test.go (Go - seeds the world, PATCHes the declared payload, asks the REAL server for the verdict)",
-    "client/desktop TypeScript consumer (lands in T3 - asserts partitionRoleHierarchy + buildReorderPayload against the declared hierarchy and payload)"
+    "Concord-Voice/Desktop TypeScript consumer (lands in T3 - asserts partitionRoleHierarchy + buildReorderPayload against the declared hierarchy and payload)"
   ],
   "why_this_file_exists": [
     "PR #2839 shipped a reorder that worked only for the server owner while its test suite was fully green.",

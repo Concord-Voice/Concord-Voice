@@ -295,11 +295,11 @@ func TestParsePayloadRejectsInvalidCallerVerdictsAndReports(t *testing.T) {
 		}, "invalid report shape"},
 		{"missing coverage", func(p map[string]any) { p["coverage"] = map[string]any{"desktop": true} }, "invalid report shape"},
 		{"invalid coverage", func(p map[string]any) {
-			p["coverage"] = map[string]any{"desktop": true, "control_plane": true, "media_plane": true, "admin": nil}
+			p["coverage"] = map[string]any{"control_plane": true, "media_plane": true, "admin": nil}
 		}, "invalid coverage shape"},
 		{"desktop replaces a component", func(p map[string]any) {
 			p["coverage"] = map[string]any{"desktop": true, "control_plane": true, "media_plane": true}
-		}, "invalid report shape"},
+		}, "invalid coverage shape"},
 		{"unknown component", func(p map[string]any) {
 			p["coverage"] = map[string]any{"desktop2": true, "control_plane": true, "media_plane": true, "admin": true}
 		}, "invalid report shape"},
@@ -320,9 +320,9 @@ func TestParsePayloadRejectsInvalidCallerVerdictsAndReports(t *testing.T) {
 	require.ErrorContains(t, err, "invalid payload")
 }
 
-// The pinned pr-ci reports the desktop component until the pin moves past the
-// client/desktop removal (epic #3947), so that shape stays valid until then.
-func TestParsePayloadAcceptsPinnedDesktopCoverageShape(t *testing.T) {
+// The desktop component left with client/desktop (epic #3947): a report that
+// still carries it, beside the three live components, is no longer a valid shape.
+func TestParsePayloadRejectsRetiredDesktopCoverage(t *testing.T) {
 	f := newOIDCFixture(t)
 	var candidate map[string]any
 	require.NoError(t, json.Unmarshal(f.raw, &candidate))
@@ -333,7 +333,7 @@ func TestParsePayloadAcceptsPinnedDesktopCoverageShape(t *testing.T) {
 		raw, err := json.Marshal(candidate)
 		require.NoError(t, err)
 		_, err = parsePayload(raw)
-		require.NoError(t, err, "desktop=%v", desktop)
+		require.ErrorContains(t, err, "invalid report shape", "desktop=%v", desktop)
 	}
 }
 

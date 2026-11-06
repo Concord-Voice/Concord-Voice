@@ -17,9 +17,9 @@ This is the project-wide entry point for Concord Voice's test strategy. It expla
 
 | Category | What it covers | Where it lives |
 |---|---|---|
-| **Unit** | Pure logic, single component/function, mocked dependencies | Desktop: `client/desktop/tests/unit/` · Control-plane: `*_test.go` (no DB) · Media-plane: `services/media-plane/tests/` |
-| **Integration** | Real datastores and cross-module behavior | Desktop: `client/desktop/tests/integration/` · Control-plane: `*_test.go` against real PostgreSQL + Redis |
-| **E2E** | Full user flows through the running app | Desktop: `client/desktop/tests/e2e/` (Playwright) |
+| **Unit** | Pure logic, single component/function, mocked dependencies | Desktop: `Concord-Voice/Desktop:desktop/tests/unit/` · Control-plane: `*_test.go` (no DB) · Media-plane: `services/media-plane/tests/` |
+| **Integration** | Real datastores and cross-module behavior | Desktop: `Concord-Voice/Desktop:desktop/tests/integration/` · Control-plane: `*_test.go` against real PostgreSQL + Redis |
+| **E2E** | Full user flows through the running app | Desktop: `Concord-Voice/Desktop:desktop/tests/e2e/` (Playwright) |
 
 Shell/operational scripts have their own lightweight test convention (no framework) under [`scripts/tests/`](../scripts/tests/README.md) and `[internal]tests/`.
 
@@ -27,7 +27,7 @@ Shell/operational scripts have their own lightweight test convention (no framewo
 
 | Service | Runner & libraries |
 |---|---|
-| **Desktop** (`client/desktop`) | Vitest · `@testing-library/react` · `@testing-library/user-event` · `@testing-library/jest-dom` · MSW v2 (API mocking) · jsdom · `@vitest/coverage-istanbul` · Playwright (E2E) |
+| **Desktop** (`Concord-Voice/Desktop:desktop`) | Vitest · `@testing-library/react` · `@testing-library/user-event` · `@testing-library/jest-dom` · MSW v2 (API mocking) · jsdom · `@vitest/coverage-istanbul` · Playwright (E2E) |
 | **Control-plane** (`services/control-plane`) | Go stdlib `testing` · `stretchr/testify` (`assert` / `require`) · shared `internal/testhelpers` · `-race` enabled |
 | **Media-plane** (`services/media-plane`) | Vitest (`services/media-plane/tests/*.test.ts`) |
 | **Scripts / deploy** | Roll-your-own bash assertions — `PASS:` / `FAIL:` + `exit 1`, no framework |
@@ -48,27 +48,27 @@ cd services/control-plane && go test -race ./...
 cd services/control-plane && golangci-lint run
 
 # Frontend (Electron/React) — desktop
-cd client/desktop && npm test          # vitest run
-cd client/desktop && npm run lint
+cd ../Desktop/desktop && npm test          # vitest run
+cd ../Desktop/desktop && npm run lint
 ```
 
 Per service, the most common invocations:
 
-- **Desktop** — `npm test` (full Vitest suite — unit + integration), `npm run test:watch`, `npm run test:coverage`, `npm run test:unit` (unit only), `npm run test:integration` (integration only), `npm run test:e2e` (Playwright: renderer-only specs need only the Vite dev server, and full-stack specs need the backend running). Full command set: [`client/desktop/tests/README.md`](../client/desktop/tests/README.md).
+- **Desktop** — `npm test` (full Vitest suite — unit + integration), `npm run test:watch`, `npm run test:coverage`, `npm run test:unit` (unit only), `npm run test:integration` (integration only), `npm run test:e2e` (Playwright: renderer-only specs need only the Vite dev server, and full-stack specs need the backend running). Full command set: [`Concord-Voice/Desktop:desktop/tests/README.md`](https://github.com/Concord-Voice/Desktop/blob/main/desktop/tests/README.md).
 - **Control-plane** — `go test ./...` and `go test -race ./...`. Integration tests require PostgreSQL and Redis (`docker-compose up -d postgres redis`). Full command set plus `testhelpers` reference: [`services/control-plane/tests/README.md`](../services/control-plane/tests/README.md).
 - **Media-plane** — `cd services/media-plane && npm test`.
-- **Whole stack for E2E** — `./scripts/concord-dev.sh up` then run Playwright from `client/desktop`.
+- **Whole stack for E2E** — `./scripts/concord-dev.sh up` then run Playwright from `Concord-Voice/Desktop:desktop`.
 
 ## CI/CD
 
-- [`.github/workflows/build.yml`](../.github/workflows/build.yml) runs on every PR, invoked via `workflow_call` from `pr-ci.yml`. The desktop, control-plane, and media-plane test suites run in parallel with coverage. Results then upload to SonarQube for Quality Gate enforcement.
-- The Playwright E2E specs run **manually** via `npm run test:e2e` in `client/desktop`. #1435 removed the CI workflow, moving to a deferred-to-manual posture. Visual-regression diffs were non-blocking advisory noise.
+- [`.github/workflows/build.yml`](../.github/workflows/build.yml) runs on every PR, invoked via `workflow_call` from `pr-ci.yml`. The control-plane, media-plane, and admin test suites run in parallel with coverage; the desktop suite runs in Concord-Voice/Desktop. Results then upload to SonarQube for Quality Gate enforcement.
+- The Playwright E2E specs run **manually** via `npm run test:e2e` in `Concord-Voice/Desktop:desktop`. #1435 removed the CI workflow, moving to a deferred-to-manual posture. Visual-regression diffs were non-blocking advisory noise.
 
-See the desktop README's [CI/CD section](../client/desktop/tests/README.md#cicd) for the full E2E job semantics.
+See the desktop README's [CI/CD section](https://github.com/Concord-Voice/Desktop/blob/main/desktop/tests/README.md#cicd) for the full E2E job semantics.
 
 ## Per-service test docs
 
-- [`client/desktop/tests/README.md`](../client/desktop/tests/README.md) — desktop unit/component/hook/service + Playwright E2E, structure, mocking patterns, known jsdom limitations.
+- [`Concord-Voice/Desktop:desktop/tests/README.md`](https://github.com/Concord-Voice/Desktop/blob/main/desktop/tests/README.md) — desktop unit/component/hook/service + Playwright E2E, structure, mocking patterns, known jsdom limitations.
 - [`services/control-plane/tests/README.md`](../services/control-plane/tests/README.md) — Go test layout across packages, `internal/testhelpers`, integration prerequisites and env vars.
 - [`scripts/tests/README.md`](../scripts/tests/README.md) — bash assertion convention for `scripts/concord-dev.sh` and deploy scripts.
 

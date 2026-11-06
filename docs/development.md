@@ -17,7 +17,7 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 
 ### Required
 
-- **Node.js** and npm 10+ for the Node workspaces. `client/desktop` and
+- **Node.js** and npm 10+ for the Node workspaces. `Concord-Voice/Desktop:desktop` and
   `client/admin` need **Node.js >= 24.15.0**, and `services/media-plane` needs
   **>= 24.11.0**. Node 26 is included. Each workspace's `package.json` `engines`
   field is authoritative. Go-only work does not require Node.js
@@ -146,8 +146,7 @@ curl http://localhost:3000/health
 In a new terminal:
 
 ```bash
-cd client/desktop
-
+cd ../Desktop/desktop   # a Concord-Voice/Desktop checkout
 # Install dependencies
 npm install
 
@@ -203,7 +202,7 @@ verification, and commissioning live in the dedicated
 - Changes apply automatically
 
 **Desktop Client**:
-- Edit files in `client/desktop/src/`
+- Edit files in `Concord-Voice/Desktop:desktop/src/`
 - Hot reload runs through Vite
 - Changes apply automatically to renderer process
 - Main process changes require restart
@@ -354,8 +353,7 @@ npm run test:coverage
 ### Desktop Client (React/TypeScript)
 
 ```bash
-cd client/desktop
-
+cd ../Desktop/desktop   # a Concord-Voice/Desktop checkout
 # Run all unit tests
 npx vitest run
 
@@ -381,7 +379,7 @@ npm run typecheck
 npm run lint
 ```
 
-Tests use Vitest + Testing Library + MSW. See `client/desktop/tests/README.md` for full details on test infrastructure and patterns.
+Tests use Vitest + Testing Library + MSW. See `Concord-Voice/Desktop:desktop/tests/README.md` for full details on test infrastructure and patterns.
 
 ## Debugging
 

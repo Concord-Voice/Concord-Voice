@@ -171,7 +171,7 @@ describe('CI path filters cover this workspace real dependencies', () => {
     // trivially satisfied, and this guard would pass while guarding nothing —
     // the exact failure mode it was written in response to.
     expect(all.length).toBeGreaterThan(0);
-    expect(all).toContain('client/desktop/src/renderer/services/voice/remoteVideoLayerPolicy.ts');
+    expect(all).toContain('tests/fixtures/desktop/src/renderer/services/voice/remoteVideoLayerPolicy.ts');
   });
 
   it.each(WORKFLOWS)('%s gates the media-plane TEST job on every one of them', (workflow) => {

@@ -243,7 +243,7 @@ func resolvePurgeRateLimit(cfg *config.Config) (int, time.Duration) {
 //
 // Why this exists: the Playwright e2e suite cannot share one authenticated
 // session across specs — the access token is held in-memory only and the
-// refresh token never enters the renderer (see client/desktop/src/renderer/
+// refresh token never enters the renderer (see Concord-Voice/Desktop:desktop/src/renderer/
 // services/system/apiClient.ts), and e2eeService initializes during the real LOGIN
 // flow (registration does NOT init it) — so each backend spec registers a fresh
 // user AND logs in. From one CI IP this exceeds the production caps (5/15min

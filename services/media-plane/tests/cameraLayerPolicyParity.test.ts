@@ -39,7 +39,7 @@ import {
   computeRemoteVideoLayerRequest,
   maxPressureSteps,
   stepDownLayerRequest,
-} from '../../../client/desktop/src/renderer/services/voice/remoteVideoLayerPolicy';
+} from '../../../tests/fixtures/desktop/src/renderer/services/voice/remoteVideoLayerPolicy';
 
 const ROLES = ['thumbnail', 'grid', 'focus'] as const;
 // Sizes straddle BOTH ladder edges (540, 1280) from either side, so an

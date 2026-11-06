@@ -2,7 +2,7 @@ package entitlements
 
 // audioTierOrder is the canonical 7-tier audio ladder, ascending. Index = rank.
 // MIRRORS the client AUDIO_QUALITY_TIERS
-// (client/desktop/src/renderer/stores/voice/audioQualityTiers.ts), the media-plane
+// (Concord-Voice/Desktop:desktop/src/renderer/stores/voice/audioQualityTiers.ts), the media-plane
 // AUDIO_QUALITY_TIERS config, and the
 // media-plane AUDIO_TIER_OPUS_BITRATE_CEILING_BPS enforcement map. Keep all
 // mirrors in lockstep.

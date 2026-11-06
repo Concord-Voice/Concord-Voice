@@ -25,7 +25,7 @@ import (
 //
 // The consequence of losing it is silent and user-visible. The desktop schema
 // types the field code_id: UUID.optional()
-// (client/desktop/src/renderer/types/ws-events.ts), and an empty string is not
+// (Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts), and an empty string is not
 // undefined — it fails UUID validation, so the ENTIRE friend_code_claimed event
 // is rejected at the dispatch boundary and the code owner never learns their
 // code was redeemed.

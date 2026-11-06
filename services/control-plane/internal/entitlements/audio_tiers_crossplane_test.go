@@ -17,11 +17,11 @@ func TestAudioTierMirrorsStayInLockstep(t *testing.T) {
 
 	// The canonical client tier map moved out of voiceStore.ts into this pure-data module in #2153
 	// (voiceStore.ts re-exports it), so the media plane's parity test can import it too.
-	desktopRaw, err := os.ReadFile("../../../../client/desktop/src/renderer/stores/voice/audioQualityTiers.ts")
+	desktopRaw, err := os.ReadFile("../../../../tests/fixtures/desktop/src/renderer/stores/voice/audioQualityTiers.ts")
 	if err != nil {
 		t.Fatalf("read desktop audio quality tiers: %v", err)
 	}
-	desktopBitrates := assertTypeScriptAudioTiers(t, "client/desktop/src/renderer/stores/voice/audioQualityTiers.ts", string(desktopRaw))
+	desktopBitrates := assertTypeScriptAudioTiers(t, "tests/fixtures/desktop/src/renderer/stores/voice/audioQualityTiers.ts", string(desktopRaw))
 
 	for _, tier := range audioTierOrder {
 		if mediaPlaneBitrates[tier] != desktopBitrates[tier] {

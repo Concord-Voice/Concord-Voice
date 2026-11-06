@@ -18,6 +18,16 @@
 > production container was verified, on the host, to run the runtime digest in
 > the "Current Fixed Release" table below.
 
+> ### Where publication runs now
+>
+> The publisher moved to
+> [Concord-Voice/Self-Hosted](https://github.com/Concord-Voice/Self-Hosted):
+> `publish-minio-image.yml`, `scripts/ci/check-oci-tag.sh` and the publisher
+> checks in `test-publish-minio-image.sh` live there, and Sections 1 to 3 run
+> from that repository and its copy of this runbook. This repository keeps the
+> source recipe, the build record and the compose consumer pin. Here, run only
+> `bash scripts/tests/test-publish-minio-image.sh --require-compose`.
+
 ## Purpose
 
 This runbook governs Concord's MinIO source build, publication, and the safety

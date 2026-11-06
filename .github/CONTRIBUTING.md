@@ -2,6 +2,8 @@
 
 Thank you for your interest in contributing to Concord Voice! This document provides guidelines and instructions for contributing.
 
+The desktop client lives in [Concord-Voice/Desktop](https://github.com/Concord-Voice/Desktop). Desktop changes go there; the frontend notes below apply to it.
+
 ## Table of Contents
 
 - [Code of Conduct](#code-of-conduct)
@@ -141,10 +143,6 @@ Co-Authored-By: <tool and model> <noreply@...>
    cd services/control-plane
    go test ./...
 
-   # Frontend tests
-   cd client/desktop
-   npm test
-
    # Admin portal tests
    cd client/admin
    npm test
@@ -156,10 +154,6 @@ Co-Authored-By: <tool and model> <noreply@...>
    # Backend (Go)
    cd services/control-plane
    golangci-lint run --timeout=5m
-
-   # Frontend (TypeScript/React)
-   cd client/desktop
-   npm run lint
 
    # Admin portal
    cd client/admin
@@ -245,7 +239,7 @@ Go linting runs automatically on staged Go files before each commit. If linting 
 
 ### TypeScript/React (Frontend)
 
-- Lint config is `client/desktop/eslint.config.mjs` (typescript-eslint + @eslint-react, type-checked). Formatting is Prettier-owned (`client/desktop/.prettierrc`) — run `npm run lint` before pushing
+- Lint config is `Concord-Voice/Desktop:desktop/eslint.config.mjs` (typescript-eslint + @eslint-react, type-checked). Formatting is Prettier-owned (`Concord-Voice/Desktop:desktop/.prettierrc`) — run `npm run lint` before pushing
 - Use TypeScript for all new code
 - Prefer functional components with hooks
 - Use explicit types (no `any`)
@@ -280,8 +274,7 @@ go test -cover ./...
 ### Frontend Tests
 
 ```bash
-cd client/desktop
-
+cd ../Desktop/desktop   # a Concord-Voice/Desktop checkout
 # Unit tests
 npm test
 

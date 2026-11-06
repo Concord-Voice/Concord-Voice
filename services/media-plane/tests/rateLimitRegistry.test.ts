@@ -14,7 +14,7 @@ import { EVENT_BUDGETS } from '../src/lib/rateLimit.js';
  * Socket.IO signature accepts any string. This source scan closes that hole.
  *
  * Same discipline as internal/auth/log_emissions_test.go and
- * client/desktop/tests/unit/main/eslint-no-raw-err-console.test.ts.
+ * Concord-Voice/Desktop:desktop/tests/unit/main/eslint-no-raw-err-console.test.ts.
  *
  * NOTE: it scans the WHOLE file, not just the io.on('connection') block —
  * join-room is registered in registerJoinRoomHandler, outside that callback. If

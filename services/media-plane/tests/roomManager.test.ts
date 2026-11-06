@@ -5349,7 +5349,7 @@ describe('RoomManager', () => {
 
     describe('stock desktop client fixture', () => {
       // Shape of the `rtpParameters` the Concord desktop mic produce hands the
-      // server, derived from mediasoup-client 3.24.4 (client/desktop/package.json
+      // server, derived from mediasoup-client 3.24.4 (Concord-Voice/Desktop:desktop/package.json
       // `^3.24.4`). It was produced by driving that version's Chrome111 handler
       // through `Transport.produce()` with the options `publishMicGraph` passes
       // (voiceService.ts): `encodings: [{ maxBitrate, adaptivePtime, priority,

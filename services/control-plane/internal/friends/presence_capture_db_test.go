@@ -767,7 +767,7 @@ func (b *recordingBroadcaster) firstOfType(t *testing.T, msgType string) broadca
 // The consequence is three layers from the mutated line and invisible on the
 // server. An empty string is a perfectly good Go string, so nothing fails here;
 // it fails at the desktop's dispatch boundary, where code_id is UUID.optional()
-// (client/desktop/src/renderer/types/ws-events.ts) and "" is not a UUID. Zod
+// (Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts) and "" is not a UUID. Zod
 // rejects the whole event, so the code OWNER -- who is not the caller, and gets
 // no error of their own -- silently never learns their code was redeemed.
 func TestFriendCodeClaimBroadcastCarriesTheCodeID(t *testing.T) {

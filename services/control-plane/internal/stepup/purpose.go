@@ -20,7 +20,7 @@ import "slices"
 // purpose at all and never reads an inline token.
 //
 // Values are wire-visible: the desktop sends them in the begin body, and
-// client/desktop/src/renderer/components/Auth/stepUpPurpose.ts mirrors the ones
+// Concord-Voice/Desktop:desktop/src/renderer/components/Auth/stepUpPurpose.ts mirrors the ones
 // it uses. Renaming one breaks every client that sends it.
 type Purpose string
 
@@ -146,7 +146,7 @@ var allPurposes = [...]Purpose{
 // before the password is verified, so a password token can never be spent on
 // an MFA-settings, session or ownership route, whose consumers never read one
 // anyway. TestOwnRulePurposes_ClosedSet pins the list and
-// client/desktop/src/renderer/components/Auth/stepUpPurpose.ts mirrors it.
+// Concord-Voice/Desktop:desktop/src/renderer/components/Auth/stepUpPurpose.ts mirrors it.
 var ownRulePurposes = [...]Purpose{
 	PurposeDMClear,
 	PurposeDMMessageDelete,

@@ -3692,25 +3692,71 @@ media_bluegreen_handoff_restore() {
   echo "media-bluegreen: restored ${old}; the cutover failed" >&2
 }
 
+# Returns 0 when Docker has restarted a colour at least
+# MEDIA_BLUEGREEN_CRASHLOOP_RESTARTS times (default 5) and three probes 2 s
+# apart all find it not ready, 1 when it is not crash-looping, and 2 when it
+# cannot tell. Each handoff removes the stopped standby before promoting it,
+# so the count is per deploy (#4221).
+media_bluegreen_crashlooping() {
+  local colour="$1" limit="${MEDIA_BLUEGREEN_CRASHLOOP_RESTARTS:-5}" inventory project id restarts port i
+  [[ "$limit" =~ ^[1-9][0-9]{0,3}$ ]] || {
+    echo 'media-bluegreen: MEDIA_BLUEGREEN_CRASHLOOP_RESTARTS must be 1-9999' >&2
+    return 2
+  }
+  inventory="$(voice_enforcement_rollout_inventory)" || return 2
+  project="${inventory%%$'\n'*}"
+  id="$(docker ps -a -q --no-trunc --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.service=media-plane-${colour}")" || return 2
+  [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 2
+  restarts="$(docker inspect --type container --format '{{.RestartCount}}' "$id")" || return 2
+  [[ "$restarts" =~ ^[0-9]+$ ]] || return 2
+  (( restarts >= limit )) || return 1
+  port="$(media_bluegreen_port "$colour")" || return 2
+  # One failed probe of a serving colour is not a crash loop.
+  for (( i = 0; i < 3; i++ )); do
+    (( i == 0 )) || sleep 2
+    media_bluegreen_probe_ready "$colour" true "$port" && return 1
+  done
+  return 0
+}
+
 # A handoff killed after promotion leaves the active colour not running while
 # the old colour keeps its drain marker. Restore it before anything else, then
 # stop so an operator sees the failed deploy before the next attempt.
 media_bluegreen_recover_stranded() {
-  local active old running tombstone port
+  local active old running tombstone port window rc
   active="$(media_bluegreen_redis GET media:active_colour)" || return 1
   case "$active" in
     blue) old=green ;;
     green) old=blue ;;
     *) return 0 ;;
   esac
-  # A restarting active colour is not stranded; leave it to its policy.
+  # Without the old colour's drain marker there is nothing to restore.
+  tombstone="$(media_bluegreen_redis GET "media:colour_draining:${old}")" || return 1
+  [[ -n "$tombstone" ]] || return 0
+  # A running or restarting active colour is left to its restart policy,
+  # unless it is crash-looping within MEDIA_BLUEGREEN_CRASHLOOP_WINDOW seconds
+  # (default 900) of the handoff's drain: an older marker means the reaper is
+  # failing, and the active colour's restarts then need not come from the deploy.
   running="$(cd "$DEPLOY_DIR" && { $COMPOSE_CMD ps --status running -q "media-plane-${active}" \
     && $COMPOSE_CMD ps --status restarting -q "media-plane-${active}"; })" || return 1
-  [[ -z "$running" ]] || return 0
-  tombstone="$(media_bluegreen_redis EXISTS "media:colour_draining:${old}")" || return 1
-  [[ "$tombstone" == 1 ]] || return 0
+  if [[ -n "$running" ]]; then
+    window="${MEDIA_BLUEGREEN_CRASHLOOP_WINDOW:-900}"
+    [[ "$window" =~ ^[1-9][0-9]{0,5}$ ]] || {
+      echo 'media-bluegreen: MEDIA_BLUEGREEN_CRASHLOOP_WINDOW must be 1-999999' >&2
+      return 1
+    }
+    [[ "${tombstone%%:*}" =~ ^[0-9]+$ ]] || return 1
+    (( $(date +%s) - ${tombstone%%:*} < window )) || return 0
+    rc=0; media_bluegreen_crashlooping "$active" || rc=$?
+    (( rc != 1 )) || return 0
+    (( rc == 0 )) || {
+      echo "media-bluegreen: cannot tell whether active ${active} is crash-looping" >&2
+      return 1
+    }
+  fi
   port="$(media_bluegreen_port "$old")" || return 1
-  echo "media-bluegreen: active ${active} is not running and ${old} is drained; restoring ${old}" >&2
+  echo "media-bluegreen: active ${active} is not running or is crash-looping, and ${old} is drained; restoring ${old}" >&2
   media_bluegreen_handoff_restore "$old" "$active" "$port" || return 1
   echo "media-bluegreen: ${old} serves again; rerun the deploy to retry the cutover" >&2
   return 1

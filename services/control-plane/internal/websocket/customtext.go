@@ -19,7 +19,7 @@ import (
 
 // customTextCategory is the rich-presence category string for custom text. It
 // must match RichPresenceCategorySchema's `custom_text` member in
-// client/desktop/src/renderer/types/ws-events.ts (#1233 Task B1/B2).
+// Concord-Voice/Desktop:desktop/src/renderer/types/ws-events.ts (#1233 Task B1/B2).
 const customTextCategory = "custom_text"
 
 const (

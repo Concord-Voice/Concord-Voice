@@ -1,7 +1,7 @@
 /**
  * Server → client wire shapes for the #2153 media-rate policer. Additive
  * only: no IPC contract, OpenAPI or control-plane change. The renderer's zod
- * mirror lives in `client/desktop/src/renderer/services/voice/mediaPolicyEvents.ts`.
+ * mirror lives in `Concord-Voice/Desktop:desktop/src/renderer/services/voice/mediaPolicyEvents.ts`.
  */
 import type {
   MediaPolicyCooldownError,
