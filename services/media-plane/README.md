@@ -240,9 +240,9 @@ MEDIASOUP_LOG_LEVEL=warn
   settings. A mediasoup worker is a single-threaded C++
   subprocess pinned to one core, so a count above the CPU allocation
   oversubscribes the CFS quota and shows up as RTP jitter rather than a crash.
-  Change the worker count and CPU quota together. The fresh-host acceptance
-  runner checks the selected model against daemon CPU capacity; that check does
-  not establish performance or minimum-memory sufficiency.
+  Change the worker count and CPU quota together. Fresh-host acceptance (run in
+  the self-host release repository) checks the selected model against daemon CPU
+  capacity; that check does not establish performance or minimum-memory sufficiency.
 - The worker count is validated fail-closed at startup (#2178): a value that is
   not an integer in `[1, 32]` logs `FATAL:` and exits 1 instead of falling back
   to the default. Both bounds matter. `NUM_WORKERS=0` would otherwise build an

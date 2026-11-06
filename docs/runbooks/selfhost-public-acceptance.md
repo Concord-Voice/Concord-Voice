@@ -14,9 +14,7 @@ This template does not establish that any acceptance run succeeded.
 
 ## Lane 1: Local fresh-host acceptance
 
-Routine PR CI no longer runs the full fresh-host acceptance job (removed 2026-10-06). Installer, wrapper, certificate and acceptance-validator contract tests remain; their results do not supply fresh-host evidence. Release acceptance of the exact published bundle runs in `Concord-Voice/Self-Hosted`. Removing routine acceptance neither runs that lane nor establishes its evidence.
-
-The reusable `selfhost-acceptance.yml` lane has no caller in Hosted since #4314 and is dormant. When called, it uses a disposable Blacksmith Ubuntu 24.04 runner with four vCPUs, a 50-minute job budget and a 44-minute acceptance-step limit. The harness admits its closed GitHub-hosted or Blacksmith CI compatibility profile; arbitrary self-hosted runners are refused. These admission and sizing contracts do not establish runner provenance or change the supported deployment-host requirements.
+Routine PR CI no longer runs the full fresh-host acceptance job (removed 2026-10-06). Installer, wrapper and certificate contract tests remain; their results do not supply fresh-host evidence. Release acceptance of the exact published bundle runs in `Concord-Voice/Self-Hosted`. Removing routine acceptance neither runs that lane nor establishes its evidence.
 
 Historical schema-1 artifacts identify their exact candidate SHA, run, runner and tools. Each bounded check contains only its stage, assertion, status and fixed code; these fields point to the recovery guidance below. Additional sanitized operator observations belong in the private evidence record, outside the artifact. Link only evidence from the actual candidate and acceptance run. All template entries remain unverified.
 
@@ -31,7 +29,7 @@ Historical schema-1 artifacts identify their exact candidate SHA, run, runner an
 
 A schema-1 PR/source artifact retains its development purpose. Release acceptance of an exact published bundle runs in [`Concord-Voice/Self-Hosted`](https://github.com/Concord-Voice/Self-Hosted); Hosted has no release-candidate lane. Job success alone is insufficient. This lane is local-only: its loopback address and test FQDN establish no public DNS, NAT, provider firewall behavior, external TURN or client use. Local TLS is not system-CA client trust; the disposable PostgreSQL-row readback establishes only the tested named-volume retention behavior, not backup or recovery.
 
-Fresh-host CI admits the tested nginx service only when it is loaded, inactive or failed, and reports a zero main PID; other states are refused before configuration changes. It then gives that service a dedicated configuration and PID and validates the shipped vhost through syntax, activation, reload, TLS and route checks. It does not stop or kill an existing service. These local checks do not replace manual public-host observations or the reviewed ingress contract.
+Hosted no longer carries a fresh-host harness or nginx fixture; the nginx admission and isolated-vhost checks run in `Concord-Voice/Self-Hosted`'s acceptance lane. They do not replace manual public-host observations or the reviewed ingress contract.
 
 ## Manual public-host lane
 
