@@ -155,7 +155,7 @@ func (h *Handler) dropPromotedOrphan(ctx context.Context, store coldTierStore, f
 // with a HEAD first. Returns at once; the work is detached and slot-bounded
 // like goColdRead.
 // DownloadAttachment does not use this: it already has the class from its GET.
-// Its first caller is the presigned-URL route in #4323, which lands after this.
+// AttachmentDownloadURL (the presigned-URL route) is its caller.
 func (h *Handler) recordAttachmentRead(store ObjectStore, fileID, key string) {
 	ts, ok := store.(coldTierStore)
 	if !ok || h.sessionRedis == nil {

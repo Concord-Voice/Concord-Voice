@@ -269,6 +269,12 @@ func isE2ETestEnv() bool {
 	return os.Getenv("CONCORD_ENV") == "test"
 }
 
+// directAttachmentDownloadEnabled is the ONE predicate for the #1612 route and
+// its capability flag.
+func directAttachmentDownloadEnabled(cfg *config.Config, mediaHandler *media.Handler) bool {
+	return mediaHandler != nil && cfg.AttachmentDirectDownload
+}
+
 func publicInviteIconHandler(invitesHandler *invites.Handler, mediaHandler *media.Handler) gin.HandlerFunc {
 	if mediaHandler != nil {
 		return mediaHandler.ProxyInviteServerIcon
@@ -1305,6 +1311,9 @@ func NewRouter(
 	// cannot complete -- and the client believes it, because a capability is
 	// the only evidence it has.
 	serverCapabilitiesHandler.SetChunkedAttachmentUpload(mediaHandler != nil && redis != nil)
+	// #1612: exactly the condition the direct-download route is registered
+	// under below, so the capability and the route cannot disagree.
+	serverCapabilitiesHandler.SetDirectAttachmentDownload(directAttachmentDownloadEnabled(cfg, mediaHandler))
 	// #3454: the same predicate the boot guard above enforced, so the
 	// capability can never advertise a gate the guard would not have admitted.
 	serverCapabilitiesHandler.SetMFAEnforcedDangerousActions(
@@ -3288,11 +3297,22 @@ func NewRouter(
 			// TestUploadSessionRouteShapes locks the exact paths.
 			media.RegisterUploadSessionRoutes(mediaRoutes, mediaHandler, redis)
 
-			// Tier 2 proxy download (E2EE attachment — proxied, not presigned)
+			// Tier 2 proxy download (E2EE attachment, proxied). The presigned
+			// alternative is /attachments/:file_id/url when #1612 is enabled.
 			mediaRoutes.GET("/attachments/:file_id",
 				middleware.RateLimitByUser(redis, 60, 1*time.Minute),
 				mediaHandler.DownloadAttachment,
 			)
+
+			// Tier 2 direct download (#1612): authorize, then answer with a
+			// short-lived presigned URL. Registered only when enabled, and the
+			// capability above reads the same function.
+			if directAttachmentDownloadEnabled(cfg, mediaHandler) {
+				mediaRoutes.GET("/attachments/:file_id/url",
+					middleware.RateLimitByUser(redis, 60, 1*time.Minute),
+					mediaHandler.AttachmentDownloadURL,
+				)
+			}
 
 			// Delete media (uploader only)
 			mediaRoutes.DELETE("/:file_id",

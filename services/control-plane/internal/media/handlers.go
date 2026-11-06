@@ -514,44 +514,12 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 // object — and an unrecognized value fails closed with 503 rather than being
 // read out of some other bucket.
 func (h *Handler) DownloadAttachment(c *gin.Context) {
-	userID := c.GetString("user_id")
-	parsedID, err := uuid.Parse(c.Param("file_id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file ID"})
+	row, ok := h.loadAuthorizedAttachment(c)
+	if !ok {
 		return
 	}
-	// Canonical form, so every spelling of one UUID shares one cold-read counter.
-	fileID := parsedID.String()
-
-	// Fetch file metadata and verify access
-	var storageKey, mimeType, uploaderID string
-	var fileSize int64
-	var channelID, conversationID *string
-	// NULLable: rows predating the client-attested epoch (#2832) carry none, and
-	// the client correctly falls back to the current key for those.
-	var keyVersion *int
-	// NULLable, permanently: NULL means the legacy backend (migration 000114
-	// is explicit that it is never backfilled), so this is not a gap to be
-	// closed — it is the value every pre-cutover object carries forever.
-	var storageBackend *string
-
-	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version, storage_backend, uploader_id
-	          FROM media_files
-	          WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`
-	err = h.db.QueryRow(query, fileID).
-		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion, &storageBackend, &uploaderID)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgFileNotFound})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to fetch file metadata", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch file"})
-		return
-	}
-
-	if !h.userCanDownloadAttachment(c, userID, uploaderID, fileID, channelID, conversationID) {
-		return
-	}
+	fileID, storageKey, mimeType, fileSize, keyVersion, storageBackend :=
+		row.fileID, row.storageKey, row.mimeType, row.fileSize, row.keyVersion, row.storageBackend
 
 	// Stream the encrypted blob to the client from the backend this row names.
 	store, ok := h.requireObjectStoreForRow(c, storageBackend)

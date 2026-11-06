@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"time"
 
@@ -318,12 +319,18 @@ func (c *Client) PromoteToStandard(ctx context.Context, key string) error {
 
 // PresignedGetURL generates a time-limited download URL for an object.
 // The URL is signed with the service credentials and expires after the given duration.
+// The signed response overrides force an opaque download, so a URL to
+// uploader-controlled bytes can never render inline from the bucket host
+// whatever Content-Type the object was stored with.
 func (c *Client) PresignedGetURL(ctx context.Context, key string, expires time.Duration) (string, error) {
-	url, err := c.minio.PresignedGetObject(ctx, c.bucket, key, expires, nil)
+	params := url.Values{}
+	params.Set("response-content-disposition", "attachment")
+	params.Set("response-content-type", "application/octet-stream")
+	signed, err := c.minio.PresignedGetObject(ctx, c.bucket, key, expires, params)
 	if err != nil {
 		return "", fmt.Errorf("storage: failed to generate presigned URL for %q: %w", key, err)
 	}
-	return url.String(), nil
+	return signed.String(), nil
 }
 
 // DeleteObject removes an object from the configured bucket.

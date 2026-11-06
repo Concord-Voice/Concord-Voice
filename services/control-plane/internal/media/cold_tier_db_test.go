@@ -74,3 +74,28 @@ func TestNoteColdRead_DeletedDuringCopyRemovesObject(t *testing.T) {
 	require.Equal(t, []string{key}, store.promoted)
 	require.False(t, ts.store.hasObject(key), "a copy that outlived its row is deleted again")
 }
+
+// A presigned download never passes through the proxy, so the URL route must
+// count the read itself: two presign requests for a cold file promote it.
+func TestAttachmentDownloadURL_SecondColdReadPromotes(t *testing.T) {
+	ts, vendor, owner, channelID := directSetup(t)
+	store := &coldStore{mockStore: vendor, class: "STANDARD_IA", done: make(chan string, 4)}
+	ts.handler.SetStoreResolver(stubDeleteStoreResolver{store: store})
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	ts.handler.SetSessionRedis(rdb)
+	backend := "r2-useast"
+	fileID := insertDirectFixture(t, ts, vendor, owner, channelID, &backend, 1<<30, nil)
+
+	for i := 0; i < 2; i++ {
+		w := getURL(ts, fileID, owner)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	}
+	select {
+	case got := <-store.done:
+		require.Equal(t, fmt.Sprintf(fmtAttachmentsKey, fileID), got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second presigned cold read did not promote")
+	}
+}

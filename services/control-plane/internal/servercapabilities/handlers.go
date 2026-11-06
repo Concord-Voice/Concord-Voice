@@ -28,6 +28,9 @@ type Handler struct {
 	// Set by the router from the dangerous-action boot guard's own predicate.
 	// See SetMFAEnforcedDangerousActions.
 	mfaEnforcedDangerousActions bool
+	// Set by the router to the registration condition of the direct-download
+	// route. See SetDirectAttachmentDownload.
+	directAttachmentDownload bool
 }
 
 // NewHandler creates a capabilities handler. No logger: the handler is a pure
@@ -66,6 +69,15 @@ func (h *Handler) SetChunkedAttachmentUpload(v bool) {
 // believe the toggle protects anything, so it says nothing it has not proved.
 func (h *Handler) SetMFAEnforcedDangerousActions(v bool) {
 	h.mfaEnforcedDangerousActions = v
+}
+
+// SetDirectAttachmentDownload records whether GET
+// /media/attachments/:file_id/url is registered (#1612). The router passes the
+// same expression it registers the route under, so the client never asks for a
+// URL this deployment cannot mint. The zero value is FALSE: a client that sees
+// false keeps using the proxy, which is always correct.
+func (h *Handler) SetDirectAttachmentDownload(v bool) {
+	h.directAttachmentDownload = v
 }
 
 // ServerInfo identifies the server and its deployment type.
@@ -123,6 +135,10 @@ type FeaturesInfo struct {
 	// ChunkedAttachmentUpload gives: a server without the gates says false
 	// rather than leaving the client to infer it from a missing key.
 	MFAEnforcedDangerousActions bool `json:"mfaEnforcedDangerousActions"`
+	// Whether GET /media/attachments/:file_id/url can mint presigned download
+	// URLs (#1612). NOT omitempty: false means "use the proxy", and a client
+	// must never have to guess that from a missing key.
+	DirectAttachmentDownload bool `json:"directAttachmentDownload"`
 }
 
 // Response is the payload for GET /api/v1/server/capabilities. The schema is
@@ -195,6 +211,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			PurgeKeepsPinned:                true,
 			ExpirationPinnedPolicySupported: true,
 			MFAEnforcedDangerousActions:     h.mfaEnforcedDangerousActions,
+			DirectAttachmentDownload:        h.directAttachmentDownload,
 		},
 		PolicyVersion: policyVersion,
 	}

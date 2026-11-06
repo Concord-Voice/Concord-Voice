@@ -4563,6 +4563,7 @@ paths:
                     - purgeKeepsPinned
                     - expirationPinnedPolicySupported
                     - mfaEnforcedDangerousActions
+                    - directAttachmentDownload
                     properties:
                       voiceTiersSupported:
                         type: boolean
@@ -4590,6 +4591,14 @@ paths:
                           Clients MUST fail closed to the single-shot
                           /media/upload/attachment path on anything but an
                           explicit true.
+                      directAttachmentDownload:
+                        type: boolean
+                        description: >-
+                          Whether GET /media/attachments/{file_id}/url is
+                          registered and can mint presigned download URLs
+                          (#1612). The route and this flag read one predicate,
+                          so they cannot disagree. Clients MUST use the proxy
+                          download on anything but an explicit true.
                       purgeKeepsPinned:
                         type: boolean
                         description: >-
@@ -9037,6 +9046,122 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           description: Media storage not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /media/attachments/{file_id}/url:
+    get:
+      tags:
+      - Media
+      summary: Get a short-lived direct download URL for an E2EE attachment
+      operationId: mediaAttachmentDownloadURL
+      description: 'Authorizes exactly as the proxy download does, then returns a presigned URL for the
+
+        encrypted blob on its vendor bucket, valid for 90 seconds (#1612, ADR-0038). Authorize-then-fetch,
+
+        never a redirect: the CSK epoch rides in the body because a presigned URL cannot carry
+
+        X-File-Key-Version. Registered only when features.directAttachmentDownload is true.
+
+        Objects on the legacy backend, and objects below STORAGE_PRESIGN_MIN_BYTES (default 1 MiB),
+
+        answer 409 proxy_only; the client then uses GET /media/attachments/{file_id}.
+
+        Rate limit: 60 requests per minute.
+
+        '
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: file_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Media file UUID
+      responses:
+        '200':
+          description: Presigned download URL for the ciphertext
+          headers:
+            Cache-Control:
+              description: no-store
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - url
+                - expiresAt
+                - mimeType
+                - keyVersion
+                - size
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  mimeType:
+                    type: string
+                    description: Original MIME type hint for client-side decryption
+                  keyVersion:
+                    type: integer
+                    minimum: 1
+                    nullable: true
+                    description: CSK epoch the file was sealed under; same meaning as X-File-Key-Version
+                  size:
+                    type: integer
+                    format: int64
+                    description: Ciphertext size in bytes; the fetched body must be exactly this long
+        '400':
+          description: Invalid file ID (not a UUID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not a member of the owning channel/conversation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: File not found (unknown, deleted, or not a Tier 2 attachment)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: proxy_only. Use GET /media/attachments/{file_id} for this file
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                - code
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - proxy_only
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The URL could not be presigned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: The row's storage backend could not be resolved
           content:
             application/json:
               schema:

@@ -502,3 +502,26 @@ func TestGetCapabilities_SessionBindingAdvertisedOnlyWhenEnabled(t *testing.T) {
 		}
 	}
 }
+
+func TestGetCapabilities_DirectAttachmentDownload(t *testing.T) {
+	read := func(h *servercapabilities.Handler) (any, bool) {
+		w, c := newTestContext()
+		h.GetCapabilities(c)
+		require.Equal(t, http.StatusOK, w.Code)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		features, ok := body["features"].(map[string]any)
+		require.True(t, ok, "features object missing")
+		got, present := features["directAttachmentDownload"]
+		return got, present
+	}
+
+	h := servercapabilities.NewHandler(&config.Config{InstanceType: "saas"})
+	got, present := read(h)
+	require.True(t, present, "false must be said, not omitted")
+	assert.Equal(t, false, got, "fail closed: the proxy is always correct")
+
+	h.SetDirectAttachmentDownload(true)
+	got, _ = read(h)
+	assert.Equal(t, true, got)
+}

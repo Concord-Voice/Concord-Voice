@@ -199,6 +199,9 @@ func (c CloudflareR2Config) String() string {
 		c.Endpoint, c.Region, c.Bucket, len(c.AccessKeyID), len(c.SecretAccessKey))
 }
 
+// minPresignBytes is ADR-0038's permanent proxy floor for direct downloads.
+const minPresignBytes int64 = 1 << 20
+
 // Config holds all configuration for the application
 type Config struct {
 	Environment string
@@ -344,6 +347,18 @@ type Config struct {
 	// AttachmentWriteBackend is the registry backend id for new v3 attachment
 	// writes. Empty configuration normalizes to the permanent legacy selector.
 	AttachmentWriteBackend string
+	// AttachmentDirectDownload registers GET /media/attachments/:file_id/url,
+	// which answers with a short-lived presigned URL on a vendor backend so
+	// large attachments skip the control-plane proxy (#1612, ADR-0038). Off by
+	// default: the proxy is the permanent path, and the capability flag that
+	// tells clients about this route reads the same value.
+	AttachmentDirectDownload bool
+	// StoragePresignMinBytes is the smallest object served direct. Below it
+	// the extra round trip costs more than the transfer (ADR-0038 default
+	// 1 MiB), so those stay on the proxy. Clamped to at least minPresignBytes:
+	// ADR-0038 keeps small files on the proxy permanently, so the env var can
+	// only raise the floor.
+	StoragePresignMinBytes int64
 	// FeedbackScreenshotR2 is a separate private bucket and credential for
 	// public issue screenshot proxies. Legacy rows still resolve to MinIO.
 	FeedbackScreenshotR2 CloudflareR2Config
@@ -559,7 +574,9 @@ func Load() (*Config, error) {
 			AccessKeyID:     getEnv("CLOUDFLARE_R2_USEAST_ID", ""),
 			SecretAccessKey: getEnv("CLOUDFLARE_R2_USEAST_ID_KEY", ""), // #nosec G101 -- env var name, not a secret
 		},
-		AttachmentWriteBackend: normalizeAttachmentWriteBackend(getEnv("ATTACHMENT_WRITE_BACKEND", "")),
+		AttachmentWriteBackend:   normalizeAttachmentWriteBackend(getEnv("ATTACHMENT_WRITE_BACKEND", "")),
+		AttachmentDirectDownload: getEnv("ATTACHMENT_DIRECT_DOWNLOAD", "false") == "true",
+		StoragePresignMinBytes:   max(getEnvInt64("STORAGE_PRESIGN_MIN_BYTES", minPresignBytes), minPresignBytes),
 		FeedbackScreenshotR2: CloudflareR2Config{
 			Endpoint:        getEnv("CLOUDFLARE_R2_FEEDBACK_ENDPOINT", ""),
 			Region:          getEnv("CLOUDFLARE_R2_FEEDBACK_REGION", "auto"),

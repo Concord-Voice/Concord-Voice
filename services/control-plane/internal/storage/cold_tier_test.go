@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -70,4 +71,16 @@ func TestStorageClass_FromHead(t *testing.T) {
 	class, err := c.StorageClass(context.Background(), "attachments/x")
 	require.NoError(t, err)
 	require.Equal(t, StorageClassInfrequentAccess, class)
+}
+
+// A presigned URL to uploader-controlled bytes must download, never render.
+func TestPresignedGetURL_ForcesOpaqueDownload(t *testing.T) {
+	var copied http.Header
+	c := fakeS3(t, &copied)
+	signed, err := c.PresignedGetURL(t.Context(), "attachments/k", 90*time.Second)
+	require.NoError(t, err)
+	u, err := url.Parse(signed)
+	require.NoError(t, err)
+	require.Equal(t, "attachment", u.Query().Get("response-content-disposition"))
+	require.Equal(t, "application/octet-stream", u.Query().Get("response-content-type"))
 }

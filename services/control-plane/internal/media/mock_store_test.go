@@ -23,6 +23,10 @@ type mockStore struct {
 	// that yields these bytes and then fails — a connection dropped mid-transfer.
 	// The pre-read and mid-read failures are the same defect at two moments.
 	getPartial []byte
+	// presignErr, when non-nil, fails PresignedGetURL. The real client signs
+	// offline and never errors for a missing object, so tests inject this
+	// instead of relying on the missing-key branch below.
+	presignErr error
 }
 
 // partialReader yields its bytes once, then fails.
@@ -89,6 +93,9 @@ func (m *mockStore) GetObject(_ context.Context, key string) (io.ReadCloser, str
 func (m *mockStore) PresignedGetURL(_ context.Context, key string, _ time.Duration) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.presignErr != nil {
+		return "", m.presignErr
+	}
 	if _, ok := m.objects[key]; !ok {
 		return "", fmt.Errorf("mock presign %q: %w", key, storage.ErrObjectNotFound)
 	}
