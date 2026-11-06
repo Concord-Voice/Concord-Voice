@@ -575,7 +575,7 @@ npm test
 
 ### How do I self-host Concord Voice?
 
-**Status:** The self-hosting installer shipped in #1616 — see `docs/runbooks/selfhost-quickstart.md`. A versioned, verified public bundle is tracked at #2506, and air-gapped/offline distribution at #210 (v1.1.0). Narrative deployment guide tracked at #819.
+**Status:** The self-hosting installer shipped in #1616 — see `docs/runbooks/selfhost-quickstart.md`. Versioned, verified release bundles are published from [`Concord-Voice/Self-Hosted`](https://github.com/Concord-Voice/Self-Hosted/releases), and air-gapped/offline distribution at #210 (v1.1.0). Narrative deployment guide tracked at #819.
 
 **Current workaround** (for developers):
 

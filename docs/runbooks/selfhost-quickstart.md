@@ -1,6 +1,6 @@
 # Self-host release guidance
 
-Self-host installation is available only through a verified published release. Consult the [public Releases index](https://github.com/Concord-Voice/Concord-Voice/releases) for published assets. If no verified self-host release is listed, installation and an install link are unavailable.
+Self-host installation is available only through a verified published release. Self-host releases are published from the Concord-Voice/Self-Hosted repository; consult its [public Releases index](https://github.com/Concord-Voice/Self-Hosted/releases) for published assets. If no verified self-host release is listed, installation and an install link are unavailable.
 
 Use the operator guide retained with the selected verified immutable release tag and archive. This ordinary snapshot provides availability guidance; it does not announce a release or provide an installation procedure.
 

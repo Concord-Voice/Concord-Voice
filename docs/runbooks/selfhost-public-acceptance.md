@@ -2,21 +2,21 @@
 
 This is an **uncompleted template**, not an evidence ledger or release authorization. Do not enter completed observations here: this file may be published. Keep actual reviewed manual and ingress records exclusively in the private release-evidence directory. Never include credentials, certificate/key bytes, raw logs, raw Compose environment, host addresses, user data or identifying customer details.
 
-Publication remains **BLOCKED** until exact-public-bundle local acceptance, every required manual observation and the reviewed ingress contract are established. Earlier source-checkout CI and synthetic fixtures do not authorize a public bundle.
+Self-host release publication (owned by `Concord-Voice/Self-Hosted`) remains **BLOCKED** until exact-bundle local acceptance, every required manual observation and the reviewed ingress contract are established. Earlier source-checkout CI and synthetic fixtures do not authorize a public bundle.
 
 **Current record:** Local fresh-host acceptance is **UNVERIFIED** pending an explicit exact-candidate acceptance run and its sanitized evidence. Public acceptance is **UNVERIFIED**. Full #2505 closure and public publication are **BLOCKED** while internal development reference omitted remains open and required public evidence is absent. No operator run or evidence reference is recorded yet.
 
 ## Candidate identity template
 
-Record these in the private evidence record: canonical version and immutable tag, full source SHA, full public snapshot SHA, archive SHA-256, trusted private staging run and Git-bundle digest, public-main parent SHA, exact acceptance run/job and schema-2 safe artifact, manual revision/attester/date, and ingress contract SHA/proof reference. All lanes must identify the same verified public archive. A PR head, PR merge ref and later squash commit are separate identities.
+Record these in the private evidence record: canonical version and immutable tag, full source SHA, archive SHA-256, exact acceptance run/job and safe artifact, manual revision/attester/date, and ingress contract SHA/proof reference. All lanes must identify the same verified release archive. A PR head, PR merge ref and later squash commit are separate identities.
 
-Release authorization also requires the candidate's path, mode and byte inventory to match an independent assembly of the pinned source data using current approved tooling, manifest and public/release overlays. Historical source commits supply data, never their own executable assembly policy. This template does not establish that reconstruction or any acceptance run succeeded.
+This template does not establish that any acceptance run succeeded.
 
 ## Lane 1: Local fresh-host acceptance
 
-Routine PR CI no longer runs the full fresh-host acceptance job (removed 2026-10-06). Installer, wrapper, certificate and acceptance-validator contract tests remain; their results do not supply fresh-host evidence. Publication still requires the explicit protected-main exact-public-bundle lane and its schema-2 identity checks. Removing routine acceptance neither runs that lane nor establishes its evidence.
+Routine PR CI no longer runs the full fresh-host acceptance job (removed 2026-10-06). Installer, wrapper, certificate and acceptance-validator contract tests remain; their results do not supply fresh-host evidence. Release acceptance of the exact published bundle runs in `Concord-Voice/Self-Hosted`. Removing routine acceptance neither runs that lane nor establishes its evidence.
 
-The explicit lane uses a disposable Blacksmith Ubuntu 24.04 runner with four vCPUs, a 50-minute job budget and a 44-minute acceptance-step limit. The harness admits its closed GitHub-hosted or Blacksmith CI compatibility profile; arbitrary self-hosted runners are refused. These admission and sizing contracts do not establish runner provenance or change the supported deployment-host requirements.
+The reusable `selfhost-acceptance.yml` lane has no caller in Hosted since #4314 and is dormant. When called, it uses a disposable Blacksmith Ubuntu 24.04 runner with four vCPUs, a 50-minute job budget and a 44-minute acceptance-step limit. The harness admits its closed GitHub-hosted or Blacksmith CI compatibility profile; arbitrary self-hosted runners are refused. These admission and sizing contracts do not establish runner provenance or change the supported deployment-host requirements.
 
 Historical schema-1 artifacts identify their exact candidate SHA, run, runner and tools. Each bounded check contains only its stage, assertion, status and fixed code; these fields point to the recovery guidance below. Additional sanitized operator observations belong in the private evidence record, outside the artifact. Link only evidence from the actual candidate and acceptance run. All template entries remain unverified.
 
@@ -29,7 +29,7 @@ Historical schema-1 artifacts identify their exact candidate SHA, run, runner an
 | Local service health, nginx routes, rendered/live bindings | UNVERIFIED | Review the actual checks; do not infer external reachability. |
 | Wrapper stop/up and down/up retention of the synthetic database row | UNVERIFIED | Establish only the tested named-volume retention scope. |
 
-A schema-1 PR/source artifact retains its development purpose. Publication needs a protected-main release-candidate run and schema-2 artifact that verifies both full SHAs and the exact public bundle digest before running the same fresh-host checks. Job success alone is insufficient. This lane is local-only: its loopback address and test FQDN establish no public DNS, NAT, provider firewall behavior, external TURN or client use. Local TLS is not system-CA client trust; the disposable PostgreSQL-row readback establishes only the tested named-volume retention behavior, not backup or recovery.
+A schema-1 PR/source artifact retains its development purpose. Release acceptance of an exact published bundle runs in [`Concord-Voice/Self-Hosted`](https://github.com/Concord-Voice/Self-Hosted); Hosted has no release-candidate lane. Job success alone is insufficient. This lane is local-only: its loopback address and test FQDN establish no public DNS, NAT, provider firewall behavior, external TURN or client use. Local TLS is not system-CA client trust; the disposable PostgreSQL-row readback establishes only the tested named-volume retention behavior, not backup or recovery.
 
 Fresh-host CI admits the tested nginx service only when it is loaded, inactive or failed, and reports a zero main PID; other states are refused before configuration changes. It then gives that service a dedicated configuration and PID and validates the shipped vhost through syntax, activation, reload, TLS and route checks. It does not stop or kill an existing service. These local checks do not replace manual public-host observations or the reviewed ingress contract.
 
@@ -87,4 +87,4 @@ Use a disposable public host and the procedures linked below. Record observation
 
 ## Current closure boundary
 
-No row above records a successful run yet. Keep #2505 open until explicit protected-main exact-public-bundle fresh-host acceptance has passed with valid schema-2 evidence, every required public-host item has actual sanitized evidence, and #2269's ingress/firewall contract and public dependency are met. The closed #2504 issue remains a shipped prerequisite; its internal development reference omitted merged, and follow-up internal development reference omitted also merged. Neither merge records a successful public-host acceptance run. Issue #1945 is contextual to the history, outside this acceptance scope, and is not a new admission here.
+No row above records a successful run yet. Keep #2505 open until exact-bundle fresh-host acceptance (run in `Concord-Voice/Self-Hosted`) has passed with valid evidence, every required public-host item has actual sanitized evidence, and #2269's ingress/firewall contract and public dependency are met. The closed #2504 issue remains a shipped prerequisite; its internal development reference omitted merged, and follow-up internal development reference omitted also merged. Neither merge records a successful public-host acceptance run. Issue #1945 is contextual to the history, outside this acceptance scope, and is not a new admission here.
