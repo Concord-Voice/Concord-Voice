@@ -1,1 +1,0 @@
-ALTER TABLE channels ADD COLUMN audio_quality_tier VARCHAR(20) DEFAULT NULL;

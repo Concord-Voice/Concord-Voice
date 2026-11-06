@@ -1,1 +1,0 @@
-ALTER TABLE servers DROP COLUMN IF EXISTS banner_url;

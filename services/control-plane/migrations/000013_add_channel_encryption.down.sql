@@ -1,2 +1,0 @@
-ALTER TABLE channels DROP COLUMN IF EXISTS is_encrypted;
-ALTER TABLE servers DROP COLUMN IF EXISTS e2ee_default;

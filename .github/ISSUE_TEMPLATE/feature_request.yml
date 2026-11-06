@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest something Concord Voice should do.
+title: "[FEATURE] "
+labels: ["type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the idea. Please search the open issues first, and add a 👍 to a matching request instead of opening a new one.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Tell us what you are trying to do and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+    validations:
+      required: true
+  - type: dropdown
+    id: app
+    attributes:
+      label: Which app?
+      multiple: true
+      options:
+        - Desktop
+        - iOS
+        - Android
+        - Self-hosted server
+        - Website
+        - All of them
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Optional. Screenshots, examples or links.
