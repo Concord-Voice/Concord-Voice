@@ -1,0 +1,36 @@
+name: SonarCloud
+
+# SonarCloud analysis runs from GitHub Actions on every repository in the
+# org, private repositories included (owner decision, 2026-11-04).
+# Automatic Analysis stays off, because SonarCloud rejects a CI scan while
+# it is on.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: sonarcloud-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonarcloud:
+    name: SonarCloud
+    # Fork PRs get no secrets, so only same-repository PRs and main are scanned.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history for new-code detection and blame
+          persist-credentials: false
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Known Issues
+    url: https://github.com/Concord-Voice/Concord-Voice/issues/39
+    about: Check whether we already know about your problem.
+  - name: Report a security vulnerability
+    url: https://github.com/Concord-Voice/.github/blob/main/SECURITY.md
+    about: Never file security problems publicly. Email security@concordvoice.com instead.
