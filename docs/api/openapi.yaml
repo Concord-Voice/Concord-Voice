@@ -9965,7 +9965,7 @@ paths:
       summary: Upload a profile banner image
       operationId: mediaUploadBanner
       description: 'Tier 1 authenticated upload. Image is resized to fit 1500x500 and re-encoded; max
-        raw upload 5 MiB for free users or 8 MiB for Supersonic users.
+        raw upload 5 MiB for free users or 10 MiB for Supersonic users.
 
         Rate limit: 5 requests per minute.
 
@@ -10325,7 +10325,8 @@ paths:
         Tier 1 authenticated upload. Requires the manage_server permission on the target server.
 
         Image is resized to fit 512x512 and re-encoded; max raw upload 5 MiB for Groundspeed servers
-        or 8 MiB for Mach servers.
+        or 8 MiB for Mach servers. An animated GIF keeps its animation on Mach 1+ (and self-host);
+        below Mach 1 it is refused with a 403 `animated_server_icon_mach`.
 
         Rate limit: 5 requests per minute.
 
@@ -13472,9 +13473,9 @@ paths:
         '403':
           description: >-
             An inline `icon_url` or `banner_url` that animates (a multi-frame GIF, an APNG or an
-            animated WebP) (#3856). A new server starts below Mach, so an animated banner is always
-            refused here, and an animated icon is refused at every tier. Static inline images are
-            accepted.
+            animated WebP) (#3856). A new managed server starts below Mach, so an animated icon or
+            banner is refused there; a new self-hosted server starts at the self-host tier, which
+            allows both. Static inline images are accepted.
           content:
             application/json:
               schema:
@@ -13752,8 +13753,8 @@ paths:
 
 
             The same status also refuses an inline `data:image/` icon or banner that animates (#3856):
-            `animated_not_supported` for an icon at every tier, `animated_server_banner_mach` for a
-            banner on a server whose tier lacks animated banners. Static inline images are accepted.
+            `animated_server_icon_mach` for an icon, or `animated_server_banner_mach` for a banner,
+            on a server whose tier lacks that animated perk (Mach 1+ has both). Static inline images are accepted.
           content:
             application/json:
               schema:
@@ -13917,19 +13918,49 @@ paths:
                         type: string
                         enum:
                         - groundspeed
-                        - mach
+                        - mach1
+                        - mach2
+                        - mach3
+                        - selfhost
                       MaxServerCustomEmoji:
                         type: integer
+                        description: Custom emoji cap; negative = unlimited (selfhost)
                       MaxServerStickers:
                         type: integer
+                        description: Sticker cap; negative = unlimited (selfhost)
+                      MaxServerSoundboards:
+                        type: integer
+                        description: Soundboard cap (feature not built yet); negative = unlimited (selfhost)
+                      MaxServerIconBytes:
+                        type: integer
+                        format: int64
+                      MaxServerBannerBytes:
+                        type: integer
+                        format: int64
+                      MaxServerUploadBytes:
+                        type: integer
+                        format: int64
+                        description: Per-file upload cap for every member; -1 = unlimited (selfhost)
+                      AllowAnimatedServerBanner:
+                        type: boolean
+                      AllowAnimatedServerIcon:
+                        type: boolean
                       MaxServerStoragePoolBytes:
                         type: integer
                         format: int64
                         description: -1 sentinel = limit not yet decided (do not enforce)
                       UnlockServerAudioQualityCaps:
                         type: boolean
-                      UnlockServerVideoQualityCaps:
-                        type: boolean
+                      ServerVideoFloorHeight:
+                        type: integer
+                        description: Granted minimum video height for every member; 0 = no floor
+                      ServerVideoFloorFps:
+                        type: integer
+                        description: Granted minimum video frame rate; 0 = no floor
+                      ServerVideoFloorPixelRate:
+                        type: integer
+                        format: int64
+                        description: Granted minimum pixel rate (16:9 width x height x fps); 0 = no floor
         '400':
           description: Invalid server ID
           content:
@@ -21630,10 +21661,12 @@ components:
         code:
           type: string
           description: >-
-            `animated_not_supported` for an icon (no tier may animate one);
-            `animated_server_banner_mach` for a banner on a server below Mach.
+            `animated_server_icon_mach` for a server icon and `animated_server_banner_mach` for a
+            server banner on a server below Mach 1; `animated_not_supported` for an upload type
+            that never animates (a group-DM icon).
           enum:
           - animated_not_supported
+          - animated_server_icon_mach
           - animated_server_banner_mach
       required:
       - error
@@ -22527,7 +22560,8 @@ components:
           nullable: true
           description: >-
             Static `data:image/` URL (PNG, JPEG, GIF or WebP, max 5 MiB). An animated icon is
-            refused with a 403.
+            refused with a 403 unless the new server's starting tier allows animated icons (a
+            self-hosted instance's tier does; Groundspeed does not).
         banner_url:
           type: string
           nullable: true
@@ -22549,7 +22583,7 @@ components:
           nullable: true
           description: >-
             The server's uploaded icon URL, a `data:image/` URL, or null to remove. An animated
-            inline icon is refused with a 403 at every tier. Re-sending the inline value the server
+            inline icon is refused with a 403 unless the server's tier allows animated icons (Mach 1+). Re-sending the inline value the server
             already stores is a no-op.
         banner_url:
           type: string

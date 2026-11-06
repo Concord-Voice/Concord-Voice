@@ -16,13 +16,15 @@ import (
 // Regression suite for #3856 Part B: CreateServer and UpdateServer accepted an
 // inline data:image/ icon or banner and stored the bytes verbatim, so an
 // animated image rendered animated in <img> without passing the upload route's
-// gates (no animated icon at any tier; animated banner needs a Mach server).
+// gates (an animated icon or banner needs a Mach server).
 // Static inline images keep working — the desktop CreateServerModal sends them
 // inline at create time.
 
 const (
-	codeAnimatedNotSupported = "animated_not_supported"
-	codeAnimatedBannerMach   = "animated_server_banner_mach"
+	codeAnimatedIconMach   = "animated_server_icon_mach"
+	codeAnimatedBannerMach = "animated_server_banner_mach"
+	// inlineFrameCapPlusOne is one frame over media's maxGifFrames (120).
+	inlineFrameCapPlusOne = 121
 )
 
 // animatedInlineImages are inline images every refusal path must catch,
@@ -127,7 +129,7 @@ func TestCreateServerStaticInlineImagesStillWork(t *testing.T) {
 	}
 }
 
-func TestCreateServerRefusesAnimatedInlineIcon(t *testing.T) {
+func TestCreateServerRefusesAnimatedInlineIconBelowMach(t *testing.T) {
 	ts := setupTS(t)
 
 	for label, dataURL := range animatedInlineImages(t) {
@@ -141,8 +143,8 @@ func TestCreateServerRefusesAnimatedInlineIcon(t *testing.T) {
 
 			var body map[string]interface{}
 			testhelpers.ParseJSON(t, w, &body)
-			assert.Equal(t, codeAnimatedNotSupported, body["code"])
-			assert.Equal(t, "Animated images are not supported for this upload type", body["error"])
+			assert.Equal(t, codeAnimatedIconMach, body["code"])
+			assert.Equal(t, "Animated server icons require a Mach server boost", body["error"])
 			assert.Zero(t, serverCountOwnedBy(t, ts, user.ID), "a refused create must not create a server")
 		})
 	}
@@ -190,34 +192,43 @@ func TestCreateServerRefusesMalformedInlineImage(t *testing.T) {
 
 // --- UpdateServer ---
 
-func TestUpdateServerRefusesAnimatedInlineIconAtEveryTier(t *testing.T) {
-	// Self-hosted resolves to a tier whose banner allowance is on; the icon
-	// still has no animated allowance anywhere (no upload route allows one).
-	for _, tc := range []struct{ name, instanceType string }{
-		{"managed", ""},
-		{"self-hosted", "self-hosted"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.instanceType != "" {
-				t.Setenv("INSTANCE_TYPE", tc.instanceType)
-			}
-			ts := setupTS(t)
+func TestUpdateServerRefusesAnimatedInlineIconBelowMach(t *testing.T) {
+	ts := setupTS(t)
 
-			for label, dataURL := range animatedInlineImages(t) {
-				user := newInlineOwner(t, ts)
-				serverID := ts.CreateTestServer(t, user.ID, "Icon Server")
-				w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
-					"name":     "Icon Server",
-					"icon_url": dataURL,
-				}, testhelpers.AuthHeaders(user.AccessToken))
-				require.Equal(t, http.StatusForbidden, w.Code, label+": "+w.Body.String())
+	for label, dataURL := range animatedInlineImages(t) {
+		user := newInlineOwner(t, ts)
+		serverID := ts.CreateTestServer(t, user.ID, "Icon Server")
+		w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
+			"name":     "Icon Server",
+			"icon_url": dataURL,
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusForbidden, w.Code, label+": "+w.Body.String())
 
-				var body map[string]interface{}
-				testhelpers.ParseJSON(t, w, &body)
-				assert.Equal(t, codeAnimatedNotSupported, body["code"], label)
-				assert.Nil(t, storedServerImage(t, ts, serverID, "icon_url"), label)
-			}
-		})
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, codeAnimatedIconMach, body["code"], label)
+		assert.Nil(t, storedServerImage(t, ts, serverID, "icon_url"), label)
+	}
+}
+
+func TestUpdateServerAcceptsAnimatedInlineIconOnATierThatAllowsIt(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updmachanimicon")
+	serverID := ts.CreateTestServer(t, user.ID, "Mach Icon Server")
+
+	images := animatedInlineImages(t)
+	for _, label := range []string{"animated gif"} {
+		dataURL := images[label]
+		w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
+			"name":     "Mach Icon Server",
+			"icon_url": dataURL,
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, label+": "+w.Body.String())
+
+		stored := storedServerImage(t, ts, serverID, "icon_url")
+		require.NotNil(t, stored, label)
+		assert.Equal(t, dataURL, *stored, label+": the allowed animated icon is stored verbatim")
 	}
 }
 
@@ -247,7 +258,7 @@ func TestUpdateServerAcceptsAnimatedInlineBannerOnATierThatAllowsIt(t *testing.T
 	serverID := ts.CreateTestServer(t, user.ID, "Mach Banner Server")
 
 	images := animatedInlineImages(t)
-	for _, label := range []string{"animated gif", "animated apng", "animated webp"} {
+	for _, label := range []string{"animated gif"} {
 		dataURL := images[label]
 		w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
 			"name":       "Mach Banner Server",
@@ -365,4 +376,50 @@ func seedServerImage(t *testing.T, ts *testhelpers.TestServer, serverID, column,
 	require.NotEmpty(t, query, "unknown column %q", column)
 	_, err := ts.DB.Exec(query, value, serverID)
 	require.NoError(t, err)
+}
+
+// An allowed animated inline image is stored verbatim and never reaches the
+// upload pipeline's decoder, so it must pass the same decode limits there:
+// only GIF is accepted (no budget walker for APNG/WebP), and a GIF over the
+// frame budget is refused like an upload would be.
+func TestUpdateServerRefusesInlineAnimationsOutsideTheDecodeLimits(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := setupTS(t)
+	images := animatedInlineImages(t)
+	cases := map[string]string{
+		"animated apng":      images["animated apng"],
+		"animated webp":      images["animated webp"],
+		"gif over frame cap": testhelpers.DataURL("image/gif", testhelpers.GIFBytes(t, inlineFrameCapPlusOne)),
+	}
+	for label, dataURL := range cases {
+		for _, column := range []string{"icon_url", "banner_url"} {
+			user := newInlineOwner(t, ts)
+			serverID := ts.CreateTestServer(t, user.ID, "Budget Server")
+			w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
+				"name": "Budget Server",
+				column: dataURL,
+			}, testhelpers.AuthHeaders(user.AccessToken))
+			require.Equal(t, http.StatusBadRequest, w.Code, label+" "+column+": "+w.Body.String())
+			assert.Nil(t, storedServerImage(t, ts, serverID, column), label+" "+column)
+		}
+	}
+}
+
+// On a self-hosted instance a new server starts at the self-host tier, which
+// allows an animated icon, so create must accept what update would.
+func TestCreateServerAcceptsAnimatedInlineIconOnSelfHosted(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := setupTS(t)
+	user := newInlineOwner(t, ts)
+	icon := testhelpers.DataURL("image/gif", testhelpers.GIFBytes(t, 3))
+
+	w := ts.DoRequest("POST", pathServers, map[string]interface{}{
+		"name":     "Self Hosted Icon",
+		"icon_url": icon,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+
+	var stored string
+	require.NoError(t, ts.DB.QueryRow(`SELECT icon_url FROM servers WHERE owner_id = $1`, user.ID).Scan(&stored))
+	assert.Equal(t, icon, stored)
 }

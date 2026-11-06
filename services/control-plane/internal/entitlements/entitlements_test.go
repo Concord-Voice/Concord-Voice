@@ -54,7 +54,7 @@ func TestFor_Premium(t *testing.T) {
 	assert.Equal(t, 10240, e.MaxMessageChars)
 	assert.Equal(t, int64(268_435_456), e.MaxAttachmentBytes)
 	assert.Equal(t, int64(8_388_608), e.MaxAvatarBytes)
-	assert.Equal(t, int64(8_388_608), e.MaxBannerBytes)
+	assert.Equal(t, int64(10_485_760), e.MaxBannerBytes)
 	assert.True(t, e.AllowAnimatedProfile)
 	assert.Equal(t, 3, e.UsernameChangeIntervalMonths)
 }

@@ -24,7 +24,7 @@ func TestGetServerEntitlements_MemberGetsGroundspeed(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	ent := body["entitlement"].(map[string]interface{})
 	assert.Equal(t, "groundspeed", ent["Tier"])
-	assert.Equal(t, float64(75), ent["MaxServerCustomEmoji"])
+	assert.Equal(t, float64(100), ent["MaxServerCustomEmoji"])
 	assert.Equal(t, float64(10), ent["MaxServerStickers"])
 	assert.Equal(t, float64(15), ent["MaxServerSoundboards"], "founder entitlement matrix baseline")
 	assert.Equal(t, float64(33_554_432), ent["MaxServerUploadBytes"], "Groundspeed public 32 MB per-file baseline")

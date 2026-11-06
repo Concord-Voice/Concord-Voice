@@ -23,9 +23,9 @@ func TestForServer_LadderValues(t *testing.T) {
 		audioUnlock    bool
 		animatedBanner bool
 	}{
-		{entitlements.TierGroundspeed, 75, 10, 15, 33_554_432, 5_242_880, 0, 0, false, false},
-		{entitlements.TierMach1, 250, 75, 30, 134_217_728, 8_388_608, 1080, 60, true, true},
-		{entitlements.TierMach2, 350, 100, 40, 268_435_456, 8_388_608, 1440, 60, true, true},
+		{entitlements.TierGroundspeed, 100, 10, 15, 33_554_432, 5_242_880, 0, 0, false, false},
+		{entitlements.TierMach1, 250, 75, 30, 268_435_456, 8_388_608, 1080, 60, true, true},
+		{entitlements.TierMach2, 350, 100, 40, 536_870_912, 8_388_608, 1440, 60, true, true},
 		{entitlements.TierMach3, 500, 150, 55, 536_870_912, 8_388_608, 2160, 60, true, true},
 		{entitlements.TierSelfHost, -1, -1, -1, -1, 8_388_608, 2160, 60, true, true},
 	}
@@ -46,6 +46,8 @@ func TestForServer_LadderValues(t *testing.T) {
 			assert.Equal(t, tc.audioUnlock, e.UnlockServerAudioQualityCaps)
 			assert.Equal(t, tc.animatedBanner, e.AllowAnimatedServerBanner,
 				"animated GIF server banner is a Mach 1+ / selfhost perk (#1302)")
+			assert.Equal(t, tc.animatedBanner, e.AllowAnimatedServerIcon,
+				"animated GIF server icon is on the same Mach 1+ / selfhost rung as the banner")
 			// Storage pool stays the #1523 sentinel on every SaaS row; selfhost is unlimited.
 			if tc.tier == entitlements.TierSelfHost {
 				assert.Equal(t, int64(entitlements.ServerLimitUnlimited), e.MaxServerStoragePoolBytes)

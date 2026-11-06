@@ -21,9 +21,9 @@ func TestAllowsCosmetic_CountGates(t *testing.T) {
 		current int
 		allowed bool
 	}{
-		{"groundspeed emoji under cap", gs, entitlements.CosmeticEmoji, 74, true},
-		{"groundspeed emoji at cap", gs, entitlements.CosmeticEmoji, 75, false},
-		{"groundspeed emoji over cap", gs, entitlements.CosmeticEmoji, 80, false},
+		{"groundspeed emoji under cap", gs, entitlements.CosmeticEmoji, 99, true},
+		{"groundspeed emoji at cap", gs, entitlements.CosmeticEmoji, 100, false},
+		{"groundspeed emoji over cap", gs, entitlements.CosmeticEmoji, 105, false},
 		{"groundspeed sticker at cap", gs, entitlements.CosmeticSticker, 10, false},
 		{"groundspeed soundboard under cap", gs, entitlements.CosmeticSoundboard, 14, true},
 		{"groundspeed soundboard at cap", gs, entitlements.CosmeticSoundboard, 15, false},

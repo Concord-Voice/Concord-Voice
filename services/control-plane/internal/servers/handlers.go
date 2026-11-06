@@ -310,12 +310,13 @@ type animatedPolicy struct {
 	message string
 }
 
-// iconAnimatedPolicy refuses an animated icon at every tier — no upload route
-// allows one — with the upload route's "not supported" body.
-func iconAnimatedPolicy() animatedPolicy {
+// iconAnimatedPolicy allows an animated icon only where the server tier grants
+// it (Mach 1+), and otherwise answers with the upload route's Mach upsell body.
+func iconAnimatedPolicy(ent entitlements.ServerEntitlement) animatedPolicy {
 	return animatedPolicy{
-		code:    media.CodeAnimatedNotSupported,
-		message: media.MsgAnimatedNotSupported,
+		allowed: ent.AllowAnimatedServerIcon,
+		code:    media.CodeAnimatedServerIconMach,
+		message: media.MsgAnimatedServerIconMach,
 	}
 }
 
@@ -335,7 +336,8 @@ func bannerAnimatedPolicy(ent entitlements.ServerEntitlement) animatedPolicy {
 // PNG/JPEG/GIF/WebP, or whose bytes media.IsAnimatedImage cannot classify, is a
 // 400 (fail closed: an image the server cannot classify cannot be proven
 // static); an animated image the policy refuses is a 403, matching the upload
-// routes.
+// routes; an allowed animated image that is not a GIF within the upload decode
+// limits is a 400.
 func checkInlineImage(dataURL, label string, policy animatedPolicy) *mediaRefusal {
 	raw, ok := decodeInlineImage(dataURL)
 	if !ok {
@@ -350,6 +352,12 @@ func checkInlineImage(dataURL, label string, policy animatedPolicy) *mediaRefusa
 			status: http.StatusForbidden,
 			body:   gin.H{"error": policy.message, "code": policy.code},
 		}
+	}
+	// An allowed animated image is stored verbatim, so it gets the upload
+	// pipeline's decode limits here instead (frame count, pixel budget, screen
+	// size); animated PNG/WebP must use the upload route.
+	if animated && media.CheckInlineAnimatedBudget(raw) != nil {
+		return badMediaRequest("animated " + label + " must be a GIF within the animated image limits; upload larger or APNG/WebP animations instead")
 	}
 	return nil
 }
@@ -485,12 +493,16 @@ func (h *Handler) CreateServer(c *gin.Context) {
 
 	serverID := uuid.New().String()
 	groundspeed := entitlements.ForServer(entitlements.TierGroundspeed)
-	if refusal := validateCreateDataURL(req.IconURL, maxDataURLLen(groundspeed.MaxServerIconBytes), "Icon", "5MB", iconAnimatedPolicy); refusal != nil {
+	// The animated icon and banner allowances are the new server's own starting
+	// tier: Groundspeed on a managed instance, the self-host tier on a
+	// self-hosted one.
+	iconPolicy := func() animatedPolicy {
+		return iconAnimatedPolicy(entitlements.ForServer(h.serverTiers.GetServerTier(c.Request.Context(), serverID)))
+	}
+	if refusal := validateCreateDataURL(req.IconURL, maxDataURLLen(groundspeed.MaxServerIconBytes), "Icon", "5MB", iconPolicy); refusal != nil {
 		refusal.respond(c)
 		return
 	}
-	// The animated-banner allowance is the new server's own starting tier:
-	// Groundspeed on a managed instance, the self-host tier on a self-hosted one.
 	bannerPolicy := func() animatedPolicy {
 		return bannerAnimatedPolicy(entitlements.ForServer(h.serverTiers.GetServerTier(c.Request.Context(), serverID)))
 	}
@@ -722,7 +734,11 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid icon_url format"})
 		return
 	}
-	if refusal := validateMediaURL(iconURL, fmt.Sprintf("/api/v1/media/server-icons/%s", serverID), maxDataURLLen(inlineEnt.MaxServerIconBytes), "Icon", iconAnimatedPolicy); refusal != nil {
+	// The tier lookup runs only for an inline icon that passed the size cap.
+	iconPolicy := func() animatedPolicy {
+		return iconAnimatedPolicy(entitlements.ForServer(h.serverTiers.GetServerTier(c.Request.Context(), serverID)))
+	}
+	if refusal := validateMediaURL(iconURL, fmt.Sprintf("/api/v1/media/server-icons/%s", serverID), maxDataURLLen(inlineEnt.MaxServerIconBytes), "Icon", iconPolicy); refusal != nil {
 		refusal.respond(c)
 		return
 	}

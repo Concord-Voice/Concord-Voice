@@ -58,9 +58,12 @@ type ServerEntitlement struct {
 	MaxServerBannerBytes int64
 
 	// Animation-preserving GIF server BANNER (#1302 — matrix §1a "animated GIF
-	// server banner" from Mach 1). Server ICONS stay static at every tier; the
-	// user-axis avatar/banner analogue is Entitlement.AllowAnimatedProfile.
+	// server banner" from Mach 1). The user-axis avatar/banner analogue is Entitlement.AllowAnimatedProfile.
 	AllowAnimatedServerBanner bool
+
+	// Animation-preserving GIF server ICON, from Mach 1 (the same rung as the
+	// animated banner). Groundspeed icons stay static.
+	AllowAnimatedServerIcon bool
 
 	// Per-file upload cap, server-wide (composes with the user axis via
 	// EffectiveAttachmentBytes; handler wiring deferred to #1556 — see spec S3).
@@ -85,7 +88,7 @@ type ServerEntitlement struct {
 var (
 	groundspeedServerEntitlement = ServerEntitlement{
 		Tier:                 TierGroundspeed,
-		MaxServerCustomEmoji: 75,
+		MaxServerCustomEmoji: 100,
 		MaxServerStickers:    10,
 		// Groundspeed soundboard baseline 15 per the founder entitlement matrix
 		// (docs/design/entitlements/entitlement-matrix.md §1/§2), the SoT the
@@ -98,6 +101,7 @@ var (
 		MaxServerStoragePoolBytes:    ServerStoragePoolUnset,
 		UnlockServerAudioQualityCaps: false,
 		AllowAnimatedServerBanner:    false, // animated GIF server banner is Mach 1+ (#1302)
+		AllowAnimatedServerIcon:      false, // animated GIF server icon is Mach 1+
 	}
 
 	mach1ServerEntitlement = ServerEntitlement{
@@ -107,10 +111,11 @@ var (
 		MaxServerSoundboards:         30,
 		MaxServerIconBytes:           8_388_608,
 		MaxServerBannerBytes:         8_388_608,
-		MaxServerUploadBytes:         134_217_728,            // 128 MiB
+		MaxServerUploadBytes:         268_435_456,            // 256 MiB
 		MaxServerStoragePoolBytes:    ServerStoragePoolUnset, // 250 GB pending #1523
 		UnlockServerAudioQualityCaps: true,
 		AllowAnimatedServerBanner:    true,
+		AllowAnimatedServerIcon:      true,
 		ServerVideoFloorHeight:       1080,
 		ServerVideoFloorFps:          60,
 		ServerVideoFloorPixelRate:    124_416_000, // 1920*1080*60
@@ -123,10 +128,11 @@ var (
 		MaxServerSoundboards:         40,
 		MaxServerIconBytes:           8_388_608,
 		MaxServerBannerBytes:         8_388_608,
-		MaxServerUploadBytes:         268_435_456,            // 256 MiB
+		MaxServerUploadBytes:         536_870_912,            // 512 MiB
 		MaxServerStoragePoolBytes:    ServerStoragePoolUnset, // 1 TB pending #1523
 		UnlockServerAudioQualityCaps: true,
 		AllowAnimatedServerBanner:    true,
+		AllowAnimatedServerIcon:      true,
 		ServerVideoFloorHeight:       1440,
 		ServerVideoFloorFps:          60,
 		ServerVideoFloorPixelRate:    221_184_000, // 2560*1440*60
@@ -143,6 +149,7 @@ var (
 		MaxServerStoragePoolBytes:    ServerStoragePoolUnset, // 2.5 TB pending #1523
 		UnlockServerAudioQualityCaps: true,
 		AllowAnimatedServerBanner:    true,
+		AllowAnimatedServerIcon:      true,
 		ServerVideoFloorHeight:       2160,
 		ServerVideoFloorFps:          60,
 		ServerVideoFloorPixelRate:    497_664_000, // 3840*2160*60
@@ -159,6 +166,7 @@ var (
 		MaxServerStoragePoolBytes:    ServerLimitUnlimited, // "unlimited server file storage"
 		UnlockServerAudioQualityCaps: true,
 		AllowAnimatedServerBanner:    true,
+		AllowAnimatedServerIcon:      true,
 		// Floor = top ladder floor: floors are GRANTS (minimum quality), and
 		// "uncapped" applies to caps — this is what #1542/#1602 read as the
 		// server-granted minimum.

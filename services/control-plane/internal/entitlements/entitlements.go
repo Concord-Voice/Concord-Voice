@@ -118,9 +118,9 @@ var (
 		MaxWebcamPublishers:          25,
 		MaxScreensharePublishers:     16, // 2× the free cap (raised 3→16 alongside the free 1→8 parity bump)
 		MaxMessageChars:              10240,
-		MaxAttachmentBytes:           268_435_456, // 256 MiB — Supersonic's pinned 256 MB (512 MB is Mach 3 server-wide)
+		MaxAttachmentBytes:           268_435_456, // 256 MiB per file; Mach 2 and Mach 3 servers allow 512 MiB
 		MaxAvatarBytes:               8_388_608,   // 8 MiB
-		MaxBannerBytes:               8_388_608,   // 8 MiB
+		MaxBannerBytes:               10_485_760,  // 10 MiB
 		AllowAnimatedProfile:         true,
 		UsernameChangeIntervalMonths: 3,
 	}

@@ -292,6 +292,27 @@ func IsAnimatedImage(raw []byte) (bool, error) {
 	}
 }
 
+// CheckInlineAnimatedBudget applies the upload pipeline's decompression-bomb
+// limits to an animated image that will be stored verbatim (an inline
+// `data:image/` icon or banner), since such an image never reaches
+// safeDecodeGIF. A GIF must pass the same logical-screen dimension check and
+// pre-decode frame/pixel budget as an upload. Animated PNG and WebP have no
+// budget walker here, so they are refused: they can still go through the
+// upload routes. Errors name bounds only, never payload bytes.
+func CheckInlineAnimatedBudget(raw []byte) error {
+	if !bytes.HasPrefix(raw, []byte("GIF87a")) && !bytes.HasPrefix(raw, []byte("GIF89a")) {
+		return fmt.Errorf("media: inline animated images must be GIF")
+	}
+	cfg, err := gif.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return fmt.Errorf("media: failed to decode gif config: %w", err)
+	}
+	if err := validateDecodeDims(cfg.Width, cfg.Height); err != nil {
+		return err
+	}
+	return scanGIFFrameBudget(raw)
+}
+
 var (
 	pngSignature  = []byte("\x89PNG\r\n\x1a\n")
 	jpegSignature = []byte{0xFF, 0xD8, 0xFF}

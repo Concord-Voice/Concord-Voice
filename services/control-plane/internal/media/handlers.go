@@ -1667,16 +1667,19 @@ func (h *Handler) processGIFTier1Image(c *gin.Context, file multipart.File, job 
 const (
 	CodeAnimatedProfilePremium   = "animated_profile_premium"
 	CodeAnimatedServerBannerMach = "animated_server_banner_mach"
+	CodeAnimatedServerIconMach   = "animated_server_icon_mach"
 	CodeAnimatedNotSupported     = "animated_not_supported"
 
 	MsgAnimatedProfilePremium   = "Animated avatars and banners require a premium subscription"
 	MsgAnimatedServerBannerMach = "Animated server banners require a Mach server boost"
+	MsgAnimatedServerIconMach   = "Animated server icons require a Mach server boost"
 	MsgAnimatedNotSupported     = "Animated images are not supported for this upload type"
 )
 
 // authorizeAnimatedUpload enforces the animated-media entitlements (#1302):
 // user axis (AllowAnimatedProfile) for avatar/banner, server axis
-// (AllowAnimatedServerBanner) for server banners, rejected for every other
+// (AllowAnimatedServerBanner / AllowAnimatedServerIcon) for server banners and
+// icons, rejected for every other
 // purpose. Typed codes let the client render the upsell affordance (#1522
 // pattern). On rejection the 403 response is written and false returned.
 func (h *Handler) authorizeAnimatedUpload(c *gin.Context, userID, purpose, serverID string) bool {
@@ -1696,6 +1699,15 @@ func (h *Handler) authorizeAnimatedUpload(c *gin.Context, userID, purpose, serve
 			c.JSON(http.StatusForbidden, gin.H{
 				"error": MsgAnimatedServerBannerMach,
 				"code":  CodeAnimatedServerBannerMach,
+			})
+			return false
+		}
+	case purposeServerIcon:
+		serverEnt := entitlements.ForServer(h.serverTier(c.Request.Context(), serverID))
+		if !serverEnt.AllowAnimatedServerIcon {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": MsgAnimatedServerIconMach,
+				"code":  CodeAnimatedServerIconMach,
 			})
 			return false
 		}

@@ -3596,8 +3596,8 @@ func TestUploadServerBannerAnimatedGIF_SelfhostPreserved(t *testing.T) {
 	assert.Len(t, out.Image, 3, "animation preserved")
 }
 
-func TestUploadServerIconAnimatedGIF_RejectedUnsupported(t *testing.T) {
-	ts := setupMediaTest(t)
+func TestUploadServerIconAnimatedGIF_GroundspeedRejected(t *testing.T) {
+	ts := setupMediaTest(t) // serverTiers nil → ResolveServerTier → groundspeed
 	owner := ts.createTestUser(t, "animiconowner")
 	serverID := ts.createTestServer(t, owner, "Anim Icon Server")
 
@@ -3607,7 +3607,30 @@ func TestUploadServerIconAnimatedGIF_RejectedUnsupported(t *testing.T) {
 
 	require.Equal(t, http.StatusForbidden, w.Code)
 	resp := parseBody(t, w)
-	assert.Equal(t, "animated_not_supported", resp["code"], "server icons stay static at every tier")
+	assert.Equal(t, "animated_server_icon_mach", resp["code"], "animated server icons are a Mach 1+ perk")
+	assert.False(t, ts.store.hasObject(fmt.Sprintf("server-icons/%s", serverID)))
+}
+
+func TestUploadServerIconAnimatedGIF_MachPreserved(t *testing.T) {
+	for _, tier := range []string{entitlements.TierMach1, entitlements.TierSelfHost} {
+		t.Run(tier, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			ts.handler.serverTiers = serverTierStub{tier}
+			owner := ts.createTestUser(t, "machiconowner")
+			serverID := ts.createTestServer(t, owner, "Mach Icon Server")
+
+			body, ct := multipartBody(t, "file", "icon.gif", makeAnimatedGIFUpload(t),
+				map[string]string{keyServerID: serverID})
+			w := ts.doMultipart(ts.handler.UploadServerIcon, "POST", pathUploadServerIcon, owner, body, ct)
+
+			require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+			data, contentType := ts.storedObject(t, fmt.Sprintf("server-icons/%s", serverID))
+			assert.Equal(t, "image/gif", contentType)
+			out, err := gif.DecodeAll(bytes.NewReader(data))
+			require.NoError(t, err)
+			assert.Len(t, out.Image, 3, "animation preserved")
+		})
+	}
 }
 
 func TestUploadDMIconAnimatedGIF_RejectedUnsupported(t *testing.T) {
